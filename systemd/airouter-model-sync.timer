@@ -1,0 +1,10 @@
+[Unit]
+Description=Run airouter model sync daily
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

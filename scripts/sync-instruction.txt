@@ -1,0 +1,55 @@
+Task: regenerate the fallback chains in ./config.yaml from the freshly fetched
+free-model list in /tmp/free-models.json (output of fetch-free-models.py).
+Read /tmp/free-models.json and ./config.yaml before editing anything.
+
+Rules:
+
+1. The `providers:` section stays unchanged. Only rewrite the `models:` section.
+
+2. Map the JSON "provider" field to config providers:
+   - nvidia-nim      -> nvidia, nvidia2 or nvidia3 (see rule 3)
+   - kilocode        -> kilocode
+   - opencode        -> opencode
+   - ollama-cloud    -> ollama
+   - google-ai-studio -> google
+
+3. Rate-limit absorption: the TOP model of each chain is repeated as three
+   consecutive entries on providers nvidia, nvidia2, nvidia3 (same model id).
+   Every other nvidia-nim model appears exactly once under provider `nvidia`.
+
+4. Order each chain best-first, descending by "intelligence". Skip models whose
+   intelligence is null — EXCEPT the two auto-fallback models in rule 6, which
+   are always allowed regardless.
+
+5. Profile selection (a model may appear in several profiles when it fits, but
+   never twice in the same chain except the nvidia/nvidia2/nvidia3 trio):
+   - smart: strongest generalists, intelligence >= 25, any context length.
+   - work:  coding workhorses. Same pool as smart plus dedicated code models
+     (e.g. cohere/north-mini-code). Drop tiny models (intelligence < 15).
+   - fast:  small/cheap models only: intelligence < 25, or ids containing
+     flash-lite / lightning / nano / gemma / lfm / laguna-xs. Cap at 10 entries.
+   - large: context_length >= 200000 only. Sort by context_length desc, then
+     intelligence desc.
+
+6. The LAST entry of EVERY chain is that profile's auto fallback. Count the
+   concrete (non-auto) endpoints contributed by kilocode vs opencode in the
+   chain:
+   - kilocode count strictly greater -> provider `kilocode`, model `kilo-auto/free`
+   - otherwise                       -> provider `opencode`, model `big-pickle`
+     (ties included, i.e. ties go to kilocode)
+   Add a trailing comment with the counts, e.g.:
+   `# last: kilocode dominates (5 vs 2)` or `# last: opencode dominates (3 vs 1)`.
+
+7. Never invent model ids: only use ids present in /tmp/free-models.json.
+   Never include: stealth/*, anything matching *content-safety*, or
+   x-preview-f-free.
+
+8. Preserve the existing YAML style: `provider:` / `model:` lines with aligned
+   trailing comments carrying the score and notable context size
+   (e.g. `# 51.8  131,072 ctx`). Update the header comment block if the
+   distribution rules above changed relative to what it describes.
+
+9. Self-check after editing: every profile has a non-empty chain, every
+   referenced provider exists in `providers:`, the last entry of each chain is
+   the auto model chosen per rule 6. Finish with a compact summary table listing
+   the four chains (profile, entry count, head model, tail auto model).
