@@ -1,0 +1,11 @@
+# Secrets / env
+.envrc
+.env
+
+# Build artifacts
+airouter
+__pycache__/
+*.bak
+
+# Regenerable caches
+free-models-cache.json

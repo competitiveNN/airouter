@@ -1,0 +1,8 @@
+[Unit]
+Description=Airouter model sync (fetch free models, rebuild config.yaml via maki)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/airouter
+ExecStart=%h/dev/airouter/scripts/sync-models.sh
+TimeoutStartSec=30min
