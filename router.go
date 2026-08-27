@@ -1,30 +1,86 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"log"
+	"os"
 	"sync"
 	"time"
 )
 
 type CooldownEntry struct {
-	Expiry      time.Time
-	StatusCode  int
-	ErrorCount  int
-	LastError   string
+	Expiry      time.Time `json:"expiry"`
+	StatusCode  int       `json:"status_code"`
+	ErrorCount  int       `json:"error_count"`
+	LastError   string    `json:"last_error"`
 }
 
 type Router struct {
-	config    *Config
-	sessions  map[string]ModelEndpoint
-	cooldowns map[string]CooldownEntry
-	mu        sync.RWMutex
+	config       *Config
+	sessions     map[string]ModelEndpoint
+	cooldowns    map[string]CooldownEntry
+	rrCounters   map[string]int
+	cooldownPath string
+	mu           sync.RWMutex
 }
 
-func NewRouter(cfg *Config) *Router {
-	return &Router{
-		config:    cfg,
-		sessions:  make(map[string]ModelEndpoint),
-		cooldowns: make(map[string]CooldownEntry),
+func NewRouter(cfg *Config, cooldownPath string) *Router {
+	r := &Router{
+		config:       cfg,
+		sessions:     make(map[string]ModelEndpoint),
+		cooldowns:    make(map[string]CooldownEntry),
+		rrCounters:   make(map[string]int),
+		cooldownPath: cooldownPath,
+	}
+	r.loadCooldowns()
+	return r
+}
+
+func (r *Router) loadCooldowns() {
+	if r.cooldownPath == "" {
+		return
+	}
+	data, err := os.ReadFile(r.cooldownPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		log.Printf("[debug] failed to load cooldowns: %v", err)
+		return
+	}
+	var loaded map[string]CooldownEntry
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		log.Printf("[debug] failed to parse cooldowns: %v", err)
+		return
+	}
+	now := time.Now()
+	for k, v := range loaded {
+		if v.Expiry.After(now) {
+			r.cooldowns[k] = v
+		}
+	}
+	log.Printf("[debug] loaded %d active cooldowns", len(r.cooldowns))
+}
+
+func (r *Router) saveCooldowns() {
+	if r.cooldownPath == "" {
+		return
+	}
+	now := time.Now()
+	active := make(map[string]CooldownEntry)
+	for k, v := range r.cooldowns {
+		if v.Expiry.After(now) {
+			active[k] = v
+		}
+	}
+	data, err := json.MarshalIndent(active, "", "  ")
+	if err != nil {
+		log.Printf("[debug] failed to marshal cooldowns: %v", err)
+		return
+	}
+	if err := os.WriteFile(r.cooldownPath, data, 0644); err != nil {
+		log.Printf("[debug] failed to save cooldowns: %v", err)
 	}
 }
 
@@ -71,24 +127,29 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string) (*ModelEndpoint,
 	defer r.mu.Unlock()
 
 	chain, ok := r.config.Models[logicalModel]
-	if !ok {
+	if !ok || len(chain.Chain) == 0 {
 		return nil, 0
 	}
 
 	if ep, ok := r.sessions[sessionID]; ok {
 		if r.isAvailableLocked(&ep) {
+			log.Printf("[debug] session=%s model=%s -> sticky %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
 			return &ep, 0
 		}
+		log.Printf("[debug] session=%s model=%s -> session model %s/%s cooling down, searching fallback", sessionID, logicalModel, ep.Provider, ep.Model)
 		for _, next := range chain.Chain {
 			if r.isAvailableLocked(&next) {
+				log.Printf("[debug] session=%s model=%s -> fallback %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
 				r.sessions[sessionID] = next
 				return &next, 0
 			}
 		}
 	}
 
+	// New session
 	for _, ep := range chain.Chain {
 		if r.isAvailableLocked(&ep) {
+			log.Printf("[debug] session=%s model=%s -> new session assigned to %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
 			r.sessions[sessionID] = ep
 			return &ep, 0
 		}
@@ -133,17 +194,19 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	duration := cooldownForError(statusCode)
 	key := ep.Key()
 	cd, ok := r.cooldowns[key]
 	if !ok {
 		cd = CooldownEntry{}
 	}
+	cd.ErrorCount++
+	duration := r.cooldownForErrorWithBackoff(statusCode, cd.ErrorCount)
 	cd.Expiry = time.Now().Add(duration)
 	cd.StatusCode = statusCode
-	cd.ErrorCount++
 	cd.LastError = errMsg
 	r.cooldowns[key] = cd
+	r.saveCooldowns()
+	log.Printf("[debug] model=%s/%s -> cooldown applied (status=%d, errors=%d, duration=%v): %s", ep.Provider, ep.Model, statusCode, cd.ErrorCount, duration, errMsg)
 }
 
 func (r *Router) ApplyCooldownFromError(ep *ModelEndpoint, err error) {
@@ -156,7 +219,7 @@ func (r *Router) ApplyCooldownFromError(ep *ModelEndpoint, err error) {
 	r.ApplyCooldown(ep, statusCode, errMsg)
 }
 
-func cooldownForError(statusCode int) time.Duration {
+func baseCooldownForError(statusCode int) time.Duration {
 	switch statusCode {
 	case 429:
 		return 10 * time.Second
@@ -173,10 +236,25 @@ func cooldownForError(statusCode int) time.Duration {
 	}
 }
 
+func (r *Router) cooldownForErrorWithBackoff(statusCode int, errorCount int) time.Duration {
+	base := baseCooldownForError(statusCode)
+	multiplier := 1 << (errorCount - 1)
+	if multiplier > 32 {
+		multiplier = 32
+	}
+	duration := base * time.Duration(multiplier)
+	maxDuration := 1 * time.Hour
+	if duration > maxDuration {
+		duration = maxDuration
+	}
+	return duration
+}
+
 func (r *Router) ResetCooldown(ep *ModelEndpoint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.cooldowns, ep.Key())
+	r.saveCooldowns()
 }
 
 func (r *Router) GetSession(sessionID string) (ModelEndpoint, bool) {
