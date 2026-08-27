@@ -343,15 +343,17 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			return
 		}
 
-		reqCtx, cancel := context.WithTimeout(ctx, timeout)
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
-		err := g.proxy.StreamToClient(reqCtx, w, flusher, body, *ep)
+		// StreamToClient buffers the start of the stream and only flushes to the
+		// client once the first content token arrives, so an early upstream
+		// error is swallowed and we fall back with no output sent to the client.
+		// The size-based timeout guards only time-to-first-token; the parent
+		// context keeps the connection alive for the rest of a long generation.
+		err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
 		if err == nil {
-			cancel()
 			return
 		}
 
-		cancel()
 		g.router.ApplyCooldownFromError(ep, err)
 		continue
 	}
