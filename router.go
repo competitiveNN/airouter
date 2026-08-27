@@ -236,18 +236,27 @@ func baseCooldownForError(statusCode int) time.Duration {
 	}
 }
 
+// cooldownSchedule maps consecutive-error count (1-based) to the cooldown
+// duration applied. More consecutive failures escalate the backoff so a model
+// that keeps failing is kept out longer: 60s, 1h, 8h, 24h, 3d, 7d.
+var cooldownSchedule = []time.Duration{
+	60 * time.Second,        // 1st consecutive error
+	time.Hour,               // 2nd
+	8 * time.Hour,           // 3rd
+	24 * time.Hour,          // 4th
+	3 * 24 * time.Hour,      // 5th (3 days)
+	7 * 24 * time.Hour,      // 6th (7 days)
+}
+
 func (r *Router) cooldownForErrorWithBackoff(statusCode int, errorCount int) time.Duration {
-	base := baseCooldownForError(statusCode)
-	multiplier := 1 << (errorCount - 1)
-	if multiplier > 32 {
-		multiplier = 32
+	idx := errorCount - 1
+	if idx < 0 {
+		idx = 0
 	}
-	duration := base * time.Duration(multiplier)
-	maxDuration := 1 * time.Hour
-	if duration > maxDuration {
-		duration = maxDuration
+	if idx >= len(cooldownSchedule) {
+		idx = len(cooldownSchedule) - 1
 	}
-	return duration
+	return cooldownSchedule[idx]
 }
 
 func (r *Router) ResetCooldown(ep *ModelEndpoint) {
