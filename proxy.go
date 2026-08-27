@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -29,11 +32,51 @@ func NewProxy(cfg *Config) *Proxy {
 	}
 }
 
+// geminiStripFields lists top-level request fields that Gemini's
+// OpenAI-compatible endpoint rejects. The router otherwise forwards the raw
+// client body, so these are removed before sending upstream. Applies to all
+// providers whose name starts with "gemini" (gemini, gemini2, ...).
+var geminiStripFields = []string{"thinking", "thinking_budget", "reasoning_effort"}
+
+// sanitizeRequestBody removes provider-specific unsupported fields from the
+// request JSON. It returns the original body unchanged if nothing applies or
+// on a parse failure (fail-open so we never drop a valid request).
+func sanitizeRequestBody(body []byte, provider string) []byte {
+	var fields []string
+	if strings.HasPrefix(provider, "gemini") {
+		fields = geminiStripFields
+	}
+	if len(fields) == 0 {
+		return body
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	changed := false
+	for _, f := range fields {
+		if _, ok := obj[f]; ok {
+			delete(obj, f)
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	log.Printf("[debug] provider=%s -> stripped unsupported fields %v", provider, fields)
+	return out
+}
+
 func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEndpoint, providerCfg *ProviderConfig, stream bool) (*http.Request, error) {
 	backendBody, err := ReplaceModelName(body, endpoint.Model)
 	if err != nil {
 		return nil, fmt.Errorf("replace model name: %w", err)
 	}
+	backendBody = sanitizeRequestBody(backendBody, endpoint.Provider)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", providerCfg.URL+"/chat/completions", bytes.NewReader(backendBody))
 	if err != nil {
