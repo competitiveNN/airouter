@@ -185,7 +185,7 @@ func TestReplaceModelNamePreservesFields(t *testing.T) {
 
 func TestRouterSessionAssignment(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	sessionID := "test-session-1"
 
 	// First call should assign to first model in chain
@@ -212,7 +212,7 @@ func TestRouterSessionAssignment(t *testing.T) {
 
 func TestRouterCooldown(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
@@ -232,7 +232,7 @@ func TestRouterCooldown(t *testing.T) {
 
 func TestRouterCooldownExpiry(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
@@ -251,7 +251,7 @@ func TestRouterCooldownExpiry(t *testing.T) {
 
 func TestRouterModelFallback(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	sessionID := "test-session-2"
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
@@ -281,7 +281,7 @@ func TestRouterModelFallback(t *testing.T) {
 
 func TestRouterSelectNext(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	sessionID := "test-session-3"
 
 	chain := cfg.Models["smart"].Chain
@@ -311,7 +311,7 @@ func TestRouterSelectNext(t *testing.T) {
 
 func TestRouterSelectNextAllInCooldown(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	sessionID := "test-session-4"
 
 	chain := cfg.Models["smart"].Chain
@@ -333,7 +333,7 @@ func TestRouterSelectNextAllInCooldown(t *testing.T) {
 
 func TestRouterResetCooldown(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 	router.ApplyCooldown(ep, 429, "rate limited")
@@ -365,16 +365,16 @@ func TestCooldownDurations(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := cooldownForError(tt.statusCode)
+		got := baseCooldownForError(tt.statusCode)
 		if got != tt.expected {
-			t.Errorf("cooldownForError(%d) = %v, want %v", tt.statusCode, got, tt.expected)
+			t.Errorf("baseCooldownForError(%d) = %v, want %v", tt.statusCode, got, tt.expected)
 		}
 	}
 }
 
 func TestRouterGetAllSessions(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 
 	ep1, _ := router.SelectEndpoint("smart", "session-1")
 	ep2, _ := router.SelectEndpoint("fast", "session-2")
@@ -393,7 +393,7 @@ func TestRouterGetAllSessions(t *testing.T) {
 
 func TestRouterGetAllCooldowns(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 
 	ep1 := ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 	ep2 := ModelEndpoint{Provider: "ollama", Model: "llama3"}
@@ -451,7 +451,7 @@ func TestProviderProxyForward(t *testing.T) {
 	t.Setenv("TEST_API_KEY", "test-key-123")
 
 	proxy := NewProxy(cfg)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session")
@@ -581,7 +581,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 	}
 
 	proxy := NewProxy(cfg)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	sessionID := "recovery-test"
@@ -616,7 +616,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 
 func TestHandleModels(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
 
@@ -678,7 +678,7 @@ func TestHandleChatCompletionsNonStreaming(t *testing.T) {
 			"smart": {Chain: []ModelEndpoint{{Provider: "test", Model: "gpt-4"}}},
 		},
 	}
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
 
@@ -742,7 +742,7 @@ func TestHandleChatCompletionsWithFallback(t *testing.T) {
 			}},
 		},
 	}
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
 
@@ -802,7 +802,7 @@ func TestHandleChatCompletionsStreamingWithFallback(t *testing.T) {
 			}},
 		},
 	}
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
 
@@ -826,7 +826,7 @@ func TestHandleChatCompletionsStreamingWithFallback(t *testing.T) {
 
 func TestSessionPersistence(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	sessionID := "persist-session"
 
 	// Initial request
@@ -854,7 +854,7 @@ func TestSessionPersistence(t *testing.T) {
 
 func TestInvalidModel(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
 
@@ -876,7 +876,7 @@ func TestInvalidModel(t *testing.T) {
 
 func TestGatewayAuth(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "secret-key")
 
@@ -902,7 +902,7 @@ func TestGatewayAuth(t *testing.T) {
 
 func TestGatewayNoAuth(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
 
@@ -918,7 +918,7 @@ func TestGatewayNoAuth(t *testing.T) {
 
 func TestHealth(t *testing.T) {
 	cfg := loadTestConfig(t)
-	router := NewRouter(cfg)
+	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
 

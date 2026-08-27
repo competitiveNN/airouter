@@ -21,10 +21,12 @@
 #   - The LAST entry of every chain is that profile's "auto" fallback. It is
 #     chosen by comparing how many concrete (non-auto) endpoints kilocode vs
 #     opencode contributed to the chain:
-#         kilocode > opencode (strictly) -> kilocode  `kilo-auto/free`
-#         otherwise                      -> opencode  `big-pickle`
-#     (In the current free-model list kilocode contributes more in every chain,
-#      so all tails are `kilo-auto/free`.)
+#         kilocode_count > opencode_count -> kilocode  `kilo-auto/free`
+#         opencode_count > kilocode_count -> opencode  `big-pickle`
+#         (a tie goes to kilocode, per rule 6)
+#     In this free-model list kilocode leads in smart/work/large; fast is a
+#     1-vs-1 tie that also resolves to `kilo-auto/free`. All tails are therefore
+#     `kilo-auto/free`.
 #
 # Models carry their approximate quality score (intelligence benchmark) and
 # context window (ctx, in tokens) in the trailing comments for reference.
@@ -75,61 +77,67 @@ models:
       - provider: nvidia3
         model: moonshotai/kimi-k3  # 59.7
       - provider: opencode
-        model: muse-spark-1.2-contributor-free  # 56.8  131,072 ctx
+        model: muse-spark-1.2-contributor-free  # 56.8
+      - provider: gemini
+        model: gemini-flash-latest  # 56  1,048,576 ctx
       - provider: nvidia
-        model: deepseek-ai/deepseek-v4-flash-0731  # 51.8  131,072 ctx
+        model: deepseek-ai/deepseek-v4-pro-0813  # 53.2  131,072 ctx
       - provider: opencode
         model: deepseek-v4-flash-free  # 51.8  131,072 ctx
+      - provider: nvidia
+        model: deepseek-ai/deepseek-v4-flash-0731  # 51.8  131,072 ctx
+      - provider: nvidia
+        model: minimaxai/minimax-m3  # 45.4
+      - provider: kilocode
+        model: minimax/minimax-m3:free  # 45.4  1,048,576 ctx
       - provider: ollama
         model: minimax-m3  # 45.4  262,144 ctx
       - provider: nvidia
-        model: minimaxai/minimax-m3  # 45.4
-      - provider: nvidia
         model: moonshotai/kimi-k2.6  # 45.1
-      - provider: opencode
-        model: mimo-v2.5-free  # 42.9  131,072 ctx
-      - provider: nvidia
-        model: thinkingmachines/inkling  # 42.3  131,072 ctx
       - provider: kilocode
         model: thinkingmachines/inkling:free  # 42.3  1,048,576 ctx
-      - provider: opencode
-        model: hy3-free  # 42.2
       - provider: kilocode
         model: tencent/hy3:free  # 42.2  262,144 ctx
+      - provider: opencode
+        model: hy3-free  # 42.2
       - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 41.2  1,048,576 ctx
       - provider: kilocode
         model: minimax/minimax-m2.7:free  # 38.9  196,608 ctx
-      - provider: ollama
-        model: nemotron-3-ultra  # 38.3  1,000,000 ctx
-      - provider: opencode
-        model: nemotron-3-ultra-free  # 38.3  1,000,000 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 38.3  1,000,000 ctx
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 38.3  1,000,000 ctx
+      - provider: nvidia
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 38.3  1,000,000 ctx
+      - provider: opencode
+        model: nemotron-3-ultra-free  # 38.3  1,000,000 ctx
+      - provider: ollama
+        model: nemotron-3-ultra  # 38.3  1,000,000 ctx
       - provider: gemini
         model: gemini-flash-lite-latest  # 37.4  1,048,576 ctx
       - provider: nvidia
         model: meta/muse-glimmer-30b  # 35.1
       - provider: kilocode
-        model: meituan/longcat-2.0-free  # 34.0  1,048,756 ctx
-      - provider: nvidia
-        model: stepfun-ai/step-3.7-flash  # 30.9  131,072 ctx
+        model: meituan/longcat-2.0-free  # 34  1,048,756 ctx
       - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 30.9  262,144 ctx
+      - provider: nvidia
+        model: stepfun-ai/step-3.7-flash  # 30.9  131,072 ctx
+      - provider: nvidia
+        model: google/gemma-4-31b-it  # 29.7
       - provider: ollama
         model: gemma4:31b  # 29.7  262,144 ctx
       - provider: gemini
-        model: gemini-flash-latest  # 27.9  1,048,576 ctx
-      - provider: ollama
-        model: nemotron-3-super  # 25.7  262,144 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-super-120b-a12b  # 25.7  262,144 ctx
+        model: gemma-4-31b-it  # 29.7  262,144 ctx
+      - provider: gemini
+        model: gemma-4-26b-a4b-it  # 26.1  262,144 ctx
       - provider: kilocode
         model: nvidia/nemotron-3-super-120b-a12b:free  # 25.7  262,144 ctx
+      - provider: nvidia
+        model: nvidia/nemotron-3-super-120b-a12b  # 25.7  262,144 ctx
+      - provider: ollama
+        model: nemotron-3-super  # 25.7  262,144 ctx
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (8 vs 5)
+        model: kilo-auto/free  # last: kilocode dominates (9 vs 4)
   work:
     chain:
       - provider: nvidia
@@ -139,95 +147,103 @@ models:
       - provider: nvidia3
         model: moonshotai/kimi-k3  # 59.7
       - provider: opencode
-        model: muse-spark-1.2-contributor-free  # 56.8  131,072 ctx
+        model: muse-spark-1.2-contributor-free  # 56.8
+      - provider: gemini
+        model: gemini-flash-latest  # 56  1,048,576 ctx
       - provider: nvidia
-        model: deepseek-ai/deepseek-v4-flash-0731  # 51.8  131,072 ctx
+        model: deepseek-ai/deepseek-v4-pro-0813  # 53.2  131,072 ctx
       - provider: opencode
         model: deepseek-v4-flash-free  # 51.8  131,072 ctx
+      - provider: nvidia
+        model: deepseek-ai/deepseek-v4-flash-0731  # 51.8  131,072 ctx
+      - provider: nvidia
+        model: minimaxai/minimax-m3  # 45.4
+      - provider: kilocode
+        model: minimax/minimax-m3:free  # 45.4  1,048,576 ctx
       - provider: ollama
         model: minimax-m3  # 45.4  262,144 ctx
       - provider: nvidia
-        model: minimaxai/minimax-m3  # 45.4
-      - provider: nvidia
         model: moonshotai/kimi-k2.6  # 45.1
-      - provider: opencode
-        model: mimo-v2.5-free  # 42.9  131,072 ctx
-      - provider: nvidia
-        model: thinkingmachines/inkling  # 42.3  131,072 ctx
       - provider: kilocode
         model: thinkingmachines/inkling:free  # 42.3  1,048,576 ctx
-      - provider: opencode
-        model: hy3-free  # 42.2
       - provider: kilocode
         model: tencent/hy3:free  # 42.2  262,144 ctx
+      - provider: opencode
+        model: hy3-free  # 42.2
       - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 41.2  1,048,576 ctx
       - provider: kilocode
         model: minimax/minimax-m2.7:free  # 38.9  196,608 ctx
-      - provider: ollama
-        model: nemotron-3-ultra  # 38.3  1,000,000 ctx
-      - provider: opencode
-        model: nemotron-3-ultra-free  # 38.3  1,000,000 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 38.3  1,000,000 ctx
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 38.3  1,000,000 ctx
+      - provider: nvidia
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 38.3  1,000,000 ctx
+      - provider: opencode
+        model: nemotron-3-ultra-free  # 38.3  1,000,000 ctx
+      - provider: ollama
+        model: nemotron-3-ultra  # 38.3  1,000,000 ctx
       - provider: gemini
         model: gemini-flash-lite-latest  # 37.4  1,048,576 ctx
       - provider: nvidia
         model: meta/muse-glimmer-30b  # 35.1
       - provider: kilocode
-        model: meituan/longcat-2.0-free  # 34.0  1,048,756 ctx
-      - provider: nvidia
-        model: stepfun-ai/step-3.7-flash  # 30.9  131,072 ctx
+        model: meituan/longcat-2.0-free  # 34  1,048,756 ctx
       - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 30.9  262,144 ctx
+      - provider: nvidia
+        model: stepfun-ai/step-3.7-flash  # 30.9  131,072 ctx
+      - provider: nvidia
+        model: google/gemma-4-31b-it  # 29.7
       - provider: ollama
         model: gemma4:31b  # 29.7  262,144 ctx
       - provider: gemini
-        model: gemini-flash-latest  # 27.9  1,048,576 ctx
-      - provider: ollama
-        model: nemotron-3-super  # 25.7  262,144 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-super-120b-a12b  # 25.7  262,144 ctx
+        model: gemma-4-31b-it  # 29.7  262,144 ctx
+      - provider: gemini
+        model: gemma-4-26b-a4b-it  # 26.1  262,144 ctx
       - provider: kilocode
         model: nvidia/nemotron-3-super-120b-a12b:free  # 25.7  262,144 ctx
-      - provider: opencode
-        model: nemotron-3.5-lightning-free  # 23.6
       - provider: nvidia
-        model: nvidia/nemotron-3.5-lightning-30b-a3b  # 23.6
+        model: nvidia/nemotron-3-super-120b-a12b  # 25.7  262,144 ctx
+      - provider: ollama
+        model: nemotron-3-super  # 25.7  262,144 ctx
       - provider: kilocode
         model: nvidia/nemotron-3.5-lightning:free  # 23.6  1,000,000 ctx
+      - provider: nvidia
+        model: nvidia/nemotron-3.5-lightning-30b-a3b  # 23.6
+      - provider: opencode
+        model: nemotron-3.5-lightning-free  # 23.6
       - provider: kilocode
         model: cohere/north-mini-code:free  # 20.2  256,000 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-nano-30b-a3b  # 15.0  262,144 ctx
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (10 vs 6)
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  # 15  256,000 ctx
+      - provider: nvidia
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 15  262,144 ctx
+      - provider: kilocode
+        model: kilo-auto/free  # last: kilocode dominates (12 vs 5)
   fast:
     chain:
       - provider: nvidia
-        model: nvidia/nemotron-3.5-lightning-30b-a3b  # 23.6
+        model: google/gemma-4-31b-it  # 29.7
       - provider: nvidia2
-        model: nvidia/nemotron-3.5-lightning-30b-a3b  # 23.6
+        model: google/gemma-4-31b-it  # 29.7
       - provider: nvidia3
-        model: nvidia/nemotron-3.5-lightning-30b-a3b  # 23.6
+        model: google/gemma-4-31b-it  # 29.7
       - provider: gemini
         model: gemini-flash-lite-latest  # 37.4  1,048,576 ctx
       - provider: ollama
         model: gemma4:31b  # 29.7  262,144 ctx
+      - provider: gemini
+        model: gemma-4-31b-it  # 29.7  262,144 ctx
+      - provider: gemini
+        model: gemma-4-26b-a4b-it  # 26.1  262,144 ctx
+      - provider: kilocode
+        model: nvidia/nemotron-3.5-lightning:free  # 23.6  1,000,000 ctx
+      - provider: nvidia
+        model: nvidia/nemotron-3.5-lightning-30b-a3b  # 23.6
       - provider: opencode
         model: nemotron-3.5-lightning-free  # 23.6
       - provider: kilocode
-        model: nvidia/nemotron-3.5-lightning:free  # 23.6  1,000,000 ctx
-      - provider: kilocode
-        model: cohere/north-mini-code:free  # 20.2  256,000 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-nano-30b-a3b  # 15.0  262,144 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 14.5  262,144 ctx
-      - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (2 vs 1)
+        model: kilo-auto/free  # last: kilocode dominates (1 vs 1)
   large:
     chain:
       - provider: nvidia
@@ -237,21 +253,23 @@ models:
       - provider: nvidia3
         model: nvidia/nemotron-3-ultra-550b-a55b  # 38.3  1,000,000 ctx
       - provider: kilocode
-        model: meituan/longcat-2.0-free  # 34.0  1,048,756 ctx
+        model: meituan/longcat-2.0-free  # 34  1,048,756 ctx
+      - provider: gemini
+        model: gemini-flash-latest  # 56  1,048,576 ctx
+      - provider: kilocode
+        model: minimax/minimax-m3:free  # 45.4  1,048,576 ctx
       - provider: kilocode
         model: thinkingmachines/inkling:free  # 42.3  1,048,576 ctx
       - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 41.2  1,048,576 ctx
       - provider: gemini
         model: gemini-flash-lite-latest  # 37.4  1,048,576 ctx
-      - provider: gemini
-        model: gemini-flash-latest  # 27.9  1,048,576 ctx
-      - provider: ollama
-        model: nemotron-3-ultra  # 38.3  1,000,000 ctx
-      - provider: opencode
-        model: nemotron-3-ultra-free  # 38.3  1,000,000 ctx
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 38.3  1,000,000 ctx
+      - provider: opencode
+        model: nemotron-3-ultra-free  # 38.3  1,000,000 ctx
+      - provider: ollama
+        model: nemotron-3-ultra  # 38.3  1,000,000 ctx
       - provider: kilocode
         model: nvidia/nemotron-3.5-lightning:free  # 23.6  1,000,000 ctx
       - provider: ollama
@@ -262,27 +280,21 @@ models:
         model: stepfun/step-3.7-flash:free  # 30.9  262,144 ctx
       - provider: ollama
         model: gemma4:31b  # 29.7  262,144 ctx
-      - provider: ollama
-        model: nemotron-3-super  # 25.7  262,144 ctx
-      - provider: nvidia
-        model: nvidia/nemotron-3-super-120b-a12b  # 25.7  262,144 ctx
+      - provider: gemini
+        model: gemma-4-31b-it  # 29.7  262,144 ctx
+      - provider: gemini
+        model: gemma-4-26b-a4b-it  # 26.1  262,144 ctx
       - provider: kilocode
         model: nvidia/nemotron-3-super-120b-a12b:free  # 25.7  262,144 ctx
       - provider: nvidia
-        model: nvidia/nemotron-3-nano-30b-a3b  # 15.0  262,144 ctx
+        model: nvidia/nemotron-3-super-120b-a12b  # 25.7  262,144 ctx
+      - provider: ollama
+        model: nemotron-3-super  # 25.7  262,144 ctx
       - provider: nvidia
-        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 14.5  262,144 ctx
-      - provider: gemini
-        model: gemma-4-26b-a4b-it  # 9.5  262,144 ctx
-      - provider: gemini
-        model: gemma-4-2b-it  # 9.5  262,144 ctx
-      - provider: gemini
-        model: gemma-4-31b-it  # 9.5  262,144 ctx
-      - provider: gemini
-        model: gemma-4-9b-it  # 9.5  262,144 ctx
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 15  262,144 ctx
       - provider: kilocode
         model: cohere/north-mini-code:free  # 20.2  256,000 ctx
       - provider: kilocode
-        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  # 14.5  256,000 ctx
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  # 15  256,000 ctx
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (10 vs 1)
+        model: kilo-auto/free  # last: kilocode dominates (11 vs 1)
