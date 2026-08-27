@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -26,7 +27,8 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	router := NewRouter(cfg)
+	cooldownPath := filepath.Join(filepath.Dir(*configPath), "cooldowns.json")
+	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey)
 

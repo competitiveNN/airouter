@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -233,8 +235,36 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 }
 
+// estimateTokens approximates the request context size in tokens from the
+// prompt messages. We use the common heuristic of ~4 characters per token
+// since we don't have a model-specific tokenizer available here.
+func estimateTokens(req *ChatCompletionRequest) int {
+	totalChars := 0
+	for _, m := range req.Messages {
+		totalChars += len(m.Content)
+	}
+	tokens := totalChars / 4
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
+}
+
+// requestTimeout returns a timeout that scales with the request context size:
+// 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens.
+func requestTimeout(tokens int) time.Duration {
+	const base = 5 * time.Second
+	if tokens <= 1000 {
+		return base
+	}
+	extra := (tokens - 1000 + 9999) / 10000 // ceil division, 1s per extra 10k tokens
+	return base + time.Duration(extra)*time.Second
+}
+
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
 	ctx := r.Context()
+	tokens := estimateTokens(req)
+	timeout := requestTimeout(tokens)
 
 	for {
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID)
@@ -252,14 +282,18 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		resp, err := g.proxy.Forward(ctx, body, *ep)
+		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
+		resp, err := g.proxy.Forward(reqCtx, body, *ep)
 		if err != nil {
+			cancel()
 			g.router.ApplyCooldownFromError(ep, err)
 			continue
 		}
 		if resp.StatusCode != 200 {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			cancel()
 			g.router.ApplyCooldown(ep, resp.StatusCode, string(respBody))
 			continue
 		}
@@ -272,12 +306,15 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(200)
 		io.Copy(w, resp.Body)
 		resp.Body.Close()
+		cancel()
 		return
 	}
 }
 
 func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
 	ctx := r.Context()
+	tokens := estimateTokens(req)
+	timeout := requestTimeout(tokens)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -306,11 +343,15 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			return
 		}
 
-		err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep)
+		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
+		err := g.proxy.StreamToClient(reqCtx, w, flusher, body, *ep)
 		if err == nil {
+			cancel()
 			return
 		}
 
+		cancel()
 		g.router.ApplyCooldownFromError(ep, err)
 		continue
 	}
