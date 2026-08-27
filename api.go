@@ -470,6 +470,17 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// ReloadConfig swaps the in-memory configuration used by the gateway, router
+// and proxy without restarting the server. Sessions and cooldowns are kept, so
+// sticky routing and backoff state survive a reload. Used by the admin config
+// endpoint and the on-disk config file watcher.
+func (g *GatewayContext) ReloadConfig(cfg *Config) {
+	g.config = cfg
+	g.router.config = cfg
+	g.proxy.config = cfg
+	log.Printf("[debug] config reloaded: %d providers, %d logical models", len(cfg.Providers), len(cfg.Models))
+}
+
 func (g *GatewayContext) HandleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if !g.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
@@ -497,9 +508,7 @@ func (g *GatewayContext) HandleAdminConfig(w http.ResponseWriter, r *http.Reques
 			writeAPIError(w, 500, "Failed to reload config", "server_error", "reload_failed")
 			return
 		}
-		g.config = newCfg
-		g.router.config = newCfg
-		g.proxy.config = newCfg
+		g.ReloadConfig(newCfg)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:

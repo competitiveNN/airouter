@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -31,6 +33,10 @@ func main() {
 	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey)
+
+	// Hot-reload the config when the file changes on disk so fallback chains
+	// and providers can be updated without restarting the server.
+	go watchConfig(*configPath, gateway)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", gateway.HandleModels)
@@ -88,4 +94,41 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("Server stopped")
+}
+
+// watchConfig polls the config file and reloads it in memory whenever its
+// content changes, so fallback chains and providers can be updated without a
+// restart. Invalid configs are logged and skipped (the last good config stays
+// active). The reload swaps the config pointers only; sessions and cooldowns
+// are preserved.
+func watchConfig(path string, gateway *GatewayContext) {
+	lastHash, _ := configFileHash(path)
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		h, err := configFileHash(path)
+		if err != nil {
+			continue
+		}
+		if h == lastHash {
+			continue
+		}
+		lastHash = h
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			log.Printf("[debug] hot reload skipped: config parse error: %v", err)
+			continue
+		}
+		gateway.ReloadConfig(cfg)
+		log.Printf("Config hot-reloaded from %s", path)
+	}
+}
+
+func configFileHash(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
 }
