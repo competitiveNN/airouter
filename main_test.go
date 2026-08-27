@@ -236,16 +236,67 @@ func TestRouterCooldownExpiry(t *testing.T) {
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
-	// Use a very short cooldown by applying with 429 and checking timing
+	// First consecutive error -> 60s cooldown
 	router.ApplyCooldown(ep, 429, "rate limited")
 	if router.IsAvailable(ep) {
 		t.Error("expected model to be unavailable")
 	}
 
-	// Wait for cooldown to expire
-	time.Sleep(11 * time.Second)
-	if !router.IsAvailable(ep) {
-		t.Error("expected model to be available after cooldown expiry")
+	// The stored cooldown should reflect the first schedule entry (~60s).
+	cds := router.GetAllCooldowns()
+	cd, ok := cds[ep.Key()]
+	if !ok {
+		t.Fatal("expected cooldown entry")
+	}
+	if cd.ErrorCount != 1 {
+		t.Errorf("expected error count 1, got %d", cd.ErrorCount)
+	}
+	if d := time.Until(cd.Expiry); d < 55*time.Second || d > 65*time.Second {
+		t.Errorf("expected ~60s cooldown, got %v", d)
+	}
+
+	// While cooling down the model must stay unavailable.
+	time.Sleep(2 * time.Second)
+	if router.IsAvailable(ep) {
+		t.Error("expected model to remain unavailable during cooldown")
+	}
+}
+
+func TestRouterCooldownEscalation(t *testing.T) {
+	cfg := loadTestConfig(t)
+	router := NewRouter(cfg, "")
+
+	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
+
+	want := []time.Duration{
+		60 * time.Second,         // 1st consecutive error
+		time.Hour,                // 2nd
+		8 * time.Hour,            // 3rd
+		24 * time.Hour,           // 4th
+		3 * 24 * time.Hour,       // 5th (3 days)
+		7 * 24 * time.Hour,       // 6th (7 days)
+	}
+	for i, w := range want {
+		router.ApplyCooldown(ep, 500, "server error")
+		cd, ok := router.GetAllCooldowns()[ep.Key()]
+		if !ok {
+			t.Fatalf("iteration %d: expected cooldown entry", i)
+		}
+		if cd.ErrorCount != i+1 {
+			t.Errorf("iteration %d: expected error count %d, got %d", i, i+1, cd.ErrorCount)
+		}
+		got := time.Until(cd.Expiry)
+		if got < w-5*time.Second || got > w+5*time.Second {
+			t.Errorf("iteration %d: expected ~%v cooldown, got %v", i, w, got)
+		}
+	}
+
+	// Consecutive errors beyond the schedule stay capped at the last entry.
+	router.ApplyCooldown(ep, 500, "server error")
+	cd := router.GetAllCooldowns()[ep.Key()]
+	capDur := 7 * 24 * time.Hour
+	if got := time.Until(cd.Expiry); got < capDur-5*time.Second || got > capDur+5*time.Second {
+		t.Errorf("expected cooldown capped at 7d, got %v", got)
 	}
 }
 
@@ -514,7 +565,7 @@ func TestProviderProxyStreaming(t *testing.T) {
 	ep := ModelEndpoint{Provider: "test", Model: "gpt-4"}
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 
-	err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep)
+	err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep, 30*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -590,7 +641,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 
 	// First attempt: backend1 returns 429
 	ep, _ := router.SelectEndpoint("smart", sessionID)
-	err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep)
+	err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
 	if err == nil {
 		t.Fatal("expected error from backend1")
 	}
@@ -603,7 +654,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 	}
 
 	// Second attempt: backend2 should succeed
-	err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2)
+	err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2, 30*time.Second)
 	if err2 != nil {
 		t.Fatalf("expected success from backend2, got: %v", err2)
 	}
