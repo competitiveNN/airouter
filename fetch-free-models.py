@@ -48,6 +48,24 @@ OPENCODE_ENDPOINT = "https://opencode.ai/zen/v1/models"
 GOOGLE_AI_STUDIO_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 NVIDIA_NIM_ENDPOINT = "https://integrate.api.nvidia.com/v1/models"
 ARTIFICIAL_ANALYSIS_ENDPOINT = "https://artificialanalysis.ai/api/v2/data/llms/models"
+# arena.ai does not publish a public API for its leaderboard; this mirrors the
+# exact snapshot archived at the repo below (the code-arena leaderboard at
+# https://arena.ai/leaderboard/code). ELO is used as a FALLBACK intelligence
+# signal when Artificial Analysis has no score for a model.
+ARENA_CODE_LEADERBOARD = "https://arena.ai/leaderboard/code"
+ARENA_CODE_LATEST_URL = (
+    "https://raw.githubusercontent.com/oolong-tea-2026/arena-ai-leaderboards/main/data/latest.json"
+)
+ARENA_CODE_DATA_URL = (
+    "https://raw.githubusercontent.com/oolong-tea-2026/arena-ai-leaderboards/main/data/{date}/code.json"
+)
+ARENA_CACHE_FILE = Path(__file__).resolve().parent / "arena-code-cache.json"
+ARENA_CACHE_TTL_HOURS = 24
+# arena code-ELO band (~1440-1700) is mapped onto the AA intelligence scale
+# (~0-63) so the two signals are comparable when ELO is used as a fallback.
+# 1200 == ELO baseline (random), 1700 ~= AA ceiling (63).
+ELO_BASE = 1200.0
+ELO_TO_INTELLIGENCE = 63.0 / 500.0
 TIMEOUT = 30
 MAX_RETRIES = 3
 BACKOFF_BASE = 2
@@ -318,6 +336,7 @@ def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
         "provider": "kilocode",
         "context_length": model.get("context_length", 0),
         "intelligence": None,
+        "elo": None,
         "released": model.get("created") or model.get("release_date") or model.get("published_at"),
           "pricing": {
             "input": to_float(pricing.get("prompt", 0)),
@@ -345,6 +364,7 @@ def normalize_opencode(model: dict[str, Any]) -> dict[str, Any] | None:
         "provider": "opencode",
         "context_length": OPENCODE_FREE_MODELS_CTX.get(model_id, 0),
         "intelligence": None,
+        "elo": None,
         "released": model.get("created") or model.get("release_date") or model.get("published_at"),
         "pricing": {
             "input": 0,
@@ -371,6 +391,7 @@ def normalize_ollama(model_id: str) -> dict[str, Any] | None:
         "provider": "ollama-cloud",
         "context_length": OLLAMA_FREE_MODELS_CTX.get(model_id, 0),
         "intelligence": None,
+        "elo": None,
         "released": None,
         "pricing": {
             "input": 0,
@@ -423,6 +444,7 @@ def normalize_google_ai_studio_curated(model_id: str) -> dict[str, Any] | None:
         "provider": "google-ai-studio",
         "context_length": GOOGLE_AI_STUDIO_FREE_MODELS_CTX.get(model_id, 0),
         "intelligence": None,
+        "elo": None,
         "released": None,
         "pricing": {
             "input": 0,
@@ -532,6 +554,7 @@ def normalize_nvidia_nim(model: dict[str, Any], model_id: str) -> dict[str, Any]
         "provider": "nvidia-nim",
         "context_length": ctx,
         "intelligence": None,
+        "elo": None,
         "released": released,
         "pricing": {
             "input": 0,
@@ -768,6 +791,72 @@ def fetch_artificial_analysis_data() -> dict[str, dict[str, Any]]:
     return result
 
 
+def load_arena_cache() -> dict[str, Any] | None:
+    """Load cached arena code-ELO data if it is still fresh."""
+    if not ARENA_CACHE_FILE.exists():
+        return None
+    try:
+        data = json.loads(ARENA_CACHE_FILE.read_text())
+        fetched_at = datetime.fromisoformat(data.get("fetched_at", "").replace("Z", "+00:00"))
+        if (datetime.now(UTC) - fetched_at).total_seconds() > ARENA_CACHE_TTL_HOURS * 3600:
+            return None
+        enrichment = data.get("enrichment", {})
+        return enrichment if isinstance(enrichment, dict) else None
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None
+
+
+def save_arena_cache(enrichment: dict[str, Any]) -> None:
+    """Persist arena code-ELO data to cache."""
+    ARENA_CACHE_FILE.write_text(json.dumps({
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "enrichment": enrichment,
+    }, indent=2))
+
+
+def normalize_elo_to_intelligence(elo: float) -> float:
+    """Approximate ELO -> AA intelligence index for fallback use only."""
+    return round(max(elo - ELO_BASE, 0.0) * ELO_TO_INTELLIGENCE, 1)
+
+
+def fetch_arena_code_data() -> dict[str, dict[str, Any]]:
+    """Fetch ELO scores from the arena.ai code leaderboard snapshot.
+
+    Returns a dict mapping arena model names to
+    {"elo": float, "votes": int, "ci": float, "rank": int}.
+    """
+    cached = load_arena_cache()
+    if cached is not None:
+        print(f"Arena code: using cached ELO data ({len(cached)} models)", file=sys.stderr)
+        return cached
+
+    latest = fetch_json(ARENA_CODE_LATEST_URL)
+    if not latest or not isinstance(latest, dict) or "date" not in latest:
+        print("Arena code: could not resolve latest snapshot date", file=sys.stderr)
+        return {}
+    date = latest["date"]
+    data = fetch_json(ARENA_CODE_DATA_URL.format(date=date))
+    if not data or not isinstance(data, dict) or "models" not in data:
+        print("Arena code: no data or unexpected format", file=sys.stderr)
+        return {}
+
+    result: dict[str, dict[str, Any]] = {}
+    for m in data["models"]:
+        name = m.get("model")
+        score = m.get("score")
+        if not name or score is None:
+            continue
+        result[name] = {
+            "elo": float(score),
+            "votes": int(m.get("votes") or 0),
+            "ci": float(m.get("ci") or 0),
+            "rank": int(m.get("rank") or 0),
+        }
+    print(f"Arena code: found {len(result)} models with ELO", file=sys.stderr)
+    save_arena_cache(result)
+    return result
+
+
 # ── Output ─────────────────────────────────────────────────────────────────────
 def output_json(data: list[dict], path: str | None) -> None:
     out = json.dumps(data, indent=2)
@@ -792,6 +881,8 @@ def output_csv(data: list[dict], path: str | None) -> None:
             "context_length": d.get("context_length"),
             "intelligence": d.get("intelligence"),
             "released": d.get("released"),
+            "elo": d.get("elo"),
+            "elo_votes": d.get("elo_votes"),
             "pricing_input": pricing.get("input"),
             "pricing_output": pricing.get("output"),
             "pricing_cache_read": pricing.get("cache_read"),
@@ -827,6 +918,7 @@ def output_table(data: list[dict]) -> None:
         ("provider", 16),
         ("released", 12),
         ("intelligence", 12),
+        ("elo", 8),
         ("ctx", 10),
         ("reason", 6),
         ("vision", 6),
@@ -860,11 +952,15 @@ def output_table(data: list[dict]) -> None:
         intelligence_val = d.get("intelligence")
         intelligence_disp = f"{intelligence_val:.1f}" if intelligence_val is not None else "-"
 
+        elo_val = d.get("elo")
+        elo_disp = f"{elo_val:.0f}" if elo_val is not None else "-"
+
         row = [
             d.get("id", "")[:35],
             d.get("provider", "")[:16],
             release_disp,
             intelligence_disp,
+            elo_disp,
             ctx_disp,
             "Y" if caps.get("reasoning") else "N",
             "Y" if caps.get("vision") else "N",
@@ -951,6 +1047,31 @@ def main() -> None:
                     model["intelligence"] = aa_entry["intelligence"]
                 if "released" in aa_entry and model.get("released") is None:
                     model["released"] = aa_entry["released"]
+
+    # Enrich with Arena code-leaderboard ELO (fallback intelligence signal).
+    # arena.ai/leaderboard/code ELO is used ONLY when Artificial Analysis has no
+    # intelligence score for the model; it is normalized onto the AA scale so
+    # the existing best-first ordering and thresholds keep working.
+    arena_data = fetch_arena_code_data()
+    if arena_data:
+        matched = 0
+        for model in all_models:
+            # Same provider-override rules as AA: *-latest aliases carry a
+            # concrete match_id; unresolved aliases (match_id == "") are skipped
+            # because name-similarity matching is forbidden for them.
+            match_id = model.get("match_id")
+            if match_id == "":
+                continue
+            model_id = match_id or model.get("id", "")
+            arena_name = fuzzy_match_slug(model_id, arena_data)
+            if arena_name:
+                entry = arena_data[arena_name]
+                model["elo"] = entry["elo"]
+                model["elo_votes"] = entry.get("votes")
+                matched += 1
+                if model.get("intelligence") is None:
+                    model["intelligence"] = normalize_elo_to_intelligence(entry["elo"])
+        print(f"Arena code: matched ELO for {matched} models", file=sys.stderr)
 
     # Apply hide list — remove models we would never use
     # Only filters nvidia-nim models; all other providers always display

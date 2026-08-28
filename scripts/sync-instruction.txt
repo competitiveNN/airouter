@@ -17,9 +17,13 @@ Rules:
    consecutive entries on providers nvidia, nvidia2, nvidia3 (same model id).
    Every other nvidia-nim model appears exactly once under provider `nvidia`.
 
-4. Order each chain best-first, descending by "intelligence". Skip models whose
-   intelligence is null — EXCEPT the two auto-fallback models in rule 6, which
-   are always allowed regardless.
+ 4. Order each chain best-first, descending by "intelligence". Skip models whose
+    intelligence is null — EXCEPT the two auto-fallback models in rule 6, which
+    are always allowed regardless. Note: "intelligence" may come from two sources
+    in the JSON — the Artificial Analysis intelligence index, or (when AA has no
+    score) a normalized ELO from the arena.ai code leaderboard
+    (https://arena.ai/leaderboard/code), exposed as the raw "elo" field. Treat
+    "intelligence" as the single sortable score regardless of its source.
 
 5. Profile selection (a model may appear in several profiles when it fits, but
    never twice in the same chain except the nvidia/nvidia2/nvidia3 trio):
@@ -44,10 +48,12 @@ Rules:
    Never include: stealth/*, anything matching *content-safety*, or
    x-preview-f-free.
 
-8. Preserve the existing YAML style: `provider:` / `model:` lines with aligned
-   trailing comments carrying the score and notable context size
-   (e.g. `# 51.8  131,072 ctx`). Update the header comment block if the
-   distribution rules above changed relative to what it describes.
+ 8. Preserve the existing YAML style: `provider:` / `model:` lines with aligned
+    trailing comments carrying the score and notable context size
+    (e.g. `# 51.8  131,072 ctx`). When a model also carries an "elo" field in the
+    JSON (arena.ai code leaderboard), append it to the comment
+    (e.g. `# 51.8 elo=1587  131,072 ctx`). Update the header comment block if the
+    distribution rules above changed relative to what it describes.
 
 9. Self-check after editing: every profile has a non-empty chain, every
    referenced provider exists in `providers:`, the last entry of each chain is
