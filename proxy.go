@@ -33,15 +33,18 @@ func NewProxy(cfg *Config) *Proxy {
 	}
 }
 
-// geminiStripFields lists top-level request fields that Gemini's
-// OpenAI-compatible endpoint rejects. The router otherwise forwards the raw
-// client body, so these are removed before sending upstream. Applies to all
-// providers whose name starts with "gemini" (gemini, gemini2, ...).
-var geminiStripFields = []string{"thinking", "thinking_budget", "reasoning_effort"}
+// geminiStripFields lists request fields that Gemini's OpenAI-compatible
+// endpoint rejects (it surfaces them as 400 "Unknown name" proto errors).
+// The router otherwise forwards the raw client body, so these are removed
+// before sending upstream. They are stripped recursively at any nesting
+// depth, because clients may place them inside nested objects/arrays. Applies
+// to all providers whose name starts with "gemini" (gemini, gemini2, ...).
+var geminiStripFields = []string{"thinking", "thinking_budget", "reasoning", "reasoning_effort"}
 
 // sanitizeRequestBody removes provider-specific unsupported fields from the
-// request JSON. It returns the original body unchanged if nothing applies or
-// on a parse failure (fail-open so we never drop a valid request).
+// request JSON, recursing into nested objects and arrays. It returns the
+// original body unchanged if nothing applies or on a parse failure (fail-open
+// so we never drop a valid request).
 func sanitizeRequestBody(body []byte, provider string) []byte {
 	var fields []string
 	if strings.HasPrefix(provider, "gemini") {
@@ -50,26 +53,77 @@ func sanitizeRequestBody(body []byte, provider string) []byte {
 	if len(fields) == 0 {
 		return body
 	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
-	}
-	changed := false
+	fieldSet := make(map[string]bool, len(fields))
 	for _, f := range fields {
-		if _, ok := obj[f]; ok {
-			delete(obj, f)
-			changed = true
-		}
+		fieldSet[f] = true
 	}
+	out, changed := stripJSONFields(body, fieldSet)
 	if !changed {
-		return body
-	}
-	out, err := json.Marshal(obj)
-	if err != nil {
 		return body
 	}
 	log.Printf("[debug] provider=%s -> stripped unsupported fields %v", provider, fields)
 	return out
+}
+
+// stripJSONFields recursively walks a JSON document and removes any object
+// keys present in fields. It returns the (possibly re-encoded) document and
+// whether anything was removed.
+func stripJSONFields(v json.RawMessage, fields map[string]bool) (json.RawMessage, bool) {
+	v = bytes.TrimSpace(v)
+	if len(v) == 0 {
+		return v, false
+	}
+	switch v[0] {
+	case '{':
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(v, &obj); err != nil {
+			return v, false
+		}
+		changed := false
+		for f := range fields {
+			if _, ok := obj[f]; ok {
+				delete(obj, f)
+				changed = true
+			}
+		}
+		for k, val := range obj {
+			newVal, c := stripJSONFields(val, fields)
+			if c {
+				obj[k] = newVal
+				changed = true
+			}
+		}
+		if !changed {
+			return v, false
+		}
+		out, err := json.Marshal(obj)
+		if err != nil {
+			return v, false
+		}
+		return out, true
+	case '[':
+		var arr []json.RawMessage
+		if err := json.Unmarshal(v, &arr); err != nil {
+			return v, false
+		}
+		changed := false
+		for i, val := range arr {
+			newVal, c := stripJSONFields(val, fields)
+			if c {
+				arr[i] = newVal
+				changed = true
+			}
+		}
+		if !changed {
+			return v, false
+		}
+		out, err := json.Marshal(arr)
+		if err != nil {
+			return v, false
+		}
+		return out, true
+	}
+	return v, false
 }
 
 func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEndpoint, providerCfg *ProviderConfig, stream bool) (*http.Request, error) {

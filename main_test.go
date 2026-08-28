@@ -183,6 +183,39 @@ func TestReplaceModelNamePreservesFields(t *testing.T) {
 	}
 }
 
+func TestSanitizeRequestBody(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		body     string
+		wantStrip bool // whether "thinking"/"reasoning" should be absent afterward
+	}{
+		{"top-level thinking", "gemini", `{"model":"x","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled"}}`, true},
+		{"nested thinking", "gemini", `{"model":"x","messages":[{"role":"user","content":"hi"}],"stream_options":{"thinking":true}}`, true},
+		{"nested in array", "gemini", `{"model":"x","messages":[{"role":"user","content":"hi"}],"extra":[{"thinking":"on"}]}`, true},
+		{"reasoning_effort", "gemini", `{"model":"x","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`, true},
+		{"reasoning", "gemini", `{"model":"x","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"high"}}`, true},
+		{"non-gemini untouched", "openai", `{"model":"x","messages":[{"role":"user","content":"hi"}],"thinking":true}`, false},
+		{"no fields", "gemini", `{"model":"x","messages":[{"role":"user","content":"hi"}]}`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := sanitizeRequestBody([]byte(c.body), c.provider)
+			hasThinking := strings.Contains(string(out), "thinking") || strings.Contains(string(out), "reasoning")
+			if c.wantStrip && hasThinking {
+				t.Errorf("provider=%s: unsupported field leaked -> %s", c.provider, out)
+			}
+			if !c.wantStrip && !hasThinking {
+				t.Errorf("provider=%s: field should be preserved but was stripped -> %s", c.provider, out)
+			}
+			// Output must remain valid JSON.
+			if !json.Valid(out) {
+				t.Errorf("provider=%s: output is not valid JSON -> %s", c.provider, out)
+			}
+		})
+	}
+}
+
 func TestRouterSessionAssignment(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
