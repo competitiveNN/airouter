@@ -9,6 +9,7 @@ __pycache__/
 
 # Regenerable caches
 free-models-cache.json
+arena-code-cache.json
 
 # Runtime state (regenerated on startup)
 cooldowns.json
