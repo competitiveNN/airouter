@@ -23,10 +23,23 @@ func (p ProviderConfig) APIKey() string {
 type ModelEndpoint struct {
 	Provider string `yaml:"provider"`
 	Model    string `yaml:"model"`
+	// Vision marks whether this endpoint can accept image (multimodal)
+	// content. It is optional: when nil the gateway assumes vision is
+	// supported. Set it to false for known text-only models so vision
+	// requests are routed to a capable model in the chain. The gateway also
+	// learns this at runtime (see Router.MarkNoVision) when a provider rejects
+	// an image request.
+	Vision *bool `yaml:"vision,omitempty"`
 }
 
 func (e ModelEndpoint) Key() string {
 	return e.Provider + ":" + e.Model
+}
+
+// SupportsVision reports whether the endpoint can handle image content. A nil
+// Vision flag is interpreted as "supported" so existing configs keep working.
+func (e ModelEndpoint) SupportsVision() bool {
+	return e.Vision == nil || *e.Vision
 }
 
 func (e ModelEndpoint) Equal(other ModelEndpoint) bool {

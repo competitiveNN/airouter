@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,6 +21,7 @@ type Router struct {
 	config       *Config
 	sessions     map[string]ModelEndpoint
 	cooldowns    map[string]CooldownEntry
+	noVision     map[string]bool // endpoints that rejected an image request
 	rrCounters   map[string]int
 	cooldownPath string
 	mu           sync.RWMutex
@@ -30,6 +32,7 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 		config:       cfg,
 		sessions:     make(map[string]ModelEndpoint),
 		cooldowns:    make(map[string]CooldownEntry),
+		noVision:     make(map[string]bool),
 		rrCounters:   make(map[string]int),
 		cooldownPath: cooldownPath,
 	}
@@ -122,7 +125,7 @@ func (r *Router) minCooldownWait(chain []ModelEndpoint) time.Duration {
 	return minWait
 }
 
-func (r *Router) SelectEndpoint(logicalModel, sessionID string) (*ModelEndpoint, time.Duration) {
+func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bool) (*ModelEndpoint, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -132,14 +135,19 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string) (*ModelEndpoint,
 	}
 
 	if ep, ok := r.sessions[sessionID]; ok {
-		if r.isAvailableLocked(&ep) {
-			log.Printf("[debug] session=%s model=%s -> sticky %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
+		available := r.isAvailableLocked(&ep)
+		if available && r.visionEligible(&ep, requireVision) {
 			return &ep, 0
 		}
-		log.Printf("[debug] session=%s model=%s -> session model %s/%s cooling down, searching fallback", sessionID, logicalModel, ep.Provider, ep.Model)
+		// The sticky model is out: either cooled (routine, don't log) or it
+		// can't handle this request's capability (e.g. no vision). Only the
+		// latter is worth a log line.
+		capabilityFallback := available && !r.visionEligible(&ep, requireVision)
 		for _, next := range chain.Chain {
-			if r.isAvailableLocked(&next) {
-				log.Printf("[debug] session=%s model=%s -> fallback %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
+			if r.isEligibleLocked(&next, requireVision) {
+				if capabilityFallback {
+					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
+				}
 				r.sessions[sessionID] = next
 				return &next, 0
 			}
@@ -148,8 +156,8 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string) (*ModelEndpoint,
 
 	// New session
 	for _, ep := range chain.Chain {
-		if r.isAvailableLocked(&ep) {
-			log.Printf("[debug] session=%s model=%s -> new session assigned to %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
+		if r.isEligibleLocked(&ep, requireVision) {
+			log.Printf("[debug] session=%s model=%s -> new session -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
 			r.sessions[sessionID] = ep
 			return &ep, 0
 		}
@@ -158,7 +166,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string) (*ModelEndpoint,
 	return nil, r.minCooldownWait(chain.Chain)
 }
 
-func (r *Router) SelectNext(logicalModel, sessionID string, current *ModelEndpoint) (*ModelEndpoint, time.Duration) {
+func (r *Router) SelectNext(logicalModel, sessionID string, current *ModelEndpoint, requireVision bool) (*ModelEndpoint, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -170,7 +178,7 @@ func (r *Router) SelectNext(logicalModel, sessionID string, current *ModelEndpoi
 	found := false
 	for _, ep := range chain.Chain {
 		if found {
-			if r.isAvailableLocked(&ep) {
+			if r.isEligibleLocked(&ep, requireVision) {
 				r.sessions[sessionID] = ep
 				return &ep, 0
 			}
@@ -181,7 +189,7 @@ func (r *Router) SelectNext(logicalModel, sessionID string, current *ModelEndpoi
 	}
 
 	for _, ep := range chain.Chain {
-		if r.isAvailableLocked(&ep) {
+		if r.isEligibleLocked(&ep, requireVision) {
 			r.sessions[sessionID] = ep
 			return &ep, 0
 		}
@@ -200,13 +208,42 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 		cd = CooldownEntry{}
 	}
 	cd.ErrorCount++
-	duration := r.cooldownForErrorWithBackoff(statusCode, cd.ErrorCount)
+	duration := r.cooldownForError(statusCode, cd.ErrorCount)
 	cd.Expiry = time.Now().Add(duration)
 	cd.StatusCode = statusCode
 	cd.LastError = errMsg
 	r.cooldowns[key] = cd
+	if isVisionUnsupported(errMsg) {
+		r.noVision[key] = true
+	}
 	r.saveCooldowns()
-	log.Printf("[debug] model=%s/%s -> cooldown applied (status=%d, errors=%d, duration=%v): %s", ep.Provider, ep.Model, statusCode, cd.ErrorCount, duration, errMsg)
+	log.Printf("[debug] cooldown %s/%s status=%d errors=%d for %v: %s", ep.Provider, ep.Model, statusCode, cd.ErrorCount, duration, summarizeError(errMsg))
+}
+
+// summarizeError reduces a provider error body to a single short line for logs
+// so we don't dump multi-kilobyte JSON (e.g. Gemini's full error payload) on
+// every cooldown event.
+func summarizeError(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	const max = 120
+	if len(msg) > max {
+		return msg[:max] + "..."
+	}
+	return msg
+}
+
+// RecordSuccess resets a model's cooldown on a successful response so the error
+// count only reflects *recent* consecutive failures and escalation can't run away.
+func (r *Router) RecordSuccess(ep *ModelEndpoint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.cooldowns[ep.Key()]; ok {
+		delete(r.cooldowns, ep.Key())
+		r.saveCooldowns()
+	}
 }
 
 func (r *Router) ApplyCooldownFromError(ep *ModelEndpoint, err error) {
@@ -236,27 +273,28 @@ func baseCooldownForError(statusCode int) time.Duration {
 	}
 }
 
-// cooldownSchedule maps consecutive-error count (1-based) to the cooldown
-// duration applied. More consecutive failures escalate the backoff so a model
-// that keeps failing is kept out longer: 60s, 1h, 8h, 24h, 3d, 7d.
-var cooldownSchedule = []time.Duration{
-	60 * time.Second,        // 1st consecutive error
-	time.Hour,               // 2nd
-	8 * time.Hour,           // 3rd
-	24 * time.Hour,          // 4th
-	3 * 24 * time.Hour,      // 5th (3 days)
-	7 * 24 * time.Hour,      // 6th (7 days)
-}
-
-func (r *Router) cooldownForErrorWithBackoff(statusCode int, errorCount int) time.Duration {
-	idx := errorCount - 1
-	if idx < 0 {
-		idx = 0
+// cooldownForError returns how long to keep a model out of rotation after a
+// failure. The base duration depends on the error type (see
+// baseCooldownForError); repeated failures within the same cooldown window
+// escalate it, but always bounded so a transient burst can never disable a
+// model for more than a few minutes. The error count is reset on a successful
+// request (see Router.RecordSuccess), so escalation only reflects recent
+// consecutive failures.
+func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration {
+	base := baseCooldownForError(statusCode)
+	if errorCount <= 1 {
+		return base
 	}
-	if idx >= len(cooldownSchedule) {
-		idx = len(cooldownSchedule) - 1
+	factor := time.Duration(errorCount)
+	if factor > 6 {
+		factor = 6
 	}
-	return cooldownSchedule[idx]
+	d := base * factor
+	const maxCooldown = 10 * time.Minute
+	if d > maxCooldown {
+		d = maxCooldown
+	}
+	return d
 }
 
 func (r *Router) ResetCooldown(ep *ModelEndpoint) {
@@ -264,6 +302,39 @@ func (r *Router) ResetCooldown(ep *ModelEndpoint) {
 	defer r.mu.Unlock()
 	delete(r.cooldowns, ep.Key())
 	r.saveCooldowns()
+}
+
+// MarkNoVision records that an endpoint rejected an image request, so it is
+// skipped for subsequent vision requests (without a cooldown, since the model
+// itself is healthy). Runtime-only; not persisted.
+func (r *Router) MarkNoVision(ep *ModelEndpoint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.noVision[ep.Key()] = true
+}
+
+// visionEligible reports whether ep can serve a request that requires vision.
+// Non-vision requests (requireVision=false) are always eligible.
+func (r *Router) visionEligible(ep *ModelEndpoint, requireVision bool) bool {
+	if !requireVision {
+		return true
+	}
+	return ep.SupportsVision() && !r.noVision[ep.Key()]
+}
+
+// isEligibleLocked combines cooldown availability with capability eligibility.
+func (r *Router) isEligibleLocked(ep *ModelEndpoint, requireVision bool) bool {
+	return r.isAvailableLocked(ep) && r.visionEligible(ep, requireVision)
+}
+
+// isVisionUnsupported reports whether a provider error indicates the model
+// cannot handle image/multimodal content, so we can mark it noVision.
+func isVisionUnsupported(msg string) bool {
+	s := strings.ToLower(msg)
+	return strings.Contains(s, "image_url") ||
+		strings.Contains(s, "multimodal") ||
+		(strings.Contains(s, "vision") && strings.Contains(s, "support")) ||
+		strings.Contains(s, "does not support image")
 }
 
 func (r *Router) GetSession(sessionID string) (ModelEndpoint, bool) {

@@ -35,6 +35,9 @@ def main() -> int:
                 problems.append(f"{name}[{i}]: unknown provider {provider!r}")
             if not ep.get("model"):
                 problems.append(f"{name}[{i}]: missing model")
+            vision = ep.get("vision")
+            if vision is not None and not isinstance(vision, bool):
+                problems.append(f"{name}[{i}]: vision must be a boolean, got {vision!r}")
 
         last_model = chain[-1].get("model")
         if last_model not in ("kilo-auto/free", "big-pickle"):
