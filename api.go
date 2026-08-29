@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -28,9 +29,33 @@ type ChatCompletionRequest struct {
 }
 
 type ChatCompletionMessage struct {
-	Role    string  `json:"role"`
-	Content string  `json:"content"`
-	Name    string  `json:"name,omitempty"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	Name    string `json:"name,omitempty"`
+}
+
+// UnmarshalJSON tolerates both string content (standard) and array content
+// (vision / multimodal requests, where content is a list of text/image parts).
+// The raw request body is forwarded verbatim to providers, so we only need
+// Content as a string for token estimation; array content is stored verbatim.
+func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
+	var a struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+		Name    string          `json:"name,omitempty"`
+	}
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	m.Role, m.Name = a.Role, a.Name
+	m.Content = string(a.Content)
+	if len(a.Content) > 1 && a.Content[0] == '"' {
+		var s string
+		if json.Unmarshal(a.Content, &s) == nil {
+			m.Content = s
+		}
+	}
+	return nil
 }
 
 type StreamOptions struct {
@@ -250,6 +275,13 @@ func estimateTokens(req *ChatCompletionRequest) int {
 	return tokens
 }
 
+// requestHasVision reports whether the raw request body contains image (vision)
+// content, by looking for the OpenAI-style "image_url" part. This is what
+// drives capability-aware model selection.
+func requestHasVision(body []byte) bool {
+	return bytes.Contains(body, []byte("image_url"))
+}
+
 // requestTimeout returns a timeout that scales with the request context size:
 // 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens.
 func requestTimeout(tokens int) time.Duration {
@@ -257,7 +289,7 @@ func requestTimeout(tokens int) time.Duration {
 	if tokens <= 1000 {
 		return base
 	}
-	extra := (tokens - 1000 + 9999) / 10000 // ceil division, 1s per extra 10k tokens
+	extra := (tokens - 1000 + 4999) / 5000 // ceil division, 2s per extra 5k tokens
 	return base + time.Duration(extra)*time.Second
 }
 
@@ -267,7 +299,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	timeout := requestTimeout(tokens)
 
 	for {
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID)
+		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
 		if ep == nil {
 			if wait > 0 {
 				select {
@@ -327,7 +359,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	}
 
 	for {
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID)
+		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
 		if ep == nil {
 			if wait > 0 {
 				fmt.Fprintf(w, ": reconnecting in %v\n\n", wait.Round(time.Second))
@@ -351,6 +383,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// context keeps the connection alive for the rest of a long generation.
 		err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
 		if err == nil {
+			g.router.RecordSuccess(ep)
 			return
 		}
 
