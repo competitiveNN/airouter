@@ -13,9 +13,13 @@ Rules:
    - ollama-cloud    -> ollama
    - google-ai-studio -> google
 
-3. Rate-limit absorption: the TOP model of each chain is repeated as three
-   consecutive entries on providers nvidia, nvidia2, nvidia3 (same model id).
-   Every other nvidia-nim model appears exactly once under provider `nvidia`.
+  3. Use all three NVIDIA API keys for every NVIDIA model. Any nvidia-nim
+     model placed in a chain is emitted as three consecutive entries with
+     providers nvidia, nvidia2, nvidia3 (same model id), so a rate-limited key
+     falls through to the next key on the same model instead of failing the
+     request. Preserve best-first ordering: for each model in score order, emit
+     its nvidia / nvidia2 / nvidia3 trio before moving to the next model. No
+     nvidia-nim model should ever appear on only one provider.
 
  4. Order each chain best-first, descending by "intelligence". Skip models whose
     intelligence is null — EXCEPT the two auto-fallback models in rule 6, which
@@ -44,18 +48,39 @@ Rules:
    Add a trailing comment with the counts, e.g.:
    `# last: kilocode dominates (5 vs 2)` or `# last: opencode dominates (3 vs 1)`.
 
-7. Never invent model ids: only use ids present in /tmp/free-models.json.
+  7. Vision capability: for every concrete (non-auto) endpoint you place in a
+     chain, look up its source record in /tmp/free-models.json (same provider
+     mapping + model id you already use) and read `capabilities.vision`. Emit a
+     `vision:` line on that endpoint: `vision: true` when truthy, `vision: false`
+     when falsy. This drives capability-aware routing (vision requests are sent
+     only to vision-capable models; text-only models are skipped for them). The
+     trailing auto-fallback model (kilo-auto/free / big-pickle) is a gateway
+     meta-router, so emit `vision: true` for it. For a manually-added model with
+     no matching JSON record, keep any existing `vision:` value as-is. Place the
+     `vision:` line directly under the `model:` line (the trailing score comment
+     stays on the model line), e.g.:
+        - provider: nvidia
+          model: moonshotai/kimi-k3  # 59.7
+          vision: false
+
+  8. Never invent model ids: only use ids present in /tmp/free-models.json.
    Never include: stealth/*, anything matching *content-safety*, or
    x-preview-f-free.
 
- 8. Preserve the existing YAML style: `provider:` / `model:` lines with aligned
+  9. Preserve the existing YAML style: `provider:` / `model:` lines with aligned
     trailing comments carrying the score and notable context size
     (e.g. `# 51.8  131,072 ctx`). When a model also carries an "elo" field in the
     JSON (arena.ai code leaderboard), append it to the comment
     (e.g. `# 51.8 elo=1587  131,072 ctx`). Update the header comment block if the
     distribution rules above changed relative to what it describes.
 
-9. Self-check after editing: every profile has a non-empty chain, every
-   referenced provider exists in `providers:`, the last entry of each chain is
-   the auto model chosen per rule 6. Finish with a compact summary table listing
-   the four chains (profile, entry count, head model, tail auto model).
+  10. Self-check after editing: every profile has a non-empty chain, every
+      referenced provider exists in `providers:`, the last entry of each chain is
+      the auto model chosen per rule 6, every concrete endpoint carries a
+      `vision:` boolean (true/false), and every nvidia-nim model id appears on
+      all three providers nvidia / nvidia2 / nvidia3. Finish with a compact
+      summary table listing the four chains (profile, entry count, head model,
+      tail auto model).
+and every concrete endpoint carries a
+      `vision:` boolean (true/false). Finish with a compact summary table listing
+      the four chains (profile, entry count, head model, tail auto model).

@@ -222,7 +222,7 @@ func TestRouterSessionAssignment(t *testing.T) {
 	sessionID := "test-session-1"
 
 	// First call should assign to first model in chain
-	ep, wait := router.SelectEndpoint("smart", sessionID)
+	ep, wait := router.SelectEndpoint("smart", sessionID, false)
 	if ep == nil {
 		t.Fatal("expected endpoint, got nil")
 	}
@@ -234,7 +234,7 @@ func TestRouterSessionAssignment(t *testing.T) {
 	}
 
 	// Second call should return the same model (session persistence)
-	ep2, _ := router.SelectEndpoint("smart", sessionID)
+	ep2, _ := router.SelectEndpoint("smart", sessionID, false)
 	if ep2 == nil {
 		t.Fatal("expected endpoint, got nil")
 	}
@@ -269,13 +269,13 @@ func TestRouterCooldownExpiry(t *testing.T) {
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
-	// First consecutive error -> 60s cooldown
+	// First consecutive 429 -> 10s cooldown (status-based base).
 	router.ApplyCooldown(ep, 429, "rate limited")
 	if router.IsAvailable(ep) {
 		t.Error("expected model to be unavailable")
 	}
 
-	// The stored cooldown should reflect the first schedule entry (~60s).
+	// The stored cooldown should reflect the status-based base duration (~10s).
 	cds := router.GetAllCooldowns()
 	cd, ok := cds[ep.Key()]
 	if !ok {
@@ -284,8 +284,8 @@ func TestRouterCooldownExpiry(t *testing.T) {
 	if cd.ErrorCount != 1 {
 		t.Errorf("expected error count 1, got %d", cd.ErrorCount)
 	}
-	if d := time.Until(cd.Expiry); d < 55*time.Second || d > 65*time.Second {
-		t.Errorf("expected ~60s cooldown, got %v", d)
+	if d := time.Until(cd.Expiry); d < 8*time.Second || d > 12*time.Second {
+		t.Errorf("expected ~10s cooldown, got %v", d)
 	}
 
 	// While cooling down the model must stay unavailable.
@@ -301,13 +301,18 @@ func TestRouterCooldownEscalation(t *testing.T) {
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
+	// A 500 error has a 30s base; repeated consecutive failures escalate the
+	// backoff (factor 1..6, capped), but never beyond the 10m ceiling. The
+	// error count is reset on a successful request (RecordSuccess), so this
+	// reflects only recent consecutive failures.
+	base := 30 * time.Second
 	want := []time.Duration{
-		60 * time.Second,         // 1st consecutive error
-		time.Hour,                // 2nd
-		8 * time.Hour,            // 3rd
-		24 * time.Hour,           // 4th
-		3 * 24 * time.Hour,       // 5th (3 days)
-		7 * 24 * time.Hour,       // 6th (7 days)
+		base,     // 1st
+		2 * base, // 2nd
+		3 * base, // 3rd
+		4 * base, // 4th
+		5 * base, // 5th
+		6 * base, // 6th (factor capped at 6)
 	}
 	for i, w := range want {
 		router.ApplyCooldown(ep, 500, "server error")
@@ -324,12 +329,12 @@ func TestRouterCooldownEscalation(t *testing.T) {
 		}
 	}
 
-	// Consecutive errors beyond the schedule stay capped at the last entry.
+	// Consecutive errors beyond the escalation ceiling stay capped.
 	router.ApplyCooldown(ep, 500, "server error")
 	cd := router.GetAllCooldowns()[ep.Key()]
-	capDur := 7 * 24 * time.Hour
+	capDur := 6 * base
 	if got := time.Until(cd.Expiry); got < capDur-5*time.Second || got > capDur+5*time.Second {
-		t.Errorf("expected cooldown capped at 7d, got %v", got)
+		t.Errorf("expected cooldown capped at %v, got %v", capDur, got)
 	}
 }
 
@@ -342,7 +347,7 @@ func TestRouterModelFallback(t *testing.T) {
 	router.ApplyCooldown(ep, 500, "server error")
 
 	// Should select next model in chain
-	ep2, wait := router.SelectEndpoint("smart", sessionID)
+	ep2, wait := router.SelectEndpoint("smart", sessionID, false)
 	if ep2 == nil {
 		t.Fatal("expected endpoint, got nil")
 	}
@@ -374,7 +379,7 @@ func TestRouterSelectNext(t *testing.T) {
 	router.ApplyCooldown(&chain[0], 500, "server error")
 
 	// Select initial endpoint — should skip to second
-	ep, _ := router.SelectEndpoint("smart", sessionID)
+	ep, _ := router.SelectEndpoint("smart", sessionID, false)
 	if ep == nil {
 		t.Fatal("expected endpoint")
 	}
@@ -384,7 +389,7 @@ func TestRouterSelectNext(t *testing.T) {
 
 	// Now fail this model and select next
 	router.ApplyCooldown(ep, 500, "server error")
-	ep2, _ := router.SelectEndpoint("smart", sessionID)
+	ep2, _ := router.SelectEndpoint("smart", sessionID, false)
 	if ep2 == nil {
 		t.Fatal("expected endpoint")
 	}
@@ -406,7 +411,7 @@ func TestRouterSelectNextAllInCooldown(t *testing.T) {
 	}
 
 	// Should return nil + wait duration
-	ep, wait := router.SelectEndpoint("smart", sessionID)
+	ep, wait := router.SelectEndpoint("smart", sessionID, false)
 	if ep != nil {
 		t.Error("expected nil endpoint when all in cooldown")
 	}
@@ -460,8 +465,8 @@ func TestRouterGetAllSessions(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 
-	ep1, _ := router.SelectEndpoint("smart", "session-1")
-	ep2, _ := router.SelectEndpoint("fast", "session-2")
+	ep1, _ := router.SelectEndpoint("smart", "session-1", false)
+	ep2, _ := router.SelectEndpoint("fast", "session-2", false)
 
 	sessions := router.GetAllSessions()
 	if len(sessions) != 2 {
@@ -538,7 +543,7 @@ func TestProviderProxyForward(t *testing.T) {
 	router := NewRouter(cfg, "")
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
-	ep, _ := router.SelectEndpoint("smart", "test-session")
+	ep, _ := router.SelectEndpoint("smart", "test-session", false)
 	resp, err := proxy.Forward(context.Background(), []byte(body), *ep)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -673,7 +678,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 	flusher := &testFlusher{Buffer: &output}
 
 	// First attempt: backend1 returns 429
-	ep, _ := router.SelectEndpoint("smart", sessionID)
+	ep, _ := router.SelectEndpoint("smart", sessionID, false)
 	err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
 	if err == nil {
 		t.Fatal("expected error from backend1")
@@ -681,7 +686,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 
 	// Apply cooldown and try next
 	router.ApplyCooldownFromError(ep, err)
-	ep2, _ := router.SelectEndpoint("smart", sessionID)
+	ep2, _ := router.SelectEndpoint("smart", sessionID, false)
 	if ep2 == nil {
 		t.Fatal("expected second endpoint")
 	}
@@ -914,13 +919,13 @@ func TestSessionPersistence(t *testing.T) {
 	sessionID := "persist-session"
 
 	// Initial request
-	ep1, _ := router.SelectEndpoint("smart", sessionID)
+	ep1, _ := router.SelectEndpoint("smart", sessionID, false)
 	if ep1 == nil {
 		t.Fatal("expected endpoint")
 	}
 
 	// Subsequent request should get the same model
-	ep2, _ := router.SelectEndpoint("smart", sessionID)
+	ep2, _ := router.SelectEndpoint("smart", sessionID, false)
 	if ep2 == nil {
 		t.Fatal("expected endpoint")
 	}
@@ -930,7 +935,7 @@ func TestSessionPersistence(t *testing.T) {
 	}
 
 	// Different session should get first available (may be different)
-	ep3, _ := router.SelectEndpoint("smart", "different-session")
+	ep3, _ := router.SelectEndpoint("smart", "different-session", false)
 	if ep3 == nil {
 		t.Fatal("expected endpoint")
 	}
