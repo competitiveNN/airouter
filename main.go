@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,10 +16,15 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	port := flag.String("port", "8080", "Port to listen on")
 	gatewayAPIKey := flag.String("api-key", "", "Gateway API key (optional, can be set via GATEWAY_API_KEY env var)")
+	allowNoAuth := flag.Bool("allow-no-auth", false, "Allow running without an API key (INSECURE: all endpoints including admin become unauthenticated)")
 	flag.Parse()
 
 	if *gatewayAPIKey == "" {
 		*gatewayAPIKey = os.Getenv("GATEWAY_API_KEY")
+	}
+
+	if *gatewayAPIKey == "" && !*allowNoAuth {
+		log.Fatalf("No gateway API key configured. Set GATEWAY_API_KEY or -api-key, or pass -allow-no-auth to disable authentication (not recommended).")
 	}
 
 	cfg, err := LoadConfig(*configPath)
@@ -34,9 +37,11 @@ func main() {
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Hot-reload the config when the file changes on disk so fallback chains
 	// and providers can be updated without restarting the server.
-	go watchConfig(*configPath, gateway)
+	go watchConfig(ctx, *configPath, gateway)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", gateway.HandleModels)
@@ -60,7 +65,6 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go func() {
@@ -97,38 +101,35 @@ func main() {
 }
 
 // watchConfig polls the config file and reloads it in memory whenever its
-// content changes, so fallback chains and providers can be updated without a
+// mtime/size changes, so fallback chains and providers can be updated without a
 // restart. Invalid configs are logged and skipped (the last good config stays
-// active). The reload swaps the config pointers only; sessions and cooldowns
-// are preserved.
-func watchConfig(path string, gateway *GatewayContext) {
-	lastHash, _ := configFileHash(path)
+// active). The reload swaps the config pointers atomically; sessions and
+// cooldowns are preserved. It exits when ctx is cancelled (graceful shutdown).
+func watchConfig(ctx context.Context, path string, gateway *GatewayContext) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		h, err := configFileHash(path)
-		if err != nil {
-			continue
+	var lastMod int64
+	var lastSize int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fi, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			if fi.ModTime().UnixNano() == lastMod && fi.Size() == lastSize {
+				continue
+			}
+			lastMod, lastSize = fi.ModTime().UnixNano(), fi.Size()
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				log.Printf("[debug] hot reload skipped: config parse error: %v", err)
+				continue
+			}
+			gateway.ReloadConfig(cfg)
+			log.Printf("Config hot-reloaded from %s", path)
 		}
-		if h == lastHash {
-			continue
-		}
-		lastHash = h
-
-		cfg, err := LoadConfig(path)
-		if err != nil {
-			log.Printf("[debug] hot reload skipped: config parse error: %v", err)
-			continue
-		}
-		gateway.ReloadConfig(cfg)
-		log.Printf("Config hot-reloaded from %s", path)
 	}
-}
-
-func configFileHash(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
 }

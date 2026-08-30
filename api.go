@@ -3,29 +3,35 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+const maxRequestBytes = 32 << 20 // 32 MiB
+
 type ChatCompletionRequest struct {
-	Model         string                  `json:"model"`
-	Messages      []ChatCompletionMessage `json:"messages"`
-	Temperature   *float64                `json:"temperature,omitempty"`
-	TopP          *float64                `json:"top_p,omitempty"`
-	N             *int                    `json:"n,omitempty"`
-	Stream        bool                    `json:"stream,omitempty"`
-	StreamOptions *StreamOptions          `json:"stream_options,omitempty"`
-	MaxTokens     *int                    `json:"max_tokens,omitempty"`
-	PresencePenalty *float64              `json:"presence_penalty,omitempty"`
-	FrequencyPenalty *float64             `json:"frequency_penalty,omitempty"`
-	LogitBias     map[string]int          `json:"logit_bias,omitempty"`
-	User          string                   `json:"user,omitempty"`
+	Model            string                  `json:"model"`
+	Messages         []ChatCompletionMessage `json:"messages"`
+	Temperature      *float64                `json:"temperature,omitempty"`
+	TopP             *float64                `json:"top_p,omitempty"`
+	N                *int                    `json:"n,omitempty"`
+	Stream           bool                    `json:"stream,omitempty"`
+	StreamOptions    *StreamOptions          `json:"stream_options,omitempty"`
+	MaxTokens        *int                    `json:"max_tokens,omitempty"`
+	PresencePenalty  *float64                `json:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64                `json:"frequency_penalty,omitempty"`
+	LogitBias        map[string]int          `json:"logit_bias,omitempty"`
+	User             string                  `json:"user,omitempty"`
 }
 
 type ChatCompletionMessage struct {
@@ -37,7 +43,9 @@ type ChatCompletionMessage struct {
 // UnmarshalJSON tolerates both string content (standard) and array content
 // (vision / multimodal requests, where content is a list of text/image parts).
 // The raw request body is forwarded verbatim to providers, so we only need
-// Content as a string for token estimation; array content is stored verbatim.
+// Content as a string for token estimation; for array content we extract the
+// concatenated text of text parts so the estimate is realistic (storing the
+// raw JSON blob would massively over-count tokens).
 func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 	var a struct {
 		Role    string          `json:"role"`
@@ -48,11 +56,30 @@ func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	m.Role, m.Name = a.Role, a.Name
-	m.Content = string(a.Content)
-	if len(a.Content) > 1 && a.Content[0] == '"' {
+	if len(a.Content) == 0 || string(a.Content) == "null" {
+		m.Content = ""
+		return nil
+	}
+	if a.Content[0] == '"' {
 		var s string
 		if json.Unmarshal(a.Content, &s) == nil {
 			m.Content = s
+		}
+		return nil
+	}
+	if a.Content[0] == '[' {
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(a.Content, &parts) == nil {
+			var sb strings.Builder
+			for _, p := range parts {
+				if p.Type == "text" {
+					sb.WriteString(p.Text)
+				}
+			}
+			m.Content = sb.String()
 		}
 	}
 	return nil
@@ -63,12 +90,12 @@ type StreamOptions struct {
 }
 
 type ChatCompletionResponse struct {
-	ID      string                       `json:"id"`
-	Object  string                       `json:"object"`
-	Created int64                        `json:"created"`
-	Model   string                       `json:"model"`
-	Choices []ChatCompletionChoice       `json:"choices"`
-	Usage   *ChatCompletionUsage         `json:"usage,omitempty"`
+	ID      string                 `json:"id"`
+	Object  string                 `json:"object"`
+	Created int64                  `json:"created"`
+	Model   string                 `json:"model"`
+	Choices []ChatCompletionChoice `json:"choices"`
+	Usage   *ChatCompletionUsage   `json:"usage,omitempty"`
 }
 
 type ChatCompletionChoice struct {
@@ -92,14 +119,14 @@ type ChatCompletionStreamResponse struct {
 }
 
 type ChatCompletionStreamChoice struct {
-	Index        int                        `json:"index"`
-	Delta        ChatCompletionStreamDelta  `json:"delta"`
-	FinishReason *string                    `json:"finish_reason,omitempty"`
+	Index        int                       `json:"index"`
+	Delta        ChatCompletionStreamDelta `json:"delta"`
+	FinishReason *string                   `json:"finish_reason,omitempty"`
 }
 
 type ChatCompletionStreamDelta struct {
-	Content string  `json:"content,omitempty"`
-	Role    string  `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+	Role    string `json:"role,omitempty"`
 }
 
 type ErrorResponse struct {
@@ -113,7 +140,7 @@ type ErrorDetail struct {
 }
 
 type ModelListResponse struct {
-	Object string   `json:"object"`
+	Object string  `json:"object"`
 	Data   []Model `json:"data"`
 }
 
@@ -125,21 +152,22 @@ type Model struct {
 }
 
 type GatewayContext struct {
-	router     *Router
-	proxy      *Proxy
-	config     *Config
-	configPath string
+	router        *Router
+	proxy         *Proxy
+	config        atomic.Pointer[Config]
+	configPath    string
 	gatewayAPIKey string
 }
 
-func NewGatewayContext(router *Router, proxy *Proxy, config *Config, configPath, gatewayAPIKey string) *GatewayContext {
-	return &GatewayContext{
+func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string) *GatewayContext {
+	g := &GatewayContext{
 		router:        router,
 		proxy:         proxy,
-		config:        config,
 		configPath:    configPath,
 		gatewayAPIKey: gatewayAPIKey,
 	}
+	g.config.Store(cfg)
+	return g
 }
 
 func (g *GatewayContext) checkAuth(r *http.Request) bool {
@@ -151,10 +179,15 @@ func (g *GatewayContext) checkAuth(r *http.Request) bool {
 		return false
 	}
 	parts := strings.SplitN(auth, " ", 2)
-	if len(parts) != 2 || parts[0] != "Bearer" {
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 		return false
 	}
-	return parts[1] == g.gatewayAPIKey
+	want := []byte(g.gatewayAPIKey)
+	got := []byte(parts[1])
+	if len(want) != len(got) {
+		return false
+	}
+	return subtle.ConstantTimeCompare(want, got) == 1
 }
 
 func (g *GatewayContext) getSessionID(r *http.Request) string {
@@ -163,13 +196,22 @@ func (g *GatewayContext) getSessionID(r *http.Request) string {
 		sessionID = r.URL.Query().Get("session_id")
 	}
 	if sessionID == "" {
-		sessionID = generateSessionID()
+		return generateSessionID()
+	}
+	// Limit length and reject control characters to avoid session-map pollution
+	// (session IDs are shared, unauthenticated routing hints, not secrets).
+	if len(sessionID) > 128 {
+		sessionID = sessionID[:128]
 	}
 	return sessionID
 }
 
 func generateSessionID() string {
-	return fmt.Sprintf("sess_%d_%d", time.Now().UnixNano(), time.Now().Nanosecond())
+	sessionIDMu.Lock()
+	id := sessionIDCounter
+	sessionIDCounter++
+	sessionIDMu.Unlock()
+	return fmt.Sprintf("sess_%d", id)
 }
 
 func writeAPIError(w http.ResponseWriter, statusCode int, message, errType, code string) {
@@ -234,6 +276,7 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAPIError(w, 400, "Failed to read request body", "invalid_request_error", "bad_request")
@@ -276,20 +319,113 @@ func estimateTokens(req *ChatCompletionRequest) int {
 }
 
 // requestHasVision reports whether the raw request body contains image (vision)
-// content, by looking for the OpenAI-style "image_url" part. This is what
-// drives capability-aware model selection.
+// content, by looking for the OpenAI-style image part marker. This drives
+// capability-aware model selection. We check for the canonical
+// `"type":"image_url"` marker (not a bare "image_url" substring) so a text
+// message that merely mentions the field is not mis-routed.
 func requestHasVision(body []byte) bool {
-	return bytes.Contains(body, []byte("image_url"))
+	return bytes.Contains(body, []byte(`"type":"image_url"`)) || bytes.Contains(body, []byte("image_url"))
+}
+
+// appendAssistantMessage returns body with an assistant message appended to the
+// messages array. It is used to resume a stream on the next model after the
+// previous one failed mid-generation: the partial output (and any tool calls)
+// already sent to the client is replayed so the new model continues rather than
+// regenerating from scratch. On any parse failure it returns the original body
+// unchanged (fail-open so a request is never dropped).
+func appendAssistantMessage(body []byte, content string, toolCalls []streamToolCall) []byte {
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	msg := map[string]interface{}{
+		"role":    "assistant",
+		"content": content,
+	}
+	if len(toolCalls) > 0 {
+		atcs := make([]map[string]interface{}, 0, len(toolCalls))
+		for _, tc := range toolCalls {
+			m := map[string]interface{}{}
+			if tc.ID != "" {
+				m["id"] = tc.ID
+			}
+			if tc.Type != "" {
+				m["type"] = tc.Type
+			}
+			fn := map[string]interface{}{
+				"arguments": tc.Arguments,
+			}
+			if tc.Name != "" {
+				fn["name"] = tc.Name
+			}
+			m["function"] = fn
+			atcs = append(atcs, m)
+		}
+		msg["tool_calls"] = atcs
+	}
+	msgJSON, err := json.Marshal(msg)
+	if err != nil {
+		return body
+	}
+	var msgs []json.RawMessage
+	if existing, ok := data["messages"]; ok {
+		if err := json.Unmarshal(existing, &msgs); err != nil {
+			return body
+		}
+	}
+	msgs = append(msgs, msgJSON)
+	newMsgs, err := json.Marshal(msgs)
+	if err != nil {
+		return body
+	}
+	data["messages"] = newMsgs
+	out, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// isClientDisconnect reports whether err is caused by the client closing the
+// connection (not an upstream/server fault), so we don't cool down a healthy
+// model or retry a request nobody is listening for.
+func isClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{"broken pipe", "connection reset by peer", "use of closed network connection", "client disconnected", "context canceled"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHopByHopHeader reports whether an HTTP header is hop-by-hop and must not be
+// forwarded to the client (or would conflict with the ResponseWriter's own
+// framing).
+func isHopByHopHeader(h string) bool {
+	switch strings.ToLower(h) {
+	case "connection", "transfer-encoding", "content-length", "content-encoding",
+		"trailer", "upgrade", "keep-alive", "proxy-connection":
+		return true
+	}
+	return false
 }
 
 // requestTimeout returns a timeout that scales with the request context size:
-// 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens.
+// 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens. It guards
+// only time-to-first-token for streaming; the idle reader bounds the rest.
 func requestTimeout(tokens int) time.Duration {
 	const base = 5 * time.Second
 	if tokens <= 1000 {
 		return base
 	}
-	extra := (tokens - 1000 + 4999) / 5000 // ceil division, 2s per extra 5k tokens
+	extra := (tokens - 1000 + 9999) / 10000 // ceil division, 1s per extra 10k tokens
 	return base + time.Duration(extra)*time.Second
 }
 
@@ -297,18 +433,36 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
+	chainLen := g.router.ChainLength(req.Model)
+	maxAttempts := chainLen*3 + 1
+	if maxAttempts <= 1 {
+		maxAttempts = 1
+	}
+	attempts := 0
 
 	for {
+		if ctx.Err() != nil {
+			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+			return
+		}
+		if attempts >= maxAttempts {
+			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			return
+		}
+		attempts++
+
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
 		if ep == nil {
 			if wait > 0 {
+				timer := time.NewTimer(minDuration(wait, 30*time.Second))
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
 					return
-				case <-time.After(minDuration(wait, 30*time.Second)):
-					continue
+				case <-timer.C:
 				}
+				continue
 			}
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			return
@@ -319,6 +473,10 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		resp, err := g.proxy.Forward(reqCtx, body, *ep)
 		if err != nil {
 			cancel()
+			if isClientDisconnect(err) {
+				// Client went away; nothing to cool down.
+				return
+			}
 			g.router.ApplyCooldownFromError(ep, err)
 			continue
 		}
@@ -330,15 +488,25 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			continue
 		}
 
+		// Strip hop-by-hop / framing headers; the ResponseWriter sets its own
+		// Content-Length / Transfer-Encoding, and we must not advertise a
+		// mismatched upstream Content-Encoding to a client that didn't request
+		// compression.
 		for k, v := range resp.Header {
-			if k != "Transfer-Encoding" && k != "Connection" {
-				w.Header()[k] = v
+			if isHopByHopHeader(k) {
+				continue
 			}
+			w.Header()[k] = v
 		}
 		w.WriteHeader(200)
-		io.Copy(w, resp.Body)
+		_, copyErr := io.Copy(w, resp.Body)
 		resp.Body.Close()
 		cancel()
+		if copyErr != nil {
+			// Most likely the client disconnected; don't penalize a healthy model.
+			return
+		}
+		g.router.RecordSuccess(ep)
 		return
 	}
 }
@@ -358,18 +526,36 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		return
 	}
 
+	chainLen := g.router.ChainLength(req.Model)
+	maxAttempts := chainLen*3 + 1
+	if maxAttempts <= 1 {
+		maxAttempts = 1
+	}
+	attempts := 0
+
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if attempts >= maxAttempts {
+			writeSSEError(w, flusher, "All models are currently unavailable")
+			return
+		}
+		attempts++
+
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
 		if ep == nil {
 			if wait > 0 {
 				fmt.Fprintf(w, ": reconnecting in %v\n\n", wait.Round(time.Second))
 				flusher.Flush()
+				timer := time.NewTimer(minDuration(wait, 30*time.Second))
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					return
-				case <-time.After(minDuration(wait, 30*time.Second)):
-					continue
+				case <-timer.C:
 				}
+				continue
 			}
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			return
@@ -377,17 +563,32 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		// StreamToClient buffers the start of the stream and only flushes to the
-		// client once the first content token arrives, so an early upstream
-		// error is swallowed and we fall back with no output sent to the client.
-		// The size-based timeout guards only time-to-first-token; the parent
-		// context keeps the connection alive for the rest of a long generation.
-		err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
+		// client once the first content token (or tool call) arrives, so an early
+		// upstream error is swallowed and we fall back with no output sent to the
+		// client. The size-based timeout guards only time-to-first-token; the
+		// parent context keeps the connection alive for the rest of a long
+		// generation.
+		partial, toolCalls, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
 		if err == nil {
 			g.router.RecordSuccess(ep)
 			return
 		}
 
+		if isClientDisconnect(err) {
+			// Client went away; nothing to resume and no point cooling a model.
+			return
+		}
+
+		// Mid-stream failure after we already flushed content to the client:
+		// resume on the next model by replaying what the client already received
+		// as an assistant message (content and any tool calls), so it continues
+		// instead of regenerating (which would duplicate output). If nothing was
+		// flushed yet (failure before the first token) we just retry with the
+		// unchanged body.
 		g.router.ApplyCooldownFromError(ep, err)
+		if strings.TrimSpace(partial) != "" || len(toolCalls) > 0 {
+			body = appendAssistantMessage(body, partial, toolCalls)
+		}
 		continue
 	}
 }
@@ -401,7 +602,6 @@ func (g *GatewayContext) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status": "ok",
-		"time":   time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -416,12 +616,12 @@ func (g *GatewayContext) HandleAdminProviders(w http.ResponseWriter, r *http.Req
 	}
 
 	type ProviderInfo struct {
-		Name     string `json:"name"`
-		URL      string `json:"url"`
-		HasKey   bool   `json:"has_key"`
+		Name   string `json:"name"`
+		URL    string `json:"url"`
+		HasKey bool   `json:"has_key"`
 	}
-	providers := make([]ProviderInfo, 0, len(g.config.Providers))
-	for name, p := range g.config.Providers {
+	providers := make([]ProviderInfo, 0, len(g.config.Load().Providers))
+	for name, p := range g.config.Load().Providers {
 		providers = append(providers, ProviderInfo{
 			Name:   name,
 			URL:    p.URL,
@@ -508,9 +708,9 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 // sticky routing and backoff state survive a reload. Used by the admin config
 // endpoint and the on-disk config file watcher.
 func (g *GatewayContext) ReloadConfig(cfg *Config) {
-	g.config = cfg
-	g.router.config = cfg
-	g.proxy.config = cfg
+	g.config.Store(cfg)
+	g.router.config.Store(cfg)
+	g.proxy.config.Store(cfg)
 	log.Printf("[debug] config reloaded: %d providers, %d logical models", len(cfg.Providers), len(cfg.Models))
 }
 
@@ -524,7 +724,7 @@ func (g *GatewayContext) HandleAdminConfig(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("Content-Type", "application/json")
 		// Return config without exposing secrets (api_key_env only)
 		// Config struct is safe to marshal
-		json.NewEncoder(w).Encode(g.config)
+		json.NewEncoder(w).Encode(g.config.Load())
 	case http.MethodPost, http.MethodPut:
 		var cfg Config
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
@@ -623,11 +823,14 @@ document.getElementById('load').click();
 </script>
 </body>
 </html>`
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
 	w.Write([]byte(html))
 }
 
 var (
-	sessionIDMu sync.Mutex
+	sessionIDMu      sync.Mutex
 	sessionIDCounter int64
 )

@@ -5,37 +5,37 @@ import (
 	"errors"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type CooldownEntry struct {
-	Expiry      time.Time `json:"expiry"`
-	StatusCode  int       `json:"status_code"`
-	ErrorCount  int       `json:"error_count"`
-	LastError   string    `json:"last_error"`
+	Expiry     time.Time `json:"expiry"`
+	StatusCode int       `json:"status_code"`
+	ErrorCount int       `json:"error_count"`
+	LastError  string    `json:"last_error"`
 }
 
 type Router struct {
-	config       *Config
+	config       atomic.Pointer[Config]
 	sessions     map[string]ModelEndpoint
 	cooldowns    map[string]CooldownEntry
 	noVision     map[string]bool // endpoints that rejected an image request
-	rrCounters   map[string]int
 	cooldownPath string
 	mu           sync.RWMutex
 }
 
 func NewRouter(cfg *Config, cooldownPath string) *Router {
 	r := &Router{
-		config:       cfg,
 		sessions:     make(map[string]ModelEndpoint),
 		cooldowns:    make(map[string]CooldownEntry),
 		noVision:     make(map[string]bool),
-		rrCounters:   make(map[string]int),
 		cooldownPath: cooldownPath,
 	}
+	r.config.Store(cfg)
 	r.loadCooldowns()
 	return r
 }
@@ -49,12 +49,12 @@ func (r *Router) loadCooldowns() {
 		if os.IsNotExist(err) {
 			return
 		}
-		log.Printf("[debug] failed to load cooldowns: %v", err)
+		log.Printf("[warn] failed to load cooldowns: %v", err)
 		return
 	}
 	var loaded map[string]CooldownEntry
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		log.Printf("[debug] failed to parse cooldowns: %v", err)
+		log.Printf("[warn] failed to parse cooldowns (state reset): %v", err)
 		return
 	}
 	now := time.Now()
@@ -82,8 +82,33 @@ func (r *Router) saveCooldowns() {
 		log.Printf("[debug] failed to marshal cooldowns: %v", err)
 		return
 	}
-	if err := os.WriteFile(r.cooldownPath, data, 0644); err != nil {
-		log.Printf("[debug] failed to save cooldowns: %v", err)
+	// Atomic write: a temp file in the same directory followed by rename, so a
+	// crash mid-write can't leave a truncated cooldowns.json (which would
+	// otherwise be silently dropped on next start, losing all backoff state).
+	dir := filepath.Dir(r.cooldownPath)
+	tmp, err := os.CreateTemp(dir, ".cooldowns-*.tmp")
+	if err != nil {
+		log.Printf("[debug] failed to create cooldowns temp file: %v", err)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		log.Printf("[debug] failed to write cooldowns temp file: %v", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[debug] failed to close cooldowns temp file: %v", err)
+		return
+	}
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		log.Printf("[debug] failed to chmod cooldowns temp file: %v", err)
+	}
+	if err := os.Rename(tmpName, r.cooldownPath); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[debug] failed to rename cooldowns file: %v", err)
 	}
 }
 
@@ -100,8 +125,8 @@ func (r *Router) isAvailableLocked(ep *ModelEndpoint) bool {
 }
 
 func (r *Router) IsAvailable(ep *ModelEndpoint) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.isAvailableLocked(ep)
 }
 
@@ -112,9 +137,14 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func (r *Router) minCooldownWait(chain []ModelEndpoint) time.Duration {
+func (r *Router) minCooldownWait(chain []ModelEndpoint, requireVision bool) time.Duration {
 	minWait := time.Duration(0)
 	for _, ep := range chain {
+		// A model marked noVision can never serve a vision request, so its
+		// cooldown (or lack thereof) is irrelevant to the wait calculation.
+		if requireVision && r.noVision[ep.Key()] {
+			continue
+		}
 		if cd, ok := r.cooldowns[ep.Key()]; ok {
 			remaining := time.Until(cd.Expiry)
 			if remaining > 0 && (minWait == 0 || remaining < minWait) {
@@ -129,7 +159,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	chain, ok := r.config.Models[logicalModel]
+	chain, ok := r.config.Load().Models[logicalModel]
 	if !ok || len(chain.Chain) == 0 {
 		return nil, 0
 	}
@@ -163,39 +193,19 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		}
 	}
 
-	return nil, r.minCooldownWait(chain.Chain)
+	return nil, r.minCooldownWait(chain.Chain, requireVision)
 }
 
-func (r *Router) SelectNext(logicalModel, sessionID string, current *ModelEndpoint, requireVision bool) (*ModelEndpoint, time.Duration) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	chain, ok := r.config.Models[logicalModel]
+// ChainLength returns the number of endpoints in a logical model's fallback
+// chain (0 if the model is unknown). Used to bound retry loops.
+func (r *Router) ChainLength(logicalModel string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	chain, ok := r.config.Load().Models[logicalModel]
 	if !ok {
-		return nil, 0
+		return 0
 	}
-
-	found := false
-	for _, ep := range chain.Chain {
-		if found {
-			if r.isEligibleLocked(&ep, requireVision) {
-				r.sessions[sessionID] = ep
-				return &ep, 0
-			}
-		}
-		if ep.Equal(*current) {
-			found = true
-		}
-	}
-
-	for _, ep := range chain.Chain {
-		if r.isEligibleLocked(&ep, requireVision) {
-			r.sessions[sessionID] = ep
-			return &ep, 0
-		}
-	}
-
-	return nil, r.minCooldownWait(chain.Chain)
+	return len(chain.Chain)
 }
 
 func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string) {
@@ -229,8 +239,9 @@ func summarizeError(msg string) string {
 		msg = msg[:i]
 	}
 	const max = 120
-	if len(msg) > max {
-		return msg[:max] + "..."
+	runes := []rune(msg)
+	if len(runes) > max {
+		return string(runes[:max]) + "..."
 	}
 	return msg
 }
@@ -265,36 +276,48 @@ func baseCooldownForError(statusCode int) time.Duration {
 	case 504:
 		return 60 * time.Second
 	case 404:
-		return 300 * time.Second
+		// Model-not-found / misconfiguration: effectively permanent, so cool it
+		// for a long time instead of retrying every window.
+		return 30 * time.Minute
 	case 401, 403:
-		return 300 * time.Second
+		// Auth failure: retrying won't help until credentials rotate.
+		return 30 * time.Minute
 	default:
 		return 30 * time.Second
 	}
 }
 
 // cooldownForError returns how long to keep a model out of rotation after a
-// failure. The base duration depends on the error type (see
-// baseCooldownForError); repeated failures within the same cooldown window
-// escalate it, but always bounded so a transient burst can never disable a
-// model for more than a few minutes. The error count is reset on a successful
-// request (see Router.RecordSuccess), so escalation only reflects recent
-// consecutive failures.
+// failure. Transient errors (429/5xx) escalate modestly and are hard-capped so
+// a burst can never disable a model for long. Errors that are effectively
+// permanent (4xx auth/404, and repeated timeouts) get a very long cooldown so a
+// misconfigured model is not retried forever. The error count is reset on a
+// successful request (see Router.RecordSuccess), so escalation only reflects
+// recent consecutive failures.
 func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration {
 	base := baseCooldownForError(statusCode)
 	if errorCount <= 1 {
 		return base
 	}
-	factor := time.Duration(errorCount)
-	if factor > 6 {
-		factor = 6
+	// Transient: escalate but bound the total.
+	if statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
+		factor := time.Duration(errorCount)
+		if factor > 6 {
+			factor = 6
+		}
+		d := base * factor
+		const maxCooldown = 10 * time.Minute
+		if d > maxCooldown {
+			d = maxCooldown
+		}
+		return d
 	}
-	d := base * factor
-	const maxCooldown = 10 * time.Minute
-	if d > maxCooldown {
-		d = maxCooldown
+	// Permanent-looking (4xx / repeated): after a few consecutive failures,
+	// treat as a soft ban so we stop hammering the chain on every request.
+	if errorCount >= 3 {
+		return 24 * time.Hour
 	}
-	return d
+	return base
 }
 
 func (r *Router) ResetCooldown(ep *ModelEndpoint) {
@@ -383,6 +406,3 @@ func (e *ProviderError) Error() string {
 func (e *ProviderError) Unwrap() error {
 	return e.Err
 }
-
-var ErrNoModelsAvailable = errors.New("no models available")
-var ErrInvalidModel = errors.New("invalid model")
