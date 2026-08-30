@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 )
+
 func loadTestConfig(t *testing.T) *Config {
 	t.Helper()
 	cfg := &Config{
@@ -185,9 +186,9 @@ func TestReplaceModelNamePreservesFields(t *testing.T) {
 
 func TestSanitizeRequestBody(t *testing.T) {
 	cases := []struct {
-		name     string
-		provider string
-		body     string
+		name      string
+		provider  string
+		body      string
 		wantStrip bool // whether "thinking"/"reasoning" should be absent afterward
 	}{
 		{"top-level thinking", "gemini", `{"model":"x","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled"}}`, true},
@@ -441,16 +442,16 @@ func TestCooldownDurations(t *testing.T) {
 		statusCode int
 		expected   time.Duration
 	}{
-		{429, 10 * time.Second},   // low cooldown
-		{500, 30 * time.Second},   // medium
-		{502, 30 * time.Second},   // medium
-		{503, 30 * time.Second},   // medium
-		{504, 60 * time.Second},   // medium-long
-		{404, 300 * time.Second},  // high
-		{401, 300 * time.Second},  // high
-		{403, 300 * time.Second},  // high
-		{0, 30 * time.Second},     // default (connection error)
-		{999, 30 * time.Second},   // unknown
+		{429, 10 * time.Second}, // low cooldown
+		{500, 30 * time.Second}, // medium
+		{502, 30 * time.Second}, // medium
+		{503, 30 * time.Second}, // medium
+		{504, 60 * time.Second}, // medium-long
+		{404, 30 * time.Minute}, // effectively permanent: long cooldown
+		{401, 30 * time.Minute}, // effectively permanent: long cooldown
+		{403, 30 * time.Minute}, // effectively permanent: long cooldown
+		{0, 30 * time.Second},   // default (connection error)
+		{999, 30 * time.Second}, // unknown
 	}
 
 	for _, tt := range tests {
@@ -603,7 +604,7 @@ func TestProviderProxyStreaming(t *testing.T) {
 	ep := ModelEndpoint{Provider: "test", Model: "gpt-4"}
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 
-	err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep, 30*time.Second)
+	_, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep, 30*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -679,7 +680,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 
 	// First attempt: backend1 returns 429
 	ep, _ := router.SelectEndpoint("smart", sessionID, false)
-	err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
+	_, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
 	if err == nil {
 		t.Fatal("expected error from backend1")
 	}
@@ -692,7 +693,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 	}
 
 	// Second attempt: backend2 should succeed
-	err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2, 30*time.Second)
+	_, _, err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2, 30*time.Second)
 	if err2 != nil {
 		t.Fatalf("expected success from backend2, got: %v", err2)
 	}
@@ -700,6 +701,97 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 	outputStr := output.String()
 	if !strings.Contains(outputStr, "Recovered") {
 		t.Error("expected 'Recovered' in output")
+	}
+}
+
+// TestProviderProxyStreamingMidStreamResume verifies that when a model fails
+// mid-stream after emitting content, the partial output already sent to the
+// client is replayed as an assistant message to the next model so it continues
+// instead of regenerating (which would duplicate output to the client).
+func TestProviderProxyStreamingMidStreamResume(t *testing.T) {
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		// First model emits a partial chunk then an SSE error event.
+		events := []string{
+			`data: {"id":"t1","object":"chat.completion.chunk","created":1,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello "},"finish_reason":null}]}`,
+			`data: {"error":{"message":"upstream died","type":"server_error"}}`,
+		}
+		for _, event := range events {
+			w.Write([]byte(event + "\n\n"))
+			flusher.Flush()
+		}
+	}))
+	defer backend1.Close()
+
+	var backend2Body string
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		backend2Body = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		events := []string{
+			`data: {"id":"t2","object":"chat.completion.chunk","created":2,"model":"gpt-4-turbo","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":null}]}`,
+			`data: [DONE]`,
+		}
+		for _, event := range events {
+			w.Write([]byte(event + "\n\n"))
+			flusher.Flush()
+		}
+	}))
+	defer backend2.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"backend1": {URL: backend1.URL},
+			"backend2": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "backend1", Model: "gpt-4"},
+				{Provider: "backend2", Model: "gpt-4-turbo"},
+			}},
+		},
+	}
+
+	proxy := NewProxy(cfg)
+	router := NewRouter(cfg, "")
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	sessionID := "resume-test"
+	var output bytes.Buffer
+	flusher := &testFlusher{Buffer: &output}
+
+	// Exercise the same fallback loop handleStream uses.
+	for i := 0; i < 2; i++ {
+		ep, _ := router.SelectEndpoint("smart", sessionID, false)
+		if ep == nil {
+			t.Fatal("no endpoint selected")
+		}
+		partial, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
+		if err == nil {
+			break
+		}
+		router.ApplyCooldownFromError(ep, err)
+		if strings.TrimSpace(partial) != "" {
+			body = string(appendAssistantMessage([]byte(body), partial, nil))
+		}
+	}
+
+	outputStr := output.String()
+	if !strings.Contains(outputStr, "Hello ") {
+		t.Error("expected 'Hello ' from first model in output")
+	}
+	if !strings.Contains(outputStr, "world") {
+		t.Error("expected 'world' from second model in output")
+	}
+	if !strings.Contains(backend2Body, `"role":"assistant"`) {
+		t.Errorf("expected assistant message replayed to backend2, got body: %s", backend2Body)
+	}
+	if !strings.Contains(backend2Body, "Hello ") {
+		t.Errorf("expected partial content in replayed assistant message, got body: %s", backend2Body)
 	}
 }
 
@@ -1030,4 +1122,3 @@ func TestHealth(t *testing.T) {
 type testFlusher struct{ *bytes.Buffer }
 
 func (f *testFlusher) Flush() {}
-
