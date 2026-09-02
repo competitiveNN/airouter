@@ -964,7 +964,7 @@ func TestHandleChatCompletionsNonStreaming(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("X-Session-ID", "test-session")
+	rec := httptest.NewRecorder()
 	rec := httptest.NewRecorder()
 	gateway.HandleChatCompletions(rec, req)
 
@@ -1000,7 +1000,7 @@ func TestHandleChatCompletionsVisionNotSupported(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("X-Session-ID", "vision-session")
+	rec := httptest.NewRecorder()
 	rec := httptest.NewRecorder()
 	gateway.HandleChatCompletions(rec, req)
 
@@ -1051,7 +1051,7 @@ func TestHandleChatCompletionsVisionUnavailableCooldown(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("X-Session-ID", "vision-cooldown-session")
+	rec := httptest.NewRecorder()
 	rec := httptest.NewRecorder()
 	gateway.HandleChatCompletions(rec, req)
 
@@ -1116,7 +1116,7 @@ func TestHandleChatCompletionsWithFallback(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("X-Session-ID", "fallback-test")
+	rec := httptest.NewRecorder()
 	rec := httptest.NewRecorder()
 	gateway.HandleChatCompletions(rec, req)
 
@@ -1176,7 +1176,7 @@ func TestHandleChatCompletionsStreamingWithFallback(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("X-Session-ID", "stream-fallback-test")
+	rec := httptest.NewRecorder()
 	rec := httptest.NewRecorder()
 	gateway.HandleChatCompletions(rec, req)
 

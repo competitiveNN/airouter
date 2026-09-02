@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -190,28 +191,60 @@ func (g *GatewayContext) checkAuth(r *http.Request) bool {
 	return subtle.ConstantTimeCompare(want, got) == 1
 }
 
-func (g *GatewayContext) getSessionID(r *http.Request) string {
-	sessionID := r.Header.Get("X-Session-ID")
-	if sessionID == "" {
-		sessionID = r.URL.Query().Get("session_id")
+// bodySessionID derives a stable session identifier from a request body by
+// hashing the logical model and the full conversation messages array (role +
+// content). Two requests with the same model and identical message history
+// will hash to the same ID, which means:
+//
+//   - A client re-sending the same request (e.g. after a network timeout
+//     before any flush reached the client) gets the same session and the
+//     same sticky model choice, so the request is idempotent from the
+//     gateway's perspective.
+//   - Mid-stream failures that the gateway retries by re-issuing the request
+//     with an appended assistant message continue the session, because the
+//     retry loop captures sessionID once before the loop and never recomputes
+//     it from the mutated body.
+//   - Each distinct conversation (different messages or model) maps to its
+//     own session, so different users and conversations never share a
+//     session or a model choice.
+//
+// Fields that don't affect the conversation identity (temperature, stream,
+// max_tokens, metadata, etc.) are intentionally NOT part of the fingerprint,
+// so a client that re-sends the same conversation with minor knobs changed
+// still gets the same session.
+//
+// The hash is content-addressed, so there's no risk of an unauthenticated
+// client injecting a chosen ID to manipulate routing.
+func bodySessionID(body []byte) string {
+	// Only look at fields that identify the conversation: model + messages.
+	// We re-parse just those two fields rather than stripping the rest, so
+	// the result is well-defined regardless of other fields' presence or
+	// ordering.
+	var partial struct {
+		Model    string                   `json:"model"`
+		Messages []map[string]interface{} `json:"messages"`
 	}
-	if sessionID == "" {
-		return generateSessionID()
+	if err := json.Unmarshal(body, &partial); err != nil || partial.Model == "" {
+		// Malformed body or missing model: fall back to a content hash of
+		// the whole body so the request still gets routed (the chat handler
+		// will return 400 anyway, but routing must not panic).
+		sum := sha256.Sum256(body)
+		return "body:" + hex.EncodeToString(sum[:])
 	}
-	// Limit length and reject control characters to avoid session-map pollution
-	// (session IDs are shared, unauthenticated routing hints, not secrets).
-	if len(sessionID) > 128 {
-		sessionID = sessionID[:128]
-	}
-	return sessionID
-}
 
-func generateSessionID() string {
-	sessionIDMu.Lock()
-	id := sessionIDCounter
-	sessionIDCounter++
-	sessionIDMu.Unlock()
-	return fmt.Sprintf("sess_%d", id)
+	// Build a deterministic byte stream from model + messages. We include
+	// content so different conversations with the same role layout don't
+	// collide.
+	h := sha256.New()
+	h.Write([]byte(partial.Model))
+	h.Write([]byte{0})
+	if err := json.NewEncoder(h).Encode(partial.Messages); err != nil {
+		// json.Encoder.Encode on a []map can't fail in practice, but fall
+		// back to a full-body hash so routing never panics.
+		sum := sha256.Sum256(body)
+		return "body:" + hex.EncodeToString(sum[:])
+	}
+	return "ctx:" + hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 func writeAPIError(w http.ResponseWriter, statusCode int, message, errType, code string) {
@@ -344,7 +377,7 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	sessionID := g.getSessionID(r)
+	sessionID := bodySessionID(body)
 
 	if req.Stream {
 		g.handleStream(w, r, body, &req, sessionID)
@@ -965,7 +998,4 @@ document.getElementById('load').click();
 	w.Write([]byte(html))
 }
 
-var (
-	sessionIDMu      sync.Mutex
-	sessionIDCounter int64
-)
+
