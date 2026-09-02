@@ -421,6 +421,105 @@ func TestRouterSelectNextAllInCooldown(t *testing.T) {
 	}
 }
 
+func TestVisionChainStatusAllNoVision(t *testing.T) {
+	falseVal := false
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"textprofile": {
+				Chain: []ModelEndpoint{
+					{Provider: "p", Model: "a", Vision: &falseVal},
+					{Provider: "p", Model: "b", Vision: &falseVal},
+				},
+			},
+		},
+	}
+	router := NewRouter(cfg, "")
+	state, wait := router.VisionChainStatus("textprofile", "s1")
+	if state != VisionUnsupported {
+		t.Errorf("expected VisionUnsupported, got %v", state)
+	}
+	if wait != 0 {
+		t.Errorf("expected zero wait, got %v", wait)
+	}
+}
+
+func TestVisionChainStatusVisionAvailable(t *testing.T) {
+	falseVal := false
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {
+				Chain: []ModelEndpoint{
+					{Provider: "p", Model: "a", Vision: &falseVal},
+					{Provider: "p", Model: "b"}, // vision: nil -> supported
+				},
+		},
+	}
+	router := NewRouter(cfg, "")
+	state, wait := router.VisionChainStatus("smart", "s1")
+	if state != VisionAvailable {
+		t.Errorf("expected VisionAvailable, got %v", state)
+	}
+	if wait != 0 {
+		t.Errorf("expected zero wait, got %v", wait)
+	}
+}
+
+func TestVisionChainStatusVisionCooldown(t *testing.T) {
+	falseVal := false
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {
+				Chain: []ModelEndpoint{
+					{Provider: "p", Model: "a", Vision: &falseVal},
+					{Provider: "p", Model: "b"}, // vision: nil
+				},
+		},
+	}
+	router := NewRouter(cfg, "")
+	// Cool down the only vision-capable endpoint.
+	router.ApplyCooldown(&ModelEndpoint{Provider: "p", Model: "b"}, 429, "rate limited")
+	state, wait := router.VisionChainStatus("smart", "s1")
+	if state != VisionUnavailable {
+		t.Errorf("expected VisionUnavailable, got %v", state)
+	}
+	if wait <= 0 {
+		t.Error("expected positive wait for vision cooldown")
+	}
+}
+
+func TestVisionChainStatusStickyNonVision(t *testing.T) {
+	falseVal := false
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {
+				Chain: []ModelEndpoint{
+					{Provider: "p", Model: "a", Vision: &falseVal},
+					{Provider: "p", Model: "b"}, // vision: nil -> supported
+				},
+		},
+	}
+	router := NewRouter(cfg, "")
+	// Session pinned to text-only model.
+	router.SelectEndpoint("smart", "s1", false)
+	state, wait := router.VisionChainStatus("smart", "s1")
+	if state != VisionUnavailable {
+		t.Errorf("expected VisionUnavailable (sticky non-vision), got %v", state)
+	}
+	_ = wait // zero because the next model (b) is actually eligible
+}
+
 func TestRouterResetCooldown(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
@@ -604,7 +703,7 @@ func TestProviderProxyStreaming(t *testing.T) {
 	ep := ModelEndpoint{Provider: "test", Model: "gpt-4"}
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 
-	_, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep, 30*time.Second)
+	_, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep, 30*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -680,7 +779,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 
 	// First attempt: backend1 returns 429
 	ep, _ := router.SelectEndpoint("smart", sessionID, false)
-	_, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
+	_, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
 	if err == nil {
 		t.Fatal("expected error from backend1")
 	}
@@ -693,7 +792,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 	}
 
 	// Second attempt: backend2 should succeed
-	_, _, err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2, 30*time.Second)
+	_, _, _, err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2, 30*time.Second)
 	if err2 != nil {
 		t.Fatalf("expected success from backend2, got: %v", err2)
 	}
@@ -770,7 +869,7 @@ func TestProviderProxyStreamingMidStreamResume(t *testing.T) {
 		if ep == nil {
 			t.Fatal("no endpoint selected")
 		}
-		partial, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
+		partial, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
 		if err == nil {
 			break
 		}
@@ -881,6 +980,94 @@ func TestHandleChatCompletionsNonStreaming(t *testing.T) {
 	if result.Model != "gpt-4" {
 		t.Errorf("expected model gpt-4, got %s", result.Model)
 	}
+}
+
+func TestHandleChatCompletionsVisionNotSupported(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p", Model: "a", Vision: boolPtr(false)},
+				{Provider: "p", Model: "b", Vision: boolPtr(false)},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+
+	body := `{"model":"smart","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Session-ID", "vision-session")
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+
+	var result ChatCompletionResponse
+	json.NewDecoder(rec.Body).Decode(&result)
+	if result.Choices[0].Message.Content != "Vision not supported" {
+		t.Errorf("expected 'Vision not supported', got %q", result.Choices[0].Message.Content)
+	}
+}
+
+func TestHandleChatCompletionsVisionUnavailableCooldown(t *testing.T) {
+	requestCount := 0
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{"message": "rate limited"},
+		})
+	}))
+	defer backend.Close()
+
+	falseVal := false
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"test": {URL: backend.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "test", Model: "a", Vision: &falseVal},
+				{Provider: "test", Model: "b"}, // vision: nil = supported
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	// Cool down the only vision-capable endpoint long enough to make it
+	// unavailable for this test.
+	ep := &ModelEndpoint{Provider: "test", Model: "b"}
+	router.ApplyCooldown(ep, 429, "rate limited")
+
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+
+	body := `{"model":"smart","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Session-ID", "vision-cooldown-session")
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+
+	var result ChatCompletionResponse
+	json.NewDecoder(rec.Body).Decode(&result)
+	if result.Choices[0].Message.Content != "Vision currently not available" {
+		t.Errorf("expected 'Vision currently not available', got %q", result.Choices[0].Message.Content)
+	}
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }
 
 func TestHandleChatCompletionsWithFallback(t *testing.T) {

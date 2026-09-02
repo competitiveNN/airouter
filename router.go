@@ -12,6 +12,86 @@ import (
 	"time"
 )
 
+// VisionChainState describes the vision capability state of a logical model's
+// entire fallback chain.
+type VisionChainState int
+
+const (
+	// VisionUnsupported — no endpoint in the chain advertises vision support.
+	VisionUnsupported VisionChainState = iota
+	// VisionUnavailable — at least one endpoint supports vision but all of them
+	// are currently cooled down, marked noVision, or the sticky session is bound
+	// to a non-vision model with no eligible replacement.
+	VisionUnavailable
+	// VisionAvailable — at least one vision-capable endpoint is currently eligible.
+	VisionAvailable
+)
+
+// VisionChainStatus reports whether the chain for logicalModel can serve a
+// vision request right now and, if not, the shortest remaining cooldown before
+// any vision-capable endpoint becomes available. It also takes sessionID so the
+// sticky-session model is re-evaluated (a session pinned to a non-vision model
+// cannot satisfy a vision request and must be replaced with a vision-capable
+// one).
+func (r *Router) VisionChainStatus(logicalModel, sessionID string) (VisionChainState, time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	chain, ok := r.config.Load().Models[logicalModel]
+	if !ok || len(chain.Chain) == 0 {
+		return VisionUnsupported, 0
+	}
+
+	// A session pinned to a non-vision model must be replaced with a vision-
+	// capable one, so we treat such a sticky model as not blocking other
+	// vision-capable candidates.
+	stickyBlocks := false
+	if bound, ok := r.sessions[sessionID]; ok {
+		if !bound.SupportsVision() || r.noVision[bound.Key()] {
+			stickyBlocks = true
+		}
+	}
+
+	hasVisionSupport := false
+	hasEligibleVision := false
+	var minVisionWait time.Duration
+
+	for _, ep := range chain.Chain {
+		if !ep.SupportsVision() {
+			continue
+		}
+		hasVisionSupport = true
+		if r.noVision[ep.Key()] {
+			continue
+		}
+		// A sticky session is allowed to fall through to any vision-capable
+		// model in the chain; we count the sticky model itself only if it
+		// already supports vision (otherwise the next model in the chain is
+		// the one the router will actually pick).
+		if bound, ok := r.sessions[sessionID]; ok && bound.Equal(ep) && stickyBlocks {
+			continue
+		}
+		if cd, ok := r.cooldowns[ep.Key()]; ok {
+			remaining := time.Until(cd.Expiry)
+			if remaining > 0 {
+				if minVisionWait == 0 || remaining < minVisionWait {
+					minVisionWait = remaining
+				}
+				continue
+			}
+		}
+		hasEligibleVision = true
+	}
+
+	if !hasVisionSupport {
+		return VisionUnsupported, 0
+	}
+	if !hasEligibleVision {
+		return VisionUnavailable, minVisionWait
+	}
+	return VisionAvailable, 0
+}
+
 type CooldownEntry struct {
 	Expiry     time.Time `json:"expiry"`
 	StatusCode int       `json:"status_code"`
@@ -24,7 +104,9 @@ type Router struct {
 	sessions     map[string]ModelEndpoint
 	cooldowns    map[string]CooldownEntry
 	noVision     map[string]bool // endpoints that rejected an image request
+	tps          map[string]float64
 	cooldownPath string
+	priorityPath string
 	mu           sync.RWMutex
 }
 
@@ -33,10 +115,13 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 		sessions:     make(map[string]ModelEndpoint),
 		cooldowns:    make(map[string]CooldownEntry),
 		noVision:     make(map[string]bool),
+		tps:          make(map[string]float64),
 		cooldownPath: cooldownPath,
+		priorityPath: strings.TrimSuffix(cooldownPath, ".json") + ".priority.json",
 	}
 	r.config.Store(cfg)
 	r.loadCooldowns()
+	r.loadPriorities()
 	return r
 }
 
@@ -70,6 +155,8 @@ func (r *Router) saveCooldowns() {
 	if r.cooldownPath == "" {
 		return
 	}
+	// Copy active cooldowns under RLock to avoid blocking all routing during disk I/O.
+	r.mu.RLock()
 	now := time.Now()
 	active := make(map[string]CooldownEntry)
 	for k, v := range r.cooldowns {
@@ -77,6 +164,8 @@ func (r *Router) saveCooldowns() {
 			active[k] = v
 		}
 	}
+	r.mu.RUnlock()
+
 	data, err := json.MarshalIndent(active, "", "  ")
 	if err != nil {
 		log.Printf("[debug] failed to marshal cooldowns: %v", err)
@@ -112,13 +201,78 @@ func (r *Router) saveCooldowns() {
 	}
 }
 
+func (r *Router) loadPriorities() {
+	if r.priorityPath == "" {
+		return
+	}
+	data, err := os.ReadFile(r.priorityPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[debug] failed to load priorities: %v", err)
+		}
+		return
+	}
+	var loaded map[string]float64
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		log.Printf("[debug] failed to parse priorities: %v", err)
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k, v := range loaded {
+		r.tps[k] = v
+	}
+}
+
+func (r *Router) savePriorities() {
+	if r.priorityPath == "" || r.cooldownPath == "" {
+		return
+	}
+	r.mu.RLock()
+	data, err := json.MarshalIndent(r.tps, "", "  ")
+	r.mu.RUnlock()
+	if err != nil {
+		log.Printf("[debug] failed to marshal priorities: %v", err)
+		return
+	}
+	dir := filepath.Dir(r.priorityPath)
+	tmp, err := os.CreateTemp(dir, ".priority-*.tmp")
+	if err != nil {
+		log.Printf("[debug] failed to create priorities temp file: %v", err)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return
+	}
+	tmp.Close()
+	os.Rename(tmpName, r.priorityPath)
+}
+
+func (r *Router) RecordTPS(ep ModelEndpoint, tps float64) {
+	r.mu.Lock()
+	key := ep.Key()
+	r.tps[key] = (r.tps[key] * 0.8) + (tps * 0.2)
+	r.mu.Unlock()
+	r.savePriorities()
+}
+
 func (r *Router) isAvailableLocked(ep *ModelEndpoint) bool {
 	cd, ok := r.cooldowns[ep.Key()]
 	if !ok {
 		return true
 	}
 	if time.Now().After(cd.Expiry) {
-		delete(r.cooldowns, ep.Key())
+		// Cooldown elapsed: the model is available again. We deliberately do NOT
+		// delete the entry here, so its ErrorCount is preserved across cooldown
+		// windows. Escalation then reflects *consecutive* failures (the count is
+		// only reset on a successful response via RecordSuccess, or explicitly
+		// via ResetCooldown), instead of restarting at 1 every time a cooldown
+		// expires. Expired entries are still ignored by saveCooldowns (they have
+		// a past Expiry, so they are not persisted) and by minCooldownWait, and
+		// in-memory growth is bounded by the number of configured endpoints.
 		return true
 	}
 	return false
@@ -210,8 +364,6 @@ func (r *Router) ChainLength(logicalModel string) int {
 
 func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	key := ep.Key()
 	cd, ok := r.cooldowns[key]
 	if !ok {
@@ -226,6 +378,7 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 	if isVisionUnsupported(errMsg) {
 		r.noVision[key] = true
 	}
+	r.mu.Unlock()
 	r.saveCooldowns()
 	log.Printf("[debug] cooldown %s/%s status=%d errors=%d for %v: %s", ep.Provider, ep.Model, statusCode, cd.ErrorCount, duration, summarizeError(errMsg))
 }
@@ -250,9 +403,13 @@ func summarizeError(msg string) string {
 // count only reflects *recent* consecutive failures and escalation can't run away.
 func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	deleted := false
 	if _, ok := r.cooldowns[ep.Key()]; ok {
 		delete(r.cooldowns, ep.Key())
+		deleted = true
+	}
+	r.mu.Unlock()
+	if deleted {
 		r.saveCooldowns()
 	}
 }
@@ -322,8 +479,8 @@ func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration 
 
 func (r *Router) ResetCooldown(ep *ModelEndpoint) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	delete(r.cooldowns, ep.Key())
+	r.mu.Unlock()
 	r.saveCooldowns()
 }
 
