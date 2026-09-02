@@ -90,7 +90,7 @@ GOOGLE_AI_STUDIO_FREE_PREFIXES: tuple[str, ...] = (
     # Gemma models (open weights) - keep all
     "gemma-4-",
     # Flash experimental/preview - keep *-latest only (filtered in fetch function)
-    "gemini-flash-latest",
+    # NOTE: gemini-flash-latest is blacklisted (see GOOGLE_AI_STUDIO_FREE_MODELS)
     "gemini-flash-lite-latest",
 )
 
@@ -101,14 +101,12 @@ GOOGLE_AI_STUDIO_FREE_PREFIXES: tuple[str, ...] = (
 # (no preview/experimental/tts/image/audio variants) and matches AA via that.
 _GOOGLE_VERSION = r"(\d+(?:\.\d+)*)"
 GOOGLE_LATEST_ALIASES: dict[str, re.Pattern[str]] = {
-    "gemini-flash-latest": re.compile(rf"^gemini-{_GOOGLE_VERSION}-flash(?:-\d+)?$"),
     "gemini-flash-lite-latest": re.compile(rf"^gemini-{_GOOGLE_VERSION}-flash-lite(?:-\d+)?$"),
 }
 
 # Offline fallback when v1beta/models is unreachable — bump manually when
 # Google ships a new generation (same philosophy as the curated list below).
 GOOGLE_LATEST_FALLBACK: dict[str, str] = {
-    "gemini-flash-latest": "gemini-3.7-flash",
     "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
 }
 
@@ -160,7 +158,6 @@ OPENCODE_FREE_MODELS: set[str] = {
 }
 
 GOOGLE_AI_STUDIO_FREE_MODELS_CTX: dict[str, int] = {
-    "gemini-flash-latest":        1_048_576,
     "gemini-flash-lite-latest":   1_048_576,
     "gemma-4-31b-it":             262_144,
     "gemma-4-26b-a4b-it":         262_144,
@@ -170,7 +167,7 @@ GOOGLE_AI_STUDIO_FREE_MODELS_CTX: dict[str, int] = {
 
 # Curated free model list for Google AI Studio (used when API key not available)
 GOOGLE_AI_STUDIO_FREE_MODELS: set[str] = {
-    "gemini-flash-latest",
+    # gemini-flash-latest is BLACKLISTED (intentionally excluded)
     "gemini-flash-lite-latest",
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",

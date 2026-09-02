@@ -180,10 +180,10 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	return resp, nil
 }
 
-func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration) (string, []streamToolCall, error) {
+func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration) (string, []streamToolCall, int, error) {
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
-		return "", nil, fmt.Errorf("unknown provider: %s", endpoint.Provider)
+		return "", nil, 0, fmt.Errorf("unknown provider: %s", endpoint.Provider)
 	}
 
 	// Use the parent context for the request so the connection stays alive for
@@ -191,18 +191,28 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// guards the time-to-first-token via firstByteReader below.
 	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, true)
 	if err != nil {
-		return "", nil, err
+		return "", nil, 0, err
 	}
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", nil, &ProviderError{Err: err}
+		return "", nil, 0, &ProviderError{Err: err}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes}
+		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes}
+	}
+
+	// A 200 without an SSE content type means the provider ignored stream:true
+	// and returned a plain JSON body. Forwarding that as SSE would garble the
+	// client's stream (abrupt / malformed termination), so treat it as a failure
+	// and fall back to the next model in the chain.
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes}
 	}
 
 	// Guard only the first byte with the size-based timeout. Once the stream
@@ -353,7 +363,7 @@ func (i *idleTimeoutReader) Close() error {
 	return nil
 }
 
-func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (string, []streamToolCall, error) {
+func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (string, []streamToolCall, int, error) {
 	var eventBuf bytes.Buffer
 	scanner := bufio.NewScanner(body)
 	buf := make([]byte, 0, 64*1024)
@@ -368,6 +378,8 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	var acc strings.Builder
 	tcs := []streamToolCall{}
 	released := false
+	sawDone := false
+	completionTokens := 0
 
 	flushBuffered := func() error {
 		if buffered.Len() == 0 {
@@ -391,8 +403,16 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 			// caller to fall back.
 			return err
 		}
+		if bytes.Equal(sseDataPayload(raw), []byte("[DONE]")) {
+			sawDone = true
+		}
 		if !released && sseEventIsRelease(raw) {
 			released = true
+		}
+		// Capture completion token usage from SSE usage events emitted before
+		// [DONE] so we can report TPS for streaming requests.
+		if ct := extractStreamUsage(raw); ct > 0 {
+			completionTokens = ct
 		}
 		if released {
 			accumulateDelta(&acc, &tcs, raw)
@@ -417,7 +437,7 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 			if eventBuf.Len() > 0 {
 				raw := eventBuf.Bytes()
 				if err := processEvent(raw); err != nil {
-					return acc.String(), tcs, err
+					return acc.String(), tcs, completionTokens, err
 				}
 				eventBuf.Reset()
 			}
@@ -431,7 +451,7 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	if err := scanner.Err(); err != nil {
 		// If we never released, this is an upstream failure before any content
 		// reached the client: discard the buffer and fall back.
-		return acc.String(), tcs, err
+		return acc.String(), tcs, completionTokens, err
 	}
 
 	// Flush a trailing event that was not terminated by a blank line (some
@@ -439,16 +459,29 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	if eventBuf.Len() > 0 {
 		raw := eventBuf.Bytes()
 		if err := processEvent(raw); err != nil {
-			return acc.String(), tcs, err
+			return acc.String(), tcs, completionTokens, err
 		}
 	}
 
 	// Flush any trailing buffered events (e.g. a final [DONE] with no content).
 	if err := flushBuffered(); err != nil {
-		return acc.String(), tcs, err
+		return acc.String(), tcs, completionTokens, err
 	}
-	return acc.String(), tcs, nil
+	// If the upstream ended the stream without a terminating [DONE] event (some
+	// providers close the connection right after the last content chunk), emit
+	// one so the client sees a properly terminated SSE stream instead of a
+	// connection that just drops. We only do this on a clean EOF; on a real error
+	// we fall back to the next model instead.
+	if !sawDone {
+		if _, err := w.Write([]byte("data: [DONE]\n\n")); err != nil {
+			return acc.String(), tcs, completionTokens, err
+		}
+		flusher.Flush()
+	}
+	return acc.String(), tcs, completionTokens, nil
 }
+
+// sseEventIsRelease reports whether an SSE event is safe to flush to the
 
 // sseEventIsRelease reports whether an SSE event is safe to flush to the
 // client: either it is the [DONE] sentinel or it carries the first non-empty
@@ -494,6 +527,28 @@ func sseDataPayload(raw []byte) []byte {
 		}
 	}
 	return bytes.TrimSpace(raw)
+}
+
+// extractStreamUsage returns the completion token count from an SSE event that
+// carries an OpenAI-style usage payload. Some providers emit this after [DONE]
+// so we can measure TPS for streaming requests.
+func extractStreamUsage(raw []byte) int {
+	payload := sseDataPayload(raw)
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		return 0
+	}
+	var out struct {
+		Usage *struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return 0
+	}
+	if out.Usage != nil {
+		return out.Usage.CompletionTokens
+	}
+	return 0
 }
 
 // streamToolCall accumulates a streamed tool_call across multiple SSE deltas so

@@ -238,6 +238,56 @@ func writeSSEError(w http.ResponseWriter, flusher http.Flusher, message string) 
 	flusher.Flush()
 }
 
+// visionRejectionReply builds a complete ChatCompletionResponse containing a
+// synthetic assistant message that tells the caller vision cannot be satisfied
+// by the selected model profile. The response is structured as a normal model
+// answer (not an error) so clients that only look for HTTP 200 continue to
+// operate normally.
+func visionRejectionReply(logicalModel, message string) ChatCompletionResponse {
+	now := time.Now().Unix()
+	return ChatCompletionResponse{
+		ID:      "chatcmpl-vision-" + fmt.Sprintf("%d", now),
+		Object:  "chat.completion",
+		Created: now,
+		Model:   logicalModel,
+		Choices: []ChatCompletionChoice{{
+			Index: 0,
+			Message: ChatCompletionMessage{
+				Role:    "assistant",
+				Content: message,
+			},
+		}},
+	}
+}
+
+// writeVisionRejectionSSE emits a single SSE chunk followed by [DONE] that
+// carries the supplied message as a synthetic assistant delta. The client sees
+// a normal streaming completion, not an error.
+func writeVisionRejectionSSE(w io.Writer, flusher http.Flusher, logicalModel, message string) {
+	now := time.Now().Unix()
+	chunk, _ := json.Marshal(ChatCompletionStreamResponse{
+		ID:      "chatcmpl-vision-" + fmt.Sprintf("%d", now),
+		Object:  "chat.completion.chunk",
+		Created: now,
+		Model:   logicalModel,
+		Choices: []ChatCompletionStreamChoice{{
+			Index: 0,
+			Delta: ChatCompletionStreamDelta{
+				Content: message,
+				Role:    "assistant",
+			},
+			FinishReason: strPtr("stop"),
+		}},
+	})
+	fmt.Fprintf(w, "data: %s\n\n", chunk)
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func strPtr(s string) *string {
+	return &s
+}
+
 func (g *GatewayContext) HandleModels(w http.ResponseWriter, r *http.Request) {
 	if !g.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
@@ -304,14 +354,15 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 }
 
 // estimateTokens approximates the request context size in tokens from the
-// prompt messages. We use the common heuristic of ~4 characters per token
-// since we don't have a model-specific tokenizer available here.
+// prompt messages. We use the heuristic of ~2 characters per token (double the
+// common ~4 chars/token estimate) to be conservative about size, since we don't
+// have a model-specific tokenizer available here. This drives request timeouts.
 func estimateTokens(req *ChatCompletionRequest) int {
 	totalChars := 0
 	for _, m := range req.Messages {
 		totalChars += len(m.Content)
 	}
-	tokens := totalChars / 4
+	tokens := totalChars / 2
 	if tokens < 1 {
 		tokens = 1
 	}
@@ -417,6 +468,19 @@ func isHopByHopHeader(h string) bool {
 	return false
 }
 
+// extractCompletionTokens reads the usage field from a non-streaming response body.
+func extractCompletionTokens(body []byte) int {
+	var out struct {
+		Usage *struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(body, &out) == nil && out.Usage != nil {
+		return out.Usage.CompletionTokens
+	}
+	return 0
+}
+
 // requestTimeout returns a timeout that scales with the request context size:
 // 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens. It guards
 // only time-to-first-token for streaming; the idle reader bounds the rest.
@@ -446,6 +510,21 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if attempts >= maxAttempts {
+			if requestHasVision(body) {
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				switch state {
+				case VisionUnsupported:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision not supported"))
+					return
+				case VisionUnavailable:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision currently not available"))
+					return
+				}
+			}
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			return
 		}
@@ -453,6 +532,22 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
 		if ep == nil {
+			requireVision := requestHasVision(body)
+			if requireVision {
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				switch state {
+				case VisionUnsupported:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision not supported"))
+					return
+				case VisionUnavailable:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision currently not available"))
+					return
+				}
+			}
 			if wait > 0 {
 				timer := time.NewTimer(minDuration(wait, 30*time.Second))
 				select {
@@ -469,12 +564,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		start := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		resp, err := g.proxy.Forward(reqCtx, body, *ep)
 		if err != nil {
 			cancel()
 			if isClientDisconnect(err) {
-				// Client went away; nothing to cool down.
 				return
 			}
 			g.router.ApplyCooldownFromError(ep, err)
@@ -488,10 +583,17 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			continue
 		}
 
-		// Strip hop-by-hop / framing headers; the ResponseWriter sets its own
-		// Content-Length / Transfer-Encoding, and we must not advertise a
-		// mismatched upstream Content-Encoding to a client that didn't request
-		// compression.
+		// Read body so we can both copy to client and extract usage for TPS.
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
+		g.router.RecordSuccess(ep)
+		if dur := time.Since(start); dur > 0 {
+			if copts := extractCompletionTokens(respBody); copts > 0 {
+				g.router.RecordTPS(*ep, float64(copts)/dur.Seconds())
+			}
+		}
+
 		for k, v := range resp.Header {
 			if isHopByHopHeader(k) {
 				continue
@@ -499,14 +601,17 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			w.Header()[k] = v
 		}
 		w.WriteHeader(200)
-		_, copyErr := io.Copy(w, resp.Body)
-		resp.Body.Close()
-		cancel()
-		if copyErr != nil {
+		_, writeErr := w.Write(respBody)
+		if writeErr != nil {
 			// Most likely the client disconnected; don't penalize a healthy model.
 			return
 		}
 		g.router.RecordSuccess(ep)
+		if dur := time.Since(start); dur > 0 {
+			if copts := extractCompletionTokens(respBody); copts > 0 {
+				g.router.RecordTPS(*ep, float64(copts)/dur.Seconds())
+			}
+		}
 		return
 	}
 }
@@ -538,6 +643,17 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			return
 		}
 		if attempts >= maxAttempts {
+			if requestHasVision(body) {
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				switch state {
+				case VisionUnsupported:
+					writeVisionRejectionSSE(w, flusher, req.Model, "Vision not supported")
+					return
+				case VisionUnavailable:
+					writeVisionRejectionSSE(w, flusher, req.Model, "Vision currently not available")
+					return
+				}
+			}
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			return
 		}
@@ -545,6 +661,21 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
 		if ep == nil {
+			requireVision := requestHasVision(body)
+			if requireVision {
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				var msg string
+				switch state {
+				case VisionUnsupported:
+					msg = "Vision not supported"
+				case VisionUnavailable:
+					msg = "Vision currently not available"
+				}
+				if msg != "" {
+					writeVisionRejectionSSE(w, flusher, req.Model, msg)
+					return
+				}
+			}
 			if wait > 0 {
 				fmt.Fprintf(w, ": reconnecting in %v\n\n", wait.Round(time.Second))
 				flusher.Flush()
@@ -568,9 +699,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// client. The size-based timeout guards only time-to-first-token; the
 		// parent context keeps the connection alive for the rest of a long
 		// generation.
-		partial, toolCalls, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
+		start := time.Now()
+		partial, toolCalls, completionTokens, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
 		if err == nil {
 			g.router.RecordSuccess(ep)
+			if dur := time.Since(start); dur > 0 && completionTokens > 0 {
+				g.router.RecordTPS(*ep, float64(completionTokens)/dur.Seconds())
+			}
 			return
 		}
 
