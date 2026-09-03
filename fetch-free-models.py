@@ -910,8 +910,12 @@ def output_table(data: list[dict]) -> None:
         print("No records")
         return
 
+    # Dynamically size the id column from the actual model slugs,
+    # with the provider column as the next widest.
+    id_width = max(len(d.get("id", "")) for d in data)
+    id_width = max(id_width, len("id"))  # at least header width
     cols = [
-        ("id", 35),
+        ("id", id_width),
         ("provider", 16),
         ("released", 12),
         ("intelligence", 12),
@@ -953,8 +957,8 @@ def output_table(data: list[dict]) -> None:
         elo_disp = f"{elo_val:.0f}" if elo_val is not None else "-"
 
         row = [
-            d.get("id", "")[:35],
-            d.get("provider", "")[:16],
+            d.get("id", ""),
+            d.get("provider", ""),
             release_disp,
             intelligence_disp,
             elo_disp,
