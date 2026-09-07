@@ -17,6 +17,8 @@ func main() {
 	port := flag.String("port", "8080", "Port to listen on")
 	gatewayAPIKey := flag.String("api-key", "", "Gateway API key (optional, can be set via GATEWAY_API_KEY env var)")
 	allowNoAuth := flag.Bool("allow-no-auth", false, "Allow running without an API key (INSECURE: all endpoints including admin become unauthenticated)")
+	warmup := flag.Bool("warmup", false, "Warm up model profiles on startup (fires test requests to each provider)")
+	toolCalls := flag.Bool("tool-calls", false, "Enable synthesized tool-call events in streaming responses (disabled by default for compatibility)")
 	flag.Parse()
 
 	if *gatewayAPIKey == "" {
@@ -36,6 +38,7 @@ func main() {
 	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey)
+	proxy.SetToolCalls(*toolCalls)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -57,12 +60,27 @@ func main() {
 		http.Redirect(w, r, "/admin/", http.StatusFound)
 	})
 
+	// recoveryMiddleware wraps handlers to catch panics so a single bad
+	// request can't take down the entire server.
+	recoveryMiddleware := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[panic] %s %s: %v", r.Method, r.URL.Path, rec)
+					writeAPIError(w, 500, "Internal server error", "server_error", "internal_error")
+				}
+			}()
+			h.ServeHTTP(w, r)
+		})
+	}
+
 	server := &http.Server{
-		Addr:         ":" + *port,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 300 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              ":" + *port,
+		Handler:           recoveryMiddleware(mux),
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	defer cancel()
@@ -81,6 +99,12 @@ func main() {
 	log.Printf("Starting airouter on port %s", *port)
 	log.Printf("Config: %s", *configPath)
 	log.Printf("Models: %v", LogicalModels)
+	log.Printf("Tool calls (coalesced): %v", *toolCalls)
+
+	if *warmup {
+		log.Println("Warming up model profiles in the background...")
+		go proxy.Warmup(ctx)
+	}
 	for name, p := range cfg.Providers {
 		keyStatus := "no key"
 		if p.APIKey() != "" {
@@ -97,14 +121,17 @@ func main() {
 	}
 
 	<-ctx.Done()
+	router.Close()
 	log.Println("Server stopped")
 }
 
-// watchConfig polls the config file and reloads it in memory whenever its
-// mtime/size changes, so fallback chains and providers can be updated without a
-// restart. Invalid configs are logged and skipped (the last good config stays
-// active). The reload swaps the config pointers atomically; sessions and
-// cooldowns are preserved. It exits when ctx is cancelled (graceful shutdown).
+func flagBool(b *bool) bool {
+	if b == nil {
+		return false
+	}
+	return *b
+}
+
 func watchConfig(ctx context.Context, path string, gateway *GatewayContext) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -122,12 +149,15 @@ func watchConfig(ctx context.Context, path string, gateway *GatewayContext) {
 			if fi.ModTime().UnixNano() == lastMod && fi.Size() == lastSize {
 				continue
 			}
-			lastMod, lastSize = fi.ModTime().UnixNano(), fi.Size()
+			newMod, newSize := fi.ModTime().UnixNano(), fi.Size()
 			cfg, err := LoadConfig(path)
 			if err != nil {
 				log.Printf("[debug] hot reload skipped: config parse error: %v", err)
+				// Don't update lastMod/lastSize — retry on next tick so a
+				// transient write (e.g. editor saving) doesn't get stuck.
 				continue
 			}
+			lastMod, lastSize = newMod, newSize
 			gateway.ReloadConfig(cfg)
 			log.Printf("Config hot-reloaded from %s", path)
 		}

@@ -49,6 +49,49 @@ LOW (cleanup / hardening)
 • main.go:99-126 — watchConfig has no shutdown path; leaks goroutine on graceful shutdown.
 • main.go:128-134 — Whole-file SHA-256 every 3s; fsnotify or mtime would be cheaper.
 
+---
+
+RESOURCE LEAK AUDIT (2026-09-07)
+
+Scope: HTTP response bodies, goroutines, file descriptors, timers/contexts.
+
+HTTP Response Bodies — ✅ CLEAN
+• proxy.go:177-193 (Forward) — returns nil response on error; caller must not close. Non-stream path in handleCompletion reads and closes body on all paths (200, non-200, error).
+• proxy.go:268-316 (StreamToClient) — `defer resp.Body.Close()` at line 286 covers all paths. Explicit Close at line 299 is redundant but harmless.
+• proxy.go:238-265 (Warmup) — response bodies read and closed at lines 254-255.
+
+Goroutines — ✅ CLEAN
+• proxy.go:337-340 (firstByteReader.Read) — spawns goroutine per first-byte read. On context timeout, closes underlying reader to unblock. Latent risk: if f.r doesn't implement io.Closer, goroutine leaks until connection close. SAFETY: f.r is always *http.Response.Body which implements io.Closer.
+• proxy.go:397-421 (idleTimeoutReader.Read) — no goroutine spawned; uses time.AfterFunc. onIdle callback closes underlying reader.
+• proxy.go:241-263 (Warmup) — goroutines bounded by wg.Wait(); exit on ctx.Err().
+• main.go:88-97 (signal handler) — goroutine exits on signal.
+• main.go:134-163 (watchConfig) — goroutine exits on ctx.Done().
+
+File Descriptors — ✅ CLEAN
+• router.go:154-202 (saveCooldowns) — atomic write via tmp+rename; temp file removed on any error.
+• router.go:128-152 (loadCooldowns) — os.ReadFile closed by GC; no explicit close needed.
+
+Timers/Contexts — ✅ CLEAN
+• proxy.go:309 (StreamToClient) — `defer firstCancel()` releases timeout context.
+• proxy.go:398 (idleTimeoutReader) — timer stopped in Close(); onIdle sets closed flag.
+• api.go:641 (handleCompletion) — `defer cancel()` not used; cancel() called explicitly on all paths.
+• api.go:785 (handleStream wait timer) — timer.Stop() called on ctx.Done() path.
+
+Loop Bounds — ✅ CLEAN
+• api.go:709 (handleStream) — maxAttempts = chainLen*3 + 1 bounds the loop.
+• api.go:566 (handleCompletion) — same bound via maxAttempts.
+
+Safe-in-Practice Sites (latent risks, safe by construction)
+1. proxy.go:347-350 — firstByteReader goroutine leak if f.r not io.Closer. Safe because f.r is always *http.Response.Body.
+2. api.go:843 — body grows by one assistant message per failed stream attempt. Bounded by maxAttempts (≤10 for 3-element chain).
+3. proxy.go:405-410 — race between timer firing and onIdle execution. Safe because onIdle closes the underlying reader, unblocking any in-flight Read.
+
+Regression Tests Added
+• TestStreamSSE_FirstByteReaderNoGoroutineLeak — verifies goroutine count returns to baseline after timeout.
+• TestStreamSSE_IdleTimeoutClosesReader — verifies idle timeout unblocks a stalled Read.
+• TestStreamSSE_BoundedBodyGrowth — verifies body growth is bounded and produces valid JSON.
+• TestHandleStream_ResourceCleanup — verifies handleStream cleans up goroutines and timers when context is cancelled mid-stream.
+
 Top fixes, priority order
 
 1. Cap handleStream/handleCompletion iterations and ctx.Done()-check inside the loop — fixes #4 and #6 in the HIGH list, prevents the body-growth runaway.

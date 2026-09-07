@@ -34,8 +34,8 @@ const (
 // cannot satisfy a vision request and must be replaced with a vision-capable
 // one).
 func (r *Router) VisionChainStatus(logicalModel, sessionID string) (VisionChainState, time.Duration) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	chain, ok := r.config.Load().Models[logicalModel]
 	if !ok || len(chain.Chain) == 0 {
@@ -46,7 +46,8 @@ func (r *Router) VisionChainStatus(logicalModel, sessionID string) (VisionChainS
 	// capable one, so we treat such a sticky model as not blocking other
 	// vision-capable candidates.
 	stickyBlocks := false
-	if bound, ok := r.sessions[sessionID]; ok {
+	if se, ok := r.sessions[sessionID]; ok {
+		bound := se.ep
 		if !bound.SupportsVision() || r.noVision[bound.Key()] {
 			stickyBlocks = true
 		}
@@ -68,7 +69,7 @@ func (r *Router) VisionChainStatus(logicalModel, sessionID string) (VisionChainS
 		// model in the chain; we count the sticky model itself only if it
 		// already supports vision (otherwise the next model in the chain is
 		// the one the router will actually pick).
-		if bound, ok := r.sessions[sessionID]; ok && bound.Equal(ep) && stickyBlocks {
+		if se, ok := r.sessions[sessionID]; ok && se.ep.Equal(ep) && stickyBlocks {
 			continue
 		}
 		if cd, ok := r.cooldowns[ep.Key()]; ok {
@@ -99,30 +100,173 @@ type CooldownEntry struct {
 	LastError  string    `json:"last_error"`
 }
 
+type sessionEntry struct {
+	ep       ModelEndpoint
+	lastUsed time.Time
+}
+
+const (
+	// sessionTTL bounds how long a sticky session survives without being
+	// accessed. Sessions idle longer than this are evicted by the background
+	// sweeper so the sessions map can't grow without bound under sustained
+	// traffic with many distinct conversations.
+	sessionTTL = 2 * time.Hour
+	// sessionSweepInterval is how often the sweeper scans for stale sessions.
+	sessionSweepInterval = time.Hour
+	// cooldownSaveInterval is how long to wait before flushing cooldown state
+	// to disk after a change. A burst of failures coalesces into a single
+	// write instead of one per failure, bounding disk I/O under load.
+	cooldownSaveInterval = 5 * time.Second
+)
+
+// cooldownSaveState batches cooldown writes so a burst of failures doesn't
+// trigger a disk write on every single one. The first failure marks the state
+// dirty; a short timer coalesces subsequent changes into a single write. If the
+// timer is already pending, we just leave it. On Close we flush any pending
+// write so state isn't lost on shutdown.
+type cooldownSaveState struct {
+	mu      sync.Mutex
+	timer   *time.Timer
+	pending bool
+}
+
+func (c *cooldownSaveState) trigger(save func(), delay time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.timer != nil {
+		// A save is already pending; just ensure the delay is (re)armed.
+		c.timer.Reset(delay)
+		return
+	}
+	c.timer = time.AfterFunc(delay, func() {
+		c.mu.Lock()
+		c.timer = nil
+		c.mu.Unlock()
+		save()
+	})
+}
+
+func (c *cooldownSaveState) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+}
+
 type Router struct {
 	config       atomic.Pointer[Config]
-	sessions     map[string]ModelEndpoint
+	sessions     map[string]sessionEntry
 	cooldowns    map[string]CooldownEntry
 	noVision     map[string]bool // endpoints that rejected an image request
 	tps          map[string]float64
 	cooldownPath string
 	priorityPath string
 	mu           sync.RWMutex
+	sessionsDone chan struct{}
+	sessionsWG   sync.WaitGroup
+	cooldownSave *cooldownSaveState
 }
 
 func NewRouter(cfg *Config, cooldownPath string) *Router {
 	r := &Router{
-		sessions:     make(map[string]ModelEndpoint),
+		sessions:     make(map[string]sessionEntry),
 		cooldowns:    make(map[string]CooldownEntry),
 		noVision:     make(map[string]bool),
 		tps:          make(map[string]float64),
 		cooldownPath: cooldownPath,
 		priorityPath: strings.TrimSuffix(cooldownPath, ".json") + ".priority.json",
+		sessionsDone: make(chan struct{}),
+		cooldownSave: &cooldownSaveState{},
 	}
 	r.config.Store(cfg)
 	r.loadCooldowns()
 	r.loadPriorities()
+	r.sessionsWG.Add(1)
+	go r.sweepSessions()
 	return r
+}
+
+// cleanupStaleEntries removes entries from cooldowns, noVision, and tps maps
+// for endpoints that are no longer in the current config. Without this, removing
+// a model from the config leaves its entries in these maps forever (a slow
+// memory leak). Also caps ErrorCount so a persistently-failing model's counter
+// can't grow without bound. Called periodically by the session sweeper.
+func (r *Router) cleanupStaleEntries() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cfg := r.config.Load()
+	// Build the set of all currently-configured endpoint keys
+	valid := map[string]bool{}
+	for _, mc := range cfg.Models {
+		for _, ep := range mc.Chain {
+			valid[ep.Key()] = true
+		}
+	}
+	for k := range r.cooldowns {
+		if !valid[k] {
+			delete(r.cooldowns, k)
+			continue
+		}
+		// Cap ErrorCount so a persistently-failing model's counter can't grow
+		// without bound. The cooldown is already at maxCooldown by errorCount=10,
+		// so further increments only waste memory.
+		if cd := r.cooldowns[k]; cd.ErrorCount > 100 {
+			cd.ErrorCount = 100
+			r.cooldowns[k] = cd
+		}
+	}
+	for k := range r.noVision {
+		if !valid[k] {
+			delete(r.noVision, k)
+		}
+	}
+	for k := range r.tps {
+		if !valid[k] {
+			delete(r.tps, k)
+		}
+	}
+}
+
+// sweepSessions periodically removes sessions that haven't been accessed in
+// over sessionTTL and cleans up stale cooldown/noVision/tps entries. Without
+// this, the sessions map would grow without bound under sustained traffic with
+// many distinct conversations (each unique model+messages hash becomes a
+// permanent entry).
+func (r *Router) sweepSessions() {
+	defer r.sessionsWG.Done()
+	ticker := time.NewTicker(sessionSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.sessionsDone:
+			return
+		case <-ticker.C:
+			r.evictStaleSessions()
+			r.cleanupStaleEntries()
+		}
+	}
+}
+
+func (r *Router) evictStaleSessions() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for sid, se := range r.sessions {
+		if now.Sub(se.lastUsed) > sessionTTL {
+			delete(r.sessions, sid)
+		}
+	}
+}
+
+// Close stops the background session sweeper and flushes any pending cooldown
+// save so state isn't lost on shutdown. Called on graceful shutdown.
+func (r *Router) Close() {
+	r.cooldownSave.stop()
+	close(r.sessionsDone)
+	r.sessionsWG.Wait()
+	r.saveCooldowns()
 }
 
 func (r *Router) loadCooldowns() {
@@ -245,10 +389,18 @@ func (r *Router) savePriorities() {
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
+		log.Printf("[debug] failed to write priorities temp file: %v", err)
 		return
 	}
-	tmp.Close()
-	os.Rename(tmpName, r.priorityPath)
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[debug] failed to close priorities temp file: %v", err)
+		return
+	}
+	if err := os.Rename(tmpName, r.priorityPath); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[debug] failed to rename priorities file: %v", err)
+	}
 }
 
 func (r *Router) RecordTPS(ep ModelEndpoint, tps float64) {
@@ -279,8 +431,8 @@ func (r *Router) isAvailableLocked(ep *ModelEndpoint) bool {
 }
 
 func (r *Router) IsAvailable(ep *ModelEndpoint) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.isAvailableLocked(ep)
 }
 
@@ -294,9 +446,10 @@ func minDuration(a, b time.Duration) time.Duration {
 func (r *Router) minCooldownWait(chain []ModelEndpoint, requireVision bool) time.Duration {
 	minWait := time.Duration(0)
 	for _, ep := range chain {
-		// A model marked noVision can never serve a vision request, so its
-		// cooldown (or lack thereof) is irrelevant to the wait calculation.
-		if requireVision && r.noVision[ep.Key()] {
+		// A model that can never serve a vision request (either marked noVision
+		// at runtime or configured with vision:false) is irrelevant to the
+		// wait calculation for vision requests.
+		if requireVision && (!ep.SupportsVision() || r.noVision[ep.Key()]) {
 			continue
 		}
 		if cd, ok := r.cooldowns[ep.Key()]; ok {
@@ -318,7 +471,11 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		return nil, 0
 	}
 
-	if ep, ok := r.sessions[sessionID]; ok {
+	if se, ok := r.sessions[sessionID]; ok {
+		// Update lastUsed so the session isn't evicted while active.
+		se.lastUsed = time.Now()
+		r.sessions[sessionID] = se
+		ep := se.ep
 		available := r.isAvailableLocked(&ep)
 		if available && r.visionEligible(&ep, requireVision) {
 			return &ep, 0
@@ -332,7 +489,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 				if capabilityFallback {
 					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
 				}
-				r.sessions[sessionID] = next
+				r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
 				return &next, 0
 			}
 		}
@@ -342,7 +499,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 	for _, ep := range chain.Chain {
 		if r.isEligibleLocked(&ep, requireVision) {
 			log.Printf("[debug] session=%s model=%s -> new session -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
-			r.sessions[sessionID] = ep
+			r.sessions[sessionID] = sessionEntry{ep: ep, lastUsed: time.Now()}
 			return &ep, 0
 		}
 	}
@@ -370,17 +527,41 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 		cd = CooldownEntry{}
 	}
 	cd.ErrorCount++
+	// Cap ErrorCount so a persistently-failing model's counter can't grow
+	// without bound. The cooldown is already at maxCooldown by errorCount=10,
+	// so further increments only waste memory.
+	if cd.ErrorCount > 100 {
+		cd.ErrorCount = 100
+	}
 	duration := r.cooldownForError(statusCode, cd.ErrorCount)
 	cd.Expiry = time.Now().Add(duration)
 	cd.StatusCode = statusCode
-	cd.LastError = errMsg
+	// Truncate the error message so a verbose provider error body (e.g.
+	// Gemini's multi-kilobyte JSON) doesn't bloat cooldowns.json on every
+	// retry. Keep it short; the full detail is in the log line below.
+	cd.LastError = truncateErr(errMsg, 200)
 	r.cooldowns[key] = cd
 	if isVisionUnsupported(errMsg) {
 		r.noVision[key] = true
 	}
 	r.mu.Unlock()
-	r.saveCooldowns()
+	// Debounce: coalesce rapid successive failures into a single disk write.
+	// The first failure arms a short timer; subsequent failures reset it. On
+	// timer expiry we persist. This bounds disk I/O to at most one write per
+	// `cooldownSaveInterval` per burst, instead of one per failure.
+	r.cooldownSave.trigger(r.saveCooldowns, cooldownSaveInterval)
 	log.Printf("[debug] cooldown %s/%s status=%d errors=%d for %v: %s", ep.Provider, ep.Model, statusCode, cd.ErrorCount, duration, summarizeError(errMsg))
+}
+
+// truncateErr reduces an error message to at most maxLen runes, adding an
+// ellipsis if it was cut. It rounds on runes (not bytes) so multi-byte UTF-8
+// characters are never split.
+func truncateErr(msg string, maxLen int) string {
+	runes := []rune(msg)
+	if len(runes) <= maxLen {
+		return msg
+	}
+	return string(runes[:maxLen]) + "..."
 }
 
 // summarizeError reduces a provider error body to a single short line for logs
@@ -415,6 +596,9 @@ func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 }
 
 func (r *Router) ApplyCooldownFromError(ep *ModelEndpoint, err error) {
+	if err == nil {
+		return
+	}
 	statusCode := 0
 	var providerErr *ProviderError
 	if errors.As(err, &providerErr) {
@@ -427,7 +611,8 @@ func (r *Router) ApplyCooldownFromError(ep *ModelEndpoint, err error) {
 func baseCooldownForError(statusCode int) time.Duration {
 	switch statusCode {
 	case 429:
-		return 10 * time.Second
+		// Rate limit: start at 30s. Escalation below handles persistent limits.
+		return 30 * time.Second
 	case 500, 502, 503:
 		return 30 * time.Second
 	case 504:
@@ -448,22 +633,26 @@ func baseCooldownForError(statusCode int) time.Duration {
 // failure. Transient errors (429/5xx) escalate modestly and are hard-capped so
 // a burst can never disable a model for long. Errors that are effectively
 // permanent (4xx auth/404, and repeated timeouts) get a very long cooldown so a
-// misconfigured model is not retried forever. The error count is reset on a
-// successful request (see Router.RecordSuccess), so escalation only reflects
-// recent consecutive failures.
+// misconfigured model is not retried forever. After many consecutive failures,
+// the model is hard-banned for a very long time to avoid wasting requests on a
+// permanently broken endpoint. The error count is reset on a successful request
+// (see Router.RecordSuccess), so escalation only reflects recent consecutive
+// failures.
 func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration {
 	base := baseCooldownForError(statusCode)
 	if errorCount <= 1 {
 		return base
 	}
-	// Transient: escalate but bound the total.
+	// Transient: escalate but bound the total. Use a gentler exponential-ish
+	// curve so a persistently rate-limited model backs off to minutes (not
+	// seconds) instead of hammering it every 60s forever.
 	if statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
 		factor := time.Duration(errorCount)
-		if factor > 6 {
-			factor = 6
+		if factor > 10 {
+			factor = 10
 		}
 		d := base * factor
-		const maxCooldown = 10 * time.Minute
+		const maxCooldown = 30 * time.Minute
 		if d > maxCooldown {
 			d = maxCooldown
 		}
@@ -472,6 +661,12 @@ func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration 
 	// Permanent-looking (4xx / repeated): after a few consecutive failures,
 	// treat as a soft ban so we stop hammering the chain on every request.
 	if errorCount >= 3 {
+		// After many consecutive failures, the model is effectively
+		// permanently broken. Hard-ban it for a very long time to avoid
+		// wasting requests on every retry cycle.
+		if errorCount >= 10 {
+			return 7 * 24 * time.Hour // 7 days
+		}
 		return 24 * time.Hour
 	}
 	return base
@@ -520,16 +715,19 @@ func isVisionUnsupported(msg string) bool {
 func (r *Router) GetSession(sessionID string) (ModelEndpoint, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ep, ok := r.sessions[sessionID]
-	return ep, ok
+	se, ok := r.sessions[sessionID]
+	if !ok {
+		return ModelEndpoint{}, false
+	}
+	return se.ep, true
 }
 
 func (r *Router) GetAllSessions() map[string]ModelEndpoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	result := make(map[string]ModelEndpoint, len(r.sessions))
-	for k, v := range r.sessions {
-		result[k] = v
+	for k, se := range r.sessions {
+		result[k] = se.ep
 	}
 	return result
 }
