@@ -101,8 +101,27 @@ type CooldownEntry struct {
 }
 
 type sessionEntry struct {
-	ep       ModelEndpoint
-	lastUsed time.Time
+	ep        ModelEndpoint
+	lastUsed  time.Time
+	triedKeys map[string]bool // endpoints that have already failed this session
+}
+
+// markTried records that an endpoint has been tried and failed for this session,
+// so SelectEndpoint won't pick it again until a model succeeds (which clears the
+// set via RecordSuccess) or the session is evicted.
+func (s *sessionEntry) markTried(key string) {
+	if s.triedKeys == nil {
+		s.triedKeys = map[string]bool{}
+	}
+	s.triedKeys[key] = true
+}
+
+func (s *sessionEntry) hasTried(key string) bool {
+	return s.triedKeys[key]
+}
+
+func (s *sessionEntry) clearTried() {
+	s.triedKeys = nil
 }
 
 const (
@@ -477,21 +496,40 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		r.sessions[sessionID] = se
 		ep := se.ep
 		available := r.isAvailableLocked(&ep)
-		if available && r.visionEligible(&ep, requireVision) {
+		if available && r.visionEligible(&ep, requireVision) && !se.hasTried(ep.Key()) {
 			return &ep, 0
 		}
-		// The sticky model is out: either cooled (routine, don't log) or it
-		// can't handle this request's capability (e.g. no vision). Only the
-		// latter is worth a log line.
+		// The sticky model is out: either cooled, marked no-vision, or already
+		// tried and failed this session. Only the no-vision case is worth a log
+		// line; the others are routine.
 		capabilityFallback := available && !r.visionEligible(&ep, requireVision)
 		for _, next := range chain.Chain {
-			if r.isEligibleLocked(&next, requireVision) {
+			if r.isEligibleLocked(&next, requireVision) && !se.hasTried(next.Key()) {
 				if capabilityFallback {
 					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
 				}
 				r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
 				return &next, 0
 			}
+		}
+		// All endpoints have been tried this session. Fall back to the first
+		// available one (ignoring the tried set) so we don't return nil and
+		// error out the client when there's still a chance one will work.
+		for _, next := range chain.Chain {
+			if r.isEligibleLocked(&next, requireVision) {
+				log.Printf("[debug] session=%s model=%s -> retry exhausted, retrying %s/%s", sessionID, logicalModel, next.Provider, next.Model)
+				r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+				return &next, 0
+			}
+		}
+		// All endpoints are in cooldown. Pick the first one anyway so the
+		// client gets a chance (the cooldown may expire between now and the
+		// next retry). Without this, we'd return nil and error out.
+		if len(chain.Chain) > 0 {
+			next := chain.Chain[0]
+			log.Printf("[debug] session=%s model=%s -> all cooled down, retrying %s/%s", sessionID, logicalModel, next.Provider, next.Model)
+			r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+			return &next, 0
 		}
 	}
 
@@ -520,6 +558,14 @@ func (r *Router) ChainLength(logicalModel string) int {
 }
 
 func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string) {
+	r.ApplyCooldownForSession(ep, statusCode, errMsg, "")
+}
+
+// ApplyCooldownForSession records a failure for an endpoint and marks it as
+// tried for the given session so SelectEndpoint won't pick it again until a
+// model succeeds (which clears the tried set). An empty sessionID skips the
+// per-session tracking (used by tests and background tasks).
+func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string) {
 	r.mu.Lock()
 	key := ep.Key()
 	cd, ok := r.cooldowns[key]
@@ -543,6 +589,14 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 	r.cooldowns[key] = cd
 	if isVisionUnsupported(errMsg) {
 		r.noVision[key] = true
+	}
+	// Mark this endpoint as tried for the session so we don't pick it again
+	// after its cooldown expires (prevents retry storms on the same model).
+	if sessionID != "" {
+		if se, ok := r.sessions[sessionID]; ok {
+			se.markTried(key)
+			r.sessions[sessionID] = se
+		}
 	}
 	r.mu.Unlock()
 	// Debounce: coalesce rapid successive failures into a single disk write.
@@ -581,13 +635,28 @@ func summarizeError(msg string) string {
 }
 
 // RecordSuccess resets a model's cooldown on a successful response so the error
-// count only reflects *recent* consecutive failures and escalation can't run away.
+// count only reflects *recent* consecutive failures and escalation can't run
+// away. Also clears the session's tried set so previously-failed endpoints
+// become eligible again (the rate limit may have cleared).
 func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 	r.mu.Lock()
 	deleted := false
-	if _, ok := r.cooldowns[ep.Key()]; ok {
-		delete(r.cooldowns, ep.Key())
+	key := ep.Key()
+	if _, ok := r.cooldowns[key]; ok {
+		delete(r.cooldowns, key)
 		deleted = true
+	}
+	// Clear the tried set for all sessions that had this endpoint marked.
+	// This is O(sessions) but bounded by sessionTTL eviction, and success is
+	// far less frequent than failure.
+	for sid, se := range r.sessions {
+		if se.triedKeys != nil && se.triedKeys[key] {
+			delete(se.triedKeys, key)
+			if len(se.triedKeys) == 0 {
+				se.triedKeys = nil
+			}
+			r.sessions[sid] = se
+		}
 	}
 	r.mu.Unlock()
 	if deleted {
@@ -596,6 +665,10 @@ func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 }
 
 func (r *Router) ApplyCooldownFromError(ep *ModelEndpoint, err error) {
+	r.ApplyCooldownFromErrorForSession(ep, err, "")
+}
+
+func (r *Router) ApplyCooldownFromErrorForSession(ep *ModelEndpoint, err error, sessionID string) {
 	if err == nil {
 		return
 	}
@@ -605,7 +678,7 @@ func (r *Router) ApplyCooldownFromError(ep *ModelEndpoint, err error) {
 		statusCode = providerErr.StatusCode
 	}
 	errMsg := err.Error()
-	r.ApplyCooldown(ep, statusCode, errMsg)
+	r.ApplyCooldownForSession(ep, statusCode, errMsg, sessionID)
 }
 
 func baseCooldownForError(statusCode int) time.Duration {

@@ -611,7 +611,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if ep != nil {
 			// Skip endpoints we've already tried this request
 			if tried[ep.Key()] {
-				g.router.ApplyCooldown(ep, 429, "already tried this request")
+				g.router.ApplyCooldownForSession(ep, 429, "already tried this request", sessionID)
 				attempts--
 				continue
 			}
@@ -662,14 +662,14 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				return
 			}
-			g.router.ApplyCooldownFromError(ep, err)
+			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			continue
 		}
 		if resp.StatusCode != 200 {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			cancel()
-			g.router.ApplyCooldown(ep, resp.StatusCode, string(respBody))
+			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID)
 			continue
 		}
 
@@ -822,7 +822,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			// Force the router to pick something else by temporarily
 			// cooling this endpoint. It will be reset on success or
 			// at the end of the request.
-			g.router.ApplyCooldown(ep, 429, "already tried this request")
+			g.router.ApplyCooldownForSession(ep, 429, "already tried this request", sessionID)
 			// Try again without consuming an attempt
 			attempts--
 			continue
@@ -865,7 +865,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// is bounded by maxAttempts (chainLen*3 + 1, set above). For a typical
 		// 3-element chain that's 10 attempts max. Each assistant message is
 		// small (partial output from one attempt), so memory stays bounded.
-		g.router.ApplyCooldownFromError(ep, err)
+		g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 		if strings.TrimSpace(partial) != "" || len(toolCalls) > 0 {
 			// Compute the content delta: only the new content not yet replayed.
 			// If the model continued from the replayed context, partial will
