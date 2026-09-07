@@ -13,3 +13,4 @@ arena-code-cache.json
 
 # Runtime state (regenerated on startup)
 cooldowns.json
+cooldowns.priority.json
