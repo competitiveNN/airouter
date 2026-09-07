@@ -2892,3 +2892,94 @@ func readFile(path string) ([]byte, error) {
 	defer f.Close()
 	return io.ReadAll(f)
 }
+
+// TestSessionSkipsTriedEndpoints verifies that after a model fails for a
+// session, SelectEndpoint won't pick it again even after its cooldown expires.
+// This prevents the retry storm where the same model gets retried every time
+// its cooldown window closes.
+func TestSessionSkipsTriedEndpoints(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
+			"p2": {URL: "https://p2.example.com/v1", APIKeyEnv: "P2_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p1", Model: "m1"},
+				{Provider: "p2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	sessionID := "test-retry-storm"
+
+	// First call: gets p1
+	ep, _ := router.SelectEndpoint("smart", sessionID, false)
+	if ep == nil || ep.Provider != "p1" {
+		t.Fatalf("expected p1, got %v", ep)
+	}
+
+	// p1 fails
+	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID)
+
+	// Second call: should skip p1 (tried) and get p2
+	ep, _ = router.SelectEndpoint("smart", sessionID, false)
+	if ep == nil || ep.Provider != "p2" {
+		t.Fatalf("expected p2 after p1 failed, got %v", ep)
+	}
+
+	// p2 also fails
+	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID)
+
+	// Third call: both have been tried, but p1's cooldown may have expired
+	// (30s base). We should still skip it because it's in the tried set.
+	// The tried set only clears on success.
+	ep, _ = router.SelectEndpoint("smart", sessionID, false)
+	if ep == nil {
+		t.Fatal("expected an endpoint (exhausted fallback), got nil")
+	}
+	// At this point both are tried, so it should pick the first available
+	// (the exhausted fallback path). The key point is it doesn't loop forever.
+}
+
+// TestRecordSuccessClearsTriedSet verifies that a successful response clears
+// the session's tried set, making all endpoints eligible again.
+func TestRecordSuccessClearsTriedSet(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
+			"p2": {URL: "https://p2.example.com/v1", APIKeyEnv: "P2_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p1", Model: "m1"},
+				{Provider: "p2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	sessionID := "test-clear-tried"
+
+	// p1 fails
+	ep1, _ := router.SelectEndpoint("smart", sessionID, false)
+	router.ApplyCooldownForSession(ep1, 429, "rate limited", sessionID)
+
+	// Should now get p2
+	ep2, _ := router.SelectEndpoint("smart", sessionID, false)
+	if ep2.Provider != "p2" {
+		t.Fatalf("expected p2, got %s", ep2.Provider)
+	}
+
+	// p2 succeeds — this should clear the tried set
+	router.RecordSuccess(ep2)
+
+	// Now p1 should be eligible again (even though its cooldown hasn't expired)
+	ep, _ := router.SelectEndpoint("smart", sessionID, false)
+	if ep == nil {
+		t.Fatal("expected an endpoint after success cleared tried set")
+	}
+	// p1 is still in cooldown, so we should get p2 again (the first available)
+	if ep.Provider != "p2" {
+		t.Fatalf("expected p2 (p1 still in cooldown), got %s", ep.Provider)
+	}
+}

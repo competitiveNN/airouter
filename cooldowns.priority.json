@@ -1,6 +1,6 @@
 {
   "gemini:gemini-flash-lite-latest": 169.5447846412586,
-  "kilocode:dots-studio/dots-3-note-preview:free": 91.1840700672028,
+  "kilocode:dots-studio/dots-3-note-preview:free": 96.0044190605515,
   "kilocode:inclusionai/ling-3.0-flash-fin:free": 134.36153019656965,
   "kilocode:kilo-auto/free": 7.270249932520722,
   "kilocode:minimax/minimax-m2.7:free": 47.983172098854354,
@@ -14,10 +14,12 @@
   "kilocode:thinkingmachines/inkling:free": 64.35773611515926,
   "nvidia2:meta/muse-glimmer-30b": 26.834858583797892,
   "nvidia2:minimaxai/minimax-m3": 11.072652373302772,
+  "nvidia2:moonshotai/kimi-k3": 5.875227794812839,
   "nvidia2:nvidia/nemotron-3-super-120b-a12b": 24.939258281054702,
   "nvidia2:nvidia/nemotron-3-ultra-550b-a55b": 5.545827611852396,
   "nvidia2:nvidia/nemotron-3.5-lightning-30b-a3b": 26.140079603022976,
   "nvidia3:minimaxai/minimax-m3": 21.032131217919677,
+  "nvidia3:moonshotai/kimi-k3": 9.347520333711715,
   "nvidia3:nvidia/nemotron-3-super-120b-a12b": 9.039395301630426,
   "nvidia3:nvidia/nemotron-3-ultra-550b-a55b": 4.012854720483993,
   "nvidia3:nvidia/nemotron-3.5-lightning-30b-a3b": 14.088242546441053,
@@ -26,7 +28,7 @@
   "nvidia:nvidia/nemotron-3-super-120b-a12b": 32.94117643202146,
   "nvidia:nvidia/nemotron-3-ultra-550b-a55b": 22.08047424975971,
   "nvidia:nvidia/nemotron-3.5-lightning-30b-a3b": 27.028617103247296,
-  "ollama:gemma4:31b": 37.0630308115356,
+  "ollama:gemma4:31b": 37.22224188471121,
   "opencode:nemotron-3-ultra-free": 5.5848025968576005,
   "opencode:nemotron-3.5-lightning-free": 4.800769756490059
 }
