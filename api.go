@@ -36,9 +36,19 @@ type ChatCompletionRequest struct {
 }
 
 type ChatCompletionMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	Name    string `json:"name,omitempty"`
+	Role      string                  `json:"role"`
+	Content   string                  `json:"content"`
+	Name      string                  `json:"name,omitempty"`
+	ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+}
+
+type ChatCompletionToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 // UnmarshalJSON tolerates both string content (standard) and array content
@@ -185,8 +195,18 @@ func (g *GatewayContext) checkAuth(r *http.Request) bool {
 	}
 	want := []byte(g.gatewayAPIKey)
 	got := []byte(parts[1])
-	if len(want) != len(got) {
-		return false
+	// ConstantTimeCompare requires equal-length inputs; always run it to
+	// avoid leaking the key length via timing. Pad the shorter input to
+	// match the longer one (the comparison will fail, but in constant time).
+	if len(want) == len(got) {
+		return subtle.ConstantTimeCompare(want, got) == 1
+	}
+	// Lengths differ: run ConstantTimeCompare on equal-length slices so the
+	// timing doesn't reveal the key length. Result is always false.
+	if len(got) < len(want) {
+		got = append(got, make([]byte, len(want)-len(got))...)
+	} else {
+		want = append(want, make([]byte, len(got)-len(want))...)
 	}
 	return subtle.ConstantTimeCompare(want, got) == 1
 }
@@ -260,6 +280,10 @@ func writeAPIError(w http.ResponseWriter, statusCode int, message, errType, code
 }
 
 func writeSSEError(w http.ResponseWriter, flusher http.Flusher, message string) {
+	// Sanitize: SSE events are delimited by newlines, so a multi-line
+	// message would break framing. Collapse to a single line.
+	message = strings.ReplaceAll(message, "\r", " ")
+	message = strings.ReplaceAll(message, "\n", " ")
 	errJSON, _ := json.Marshal(ErrorResponse{
 		Error: ErrorDetail{
 			Message: message,
@@ -408,7 +432,7 @@ func estimateTokens(req *ChatCompletionRequest) int {
 // `"type":"image_url"` marker (not a bare "image_url" substring) so a text
 // message that merely mentions the field is not mis-routed.
 func requestHasVision(body []byte) bool {
-	return bytes.Contains(body, []byte(`"type":"image_url"`)) || bytes.Contains(body, []byte("image_url"))
+	return bytes.Contains(body, []byte(`"type":"image_url"`))
 }
 
 // appendAssistantMessage returns body with an assistant message appended to the
@@ -417,6 +441,11 @@ func requestHasVision(body []byte) bool {
 // already sent to the client is replayed so the new model continues rather than
 // regenerating from scratch. On any parse failure it returns the original body
 // unchanged (fail-open so a request is never dropped).
+//
+// Incomplete tool calls (those with no function name yet) are dropped: they
+// represent deltas where only the id arrived but the name never did, and
+// replaying them as `{"function":{"arguments":...}}` with no name would produce
+// a malformed tool call that breaks the next model's parser.
 func appendAssistantMessage(body []byte, content string, toolCalls []streamToolCall) []byte {
 	var data map[string]json.RawMessage
 	if err := json.Unmarshal(body, &data); err != nil {
@@ -429,6 +458,14 @@ func appendAssistantMessage(body []byte, content string, toolCalls []streamToolC
 	if len(toolCalls) > 0 {
 		atcs := make([]map[string]interface{}, 0, len(toolCalls))
 		for _, tc := range toolCalls {
+			// Skip incomplete tool calls: a name with no arguments (or no name
+			// at all) produces an invalid tool call event. The streamer only
+			// emits complete tool calls to the client, but the fallback
+			// accumulator also holds partial deltas for replay. Replaying an
+			// incomplete one would break the next model's parser.
+			if tc.Name == "" {
+				continue
+			}
 			m := map[string]interface{}{}
 			if tc.ID != "" {
 				m["id"] = tc.ID
@@ -445,7 +482,9 @@ func appendAssistantMessage(body []byte, content string, toolCalls []streamToolC
 			m["function"] = fn
 			atcs = append(atcs, m)
 		}
-		msg["tool_calls"] = atcs
+		if len(atcs) > 0 {
+			msg["tool_calls"] = atcs
+		}
 	}
 	msgJSON, err := json.Marshal(msg)
 	if err != nil {
@@ -515,8 +554,9 @@ func extractCompletionTokens(body []byte) int {
 }
 
 // requestTimeout returns a timeout that scales with the request context size:
-// 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens. It guards
-// only time-to-first-token for streaming; the idle reader bounds the rest.
+// 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens (ceil
+// division). It guards only time-to-first-token for streaming; the idle reader
+// bounds the rest.
 func requestTimeout(tokens int) time.Duration {
 	const base = 5 * time.Second
 	if tokens <= 1000 {
@@ -536,6 +576,10 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		maxAttempts = 1
 	}
 	attempts := 0
+
+	// Track endpoints we've already tried this request so we don't re-pick a
+	// model that already failed (which would cause the same error again).
+	tried := map[string]bool{}
 
 	for {
 		if ctx.Err() != nil {
@@ -564,6 +608,15 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		attempts++
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
+		if ep != nil {
+			// Skip endpoints we've already tried this request
+			if tried[ep.Key()] {
+				g.router.ApplyCooldown(ep, 429, "already tried this request")
+				attempts--
+				continue
+			}
+			tried[ep.Key()] = true
+		}
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -603,6 +656,10 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if err != nil {
 			cancel()
 			if isClientDisconnect(err) {
+				// Client went away; send a JSON error so the client parser
+				// doesn't see a dropped connection (which would look like a
+				// partial response and trigger a retry loop).
+				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				return
 			}
 			g.router.ApplyCooldownFromError(ep, err)
@@ -634,16 +691,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			w.Header()[k] = v
 		}
 		w.WriteHeader(200)
-		_, writeErr := w.Write(respBody)
-		if writeErr != nil {
-			// Most likely the client disconnected; don't penalize a healthy model.
+		if _, writeErr := w.Write(respBody); writeErr != nil {
+			// Most likely the client disconnected; log for observability but
+			// don't penalize a healthy model.
+			log.Printf("[debug] session=%s model=%s -> write error (client likely disconnected): %v", sessionID, req.Model, writeErr)
 			return
-		}
-		g.router.RecordSuccess(ep)
-		if dur := time.Since(start); dur > 0 {
-			if copts := extractCompletionTokens(respBody); copts > 0 {
-				g.router.RecordTPS(*ep, float64(copts)/dur.Seconds())
-			}
 		}
 		return
 	}
@@ -671,8 +723,44 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	}
 	attempts := 0
 
+	// Track endpoints we've already tried this request so we don't re-pick a
+	// model that already failed. Without this, a model that enters cooldown
+	// mid-loop could be re-selected after its cooldown expires between
+	// attempts, causing the same failure again.
+	tried := map[string]bool{}
+
+	// doneSent tracks whether we've already written the [DONE] sentinel to
+	// the client. We must always send it before returning so the client
+	// parser doesn't hang waiting for stream termination.
+	doneSent := false
+
+	// accumulatedContent tracks the total content already replayed across
+	// fallback attempts. On each failed attempt, partial contains the full
+	// output from that model (which includes prior replayed context). We
+	// only append the delta (new content not yet in the body) to prevent
+	// duplicated text from accumulating across fallbacks.
+	var accumulatedContent string
+
+	// accumulatedTCs tracks tool call state across fallbacks so that
+	// partially-received tool calls persist across model switches.
+	var accumulatedTCs []streamToolCall
+	sendDone := func() {
+		if doneSent {
+			return
+		}
+		doneSent = true
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
+	defer sendDone()
+
 	for {
 		if ctx.Err() != nil {
+			// Context cancelled (client disconnect or timeout). Log the cause
+			// for debugging; the deferred sendDone() will terminate the stream.
+			if cause := context.Cause(ctx); cause != nil {
+				log.Printf("[debug] session=%s model=%s -> context cancelled: %v", sessionID, req.Model, cause)
+			}
 			return
 		}
 		if attempts >= maxAttempts {
@@ -681,13 +769,16 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				switch state {
 				case VisionUnsupported:
 					writeVisionRejectionSSE(w, flusher, req.Model, "Vision not supported")
+					doneSent = true
 					return
 				case VisionUnavailable:
 					writeVisionRejectionSSE(w, flusher, req.Model, "Vision currently not available")
+					doneSent = true
 					return
 				}
 			}
 			writeSSEError(w, flusher, "All models are currently unavailable")
+			// sendDone fires via defer
 			return
 		}
 		attempts++
@@ -706,6 +797,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				}
 				if msg != "" {
 					writeVisionRejectionSSE(w, flusher, req.Model, msg)
+					doneSent = true
 					return
 				}
 			}
@@ -725,6 +817,18 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			return
 		}
 
+		// Skip endpoints we've already tried this request
+		if tried[ep.Key()] {
+			// Force the router to pick something else by temporarily
+			// cooling this endpoint. It will be reset on success or
+			// at the end of the request.
+			g.router.ApplyCooldown(ep, 429, "already tried this request")
+			// Try again without consuming an attempt
+			attempts--
+			continue
+		}
+		tried[ep.Key()] = true
+
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		// StreamToClient buffers the start of the stream and only flushes to the
 		// client once the first content token (or tool call) arrives, so an early
@@ -739,6 +843,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			if dur := time.Since(start); dur > 0 && completionTokens > 0 {
 				g.router.RecordTPS(*ep, float64(completionTokens)/dur.Seconds())
 			}
+			// StreamToClient emits [DONE] on success; mark as sent so the
+			// deferred sendDone() doesn't emit a duplicate.
+			doneSent = true
 			return
 		}
 
@@ -753,9 +860,47 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// instead of regenerating (which would duplicate output). If nothing was
 		// flushed yet (failure before the first token) we just retry with the
 		// unchanged body.
+		//
+		// SAFETY: body grows by one assistant message per failed attempt. This
+		// is bounded by maxAttempts (chainLen*3 + 1, set above). For a typical
+		// 3-element chain that's 10 attempts max. Each assistant message is
+		// small (partial output from one attempt), so memory stays bounded.
 		g.router.ApplyCooldownFromError(ep, err)
 		if strings.TrimSpace(partial) != "" || len(toolCalls) > 0 {
-			body = appendAssistantMessage(body, partial, toolCalls)
+			// Compute the content delta: only the new content not yet replayed.
+			// If the model continued from the replayed context, partial will
+			// start with accumulatedContent and we strip that prefix.
+			contentDelta := partial
+			if strings.HasPrefix(partial, accumulatedContent) {
+				contentDelta = partial[len(accumulatedContent):]
+			}
+			// Accumulate tool calls across fallbacks. Merge new tool calls
+			// into the accumulator so partial tool call deltas survive
+			// across model switches.
+			for _, tc := range toolCalls {
+				found := false
+				for i := range accumulatedTCs {
+					if accumulatedTCs[i].Index == tc.Index {
+						if tc.ID != "" {
+							accumulatedTCs[i].ID = tc.ID
+						}
+						if tc.Type != "" {
+							accumulatedTCs[i].Type = tc.Type
+						}
+						if tc.Name != "" {
+							accumulatedTCs[i].Name = tc.Name
+						}
+						accumulatedTCs[i].Arguments += tc.Arguments
+						found = true
+						break
+					}
+				}
+				if !found {
+					accumulatedTCs = append(accumulatedTCs, tc)
+				}
+			}
+			body = appendAssistantMessage(body, contentDelta, accumulatedTCs)
+			accumulatedContent = partial
 		}
 		continue
 	}

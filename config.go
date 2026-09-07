@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -60,6 +62,15 @@ type Config struct {
 var LogicalModels = []string{"smart", "work", "fast", "large"}
 
 func LoadConfig(path string) (*Config, error) {
+	// Bound file size to prevent OOM from malformed/malicious config
+	const maxConfigBytes = 10 << 20 // 10 MiB
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat config: %w", err)
+	}
+	if fi.Size() > maxConfigBytes {
+		return nil, fmt.Errorf("config file too large: %d bytes (max %d)", fi.Size(), maxConfigBytes)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -116,6 +127,14 @@ func (c *Config) validate() error {
 	if len(c.Models) == 0 {
 		return fmt.Errorf("no models configured")
 	}
+	for name, p := range c.Providers {
+		if p.URL == "" {
+			return fmt.Errorf("provider %s has empty URL", name)
+		}
+		if !strings.HasPrefix(p.URL, "http://") && !strings.HasPrefix(p.URL, "https://") {
+			return fmt.Errorf("provider %s URL must start with http:// or https://: %q", name, p.URL)
+		}
+	}
 	for name, model := range c.Models {
 		if len(model.Chain) == 0 {
 			return fmt.Errorf("model %s has empty chain", name)
@@ -134,7 +153,8 @@ func (c *Config) GetChain(logicalModel string) ([]ModelEndpoint, bool) {
 	if !ok {
 		return nil, false
 	}
-	return mc.Chain, true
+	// Return a copy so callers can't mutate the internal slice
+	return append([]ModelEndpoint(nil), mc.Chain...), true
 }
 
 func (c *Config) GetProvider(provider string) (ProviderConfig, bool) {
@@ -173,83 +193,53 @@ func (e *SSEError) Error() string {
 }
 
 func ExtractSSEError(data []byte) error {
-	for _, line := range splitLines(data) {
-		line = trimSpace(line)
-		if len(line) == 0 {
+	// SSE events can carry errors in three shapes:
+	//   1. A "data:" line whose JSON payload contains an "error" object
+	//      (OpenAI-style, most common).
+	//   2. An "event: error" line followed by a "data:" line carrying the
+	//      error payload (Anthropic / some providers).
+	//   3. A bare JSON error object outside any "data:" wrapper (seen from
+	//      some proxy layers that strip framing).
+	//
+	// We scan line-by-line so each data: line is examined independently.
+
+	for _, raw := range bytes.Split(data, []byte("\n")) {
+		line := bytes.TrimSpace(raw)
+		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
-		if bytesHasPrefix(line, []byte("data: ")) {
-			payload := line[6:]
-			if bytesEqual(payload, []byte("[DONE]")) {
-				return nil
+
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+
+		// Fast path: if the payload is a JSON object containing an "error"
+		// field, it's an error event.
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &obj); err == nil {
+			// An error field that is null or an empty object {} is not an error.
+			// Some providers emit "error":{} on non-error chunks (e.g. usage-only
+			// events), so we must not treat it as a failure.
+			if errRaw, ok := obj["error"]; ok && len(errRaw) > 2 && string(errRaw) != "null" {
+				return &SSEError{Data: string(errRaw)}
 			}
-			var obj map[string]json.RawMessage
-			if err := json.Unmarshal(payload, &obj); err == nil {
-				if errRaw, ok := obj["error"]; ok {
-					var apiErr struct {
-						Error struct {
-							Message string `json:"message"`
-							Type    string `json:"type"`
-							Code    string `json:"code"`
-						} `json:"error"`
-					}
-					_ = json.Unmarshal(errRaw, &apiErr.Error)
-					return &SSEError{Data: string(errRaw)}
-				}
-			}
-			return nil
 		}
 	}
+
+	// Fallback: if no data: error was found, check whether the raw body itself
+	// is a JSON error object (some providers return the error as the entire
+	// response body with no SSE framing at all).
+	trimmed := bytes.TrimSpace(data)
+	if bytes.HasPrefix(trimmed, []byte("{")) {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &obj); err == nil {
+			// Same guard as above: skip null/empty error objects.
+			if errRaw, ok := obj["error"]; ok && len(errRaw) > 2 && string(errRaw) != "null" {
+				return &SSEError{Data: string(errRaw)}
+			}
+		}
+	}
+
 	return nil
-}
-
-func splitLines(data []byte) [][]byte {
-	return bytesSplit(data, []byte("\n"))
-}
-
-func trimSpace(data []byte) []byte {
-	return bytesTrimSpace(data)
-}
-
-func bytesHasPrefix(data, prefix []byte) bool {
-	return len(data) >= len(prefix) && equal(data[:len(prefix)], prefix)
-}
-
-func bytesEqual(a, b []byte) bool {
-	return len(a) == len(b) && equal(a, b)
-}
-
-func equal(a, b []byte) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func bytesSplit(data, sep []byte) [][]byte {
-	var result [][]byte
-	start := 0
-	for i := 0; i <= len(data)-len(sep); i++ {
-		if equal(data[i:i+len(sep)], sep) {
-			result = append(result, data[start:i])
-			start = i + len(sep)
-			i += len(sep) - 1
-		}
-	}
-	result = append(result, data[start:])
-	return result
-}
-
-func bytesTrimSpace(data []byte) []byte {
-	start := 0
-	for start < len(data) && (data[start] == ' ' || data[start] == '\t' || data[start] == '\r') {
-		start++
-	}
-	end := len(data)
-	for end > start && (data[end-1] == ' ' || data[end-1] == '\t' || data[end-1] == '\r') {
-		end--
-	}
-	return data[start:end]
 }
