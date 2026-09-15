@@ -101,27 +101,8 @@ type CooldownEntry struct {
 }
 
 type sessionEntry struct {
-	ep        ModelEndpoint
-	lastUsed  time.Time
-	triedKeys map[string]bool // endpoints that have already failed this session
-}
-
-// markTried records that an endpoint has been tried and failed for this session,
-// so SelectEndpoint won't pick it again until a model succeeds (which clears the
-// set via RecordSuccess) or the session is evicted.
-func (s *sessionEntry) markTried(key string) {
-	if s.triedKeys == nil {
-		s.triedKeys = map[string]bool{}
-	}
-	s.triedKeys[key] = true
-}
-
-func (s *sessionEntry) hasTried(key string) bool {
-	return s.triedKeys[key]
-}
-
-func (s *sessionEntry) clearTried() {
-	s.triedKeys = nil
+	ep       ModelEndpoint
+	lastUsed time.Time
 }
 
 const (
@@ -141,37 +122,49 @@ const (
 // cooldownSaveState batches cooldown writes so a burst of failures doesn't
 // trigger a disk write on every single one. The first failure marks the state
 // dirty; a short timer coalesces subsequent changes into a single write. If the
-// timer is already pending, we just leave it. On Close we flush any pending
-// write so state isn't lost on shutdown.
+// timer is already pending, we stop it and re-arm with the latest delay. On Close
+// we flush any pending write so state isn't lost on shutdown.
+//
+// SAFETY: Each trigger creates a new timer and stops the old one rather than
+// calling Reset on an already-fired AfterFunc timer (which is undefined per the
+// time package docs). The callback checks its identity against the current timer
+// so that a callback from a superseded timer aborts without writing — preventing
+// both timer leaks and orphaned callbacks that could clobber a newer trigger's
+// timer reference.
 type cooldownSaveState struct {
-	mu      sync.Mutex
-	timer   *time.Timer
-	pending bool
+	mu    sync.Mutex
+	timer *time.Timer
 }
 
 func (c *cooldownSaveState) trigger(save func(), delay time.Duration) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.timer != nil {
-		// A save is already pending; just ensure the delay is (re)armed.
-		c.timer.Reset(delay)
-		return
+		c.timer.Stop()
 	}
-	c.timer = time.AfterFunc(delay, func() {
+	// t escapes to the heap; the callback closes over it for identity comparison.
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
 		c.mu.Lock()
+		// Only proceed if no newer trigger has replaced this timer.
+		if c.timer != t {
+			c.mu.Unlock()
+			return
+		}
 		c.timer = nil
 		c.mu.Unlock()
 		save()
 	})
+	c.timer = t
+	c.mu.Unlock()
 }
 
 func (c *cooldownSaveState) stop() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.timer != nil {
 		c.timer.Stop()
 		c.timer = nil
 	}
+	c.mu.Unlock()
 }
 
 type Router struct {
@@ -481,7 +474,16 @@ func (r *Router) minCooldownWait(chain []ModelEndpoint, requireVision bool) time
 	return minWait
 }
 
-func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bool) (*ModelEndpoint, time.Duration) {
+// SelectEndpoint selects the next endpoint for a logical model, considering the
+// session's sticky routing, cooldowns, vision eligibility, and the set of
+// endpoints already tried in the current fallback sequence (tried).
+//
+// The tried set is per-request (local to each handleStream/handleCompletion
+// fallback loop), NOT stored in the shared session. This prevents concurrent
+// requests with the same session ID from interfering with each other's
+// endpoint selection — one request's failures do not cause the other to skip
+// an endpoint it has not independently tried.
+func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bool, tried map[string]bool) (*ModelEndpoint, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -496,15 +498,14 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		r.sessions[sessionID] = se
 		ep := se.ep
 		available := r.isAvailableLocked(&ep)
-		if available && r.visionEligible(&ep, requireVision) && !se.hasTried(ep.Key()) {
+		if available && r.visionEligible(&ep, requireVision) && !tried[ep.Key()] {
 			return &ep, 0
 		}
 		// The sticky model is out: either cooled, marked no-vision, or already
-		// tried and failed this session. Only the no-vision case is worth a log
-		// line; the others are routine.
+		// tried and failed in this request's fallback sequence.
 		capabilityFallback := available && !r.visionEligible(&ep, requireVision)
 		for _, next := range chain.Chain {
-			if r.isEligibleLocked(&next, requireVision) && !se.hasTried(next.Key()) {
+			if r.isEligibleLocked(&next, requireVision) && !tried[next.Key()] {
 				if capabilityFallback {
 					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
 				}
@@ -512,9 +513,9 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 				return &next, 0
 			}
 		}
-		// All endpoints have been tried this session. Fall back to the first
-		// available one (ignoring the tried set) so we don't return nil and
-		// error out the client when there's still a chance one will work.
+		// All endpoints have been tried in this fallback sequence. Fall back to
+		// the first available one (ignoring the tried set) so we don't return
+		// nil and error out the client when there's still a chance one will work.
 		for _, next := range chain.Chain {
 			if r.isEligibleLocked(&next, requireVision) {
 				log.Printf("[debug] session=%s model=%s -> retry exhausted, retrying %s/%s", sessionID, logicalModel, next.Provider, next.Model)
@@ -561,10 +562,11 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 	r.ApplyCooldownForSession(ep, statusCode, errMsg, "")
 }
 
-// ApplyCooldownForSession records a failure for an endpoint and marks it as
-// tried for the given session so SelectEndpoint won't pick it again until a
-// model succeeds (which clears the tried set). An empty sessionID skips the
-// per-session tracking (used by tests and background tasks).
+// ApplyCooldownForSession records a failure for an endpoint. The sessionID
+// parameter is retained for API compatibility but no longer controls any
+// per-session state — failed-endpoint tracking is now local to each request's
+// fallback loop (see handleStream/handleCompletion) to avoid interference
+// between concurrent requests that share a session ID.
 func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string) {
 	r.mu.Lock()
 	key := ep.Key()
@@ -589,14 +591,6 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 	r.cooldowns[key] = cd
 	if isVisionUnsupported(errMsg) {
 		r.noVision[key] = true
-	}
-	// Mark this endpoint as tried for the session so we don't pick it again
-	// after its cooldown expires (prevents retry storms on the same model).
-	if sessionID != "" {
-		if se, ok := r.sessions[sessionID]; ok {
-			se.markTried(key)
-			r.sessions[sessionID] = se
-		}
 	}
 	r.mu.Unlock()
 	// Debounce: coalesce rapid successive failures into a single disk write.
@@ -634,10 +628,9 @@ func summarizeError(msg string) string {
 	return msg
 }
 
-// RecordSuccess resets a model's cooldown on a successful response so the error
-// count only reflects *recent* consecutive failures and escalation can't run
-// away. Also clears the session's tried set so previously-failed endpoints
-// become eligible again (the rate limit may have cleared).
+// RecordSuccess resets a model's cooldown on a successful response so the
+// error count only reflects *recent* consecutive failures and escalation can't
+// run away.
 func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 	r.mu.Lock()
 	deleted := false
@@ -645,18 +638,6 @@ func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 	if _, ok := r.cooldowns[key]; ok {
 		delete(r.cooldowns, key)
 		deleted = true
-	}
-	// Clear the tried set for all sessions that had this endpoint marked.
-	// This is O(sessions) but bounded by sessionTTL eviction, and success is
-	// far less frequent than failure.
-	for sid, se := range r.sessions {
-		if se.triedKeys != nil && se.triedKeys[key] {
-			delete(se.triedKeys, key)
-			if len(se.triedKeys) == 0 {
-				se.triedKeys = nil
-			}
-			r.sessions[sid] = se
-		}
 	}
 	r.mu.Unlock()
 	if deleted {
