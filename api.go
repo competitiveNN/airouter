@@ -36,9 +36,9 @@ type ChatCompletionRequest struct {
 }
 
 type ChatCompletionMessage struct {
-	Role      string                  `json:"role"`
-	Content   string                  `json:"content"`
-	Name      string                  `json:"name,omitempty"`
+	Role      string                   `json:"role"`
+	Content   string                   `json:"content"`
+	Name      string                   `json:"name,omitempty"`
 	ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
 }
 
@@ -577,8 +577,9 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	}
 	attempts := 0
 
-	// Track endpoints we've already tried this request so we don't re-pick a
-	// model that already failed (which would cause the same error again).
+	// tried tracks endpoints that have failed in THIS request's fallback loop.
+	// It is local to this goroutine so concurrent requests with the same
+	// session ID don't interfere with each other's endpoint selection.
 	tried := map[string]bool{}
 
 	for {
@@ -607,16 +608,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 		attempts++
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
-		if ep != nil {
-			// Skip endpoints we've already tried this request
-			if tried[ep.Key()] {
-				g.router.ApplyCooldownForSession(ep, 429, "already tried this request", sessionID)
-				attempts--
-				continue
-			}
-			tried[ep.Key()] = true
-		}
+		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -656,12 +648,10 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if err != nil {
 			cancel()
 			if isClientDisconnect(err) {
-				// Client went away; send a JSON error so the client parser
-				// doesn't see a dropped connection (which would look like a
-				// partial response and trigger a retry loop).
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				return
 			}
+			tried[ep.Key()] = true
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			continue
 		}
@@ -669,6 +659,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			cancel()
+			tried[ep.Key()] = true
 			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID)
 			continue
 		}
@@ -723,10 +714,10 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	}
 	attempts := 0
 
-	// Track endpoints we've already tried this request so we don't re-pick a
-	// model that already failed. Without this, a model that enters cooldown
-	// mid-loop could be re-selected after its cooldown expires between
-	// attempts, causing the same failure again.
+	// tried tracks endpoints that have failed in THIS request's fallback loop.
+	// It is local to this goroutine so concurrent requests with the same
+	// session ID (e.g. duplicate client retries) don't interfere with each
+	// other's endpoint selection through a shared tried set.
 	tried := map[string]bool{}
 
 	// doneSent tracks whether we've already written the [DONE] sentinel to
@@ -783,7 +774,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		}
 		attempts++
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body))
+		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -817,19 +808,6 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			return
 		}
 
-		// Skip endpoints we've already tried this request
-		if tried[ep.Key()] {
-			// Force the router to pick something else by temporarily
-			// cooling this endpoint. It will be reset on success or
-			// at the end of the request.
-			g.router.ApplyCooldownForSession(ep, 429, "already tried this request", sessionID)
-			// Try again without consuming an attempt
-			attempts--
-			continue
-		}
-		tried[ep.Key()] = true
-
-		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		// StreamToClient buffers the start of the stream and only flushes to the
 		// client once the first content token (or tool call) arrives, so an early
 		// upstream error is swallowed and we fall back with no output sent to the
@@ -837,6 +815,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// parent context keeps the connection alive for the rest of a long
 		// generation.
 		start := time.Now()
+		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		partial, toolCalls, completionTokens, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
 		if err == nil {
 			g.router.RecordSuccess(ep)
@@ -854,6 +833,12 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			return
 		}
 
+		// Mark this endpoint as tried in THIS request's local fallback set so
+		// we don't retry it within the same loop. Unlike the old shared
+		// triedKeys approach, this doesn't leak state to other concurrent
+		// requests that share the same session ID.
+		tried[ep.Key()] = true
+		g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 		// Mid-stream failure after we already flushed content to the client:
 		// resume on the next model by replaying what the client already received
 		// as an assistant message (content and any tool calls), so it continues
@@ -865,7 +850,6 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// is bounded by maxAttempts (chainLen*3 + 1, set above). For a typical
 		// 3-element chain that's 10 attempts max. Each assistant message is
 		// small (partial output from one attempt), so memory stays bounded.
-		g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 		if strings.TrimSpace(partial) != "" || len(toolCalls) > 0 {
 			// Compute the content delta: only the new content not yet replayed.
 			// If the model continued from the replayed context, partial will
@@ -1142,5 +1126,3 @@ document.getElementById('load').click();
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
 	w.Write([]byte(html))
 }
-
-
