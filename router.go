@@ -509,7 +509,9 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 				if capabilityFallback {
 					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
 				}
-				r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+				if len(tried) == 0 {
+					r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+				}
 				return &next, 0
 			}
 		}
@@ -529,7 +531,9 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		if len(chain.Chain) > 0 {
 			next := chain.Chain[0]
 			log.Printf("[debug] session=%s model=%s -> all cooled down, retrying %s/%s", sessionID, logicalModel, next.Provider, next.Model)
-			r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+			if len(tried) == 0 {
+				r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+			}
 			return &next, 0
 		}
 	}
