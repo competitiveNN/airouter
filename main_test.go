@@ -3354,3 +3354,31 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 		t.Errorf("expected backend1 to be hit exactly %d times (once per concurrent request), got %d", n, hits)
 	}
 }
+
+// TestConcurrentStickySessionGuard verifies that concurrent requests with
+// the same session ID do not overwrite each other's fallback routing.
+func TestConcurrentStickySessionGuard(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{"p1": {URL: "https://p1"}, "p2": {URL: "https://p2"}},
+		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "p1", Model: "m1"}, {Provider: "p2", Model: "m2"}}}},
+	}
+	router := NewRouter(cfg, "")
+	sessionID := "sticky-guard"
+	tried := map[string]bool{}
+	ep, _ := router.SelectEndpoint("smart", sessionID, false, tried)
+	if ep == nil || ep.Provider != "p1" {
+		t.Fatalf("expected p1, got %v", ep)
+	}
+	// Fallback should not update session when tried is non-empty
+	tried[ep.Key()] = true
+	router.ApplyCooldown(ep, 429, "rate limited")
+	ep2, _ := router.SelectEndpoint("smart", sessionID, false, tried)
+	if ep2 == nil || ep2.Provider != "p2" {
+		t.Fatalf("expected p2 fallback, got %v", ep2)
+	}
+	// Session should remain p1 because tried != 0 (only first selection updates)
+	stored, ok := router.GetSession(sessionID)
+	if !ok || stored.Provider != "p1" {
+		t.Errorf("expected session still pinned to p1 after fallback guard, got %v", stored)
+	}
+}
