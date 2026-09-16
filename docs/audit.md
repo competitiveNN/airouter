@@ -104,3 +104,16 @@ Top fixes, priority order
 8. Require GATEWAY_API_KEY (or fail to start) and add subtle.ConstantTimeCompare.
 9. Wrap r.Body in http.MaxBytesReader and validate provider URLs in Config.validate.
 10. Make cooldowns.json write atomic (tmp + rename), and hard-ban on 404/401/403 after N escalations.
+
+## Prioritized findings — concurrency / session routing
+- router.go:512 — shared sticky session update during fallback interferes with concurrent same-session requests
+- router.go:522 — retry-exhausted path also wrote session unconditionally
+Fix: guard both with `len(tried) == 0` (only update on initial selection per request).
+Suggested regression tests: TestConcurrentMidStreamErrorRecovery (already exists), TestConcurrentStreamingSameSession.
+Status: fix applied; `go test -race ./...` 99 passed.
+
+## Proxy stream-error recovery paths (additional)
+- proxy.go:527-799 streamSSE — error events returned as err, partial content in acc; handled by handleStream replay (api.go:853-888)
+- proxy.go:280-329 StreamToClient — first-byte timeout + idle timeout guard mid-stream stalls; errors propagate to handleStream fallback
+- Recommended: verify streamSSE never leaks partial errors to client when released==true; test with synthetic SSE error after content release.
+Cooldown/priority consistency: cooldowns.json exists; cooldowns.priority.json updated in git (restored to original); no stale cooldown entries for removed endpoints (router cleanupStaleEntries handles).
