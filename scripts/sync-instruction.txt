@@ -12,14 +12,19 @@ Rules:
    - opencode        -> opencode
    - ollama-cloud    -> ollama
    - google-ai-studio -> google
+   - commandcode      -> commandcode or commandcode2 (see rule 3)
 
-  3. Use all three NVIDIA API keys for every NVIDIA model. Any nvidia-nim
-     model placed in a chain is emitted as three consecutive entries with
-     providers nvidia, nvidia2, nvidia3 (same model id), so a rate-limited key
-     falls through to the next key on the same model instead of failing the
-     request. Preserve best-first ordering: for each model in score order, emit
-     its nvidia / nvidia2 / nvidia3 trio before moving to the next model. No
-     nvidia-nim model should ever appear on only one provider.
+   3. Use all three NVIDIA API keys for every NVIDIA model, and both CommandCode
+     API keys for every CommandCode model. Any nvidia-nim model placed in a chain
+     is emitted as three consecutive entries with providers nvidia, nvidia2, nvidia3
+     (same model id), and any commandcode model is emitted as two consecutive
+     entries with providers commandcode, commandcode2 (same model id), so a
+     rate-limited key falls through to the next key on the same model instead of
+     failing the request. Preserve best-first ordering: for each model in score
+     order, emit its full provider group (nvidia/nvidia2/nvidia3 trio or
+     commandcode/commandcode2 pair) before moving to the next model. No nvidia-nim
+     model should ever appear on only one NVIDIA provider, and no commandcode model
+     should ever appear on only one CommandCode provider.
 
  4. Order each chain best-first, descending by "intelligence". Skip models whose
     intelligence is null — EXCEPT the two auto-fallback models in rule 6, which
@@ -77,10 +82,8 @@ Rules:
   10. Self-check after editing: every profile has a non-empty chain, every
       referenced provider exists in `providers:`, the last entry of each chain is
       the auto model chosen per rule 6, every concrete endpoint carries a
-      `vision:` boolean (true/false), and every nvidia-nim model id appears on
-      all three providers nvidia / nvidia2 / nvidia3. Finish with a compact
+      `vision:` boolean (true/false), every nvidia-nim model id appears on
+      all three providers nvidia / nvidia2 / nvidia3, and every commandcode model
+      id appears on both providers commandcode / commandcode2. Finish with a compact
       summary table listing the four chains (profile, entry count, head model,
       tail auto model).
-and every concrete endpoint carries a
-      `vision:` boolean (true/false). Finish with a compact summary table listing
-      the four chains (profile, entry count, head model, tail auto model).
