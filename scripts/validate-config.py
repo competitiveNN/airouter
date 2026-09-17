@@ -21,6 +21,14 @@ def main() -> int:
     if not providers:
         problems.append("no providers configured")
 
+    # Provider groups: models from these sources must appear on every provider
+    # in their group (same model id, consecutive entries) so a rate-limited
+    # key falls through to the next key on the same model.
+    provider_groups: dict[str, tuple[str, ...]] = {
+        "nvidia-nim": ("nvidia", "nvidia2", "nvidia3"),
+        "commandcode": ("commandcode", "commandcode2"),
+    }
+
     for name in ("smart", "work", "fast", "large"):
         if name not in models:
             problems.append(f"missing profile {name}")
@@ -45,6 +53,34 @@ def main() -> int:
                 f"{name}: last chain entry must be kilo-auto/free or "
                 f"big-pickle, got {last_model!r}"
             )
+
+        # Enforce provider-group completeness: if a model from a grouped
+        # source appears on any provider in the group, it must appear on
+        # ALL providers in that group (same model id) so rate-limit
+        # fallback has a sibling key to fall through to.
+        for source, group in provider_groups.items():
+            # Map provider -> set of model ids used in this chain
+            prov_models: dict[str, set[str]] = {p: set() for p in group}
+            for ep in chain:
+                prov = ep.get("provider", "")
+                if prov in prov_models:
+                    mid = ep.get("model", "")
+                    if mid not in ("kilo-auto/free", "big-pickle"):
+                        prov_models[prov].add(mid)
+            # Union of all model ids across the group
+            all_models: set[str] = set()
+            for mids in prov_models.values():
+                all_models.update(mids)
+            if not all_models:
+                continue
+            # Every provider in the group must carry the full set
+            for prov, mids in prov_models.items():
+                missing = all_models - mids
+                if missing:
+                    problems.append(
+                        f"{name}: {source} provider {prov} missing model(s) "
+                        f"{sorted(missing)} present on other {source} provider(s)"
+                    )
 
     if problems:
         for p in problems:
