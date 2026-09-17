@@ -525,17 +525,13 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 				return &next, 0
 			}
 		}
-		// All endpoints are in cooldown. Pick the first one anyway so the
-		// client gets a chance (the cooldown may expire between now and the
-		// next retry). Without this, we'd return nil and error out.
-		if len(chain.Chain) > 0 {
-			next := chain.Chain[0]
-			log.Printf("[debug] session=%s model=%s -> all cooled down, retrying %s/%s", sessionID, logicalModel, next.Provider, next.Model)
-			if len(tried) == 0 {
-				r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
-			}
-			return &next, 0
-		}
+		// All endpoints are in cooldown. Return nil so the handler waits
+		// for the shortest cooldown to expire rather than hammering a
+		// cooled model on every iteration (which caused the
+		// "all cooled down, retrying X" spam loop). The handler's
+		// attempts counter bounds the total retries, so this never
+		// causes an infinite loop.
+		return nil, r.minCooldownWait(chain.Chain, requireVision)
 	}
 
 	// New session
@@ -571,7 +567,7 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 // per-session state — failed-endpoint tracking is now local to each request's
 // fallback loop (see handleStream/handleCompletion) to avoid interference
 // between concurrent requests that share a session ID.
-func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string) {
+func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string) time.Duration {
 	r.mu.Lock()
 	key := ep.Key()
 	cd, ok := r.cooldowns[key]
@@ -603,6 +599,31 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 	// `cooldownSaveInterval` per burst, instead of one per failure.
 	r.cooldownSave.trigger(r.saveCooldowns, cooldownSaveInterval)
 	log.Printf("[debug] cooldown %s/%s status=%d errors=%d for %v: %s", ep.Provider, ep.Model, statusCode, cd.ErrorCount, duration, summarizeError(errMsg))
+	return duration
+}
+
+// ApplyCooldownWithDuration records a failure for an endpoint with a
+// caller-specified cooldown duration (used by tests to avoid sleeping
+// for hours). Otherwise identical to ApplyCooldownForSession.
+func (r *Router) ApplyCooldownWithDuration(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string, duration time.Duration) {
+	r.mu.Lock()
+	key := ep.Key()
+	cd, ok := r.cooldowns[key]
+	if !ok {
+		cd = CooldownEntry{}
+	}
+	cd.ErrorCount++
+	if cd.ErrorCount > 100 {
+		cd.ErrorCount = 100
+	}
+	cd.Expiry = time.Now().Add(duration)
+	cd.StatusCode = statusCode
+	cd.LastError = truncateErr(errMsg, 200)
+	r.cooldowns[key] = cd
+	if isVisionUnsupported(errMsg) {
+		r.noVision[key] = true
+	}
+	r.mu.Unlock()
 }
 
 // truncateErr reduces an error message to at most maxLen runes, adding an
@@ -676,9 +697,9 @@ func baseCooldownForError(statusCode int) time.Duration {
 	case 504:
 		return 60 * time.Second
 	case 404:
-		// Model-not-found / misconfiguration: effectively permanent, so cool it
-		// for a long time instead of retrying every window.
-		return 30 * time.Minute
+		// Model-not-found / misconfiguration: effectively permanent,
+		// so cool it for 7 days to avoid wasting requests.
+		return 7 * 24 * time.Hour
 	case 401, 403:
 		// Auth failure: retrying won't help until credentials rotate.
 		return 30 * time.Minute
