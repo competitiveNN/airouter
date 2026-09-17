@@ -47,6 +47,7 @@ KILO_ENDPOINT = "https://api.kilo.ai/api/gateway/v1/models"
 OPENCODE_ENDPOINT = "https://opencode.ai/zen/v1/models"
 GOOGLE_AI_STUDIO_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 NVIDIA_NIM_ENDPOINT = "https://integrate.api.nvidia.com/v1/models"
+COMMANDCODE_ENDPOINT = "http://localhost:3050/v1/models"
 ARTIFICIAL_ANALYSIS_ENDPOINT = "https://artificialanalysis.ai/api/v2/data/llms/models"
 # arena.ai does not publish a public API for its leaderboard; this mirrors the
 # exact snapshot archived at the repo below (the code-arena leaderboard at
@@ -207,6 +208,10 @@ NVIDIA_NIM_CTX: dict[str, int] = {
     "inkling": 131_072,
     "qwen": 131_072,
     "gpt-oss": 131_072,
+}
+
+COMMANDCODE_FREE_MODELS_CTX: dict[str, int] = {
+    # Add known commandcode free models here as discovered
 }
 
 HEADERS = {
@@ -611,6 +616,54 @@ def fetch_opencode() -> list[dict[str, Any]]:
     return free_models
 
 
+def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert CommandCode model format to common schema."""
+    model_id = model.get("id", "")
+    return {
+        "id": model_id,
+        "name": model_id,
+        "provider": "commandcode",
+        "context_length": COMMANDCODE_FREE_MODELS_CTX.get(model_id, 0),
+        "intelligence": None,
+        "elo": None,
+        "released": model.get("created") or model.get("release_date") or model.get("published_at"),
+        "pricing": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+        },
+        "capabilities": {
+            "reasoning": False,
+            "vision": False,
+            "open_weights": False,
+        },
+        "source": "commandcode",
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "raw": model,
+    }
+
+
+def fetch_commandcode() -> list[dict[str, Any]]:
+    """Fetch CommandCode models; free ones end in -free or :free."""
+    print("Fetching from CommandCode API...", file=sys.stderr)
+    data = fetch_json(COMMANDCODE_ENDPOINT)
+    if not data or not isinstance(data, dict) or "data" not in data:
+        print("CommandCode: no data or unexpected format", file=sys.stderr)
+        return []
+
+    free_models = []
+    for model in data.get("data", []):
+        model_id = model.get("id", "")
+        if model_id.endswith("-free") or model_id.endswith(":free"):
+            normalized = normalize_commandcode(model)
+            if normalized:
+                free_models.append(normalized)
+
+    print(f"CommandCode: found {len(free_models)} free models ('-free' or ':free' suffix)", file=sys.stderr)
+    return free_models
+
+
 def fetch_ollama() -> list[dict[str, Any]]:
     """Return the curated Ollama Cloud free-tier marklist."""
     print(
@@ -972,7 +1025,7 @@ def output_table(data: list[dict]) -> None:
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch free models from Kilo Code, OpenCode, Ollama Cloud, Google AI Studio, and NVIDIA NIM APIs"
+        description="Fetch free models from Kilo Code, OpenCode, Ollama Cloud, Google AI Studio, NVIDIA NIM, and CommandCode APIs"
     )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--csv", action="store_true", help="Output as CSV")
@@ -983,6 +1036,7 @@ def main() -> None:
     parser.add_argument("--ollama-only", action="store_true", help="Only fetch from Ollama Cloud API")
     parser.add_argument("--google-ai-studio-only", action="store_true", help="Only fetch from Google AI Studio API")
     parser.add_argument("--nvidia-nim-only", action="store_true", help="Only fetch from NVIDIA NIM API")
+    parser.add_argument("--commandcode-only", action="store_true", help="Only fetch from CommandCode API")
     args = parser.parse_args()
 
     # Default to table if no format specified
@@ -990,10 +1044,10 @@ def main() -> None:
         args.table = True
 
     # Validate mutually exclusive flags
-    only_count = sum([args.kilocode_only, args.opencode_only, args.ollama_only, args.google_ai_studio_only, args.nvidia_nim_only])
+    only_count = sum([args.kilocode_only, args.opencode_only, args.ollama_only, args.google_ai_studio_only, args.nvidia_nim_only, args.commandcode_only])
     if only_count > 1:
         print(
-            "Error: --kilocode-only, --opencode-only, --ollama-only, --google-ai-studio-only, and --nvidia-nim-only are mutually exclusive",
+            "Error: --kilocode-only, --opencode-only, --ollama-only, --google-ai-studio-only, --nvidia-nim-only, and --commandcode-only are mutually exclusive",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1001,15 +1055,15 @@ def main() -> None:
     # Fetch data
     all_models = []
 
-    if not args.opencode_only and not args.ollama_only and not args.google_ai_studio_only and not args.nvidia_nim_only:
+    if not args.opencode_only and not args.ollama_only and not args.google_ai_studio_only and not args.nvidia_nim_only and not args.commandcode_only:
         kilo_models = fetch_kilo()
         all_models.extend(kilo_models)
 
-    if not args.kilocode_only and not args.ollama_only and not args.google_ai_studio_only and not args.nvidia_nim_only:
+    if not args.kilocode_only and not args.ollama_only and not args.google_ai_studio_only and not args.nvidia_nim_only and not args.commandcode_only:
         opencode_models = fetch_opencode()
         all_models.extend(opencode_models)
 
-    if not args.kilocode_only and not args.opencode_only and not args.google_ai_studio_only and not args.nvidia_nim_only:
+    if not args.kilocode_only and not args.opencode_only and not args.google_ai_studio_only and not args.nvidia_nim_only and not args.commandcode_only:
         ollama_models = fetch_ollama()
         all_models.extend(ollama_models)
 
@@ -1020,6 +1074,10 @@ def main() -> None:
     if not args.kilocode_only and not args.opencode_only and not args.ollama_only and not args.google_ai_studio_only:
         nvidia_models = fetch_nvidia_nim()
         all_models.extend(nvidia_models)
+
+    if not args.kilocode_only and not args.opencode_only and not args.ollama_only and not args.google_ai_studio_only and not args.nvidia_nim_only:
+        commandcode_models = fetch_commandcode()
+        all_models.extend(commandcode_models)
 
     if not all_models:
         print("No free models found", file=sys.stderr)

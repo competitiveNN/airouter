@@ -161,6 +161,34 @@ def _is_subsequence(needle: str, haystack: str) -> bool:
     return all(ch in it for ch in needle)
 
 
+def _is_version_only_diff(shorter: str, longer: str) -> bool:
+    """True if longer differs from shorter only by digit insertions adjacent
+    to existing digits — i.e. a version-number difference (n2 vs n2.5).
+
+    This prevents the fuzzy matcher from conflating different model versions
+    that share the same base name (e.g. "nexn2mini" vs "nexn25mini").
+    """
+    if len(longer) <= len(shorter):
+        return False
+    # Walk both strings; every extra char in longer must be a digit
+    # adjacent to an existing digit in shorter.
+    i = j = 0
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+            j += 1
+        elif longer[j].isdigit() and (i > 0 and shorter[i - 1].isdigit()):
+            j += 1  # version digit inserted
+        else:
+            return False
+    # Remaining chars in longer must all be digits adjacent to digits
+    while j < len(longer):
+        if not (longer[j].isdigit() and i > 0 and shorter[i - 1].isdigit()):
+            return False
+        j += 1
+    return True
+
+
 def normalize_slug(slug: str) -> str:
     """Normalize a model slug for exact matching against AA API slugs.
 
@@ -272,6 +300,14 @@ def fuzzy_match_slug(model_id: str, aa_slugs: dict[str, Any]) -> str | None:
         if ratio >= _FUZZY_CUTOFF and (
             _is_subsequence(folded_id, fold) or _is_subsequence(fold, folded_id)
         ):
+            # Reject when the only difference is digit insertions adjacent
+            # to existing digits — that is a version-number difference
+            # (n2 vs n2.5), not a variant of the same model.
+            shorter, longer = (
+                (fold, folded_id) if len(fold) <= len(folded_id) else (folded_id, fold)
+            )
+            if _is_version_only_diff(shorter, longer):
+                continue
             scored.append((ratio, slug))
     if not scored:
         return None
