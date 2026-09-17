@@ -168,6 +168,7 @@ type GatewayContext struct {
 	config        atomic.Pointer[Config]
 	configPath    string
 	gatewayAPIKey string
+	testCooldown  time.Duration // override for tests: forces all cooldowns to this duration
 }
 
 func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string) *GatewayContext {
@@ -179,6 +180,12 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 	}
 	g.config.Store(cfg)
 	return g
+}
+
+// SetTestCooldown overrides the cooldown duration returned by
+// ApplyCooldownForSession for testing. Zero disables the override.
+func (g *GatewayContext) SetTestCooldown(d time.Duration) {
+	g.testCooldown = d
 }
 
 func (g *GatewayContext) checkAuth(r *http.Request) bool {
@@ -653,6 +660,9 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			}
 			tried[ep.Key()] = true
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+			}
 			continue
 		}
 		if resp.StatusCode != 200 {
@@ -661,6 +671,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			cancel()
 			tried[ep.Key()] = true
 			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID)
+			if g.testCooldown > 0 {
+				// Override the cooldown for testing: force the
+				// endpoint's cooldown expiry to now+testCooldown
+				// so the handler doesn't sleep for hours.
+				g.router.ApplyCooldownWithDuration(ep, resp.StatusCode, string(respBody), sessionID, g.testCooldown)
+			}
 			continue
 		}
 

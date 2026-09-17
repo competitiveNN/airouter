@@ -681,9 +681,9 @@ func TestCooldownDurations(t *testing.T) {
 		{502, 30 * time.Second}, // medium
 		{503, 30 * time.Second}, // medium
 		{504, 60 * time.Second}, // medium-long
-		{404, 30 * time.Minute}, // effectively permanent: long cooldown
-		{401, 30 * time.Minute}, // effectively permanent: long cooldown
-		{403, 30 * time.Minute}, // effectively permanent: long cooldown
+		{404, 7 * 24 * time.Hour}, // effectively permanent: 7 days
+		{401, 30 * time.Minute}, // auth failure
+		{403, 30 * time.Minute}, // auth failure
 		{0, 30 * time.Second},   // default (connection error)
 		{999, 30 * time.Second}, // unknown
 	}
@@ -697,36 +697,22 @@ func TestCooldownDurations(t *testing.T) {
 }
 
 // TestCooldownHardBan verifies that after many consecutive 4xx failures, the
-// model is hard-banned for a very long time (7 days) rather than cycling at
-// 24h intervals forever.
+// model is hard-banned for 7 days rather than cycling at shorter intervals.
 func TestCooldownHardBan(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
-	// After 3 consecutive 404s, cooldown should be 24h.
-	for i := 0; i < 3; i++ {
+	// After 10 consecutive 404s, cooldown should be 7 days (not 24h like the old 3-failure rule).
+	for i := 0; i < 10; i++ {
 		router.ApplyCooldown(ep, 404, "not found")
 	}
 	cd := router.GetAllCooldowns()[ep.Key()]
-	if cd.ErrorCount != 3 {
-		t.Errorf("expected error count 3, got %d", cd.ErrorCount)
-	}
-	wait := time.Until(cd.Expiry)
-	if wait < 23*time.Hour || wait > 25*time.Hour {
-		t.Errorf("expected ~24h cooldown after 3 failures, got %v", wait)
-	}
-
-	// After 10 consecutive 404s, cooldown should jump to 7 days.
-	for i := 3; i < 10; i++ {
-		router.ApplyCooldown(ep, 404, "not found")
-	}
-	cd = router.GetAllCooldowns()[ep.Key()]
 	if cd.ErrorCount != 10 {
 		t.Errorf("expected error count 10, got %d", cd.ErrorCount)
 	}
-	wait = time.Until(cd.Expiry)
+	wait := time.Until(cd.Expiry)
 	if wait < 6*24*time.Hour || wait > 8*24*time.Hour {
 		t.Errorf("expected ~7d cooldown after 10 failures, got %v", wait)
 	}
@@ -2725,13 +2711,13 @@ func TestModelCooldownDuration(t *testing.T) {
 		t.Errorf("429 cooldown expected ~30s, got %v", wait429)
 	}
 
-	// A 404 should yield a long cooldown (30 min)
+	// A 404 should yield a long cooldown (7 days)
 	router.ResetCooldown(ep)
 	router.ApplyCooldown(ep, 404, "not found")
 	cd = router.GetAllCooldowns()[ep.Key()]
 	wait404 := time.Until(cd.Expiry)
-	if wait404 < 29*time.Minute || wait404 > 31*time.Minute {
-		t.Errorf("404 cooldown expected ~30m, got %v", wait404)
+	if wait404 < 6*24*time.Hour || wait404 > 8*24*time.Hour {
+		t.Errorf("404 cooldown expected ~7d, got %v", wait404)
 	}
 
 	// 404 cooldown must be MUCH longer than 429 cooldown
@@ -2934,11 +2920,15 @@ func TestSessionSkipsTriedEndpoints(t *testing.T) {
 	tried[ep.Key()] = true
 	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID)
 
-	// Third call: both have been tried, so it should pick the first available
-	// (the exhausted fallback path). The key point is it doesn't loop forever.
-	ep, _ = router.SelectEndpoint("smart", sessionID, false, tried)
-	if ep == nil {
-		t.Fatal("expected an endpoint (exhausted fallback), got nil")
+	// Third call: both have been tried and cooled. SelectEndpoint now
+	// returns nil (handler waits for cooldown) instead of returning
+	// the cooled endpoint and looping forever.
+	ep, wait := router.SelectEndpoint("smart", sessionID, false, tried)
+	if ep != nil {
+		t.Fatalf("expected nil (all cooled), got %s", ep.Provider)
+	}
+	if wait == 0 {
+		t.Fatal("expected a non-zero wait when all endpoints are cooled")
 	}
 }
 
@@ -2987,13 +2977,13 @@ func TestRecordSuccessClearsCooldown(t *testing.T) {
 	}
 }
 
-// TestNoInfiniteLoopWhenAllCooledAndTried verifies that the request handler
-// terminates quickly when all endpoints are both cooled down AND marked as
-// tried for the session. Previously, SelectEndpoint would return the first
-// endpoint (ignoring the tried set) when all were cooled down, and the
-// retry loop in handleCompletion would see it was already tried, apply a
-// cooldown, decrement attempts, and loop forever. The fix removes the
-// api.go-level tried check, letting attempts increment and bound the loop.
+// TestNoInfiniteLoopWhenAllCooledAndTried verifies that the request
+// handler terminates quickly when all endpoints are cooled down.
+// Previously, SelectEndpoint returned the first endpoint (ignoring
+// cooldowns) when all were cooled, and the handler looped forever
+// hammering the same cooled model. The fix makes SelectEndpoint
+// return nil + wait so the handler sleeps and eventually bounds
+// out via maxAttempts, returning 503.
 func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 	// Backend that always returns 429 to simulate a fully rate-limited chain.
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3019,6 +3009,7 @@ func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway.SetTestCooldown(200 * time.Millisecond)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -3303,6 +3294,7 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway.SetTestCooldown(200 * time.Millisecond)
 
 	// All requests use the same body → same session ID
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
