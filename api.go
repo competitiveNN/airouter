@@ -165,20 +165,34 @@ type Model struct {
 type GatewayContext struct {
 	router        *Router
 	proxy         *Proxy
-	config        atomic.Pointer[Config]
+	config        *atomic.Pointer[Config]
 	configPath    string
 	gatewayAPIKey string
-	testCooldown  time.Duration // override for tests: forces all cooldowns to this duration
+	allowNoAuth   bool            // explicit opt-in to unauthenticated mode (-allow-no-auth)
+	testCooldown  time.Duration   // override for tests: forces all cooldowns to this duration
 }
 
-func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string) *GatewayContext {
+func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string, allowNoAuth ...bool) *GatewayContext {
 	g := &GatewayContext{
 		router:        router,
 		proxy:         proxy,
 		configPath:    configPath,
 		gatewayAPIKey: gatewayAPIKey,
 	}
-	g.config.Store(cfg)
+	if len(allowNoAuth) > 0 {
+		g.allowNoAuth = allowNoAuth[0]
+	}
+	// Share ONE atomic.Pointer[Config] across gateway, router and proxy so a
+	// config reload is a single atomic store that all three observe together.
+	// Without this, ReloadConfig would swap three independent pointers with no
+	// synchronization, and an in-flight request could observe a mix (e.g.
+	// routing from the new chain while forwarding through old provider URLs),
+	// which is undefined and can misroute or 404.
+	shared := &atomic.Pointer[Config]{}
+	shared.Store(cfg)
+	g.config = shared
+	g.router.config = shared
+	g.proxy.config = shared
 	return g
 }
 
@@ -189,8 +203,15 @@ func (g *GatewayContext) SetTestCooldown(d time.Duration) {
 }
 
 func (g *GatewayContext) checkAuth(r *http.Request) bool {
+	// Fail closed unless the operator explicitly opted into unauthenticated
+	// mode with -allow-no-auth. An empty key with allowNoAuth=false means
+	// auth was never configured correctly, so every request (including
+	// admin) must be rejected. Production is additionally guarded by main.go,
+	// which refuses to start without a key unless the flag is passed — this
+	// is defense-in-depth so a misconfigured instance can't silently serve
+	// everything unauthenticated even if it somehow reaches a handler.
 	if g.gatewayAPIKey == "" {
-		return true
+		return g.allowNoAuth
 	}
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
@@ -1021,10 +1042,16 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 // sticky routing and backoff state survive a reload. Used by the admin config
 // endpoint and the on-disk config file watcher.
 func (g *GatewayContext) ReloadConfig(cfg *Config) {
+	// Single atomic store onto the shared pointer; router and proxy read from
+	// the same pointer, so they observe the new config atomically.
 	g.config.Store(cfg)
-	g.router.config.Store(cfg)
-	g.proxy.config.Store(cfg)
-	log.Printf("[debug] config reloaded: %d providers, %d logical models", len(cfg.Providers), len(cfg.Models))
+	providers := 0
+	models := 0
+	if cfg != nil {
+		providers = len(cfg.Providers)
+		models = len(cfg.Models)
+	}
+	log.Printf("[debug] config reloaded: %d providers, %d logical models", providers, models)
 }
 
 func (g *GatewayContext) HandleAdminConfig(w http.ResponseWriter, r *http.Request) {

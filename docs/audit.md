@@ -110,7 +110,45 @@ Top fixes, priority order
 - router.go:522 — retry-exhausted path also wrote session unconditionally
 Fix: guard both with `len(tried) == 0` (only update on initial selection per request).
 Suggested regression tests: TestConcurrentMidStreamErrorRecovery (already exists), TestConcurrentStreamingSameSession.
-Status: fix applied; `go test -race ./...` 99 passed.
+Status: fix applied; `go test -race ./...` 101 passed.
+
+## Config reload atomicity (2026-09-20)
+- api.go:1034-1049 (ReloadConfig) previously swapped three independent
+  atomic.Pointer[Config] values (gateway/router/proxy) with no
+  synchronization. An in-flight request could observe a mix — routing from
+  the new chain while forwarding through old provider URLs — causing
+  misrouting / 404s.
+Fix: gateway, router and proxy now share ONE `*atomic.Pointer[Config]`,
+  wired up in NewGatewayContext. ReloadConfig performs a single atomic
+  store onto that shared pointer, so all three observe the new config
+  together. Field types changed from `atomic.Pointer[Config]` to
+  `*atomic.Pointer[Config]` (Go auto-dereferences all `.config.Load()`
+  and `.config.Store()` call sites, so no other code needed changes).
+TestReloadConfigConcurrent verifies that under concurrent reloads and
+  reads, every individual load returns a fully-consistent *Config — never
+  nil, never a third version, and never a partially-written struct.
+  Status: fix applied; `go test -race ./...` 102 passed, `go vet` clean,
+  `go build` success.
+
+## Auth hardening notes (2026-09-20)
+- checkAuth (api.go:191) now FAILS CLOSED when gatewayAPIKey == "" unless
+  the operator explicitly passed -allowNoAuth. Previously it returned true
+  (fail-open) on an empty key, which meant any instance that somehow reached
+  a handler without a configured key would serve all endpoints — including
+  admin — unauthenticated. main.go still refuses to start without a key (or
+  -allow-no-auth), so this is defense-in-depth. The opt-in unauthenticated
+  mode (TestGatewayNoAuth) still works when -allowNoAuth is set; a new test
+  assertion verifies that without it, even admin endpoints return 401.
+  (fail-open) on an empty key, which meant any instance that somehow reached
+  a handler without a configured key would serve all endpoints — including
+  admin — unauthenticated. main.go still refuses to start without a key (or
+  -allow-no-auth), so this is defense-in-depth. The opt-in unauthenticated
+  mode (TestGatewayNoAuth) still works when -allowNoAuth is set; a new test
+  assertion verifies that without it, even admin endpoints return 401.
+- /health (api.go:909) remains intentionally public. It returns only
+  `{"status":"ok"}` — no config, sessions, cooldowns, provider URLs or
+  keys — so it is safe to expose to load balancers and health checks.
+  It is not in the auth scope.
 
 ## Proxy stream-error recovery paths (additional)
 - proxy.go:527-799 streamSSE — error events returned as err, partial content in acc; handled by handleStream replay (api.go:853-888)

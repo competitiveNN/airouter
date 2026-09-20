@@ -15,13 +15,15 @@ class Model:
     provider: str  # original provider from JSON
     context_length: int
     intelligence: float | None
+    intelligence_source: str | None
+    intelligence_note: str | None
     elo: float | None
     vision: bool
     raw: dict
 
     @property
     def score(self) -> float | None:
-        """Effective intelligence score (intelligence only, per rule 4)"""
+        """Effective intelligence score (AA, Arena ELO, or the smart floor)."""
         return self.intelligence
 
     @property
@@ -63,6 +65,8 @@ class Model:
         parts = []
         if self.score is not None:
             parts.append(f"{self.score:.1f}")
+            if self.intelligence_source == "smart floor":
+                parts.append("floor")
         if self.elo is not None:
             parts.append(f"elo={int(self.elo)}")
         if self.context_length and self.context_length > 0:
@@ -84,6 +88,8 @@ def load_models(json_path: str) -> list[Model]:
             provider=item.get('provider', ''),
             context_length=item.get('context_length') or 0,
             intelligence=item.get('intelligence'),
+            intelligence_source=item.get('intelligence_source'),
+            intelligence_note=item.get('intelligence_note'),
             elo=item.get('elo'),
             vision=caps.get('vision', False),
             raw=item.get('raw', {})
@@ -284,13 +290,14 @@ def main():
     with open('/var/home/fra/dev/airouter/config.yaml', 'r') as f:
         config = f.read()
     
-    # Find and replace the models section
-    # The models section starts at "models:" and goes to end of file
-    models_start = config.find('\nmodels:')
+    # Find where the models section begins.  The header may end with one or
+    # more blank lines; normalize to exactly one blank line before `models:`
+    # so regeneration is idempotent (re-running never grows the file).
+    models_start = config.find('models:')
     if models_start == -1:
-        models_start = config.find('models:')
-    
-    new_config = config[:models_start + 1] + '\n' + new_models
+        raise SystemExit("Could not find 'models:' section in config.yaml")
+    header = config[:models_start].rstrip('\n')
+    new_config = header + '\n\n' + new_models
     
     with open('/var/home/fra/dev/airouter/config.yaml', 'w') as f:
         f.write(new_config)

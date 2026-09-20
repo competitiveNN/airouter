@@ -1124,7 +1124,7 @@ func TestHandleModels(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	rec := httptest.NewRecorder()
@@ -1186,7 +1186,7 @@ func TestHandleChatCompletionsNonStreaming(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -1221,7 +1221,7 @@ func TestHandleChatCompletionsVisionNotSupported(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -1271,7 +1271,7 @@ func TestHandleChatCompletionsVisionUnavailableCooldown(t *testing.T) {
 	router.ApplyCooldown(ep, 429, "rate limited")
 
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -1335,7 +1335,7 @@ func TestHandleChatCompletionsWithFallback(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -1394,7 +1394,7 @@ func TestHandleChatCompletionsStreamingWithFallback(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -1445,7 +1445,7 @@ func TestInvalidModel(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"nonexistent","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -1493,9 +1493,9 @@ func TestGatewayNoAuth(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
-	// No API key set — should allow all requests
+	// No API key set with allowNoAuth=true — should allow all requests
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	gateway.HandleModels(rec, req)
@@ -1503,13 +1503,34 @@ func TestGatewayNoAuth(t *testing.T) {
 	if rec.Code != 200 {
 		t.Errorf("expected status 200 without auth when no key configured, got %d", rec.Code)
 	}
+
+	// No API key set with allowNoAuth=false (default) — should reject all
+	// requests, including admin endpoints. This is the defense-in-depth fix
+	// for the audit's HIGH #2 finding: checkAuth must fail closed.
+	gatewayFailClosed := NewGatewayContext(router, proxy, cfg, "", "")
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec2 := httptest.NewRecorder()
+	gatewayFailClosed.HandleModels(rec2, req2)
+
+	if rec2.Code != 401 {
+		t.Errorf("expected status 401 without auth when no key and allowNoAuth=false, got %d", rec2.Code)
+	}
+
+	// Admin endpoints must also be gated
+	req3 := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+	rec3 := httptest.NewRecorder()
+	gatewayFailClosed.HandleAdminConfig(rec3, req3)
+
+	if rec3.Code != 401 {
+		t.Errorf("expected status 401 for admin without auth when no key, got %d", rec3.Code)
+	}
 }
 
 func TestHealth(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
@@ -2082,7 +2103,7 @@ func TestHandleChatCompletionsStreamingWithFallback_ReplaysPartialToolCalls(t *t
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
 	proxy.SetToolCalls(true)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true,"tool_calls":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -2260,7 +2281,7 @@ func TestHandleStream_ResourceCleanup(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	// Measure goroutine count before.
 	before := runtime.NumGoroutine()
@@ -2447,7 +2468,7 @@ func TestFourModelAliases(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	for _, model := range LogicalModels {
 		t.Run(model, func(t *testing.T) {
@@ -2500,7 +2521,7 @@ func TestSessionPersistenceAcrossRequests(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"what is 2+2?"}]}`
 
@@ -2582,7 +2603,7 @@ func TestRateLimitFallthrough(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 
@@ -2668,7 +2689,7 @@ func TestMidStreamErrorRecovery(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -3008,7 +3029,7 @@ func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 	gateway.SetTestCooldown(200 * time.Millisecond)
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
@@ -3087,7 +3108,7 @@ func TestConcurrentStreamingSameSession(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 
 	// All requests use the same body, so they derive the same session ID.
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
@@ -3293,7 +3314,7 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "")
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 	gateway.SetTestCooldown(200 * time.Millisecond)
 
 	// All requests use the same body → same session ID
@@ -3372,5 +3393,205 @@ func TestConcurrentStickySessionGuard(t *testing.T) {
 	stored, ok := router.GetSession(sessionID)
 	if !ok || stored.Provider != "p1" {
 		t.Errorf("expected session still pinned to p1 after fallback guard, got %v", stored)
+	}
+}
+
+// TestReloadConfigIsAtomic verifies that a config reload is a single atomic
+// store onto a shared pointer: gateway, router and proxy all observe the new
+// config together. Without this, a reload that swaps three independent
+// pointers could let an in-flight request route through a new chain while
+// forwarding through old provider URLs (misrouting / 404s).
+func TestReloadConfigIsAtomic(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example/v1"},
+			"p2": {URL: "https://p2.example/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p1", Model: "m1"},
+				{Provider: "p2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	// All three must share the same underlying atomic.Pointer[Config].
+	if gateway.config != router.config || gateway.config != proxy.config {
+		t.Fatalf("gateway/router/proxy do not share one config pointer: gw=%p rtr=%p px=%p",
+			gateway.config, router.config, proxy.config)
+	}
+
+	// Reload with a different chain and confirm all three see it atomically.
+	cfg2 := &Config{
+		Providers: map[string]ProviderConfig{
+			"p3": {URL: "https://p3.example/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p3", Model: "m3"},
+			}},
+		},
+	}
+	gateway.ReloadConfig(cfg2)
+
+	// Router and proxy must observe the new chain, and the shared pointer must
+	// be the one that was just stored.
+	if gateway.config.Load() != cfg2 {
+		t.Errorf("gateway config not updated to cfg2")
+	}
+	if router.config.Load() != cfg2 {
+		t.Errorf("router config not updated to cfg2")
+	}
+	if proxy.config.Load() != cfg2 {
+		t.Errorf("proxy config not updated to cfg2")
+	}
+	if gateway.config.Load() != router.config.Load() {
+		t.Errorf("gateway and router config pointers diverged after reload")
+	}
+
+	// Routing must reflect the new chain (m3/p3), not the old one.
+	ep, _ := router.SelectEndpoint("smart", "reload-test", false, nil)
+	if ep == nil || ep.Provider != "p3" || ep.Model != "m3" {
+		t.Errorf("expected p3/m3 after reload, got %+v", ep)
+	}
+}
+
+// TestReloadConfigConcurrent verifies that under concurrent reloads and
+// reads, every individual config load returns a fully-consistent *Config —
+// never nil, never a third (unknown) version, and never a partially-written
+// struct. atomic.Pointer[Config] guarantees the latter by construction; this
+// test exercises it under real contention.
+//
+// Note: this test deliberately does NOT assert that gateway/router/proxy
+// agree on the same version at the same instant. They perform three separate
+// atomic loads, and a reloader running between them can legitimately make
+// them observe different versions (cfgA then cfgB). That is correct behaviour
+// — what matters is that each individual observation is a complete, valid
+// config, not a torn mix of old + new fields. The shared-pointer identity
+// (that all three read from the same atomic.Pointer[Config]) is checked by
+// TestReloadConfigIsAtomic; the consistency of each individual load is
+// checked here.
+func TestReloadConfigConcurrent(t *testing.T) {
+	cfgA := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example/v1"},
+			"p2": {URL: "https://p2.example/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p1", Model: "m1"},
+				{Provider: "p2", Model: "m2"},
+			}},
+		},
+	}
+	cfgB := &Config{
+		Providers: map[string]ProviderConfig{
+			"p3": {URL: "https://p3.example/v1"},
+			"p4": {URL: "https://p4.example/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p3", Model: "m3"},
+				{Provider: "p4", Model: "m4"},
+			}},
+		},
+	}
+	router := NewRouter(cfgA, "")
+	proxy := NewProxy(cfgA)
+	gateway := NewGatewayContext(router, proxy, cfgA, "", "", true)
+
+	const (
+		reloaders  = 4
+		readers    = 8
+		iterations = 200
+	)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reloaders alternate between cfgA and cfgB.
+	for r := 0; r < reloaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if i%2 == 0 {
+					gateway.ReloadConfig(cfgA)
+				} else {
+					gateway.ReloadConfig(cfgB)
+				}
+			}
+		}()
+	}
+
+	// Readers verify that every individual load returns a valid, known config
+	// version — never nil and never a third (unknown) struct. They also verify
+	// that the shared pointer identity holds (all three components read from
+	// the same atomic.Pointer[Config]).
+	errc := make(chan error, readers)
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// Shared-pointer identity: all three must read from the same
+				// atomic.Pointer[Config] instance.
+				if gateway.config != router.config || gateway.config != proxy.config {
+					errc <- fmt.Errorf("shared pointer identity lost: gw=%p rtr=%p px=%p",
+						gateway.config, router.config, proxy.config)
+					return
+				}
+				// Each individual load must return a fully-consistent config.
+				for _, loaded := range []*Config{
+					gateway.config.Load(),
+					router.config.Load(),
+					proxy.config.Load(),
+				} {
+					if loaded == nil {
+						errc <- fmt.Errorf("config load returned nil")
+						return
+					}
+					if loaded != cfgA && loaded != cfgB {
+						errc <- fmt.Errorf("unknown config version: %p (want %p or %p)",
+							loaded, cfgA, cfgB)
+						return
+					}
+					// The loaded config must be internally consistent: its
+					// providers map must match the version it claims to be.
+					if loaded == cfgA {
+						if _, ok := loaded.Providers["p1"]; !ok {
+							errc <- fmt.Errorf("cfgA load missing p1 provider (torn struct)")
+							return
+						}
+					}
+					if loaded == cfgB {
+						if _, ok := loaded.Providers["p3"]; !ok {
+							errc <- fmt.Errorf("cfgB load missing p3 provider (torn struct)")
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errc)
+
+	for err := range errc {
+		t.Errorf("concurrent reload invariant violated: %v", err)
 	}
 }

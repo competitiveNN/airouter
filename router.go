@@ -168,7 +168,7 @@ func (c *cooldownSaveState) stop() {
 }
 
 type Router struct {
-	config       atomic.Pointer[Config]
+	config       *atomic.Pointer[Config]
 	sessions     map[string]sessionEntry
 	cooldowns    map[string]CooldownEntry
 	noVision     map[string]bool // endpoints that rejected an image request
@@ -192,6 +192,7 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 		sessionsDone: make(chan struct{}),
 		cooldownSave: &cooldownSaveState{},
 	}
+	r.config = &atomic.Pointer[Config]{}
 	r.config.Store(cfg)
 	r.loadCooldowns()
 	r.loadPriorities()

@@ -23,10 +23,10 @@
 #         opencode_count > kilocode_count -> opencode  `big-pickle`
 #         (ties go to kilocode, per rule 6)
 #     Profile-level comparison:
-#         smart  -> kilocode leads (3 vs 3)   -> kilocode  `kilo-auto/free`
-#         work   -> kilocode leads (8 vs 5)   -> kilocode  `kilo-auto/free`
-#         fast   -> kilocode leads (4 vs 1)   -> kilocode  `kilo-auto/free`
-#         large  -> kilocode leads (11 vs 1)   -> kilocode  `kilo-auto/free`
+#         smart  -> kilocode leads (10 vs 5)    -> kilocode  `kilo-auto/free`
+#         work   -> kilocode leads (15 vs 7)    -> kilocode  `kilo-auto/free`
+#         fast   -> kilocode leads (6 vs 1)     -> kilocode  `kilo-auto/free`
+#         large  -> kilocode leads (18 vs 1)    -> kilocode  `kilo-auto/free`
 #     (ties go to kilocode, per rule 6)
 #
 # Every concrete endpoint carries a `vision:` boolean (true/false) taken from the
@@ -83,329 +83,383 @@ models:
   smart:
     chain:
       - provider: opencode
-        model: muse-spark-1.3-contributor-free  # 48.2  elo=1652
+        model: muse-spark-1.3-contributor-free  # 48.1  elo=1652
         vision: false
       - provider: nvidia
-        model: z-ai/glm-5.3  # 44.9  elo=1614  131,072 ctx
+        model: z-ai/glm-5.3  # 44.8  elo=1614  131,072 ctx
         vision: false
       - provider: nvidia2
-        model: z-ai/glm-5.3  # 44.9  elo=1614  131,072 ctx
+        model: z-ai/glm-5.3  # 44.8  elo=1614  131,072 ctx
         vision: false
       - provider: nvidia3
-        model: z-ai/glm-5.3  # 44.9  elo=1614  131,072 ctx
+        model: z-ai/glm-5.3  # 44.8  elo=1614  131,072 ctx
         vision: false
       - provider: nvidia
-        model: moonshotai/kimi-k3  # 43.8  elo=1674
+        model: moonshotai/kimi-k3  # 43.6  elo=1674
         vision: false
       - provider: nvidia2
-        model: moonshotai/kimi-k3  # 43.8  elo=1674
+        model: moonshotai/kimi-k3  # 43.6  elo=1674
         vision: false
       - provider: nvidia3
-        model: moonshotai/kimi-k3  # 43.8  elo=1674
+        model: moonshotai/kimi-k3  # 43.6  elo=1674
         vision: false
       - provider: nvidia
-        model: z-ai/glm-5.3-flash  # 41.9  elo=1607  131,072 ctx
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1607  131,072 ctx
         vision: false
       - provider: nvidia2
-        model: z-ai/glm-5.3-flash  # 41.9  elo=1607  131,072 ctx
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1607  131,072 ctx
         vision: false
       - provider: nvidia3
-        model: z-ai/glm-5.3-flash  # 41.9  elo=1607  131,072 ctx
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1607  131,072 ctx
         vision: false
       - provider: opencode
-        model: muse-spark-1.2-contributor-free  # 39.8
+        model: muse-spark-1.2-contributor-free  # 39.6
         vision: false
       - provider: opencode
-        model: deepseek-v4-flash-free  # 34.5  elo=1614  131,072 ctx
+        model: deepseek-v4-flash-free  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: nvidia
-        model: deepseek-ai/deepseek-v4-flash-0731  # 34.5  131,072 ctx
+        model: deepseek-ai/deepseek-v4-flash-0731  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: nvidia2
-        model: deepseek-ai/deepseek-v4-flash-0731  # 34.5  131,072 ctx
+        model: deepseek-ai/deepseek-v4-flash-0731  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: nvidia3
-        model: deepseek-ai/deepseek-v4-flash-0731  # 34.5  131,072 ctx
+        model: deepseek-ai/deepseek-v4-flash-0731  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: kilocode
-        model: z-ai/glm-5.2:free  # 34.0  elo=1592  32,768 ctx
+        model: qwen/qwen3.8-27b:free  # 33.7  elo=1593  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: z-ai/glm-5.2:free  # 33.7  elo=1592  32,768 ctx
         vision: false
       - provider: ollama
-        model: minimax-m3  # 29.6  262,144 ctx
+        model: minimax-m3  # 29.2  262,144 ctx
         vision: false
       - provider: kilocode
-        model: nex-agi/nex-n2.5-pro:free  # 28.2  262,144 ctx
+        model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
       - provider: nvidia
-        model: moonshotai/kimi-k2.6  # 27.5
+        model: moonshotai/kimi-k2.6  # 27.0  elo=1509
         vision: false
       - provider: nvidia2
-        model: moonshotai/kimi-k2.6  # 27.5
+        model: moonshotai/kimi-k2.6  # 27.0  elo=1509
         vision: false
       - provider: nvidia3
-        model: moonshotai/kimi-k2.6  # 27.5
+        model: moonshotai/kimi-k2.6  # 27.0  elo=1509
         vision: false
       - provider: kilocode
-        model: thinkingmachines/inkling-small:free  # 26.1  1,048,576 ctx
+        model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
         vision: true
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (3 vs 3)
+        model: nex-agi/nex-n2.5-pro:free  # 25.0  floor  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: nex-agi/nex-n2.5-mini:free  # 25.0  floor  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: kilo-auto/free  # last: kilocode dominates (8 vs 3)
         vision: true
   work:
     chain:
       - provider: opencode
-        model: muse-spark-1.3-contributor-free  # 48.2  elo=1652
+        model: muse-spark-1.3-contributor-free  # 48.1  elo=1652
         vision: false
       - provider: nvidia
-        model: z-ai/glm-5.3  # 44.9  elo=1614  131,072 ctx
+        model: z-ai/glm-5.3  # 44.8  elo=1614  131,072 ctx
         vision: false
       - provider: nvidia2
-        model: z-ai/glm-5.3  # 44.9  elo=1614  131,072 ctx
+        model: z-ai/glm-5.3  # 44.8  elo=1614  131,072 ctx
         vision: false
       - provider: nvidia3
-        model: z-ai/glm-5.3  # 44.9  elo=1614  131,072 ctx
+        model: z-ai/glm-5.3  # 44.8  elo=1614  131,072 ctx
         vision: false
       - provider: nvidia
-        model: moonshotai/kimi-k3  # 43.8  elo=1674
+        model: moonshotai/kimi-k3  # 43.6  elo=1674
         vision: false
       - provider: nvidia2
-        model: moonshotai/kimi-k3  # 43.8  elo=1674
+        model: moonshotai/kimi-k3  # 43.6  elo=1674
         vision: false
       - provider: nvidia3
-        model: moonshotai/kimi-k3  # 43.8  elo=1674
+        model: moonshotai/kimi-k3  # 43.6  elo=1674
         vision: false
       - provider: nvidia
-        model: z-ai/glm-5.3-flash  # 41.9  elo=1607  131,072 ctx
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1607  131,072 ctx
         vision: false
       - provider: nvidia2
-        model: z-ai/glm-5.3-flash  # 41.9  elo=1607  131,072 ctx
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1607  131,072 ctx
         vision: false
       - provider: nvidia3
-        model: z-ai/glm-5.3-flash  # 41.9  elo=1607  131,072 ctx
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1607  131,072 ctx
         vision: false
       - provider: opencode
-        model: muse-spark-1.2-contributor-free  # 39.8
+        model: muse-spark-1.2-contributor-free  # 39.6
         vision: false
       - provider: opencode
-        model: deepseek-v4-flash-free  # 34.5  elo=1614  131,072 ctx
+        model: deepseek-v4-flash-free  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: nvidia
-        model: deepseek-ai/deepseek-v4-flash-0731  # 34.5  131,072 ctx
+        model: deepseek-ai/deepseek-v4-flash-0731  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: nvidia2
-        model: deepseek-ai/deepseek-v4-flash-0731  # 34.5  131,072 ctx
+        model: deepseek-ai/deepseek-v4-flash-0731  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: nvidia3
-        model: deepseek-ai/deepseek-v4-flash-0731  # 34.5  131,072 ctx
+        model: deepseek-ai/deepseek-v4-flash-0731  # 34.3  elo=1580  131,072 ctx
         vision: false
       - provider: kilocode
-        model: z-ai/glm-5.2:free  # 34.0  elo=1592  32,768 ctx
+        model: qwen/qwen3.8-27b:free  # 33.7  elo=1593  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: z-ai/glm-5.2:free  # 33.7  elo=1592  32,768 ctx
         vision: false
       - provider: ollama
-        model: minimax-m3  # 29.6  262,144 ctx
+        model: minimax-m3  # 29.2  262,144 ctx
         vision: false
       - provider: kilocode
-        model: nex-agi/nex-n2.5-pro:free  # 28.2  262,144 ctx
+        model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
       - provider: nvidia
-        model: moonshotai/kimi-k2.6  # 27.5
+        model: moonshotai/kimi-k2.6  # 27.0  elo=1509
         vision: false
       - provider: nvidia2
-        model: moonshotai/kimi-k2.6  # 27.5
+        model: moonshotai/kimi-k2.6  # 27.0  elo=1509
         vision: false
       - provider: nvidia3
-        model: moonshotai/kimi-k2.6  # 27.5
+        model: moonshotai/kimi-k2.6  # 27.0  elo=1509
         vision: false
       - provider: kilocode
-        model: thinkingmachines/inkling-small:free  # 26.1  1,048,576 ctx
+        model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
         vision: true
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-vl:free  # 24.8  262,144 ctx
+        model: nex-agi/nex-n2.5-pro:free  # 25.0  floor  262,144 ctx
         vision: true
       - provider: kilocode
-        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 23.4  1,000,000 ctx
+        model: nex-agi/nex-n2.5-mini:free  # 25.0  floor  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-vl:free  # 24.6  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
       - provider: opencode
-        model: nemotron-3-ultra-free  # 23.4  1,000,000 ctx
+        model: nemotron-3-ultra-free  # 22.9  1,000,000 ctx
         vision: false
       - provider: ollama
-        model: nemotron-3-ultra  # 23.4  1,000,000 ctx
+        model: nemotron-3-ultra  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia2
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia3
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
+        vision: false
+      - provider: opencode
+        model: ling-3.0-flash-fin-free  # 22.6
         vision: false
       - provider: gemini
-        model: gemini-flash-lite-latest  # 22.7  1,048,576 ctx
+        model: gemini-flash-lite-latest  # 22.2  elo=1500  1,048,576 ctx
         vision: true
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.6  262,144 ctx
-        vision: false
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-fin:free  # 20.6  262,144 ctx
-        vision: false
-      - provider: opencode
-        model: ling-3.0-flash-fin-free  # 20.6
-        vision: false
       - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 19.5  262,144 ctx
         vision: true
+      - provider: ollama
+        model: gemma4:31b  # 19.0  262,144 ctx
+        vision: true
+      - provider: gemini
+        model: gemma-4-31b-it  # 19.0  262,144 ctx
+        vision: false
       - provider: nvidia
-        model: meta/muse-glimmer-30b  # 18.1
+        model: google/gemma-4-31b-it  # 19.0
         vision: false
       - provider: nvidia2
-        model: meta/muse-glimmer-30b  # 18.1
+        model: google/gemma-4-31b-it  # 19.0
         vision: false
       - provider: nvidia3
-        model: meta/muse-glimmer-30b  # 18.1
+        model: google/gemma-4-31b-it  # 19.0
+        vision: false
+      - provider: nvidia
+        model: meta/muse-glimmer-30b  # 17.5
+        vision: false
+      - provider: nvidia2
+        model: meta/muse-glimmer-30b  # 17.5
+        vision: false
+      - provider: nvidia3
+        model: meta/muse-glimmer-30b  # 17.5
         vision: false
       - provider: gemini
         model: gemma-4-26b-a4b-it  # 16.7  262,144 ctx
         vision: false
-      - provider: ollama
-        model: gemma4:31b  # 15.4  262,144 ctx
-        vision: true
-      - provider: gemini
-        model: gemma-4-31b-it  # 15.4  262,144 ctx
-        vision: false
-      - provider: nvidia
-        model: google/gemma-4-31b-it  # 15.4
-        vision: false
-      - provider: nvidia2
-        model: google/gemma-4-31b-it  # 15.4
-        vision: false
-      - provider: nvidia3
-        model: google/gemma-4-31b-it  # 15.4
-        vision: false
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (8 vs 5)
+        model: kilo-auto/free  # last: kilocode dominates (13 vs 5)
         vision: true
   fast:
     chain:
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-vl:free  # 24.8  262,144 ctx
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-vl:free  # 24.6  262,144 ctx
         vision: true
       - provider: kilocode
-        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
       - provider: opencode
-        model: nemotron-3-ultra-free  # 23.4  1,000,000 ctx
+        model: nemotron-3-ultra-free  # 22.9  1,000,000 ctx
         vision: false
       - provider: ollama
-        model: nemotron-3-ultra  # 23.4  1,000,000 ctx
+        model: nemotron-3-ultra  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia2
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia3
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
+        vision: false
+      - provider: opencode
+        model: ling-3.0-flash-fin-free  # 22.6
         vision: false
       - provider: gemini
-        model: gemini-flash-lite-latest  # 22.7  1,048,576 ctx
+        model: gemini-flash-lite-latest  # 22.2  elo=1500  1,048,576 ctx
         vision: true
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.6  262,144 ctx
-        vision: false
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-fin:free  # 20.6  262,144 ctx
-        vision: false
-      - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (4 vs 1)
+        model: kilo-auto/free  # last: kilocode dominates (5 vs 2)
         vision: true
   large:
     chain:
       - provider: kilocode
-        model: thinkingmachines/inkling-small:free  # 26.1  1,048,576 ctx
+        model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
       - provider: gemini
-        model: gemini-flash-lite-latest  # 22.7  1,048,576 ctx
+        model: gemini-flash-lite-latest  # 22.2  elo=1500  1,048,576 ctx
         vision: true
       - provider: kilocode
-        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
       - provider: opencode
-        model: nemotron-3-ultra-free  # 23.4  1,000,000 ctx
+        model: nemotron-3-ultra-free  # 22.9  1,000,000 ctx
         vision: false
       - provider: ollama
-        model: nemotron-3-ultra  # 23.4  1,000,000 ctx
+        model: nemotron-3-ultra  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia2
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
       - provider: nvidia3
-        model: nvidia/nemotron-3-ultra-550b-a55b  # 23.4  1,000,000 ctx
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
       - provider: kilocode
-        model: nvidia/nemotron-3.5-lightning:free  # 13.6  1,000,000 ctx
+        model: nvidia/nemotron-3.5-lightning:free  # 12.9  1,000,000 ctx
         vision: false
+      - provider: kilocode
+        model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
+        vision: true
+      - provider: kilocode
+        model: qwen/qwen3.8-27b:free  # 33.7  elo=1593  262,144 ctx
+        vision: true
       - provider: ollama
-        model: minimax-m3  # 29.6  262,144 ctx
+        model: minimax-m3  # 29.2  262,144 ctx
         vision: false
       - provider: kilocode
-        model: nex-agi/nex-n2.5-pro:free  # 28.2  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-vl:free  # 24.8  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.6  262,144 ctx
+        model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-fin:free  # 20.6  262,144 ctx
+        model: nex-agi/nex-n2.5-pro:free  # 25.0  floor  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: nex-agi/nex-n2.5-mini:free  # 25.0  floor  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-vl:free  # 24.6  262,144 ctx
+        vision: true
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
         vision: false
       - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 19.5  262,144 ctx
         vision: true
+      - provider: ollama
+        model: gemma4:31b  # 19.0  262,144 ctx
+        vision: true
+      - provider: gemini
+        model: gemma-4-31b-it  # 19.0  262,144 ctx
+        vision: false
       - provider: gemini
         model: gemma-4-26b-a4b-it  # 16.7  262,144 ctx
         vision: false
+      - provider: kilocode
+        model: nvidia/nemotron-3-super-120b-a12b:free  # 12.8  262,144 ctx
+        vision: false
       - provider: ollama
-        model: gemma4:31b  # 15.4  262,144 ctx
+        model: nemotron-3-super  # 12.8  262,144 ctx
+        vision: false
+      - provider: nvidia
+        model: nvidia/nemotron-3-super-120b-a12b  # 12.8  262,144 ctx
+        vision: false
+      - provider: nvidia2
+        model: nvidia/nemotron-3-super-120b-a12b  # 12.8  262,144 ctx
+        vision: false
+      - provider: nvidia3
+        model: nvidia/nemotron-3-super-120b-a12b  # 12.8  262,144 ctx
+        vision: false
+      - provider: nvidia
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
+        vision: true
+      - provider: nvidia2
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
+        vision: true
+      - provider: nvidia3
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
         vision: true
       - provider: gemini
-        model: gemma-4-31b-it  # 15.4  262,144 ctx
-        vision: false
-      - provider: kilocode
-        model: nvidia/nemotron-3-super-120b-a12b:free  # 13.6  262,144 ctx
-        vision: false
-      - provider: ollama
-        model: nemotron-3-super  # 13.6  262,144 ctx
-        vision: false
-      - provider: nvidia
-        model: nvidia/nemotron-3-super-120b-a12b  # 13.6  262,144 ctx
-        vision: false
-      - provider: nvidia2
-        model: nvidia/nemotron-3-super-120b-a12b  # 13.6  262,144 ctx
-        vision: false
-      - provider: nvidia3
-        model: nvidia/nemotron-3-super-120b-a12b  # 13.6  262,144 ctx
-        vision: false
-      - provider: nvidia
-        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
-        vision: true
-      - provider: nvidia2
-        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
-        vision: true
-      - provider: nvidia3
-        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: cohere/north-mini-code:free  # 12.8  256,000 ctx
+        model: gemma-4-2b-it  # 7.8  262,144 ctx
         vision: false
       - provider: kilocode
         model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  # 10.3  256,000 ctx
         vision: true
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (11 vs 1)
+        model: cohere/north-mini-code:free  # 9.9  256,000 ctx
+        vision: false
+      - provider: kilocode
+        model: kilo-auto/free  # last: kilocode dominates (16 vs 1)
         vision: true
