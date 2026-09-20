@@ -21,7 +21,7 @@ import (
 
 type Proxy struct {
 	client            *http.Client
-	config            atomic.Pointer[Config]
+	config            *atomic.Pointer[Config]
 	toolCalls         atomic.Bool
 	streamIdleTimeout time.Duration
 }
@@ -48,6 +48,7 @@ func NewProxy(cfg *Config) *Proxy {
 		},
 		streamIdleTimeout: 60 * time.Second,
 	}
+	p.config = &atomic.Pointer[Config]{}
 	p.config.Store(cfg)
 	return p
 }

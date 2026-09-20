@@ -67,6 +67,42 @@ ARENA_CACHE_TTL_HOURS = 24
 # 1200 == ELO baseline (random), 1700 ~= AA ceiling (63).
 ELO_BASE = 1200.0
 ELO_TO_INTELLIGENCE = 63.0 / 500.0
+# Models with no Artificial Analysis intelligence score AND no arena.ai
+# code-leaderboard ELO receive the "smart floor" (25.0) -- the lowest value
+# that still lets them enter the smart/work/large chains. This is a
+# deterministic default, not a hand-picked override: it keeps unscored models
+# visible in the chains without claiming a benchmark score they never earned.
+SMART_FLOOR = 25.0
+
+# Meta-router auto-fallback models. They are never real candidates, so they
+# stay unscored (null intelligence) and only ever appear as the trailing
+# chain entry -- never floored into the concrete pool.
+AUTO_FALLBACK_MODELS = {"kilo-auto/free", "big-pickle"}
+
+# Models that are unscored (no AA intelligence, no arena ELO) but are NOT
+# usable routing candidates. They are excluded BEFORE the smart floor is
+# applied so they never enter the chains. Each entry has a concrete reason;
+# this is a curated negative list, not a score threshold:
+#   - meta-routers (openrouter/free): selects random models, not a model
+#   - guardrail / content-safety models: not general-purpose coding
+#   - opaque zero-metadata models: no name/description/context, unknown
+#     quality, and no way to review them
+#   - small instruction models (gemma-4-9b-it): a 9B model floored at 25.0
+#     would sit ahead of genuinely scored 24.x models, misrepresenting it as
+#     smart-tier; it is a legitimate free model but not a floor candidate
+UNSCORED_EXCLUDE: set[str] = {
+    "openrouter/free",
+    "nvidia/nemotron-3.5-content-safety:free",
+    "jev-1.13-free",
+    "mimo-v2.5-free",
+    "meta/llama2-70b",
+    "nvidia/llama-3.1-nemotron-70b-instruct",
+    "deepseek-ai/deepseek-coder-6.7b-instruct",
+    "ibm/granite-3.0-3b-a800m-instruct",
+    "ibm/granite-3.0-8b-instruct",
+    "poolside/laguna-xs-2.1",
+    "gemma-4-9b-it",
+}
 TIMEOUT = 30
 MAX_RETRIES = 3
 BACKOFF_BASE = 2
@@ -930,6 +966,8 @@ def output_csv(data: list[dict], path: str | None) -> None:
             "provider": d.get("provider"),
             "context_length": d.get("context_length"),
             "intelligence": d.get("intelligence"),
+            "intelligence_source": d.get("intelligence_source"),
+            "intelligence_note": d.get("intelligence_note"),
             "released": d.get("released"),
             "elo": d.get("elo"),
             "elo_votes": d.get("elo_votes"),
@@ -1131,6 +1169,33 @@ def main() -> None:
                 if model.get("intelligence") is None:
                     model["intelligence"] = normalize_elo_to_intelligence(entry["elo"])
         print(f"Arena code: matched ELO for {matched} models", file=sys.stderr)
+
+    # Deterministic smart floor: any model that still has no intelligence
+    # score (neither AA nor arena code ELO) gets the lowest value that lets
+    # it enter the smart/work/large chains. Auto-fallback meta-router models
+    # and curated unscored-exclude models stay unscored -- they only ever
+    # appear as the trailing chain entry, never as concrete candidates.
+    floored = 0
+    excluded = 0
+    for model in all_models:
+        if model.get("intelligence") is not None:
+            continue
+        if model.get("id") in AUTO_FALLBACK_MODELS or model.get("id") in UNSCORED_EXCLUDE:
+            excluded += 1
+            continue
+        model["intelligence"] = SMART_FLOOR
+        model["intelligence_source"] = "smart floor"
+        model["intelligence_note"] = (
+            "No AA intelligence score and no arena.ai code-leaderboard ELO; "
+            "assigned the smart floor (25.0) so the model is visible in the "
+            "chains. This is a deterministic default, not a benchmark score."
+        )
+        floored += 1
+    print(
+        f"Smart floor: floored {floored} models, excluded {excluded} "
+        f"(meta-router / curated unscored-exclude)",
+        file=sys.stderr,
+    )
 
     # Apply hide list — remove models we would never use
     # Only filters nvidia-nim models; all other providers always display
