@@ -672,7 +672,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
-		resp, err := g.proxy.Forward(reqCtx, body, *ep)
+		resp, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
 		if err != nil {
 			cancel()
 			if isClientDisconnect(err) {
@@ -853,7 +853,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// generation.
 		start := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
-		partial, toolCalls, completionTokens, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout)
+		partial, toolCalls, completionTokens, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout, sessionID)
 		if err == nil {
 			g.router.RecordSuccess(ep)
 			if dur := time.Since(start); dur > 0 && completionTokens > 0 {

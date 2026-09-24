@@ -211,9 +211,12 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestConcurrentStickySessionGuard
 • TestReloadConfigIsAtomic
 • TestReloadConfigConcurrent  (new, 2026-09-20)
+• TestOpencodeHeadersInjected  (new, 2026-09-23)
+• TestOpencodeHeadersNotInjectedForNonOpencode  (new, 2026-09-23)
+• TestOpencodeProviderHeaderOverride  (new, 2026-09-23)
 
 ## Test summary
-  `go test -race ./...` → 101 passed
+  `go test -race ./...` → 104 passed
   `go vet ./...` → no issues
   `go build ./...` → success
   `python3 scripts/validate-config.py` → OK: 4 profiles validated
