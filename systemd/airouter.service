@@ -1,0 +1,14 @@
+[Unit]
+Description=Airouter AI gateway daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dev/airouter
+ExecStart=%h/dev/airouter/airouter -port 9090 -api-key admin
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=default
