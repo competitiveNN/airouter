@@ -1,6 +1,6 @@
 {
   "gemini:gemini-flash-lite-latest": 163.79834489009755,
-  "kilocode:dots-studio/dots-3-note-preview:free": 47.82153482523461,
+  "kilocode:dots-studio/dots-3-note-preview:free": 41.88558477303826,
   "kilocode:inclusionai/ling-3.0-flash-fin:free": 97.80061026050875,
   "kilocode:inclusionai/ling-3.0-flash-sante:free": 82.9331835037804,
   "kilocode:inclusionai/ling-3.0-flash-vl:free": 42.71847672557978,
@@ -10,7 +10,7 @@
   "kilocode:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": 14.874681357750006,
   "kilocode:nvidia/nemotron-3-super-120b-a12b:free": 12.200937026367665,
   "kilocode:nvidia/nemotron-3-ultra-550b-a55b:free": 16.281192930372548,
-  "kilocode:nvidia/nemotron-3.5-lightning:free": 2.5782614198413083,
+  "kilocode:nvidia/nemotron-3.5-lightning:free": 1.5965324088253074,
   "kilocode:poolside/laguna-s-2.1:free": 51.24283258708401,
   "kilocode:poolside/laguna-xs-2.1:free": 23.1510651715014,
   "kilocode:stepfun/step-3.7-flash:free": 66.62923443313747,
