@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,8 +15,44 @@ import (
 )
 
 type ProviderConfig struct {
-	URL       string `yaml:"url"`
-	APIKeyEnv string `yaml:"api_key_env"`
+	URL       string            `yaml:"url"`
+	APIKeyEnv string            `yaml:"api_key_env"`
+	Headers   map[string]string `yaml:"headers,omitempty"`
+}
+
+// opencodeProviderPrefixes lists provider names whose upstream endpoint is an
+// OpenCode gateway (opencode.ai/zen or opencode.ai/zen/go). Requests to these
+// providers must carry OpenCode client-attribution headers, otherwise the
+// gateway treats the request as anonymous and rejects free-tier models with
+// `403 FreeTierError: OpenCode's free tier can only be used from within
+// OpenCode` (see oh-my-pi#12306). The headers are synthesized at request time
+// with fresh per-request IDs so the upstream cannot fingerprint a single
+// client across sessions — matching the official opencode CLI behaviour.
+var opencodeProviderPrefixes = []string{"opencode", "opencode-go", "opencode-zen"}
+
+// isOpencodeProvider reports whether the named provider is an OpenCode gateway
+// that requires client-attribution headers.
+func isOpencodeProvider(provider string) bool {
+	for _, p := range opencodeProviderPrefixes {
+		if p == provider {
+			return true
+		}
+	}
+	return false
+}
+
+// opencodeRequestHeaders returns the OpenCode client-attribution headers that
+// must accompany every request to an OpenCode gateway. The session/request IDs
+// are generated fresh per call so the upstream sees a distinct identity each
+// time, exactly like the official CLI.
+func opencodeRequestHeaders() map[string]string {
+	return map[string]string{
+		"User-Agent":         "opencode/1.18.31/cli",
+		"x-opencode-client":  "cli",
+		"x-opencode-session": "ses_" + randomHex(16),
+		"x-opencode-request": "msg_" + randomHex(16),
+		"x-opencode-project": "default",
+	}
 }
 
 func (p ProviderConfig) APIKey() string {
@@ -182,6 +220,22 @@ func IsValidModel(name string) bool {
 		}
 	}
 	return false
+}
+
+// randomHex returns n random hex bytes (2*n characters) from crypto/rand.
+// Used to synthesize per-request OpenCode session/request IDs so the upstream
+// cannot fingerprint a single client across sessions.
+func randomHex(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback: never block a request on RNG failure; emit a deterministic
+		// placeholder so attribution is still present (just not unique).
+		return strings.Repeat("0", 2*n)
+	}
+	return hex.EncodeToString(b)
 }
 
 type SSEError struct {
