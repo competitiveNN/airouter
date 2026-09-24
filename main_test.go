@@ -870,7 +870,7 @@ func TestProviderProxyForward(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, err := proxy.Forward(context.Background(), []byte(body), *ep)
+	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -929,7 +929,7 @@ func TestProviderProxyStreaming(t *testing.T) {
 	ep := ModelEndpoint{Provider: "test", Model: "gpt-4"}
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
 
-	_, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep, 30*time.Second)
+	_, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), ep, 30*time.Second, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -942,6 +942,158 @@ func TestProviderProxyStreaming(t *testing.T) {
 	}
 	if !strings.Contains(outputStr, "[DONE]") {
 		t.Error("expected [DONE] in output")
+	}
+}
+
+// TestOpencodeHeadersInjected verifies that requests to an OpenCode gateway
+// provider carry the client-attribution headers the upstream requires to grant
+// free-tier access. Without them the gateway rejects free models with
+// `403 FreeTierError: OpenCode's free tier can only be used from within
+// OpenCode` (oh-my-pi#12306).
+func TestOpencodeHeadersInjected(t *testing.T) {
+	var gotUA, gotClient, gotSession, gotRequest, gotProject string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		gotClient = r.Header.Get("x-opencode-client")
+		gotSession = r.Header.Get("x-opencode-session")
+		gotRequest = r.Header.Get("x-opencode-request")
+		gotProject = r.Header.Get("x-opencode-project")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "test", Object: "chat.completion", Created: 1,
+			Model: "muse-spark-1.3-contributor-free",
+			Choices: []ChatCompletionChoice{
+				{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "OK"}},
+			},
+		})
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"opencode": {URL: backend.URL, APIKeyEnv: "OPENCODE_API_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "opencode", Model: "muse-spark-1.3-contributor-free"}}},
+		},
+	}
+	t.Setenv("OPENCODE_API_KEY", "sk-test")
+
+	proxy := NewProxy(cfg)
+	router := NewRouter(cfg, "")
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
+	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "test-session")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotUA == "" {
+		t.Error("expected User-Agent attribution header")
+	}
+	if gotClient != "cli" {
+		t.Errorf("expected x-opencode-client=cli, got %q", gotClient)
+	}
+	if gotSession != "test-session" {
+		t.Errorf("expected x-opencode-session pinned to session, got %q", gotSession)
+	}
+	if gotRequest == "" {
+		t.Error("expected x-opencode-request header")
+	}
+	if gotProject != "default" {
+		t.Errorf("expected x-opencode-project=default, got %q", gotProject)
+	}
+}
+
+// TestOpencodeHeadersNotInjectedForNonOpencode verifies that providers that are
+// not OpenCode gateways do not receive synthesized attribution headers.
+func TestOpencodeHeadersNotInjectedForNonOpencode(t *testing.T) {
+	var gotHeaders http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "test", Object: "chat.completion", Created: 1,
+			Model: "gpt-4",
+			Choices: []ChatCompletionChoice{
+				{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "OK"}},
+			},
+		})
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"openai": {URL: backend.URL, APIKeyEnv: "OPENAI_API_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "openai", Model: "gpt-4"}}},
+		},
+	}
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+
+	proxy := NewProxy(cfg)
+	router := NewRouter(cfg, "")
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
+	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	for _, h := range []string{"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project"} {
+		if v := gotHeaders.Get(h); v != "" {
+			t.Errorf("expected no %s header for non-opencode provider, got %q", h, v)
+		}
+	}
+}
+
+// TestOpencodeProviderHeaderOverride verifies that explicit headers declared in
+// the provider config take precedence over the synthesized OpenCode
+// attribution headers.
+func TestOpencodeProviderHeaderOverride(t *testing.T) {
+	var gotUA string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "test", Object: "chat.completion", Created: 1,
+			Model: "muse-spark-1.3-contributor-free",
+			Choices: []ChatCompletionChoice{
+				{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "OK"}},
+			},
+		})
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"opencode": {
+				URL:       backend.URL,
+				APIKeyEnv: "OPENCODE_API_KEY",
+				Headers:   map[string]string{"User-Agent": "airouter/1.0"},
+			},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "opencode", Model: "muse-spark-1.3-contributor-free"}}},
+		},
+	}
+	t.Setenv("OPENCODE_API_KEY", "sk-test")
+
+	proxy := NewProxy(cfg)
+	router := NewRouter(cfg, "")
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
+	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotUA != "airouter/1.0" {
+		t.Errorf("expected config User-Agent to win, got %q", gotUA)
 	}
 }
 
@@ -1005,7 +1157,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 
 	// First attempt: backend1 returns 429
 	ep, _ := router.SelectEndpoint("smart", sessionID, false, nil)
-	_, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
+	_, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second, "")
 	if err == nil {
 		t.Fatal("expected error from backend1")
 	}
@@ -1018,7 +1170,7 @@ func TestProviderProxyStreamingErrorRecovery(t *testing.T) {
 	}
 
 	// Second attempt: backend2 should succeed
-	_, _, _, err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2, 30*time.Second)
+	_, _, _, err2 := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep2, 30*time.Second, "")
 	if err2 != nil {
 		t.Fatalf("expected success from backend2, got: %v", err2)
 	}
@@ -1095,7 +1247,7 @@ func TestProviderProxyStreamingMidStreamResume(t *testing.T) {
 		if ep == nil {
 			t.Fatal("no endpoint selected")
 		}
-		partial, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second)
+		partial, _, _, err := proxy.StreamToClient(context.Background(), &output, flusher, []byte(body), *ep, 30*time.Second, "")
 		if err == nil {
 			break
 		}

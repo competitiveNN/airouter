@@ -164,7 +164,7 @@ func (p *Proxy) ToolCallsEnabled() bool {
 	return p.toolCalls.Load()
 }
 
-func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEndpoint, providerCfg *ProviderConfig, stream bool) (*http.Request, error) {
+func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEndpoint, providerCfg *ProviderConfig, stream bool, sessionID string) (*http.Request, error) {
 	backendBody, err := ReplaceModelName(body, endpoint.Model)
 	if err != nil {
 		return nil, fmt.Errorf("replace model name: %w", err)
@@ -184,16 +184,39 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
+	// OpenCode gateways (opencode.ai/zen, /zen/go) require client-attribution
+	// headers to grant free-tier access and to pin a session to a single
+	// upstream for cache affinity. Without them the gateway treats the request
+	// as anonymous and rejects free models with
+	// `403 FreeTierError: OpenCode's free tier can only be used from within
+	// OpenCode` (oh-my-pi#12306). The session/request IDs are synthesized
+	// per request so the upstream cannot fingerprint one client across
+	// sessions, matching the official opencode CLI. Explicit provider headers
+	// in the config always win (set after the synthesized ones below).
+	if isOpencodeProvider(endpoint.Provider) {
+		for k, v := range opencodeRequestHeaders() {
+			req.Header.Set(k, v)
+		}
+		if sessionID != "" {
+			req.Header.Set("x-opencode-session", sessionID)
+		}
+	}
+	// Provider-level header overrides from config take precedence over the
+	// synthesized OpenCode attribution headers.
+	for k, v := range providerCfg.Headers {
+		req.Header.Set(k, v)
+	}
+
 	return req, nil
 }
 
-func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint) (*http.Response, error) {
+func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, error) {
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", endpoint.Provider)
 	}
 
-	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, false)
+	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, false, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +281,7 @@ func (p *Proxy) Warmup(ctx context.Context) {
 						return
 					}
 					warmupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-					resp, err := p.Forward(warmupCtx, body, s.ep)
+					resp, err := p.Forward(warmupCtx, body, s.ep, "")
 					cancel()
 					if err != nil {
 						log.Printf("[warmup] %s/%s depth=%.2f round=%d: %v", s.ep.Provider, s.ep.Model, s.depth, round, err)
@@ -278,7 +301,7 @@ func (p *Proxy) Warmup(ctx context.Context) {
 	}
 }
 
-func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration) (string, []streamToolCall, int, error) {
+func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration, sessionID string) (string, []streamToolCall, int, error) {
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
 		return "", nil, 0, fmt.Errorf("unknown provider: %s", endpoint.Provider)
@@ -287,7 +310,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// Use the parent context for the request so the connection stays alive for
 	// the whole (potentially long) generation. The size-based timeout only
 	// guards the time-to-first-token via firstByteReader below.
-	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, true)
+	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, true, sessionID)
 	if err != nil {
 		return "", nil, 0, err
 	}
