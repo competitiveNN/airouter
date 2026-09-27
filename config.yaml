@@ -16,17 +16,23 @@
 #   - Every NVIDIA NIM model is emitted as a consecutive nvidia / nvidia2 / nvidia3
 #     trio (same model id, three API keys) so a 429 on one key falls through to the
 #     next key on the same model instead of failing the request. No NVIDIA-NIM model
-#     ever appears on only one key.
+#     ever appears on only one key. Likewise every CommandCode model is emitted as a
+#     consecutive commandcode / commandcode2 pair (same model id, two API keys on the
+#     shared localhost:3050 proxy) so a rate-limited key falls through to the next.
+#     CommandCode models are the four free-tier deals published at
+#     https://commandcode.ai/docs/resources/pricing-limits:
+#       stealth/space-bunny-alpha, poolside/laguna-s-2.1-free,
+#       inclusionai/ling-3.0-flash-sante:free, meituan/longcat-2.0-free
 #   - The LAST entry of every chain is that profile's "auto" fallback, chosen by
 #     comparing how many concrete (non-auto) endpoints kilocode vs opencode contributed:
 #         kilocode_count > opencode_count -> kilocode  `kilo-auto/free`
 #         opencode_count > kilocode_count -> opencode  `big-pickle`
 #         (ties go to kilocode, per rule 6)
-#     Profile-level comparison:
-#         smart  -> kilocode leads (8 vs 4)    -> kilocode  `kilo-auto/free`
-#         work   -> kilocode leads (8 vs 4)    -> kilocode  `kilo-auto/free`
-#         fast   -> kilocode leads (5 vs 2)     -> kilocode  `kilo-auto/free`
-#         large  -> kilocode leads (16 vs 1)    -> kilocode  `kilo-auto/free`
+#     Profile-level comparison (concrete kilocode vs opencode endpoints):
+#         smart  -> kilocode leads (8 vs 5)    -> kilocode  `kilo-auto/free`
+#         work   -> kilocode leads (12 vs 7)   -> kilocode  `kilo-auto/free`
+#         fast   -> kilocode leads (4 vs 2)    -> kilocode  `kilo-auto/free`
+#         large  -> kilocode leads (15 vs 1)   -> kilocode  `kilo-auto/free`
 #     (ties go to kilocode, per rule 6)
 #
 # Every concrete endpoint carries a `vision:` boolean (true/false) taken from the
@@ -79,6 +85,12 @@ providers:
     url: http://127.0.0.1:3050/v1
     api_key_env: COMMANDCODE_API_KEY_2
 
+preferences:
+  # When two models have the same intelligence score, place the newer
+  # model (by release date) before the older one in the fallback chain.
+  # When false, ties keep their source-provider enumeration order.
+  newest_first_on_tie: true
+
 models:
   smart:
     chain:
@@ -130,9 +142,6 @@ models:
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1593  262,144 ctx
         vision: true
-      - provider: kilocode
-        model: z-ai/glm-5.2:free  # 33.7  elo=1592  32,768 ctx
-        vision: false
       - provider: ollama
         model: minimax-m3  # 29.2  262,144 ctx
         vision: false
@@ -140,34 +149,43 @@ models:
         model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
       - provider: nvidia
-        model: moonshotai/kimi-k2.6  # 27
+        model: moonshotai/kimi-k2.6  # 27.0
         vision: false
       - provider: nvidia2
-        model: moonshotai/kimi-k2.6  # 27
+        model: moonshotai/kimi-k2.6  # 27.0
         vision: false
       - provider: nvidia3
-        model: moonshotai/kimi-k2.6  # 27
+        model: moonshotai/kimi-k2.6  # 27.0
         vision: false
       - provider: kilocode
-        model: dots-studio/dots-3-note-preview:free  # 25  floor  512,000 ctx
-        vision: true
-      - provider: kilocode
-        model: nex-agi/nex-n2.5-mini:free  # 25  floor  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: nex-agi/nex-n2.5-pro:free  # 25  floor  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: poolside/laguna-s-2.1:free  # 25  floor  262,144 ctx
+        model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
       - provider: kilocode
-        model: poolside/laguna-xs-2.1:free  # 25  floor  262,144 ctx
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
       - provider: opencode
-        model: mimo-v2.6-flash-free  # 25  floor
+        model: mimo-v2.6-flash-free  # 25.0  floor
+        vision: false
+      - provider: commandcode
+        model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
+        vision: false
+      - provider: commandcode2
+        model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (8 vs 4)
+        model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
+        vision: true
+      - provider: opencode
+        model: space-bunny-free  # 25.0  floor
+        vision: false
+      - provider: commandcode
+        model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
+        vision: false
+      - provider: commandcode2
+        model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
+        vision: false
+      - provider: kilocode
+        model: kilo-auto/free  # last: kilocode dominates (5 vs 5)
         vision: true
   work:
     chain:
@@ -219,9 +237,6 @@ models:
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1593  262,144 ctx
         vision: true
-      - provider: kilocode
-        model: z-ai/glm-5.2:free  # 33.7  elo=1592  32,768 ctx
-        vision: false
       - provider: ollama
         model: minimax-m3  # 29.2  262,144 ctx
         vision: false
@@ -229,46 +244,50 @@ models:
         model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
       - provider: nvidia
-        model: moonshotai/kimi-k2.6  # 27
+        model: moonshotai/kimi-k2.6  # 27.0
         vision: false
       - provider: nvidia2
-        model: moonshotai/kimi-k2.6  # 27
+        model: moonshotai/kimi-k2.6  # 27.0
         vision: false
       - provider: nvidia3
-        model: moonshotai/kimi-k2.6  # 27
+        model: moonshotai/kimi-k2.6  # 27.0
         vision: false
       - provider: kilocode
-        model: dots-studio/dots-3-note-preview:free  # 25  floor  512,000 ctx
-        vision: true
-      - provider: kilocode
-        model: nex-agi/nex-n2.5-mini:free  # 25  floor  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: nex-agi/nex-n2.5-pro:free  # 25  floor  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: poolside/laguna-s-2.1:free  # 25  floor  262,144 ctx
+        model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
       - provider: kilocode
-        model: poolside/laguna-xs-2.1:free  # 25  floor  262,144 ctx
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
       - provider: opencode
-        model: mimo-v2.6-flash-free  # 25  floor
+        model: mimo-v2.6-flash-free  # 25.0  floor
+        vision: false
+      - provider: commandcode
+        model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
+        vision: false
+      - provider: commandcode2
+        model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (8 vs 4)
+        model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
         vision: true
-  fast:
-    chain:
-      - provider: kilocode
-        model: poolside/laguna-xs-2.1:free  # 25  floor  262,144 ctx
+      - provider: opencode
+        model: space-bunny-free  # 25.0  floor
+        vision: false
+      - provider: commandcode
+        model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
+        vision: false
+      - provider: commandcode2
+        model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
         vision: false
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-vl:free  # 24.6  262,144 ctx
-        vision: true
+      - provider: commandcode
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: commandcode2
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
@@ -297,7 +316,87 @@ models:
         model: gemini-flash-lite-latest  # 22.2  1,048,576 ctx
         vision: true
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (5 vs 2)
+        model: stepfun/step-3.7-flash:free  # 19.5  262,144 ctx
+        vision: true
+      - provider: commandcode
+        model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
+        vision: false
+      - provider: commandcode2
+        model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
+        vision: false
+      - provider: ollama
+        model: gemma4:31b  # 19.0  262,144 ctx
+        vision: true
+      - provider: gemini
+        model: gemma-4-31b-it  # 19.0  262,144 ctx
+        vision: false
+      - provider: nvidia
+        model: google/gemma-4-31b-it  # 19.0
+        vision: false
+      - provider: nvidia2
+        model: google/gemma-4-31b-it  # 19.0
+        vision: false
+      - provider: nvidia3
+        model: google/gemma-4-31b-it  # 19.0
+        vision: false
+      - provider: nvidia
+        model: meta/muse-glimmer-30b  # 17.5
+        vision: false
+      - provider: nvidia2
+        model: meta/muse-glimmer-30b  # 17.5
+        vision: false
+      - provider: nvidia3
+        model: meta/muse-glimmer-30b  # 17.5
+        vision: false
+      - provider: gemini
+        model: gemma-4-26b-a4b-it  # 16.7  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: kilo-auto/free  # last: kilocode dominates (9 vs 7)
+        vision: true
+  fast:
+    chain:
+      - provider: kilocode
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: commandcode
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: commandcode2
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: opencode
+        model: nemotron-3-ultra-free  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: ollama
+        model: nemotron-3-ultra  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: nvidia
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: nvidia2
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: nvidia3
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
+        vision: false
+      - provider: kilocode
+        model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
+        vision: false
+      - provider: opencode
+        model: ling-3.0-flash-fin-free  # 22.6
+        vision: false
+      - provider: gemini
+        model: gemini-flash-lite-latest  # 22.2  1,048,576 ctx
+        vision: true
+      - provider: kilocode
+        model: kilo-auto/free  # last: kilocode dominates (4 vs 2)
         vision: true
   large:
     chain:
@@ -307,6 +406,18 @@ models:
       - provider: gemini
         model: gemini-flash-lite-latest  # 22.2  1,048,576 ctx
         vision: true
+      - provider: commandcode
+        model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
+        vision: false
+      - provider: commandcode2
+        model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
+        vision: false
+      - provider: commandcode
+        model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
+        vision: false
+      - provider: commandcode2
+        model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
+        vision: false
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
@@ -329,7 +440,7 @@ models:
         model: nvidia/nemotron-3.5-lightning:free  # 12.9  1,000,000 ctx
         vision: false
       - provider: kilocode
-        model: dots-studio/dots-3-note-preview:free  # 25  floor  512,000 ctx
+        model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
         vision: true
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1593  262,144 ctx
@@ -338,23 +449,20 @@ models:
         model: minimax-m3  # 29.2  262,144 ctx
         vision: false
       - provider: kilocode
-        model: nex-agi/nex-n2.5-mini:free  # 25  floor  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: nex-agi/nex-n2.5-pro:free  # 25  floor  262,144 ctx
-        vision: true
-      - provider: kilocode
-        model: poolside/laguna-s-2.1:free  # 25  floor  262,144 ctx
+        model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
       - provider: kilocode
-        model: poolside/laguna-xs-2.1:free  # 25  floor  262,144 ctx
+        model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-vl:free  # 24.6  262,144 ctx
-        vision: true
+      - provider: commandcode
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
+      - provider: commandcode2
+        model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
+        vision: false
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
         vision: false
@@ -362,19 +470,19 @@ models:
         model: stepfun/step-3.7-flash:free  # 19.5  262,144 ctx
         vision: true
       - provider: ollama
-        model: gemma4:31b  # 19  262,144 ctx
+        model: gemma4:31b  # 19.0  262,144 ctx
         vision: true
       - provider: gemini
-        model: gemma-4-31b-it  # 19  262,144 ctx
+        model: gemma-4-31b-it  # 19.0  262,144 ctx
         vision: false
       - provider: gemini
         model: gemma-4-26b-a4b-it  # 16.7  262,144 ctx
         vision: false
-      - provider: kilocode
-        model: nvidia/nemotron-3-super-120b-a12b:free  # 12.8  262,144 ctx
-        vision: false
       - provider: ollama
         model: nemotron-3-super  # 12.8  262,144 ctx
+        vision: false
+      - provider: kilocode
+        model: nvidia/nemotron-3-super-120b-a12b:free  # 12.8  262,144 ctx
         vision: false
       - provider: nvidia
         model: nvidia/nemotron-3-super-120b-a12b  # 12.8  262,144 ctx
@@ -397,6 +505,12 @@ models:
       - provider: gemini
         model: gemma-4-2b-it  # 7.8  262,144 ctx
         vision: false
+      - provider: commandcode
+        model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
+        vision: false
+      - provider: commandcode2
+        model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
+        vision: false
       - provider: kilocode
         model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  # 10.3  256,000 ctx
         vision: true
@@ -404,5 +518,5 @@ models:
         model: cohere/north-mini-code:free  # 9.9  256,000 ctx
         vision: false
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (16 vs 1)
+        model: kilo-auto/free  # last: kilocode dominates (13 vs 1)
         vision: true

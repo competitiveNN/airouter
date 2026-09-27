@@ -26,6 +26,19 @@ Rules:
      model should ever appear on only one NVIDIA provider, and no commandcode model
      should ever appear on only one CommandCode provider.
 
+     CommandCode models are the four free-tier deals published at
+     https://commandcode.ai/docs/resources/pricing-limits, fetched from the
+     provider models endpoint at https://api.commandcode.ai/provider/v1/models
+     (the full catalog is returned there with no free flag, so the free set is
+     intersected against the curated deal list):
+       stealth/space-bunny-alpha, poolside/laguna-s-2.1-free,
+       inclusionai/ling-3.0-flash-sante:free, meituan/longcat-2.0-free
+     The endpoint spells one of them as "meituan/LongCat-2.0" (no -free suffix,
+     mixed case); canonicalize it to "meituan/longcat-2.0-free" before matching.
+     Do NOT apply the generic stealth/* exclusion to commandcode models —
+     stealth/space-bunny-alpha is a legitimate free deal, not an opaque
+     placeholder. The stealth/* exclusion still applies to all other providers.
+
  4. Order each chain best-first, descending by "intelligence". Skip models whose
     intelligence is null — EXCEPT the two auto-fallback models in rule 6, which
     are always allowed regardless. Note: "intelligence" may come from two sources
