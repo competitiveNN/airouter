@@ -92,9 +92,14 @@ type ModelConfig struct {
 	Chain []ModelEndpoint `yaml:"chain"`
 }
 
+type Preferences struct {
+	NewestFirstOnTie bool `yaml:"newest_first_on_tie"`
+}
+
 type Config struct {
-	Providers map[string]ProviderConfig `yaml:"providers"`
-	Models    map[string]ModelConfig    `yaml:"models"`
+	Providers   map[string]ProviderConfig `yaml:"providers"`
+	Preferences *Preferences              `yaml:"preferences,omitempty"`
+	Models      map[string]ModelConfig    `yaml:"models"`
 }
 
 var LogicalModels = []string{"smart", "work", "fast", "large"}
