@@ -100,3 +100,12 @@ Rules:
       id appears on both providers commandcode / commandcode2. Finish with a compact
       summary table listing the four chains (profile, entry count, head model,
       tail auto model).
+
+  11. Every concrete endpoint must also carry an `intelligence:` field with its
+      numeric score, on its own line after `vision:`. The gateway reads this at
+      runtime to rotate the first endpoint chosen for a new session across the
+      top `preferences.initial_rotation_window` entries of the chain, so a
+      missing score silently removes an endpoint from rotation. The auto-fallback
+      meta-router carries no score (it is a router, not a model) and must be left
+      without the field. Keep the trailing comment score and the `intelligence:`
+      field in sync.

@@ -72,6 +72,35 @@ type ModelEndpoint struct {
 	// learns this at runtime (see Router.MarkNoVision) when a provider rejects
 	// an image request.
 	Vision *bool `yaml:"vision,omitempty"`
+
+	// Intelligence is the model's quality score (Artificial Analysis
+	// intelligence index, or the arena.ai ELO-derived equivalent), as
+	// recorded by regenerate_config.py. It is optional: a nil value means
+	// "unknown", and the router then treats the endpoint as incomparable and
+	// falls back to strict chain order.
+	//
+	// The router uses this only to decide which endpoints are equally good
+	// enough to be treated as interchangeable for a new session's first pick
+	// (see Router.selectInitialEndpoint). It never uses it to reorder a
+	// fallback: once a request is in flight the chain is walked strictly in
+	// configured order, so quality ordering is preserved.
+	Intelligence *float64 `yaml:"intelligence,omitempty"`
+}
+
+// HasIntelligence reports whether an intelligence score is known. Endpoints
+// without one are only ever compared by chain position.
+func (e ModelEndpoint) HasIntelligence() bool {
+	return e.Intelligence != nil
+}
+
+// IntelligenceEqual reports whether two endpoints carry the same known score.
+// Endpoints with an unknown score are never considered equal, so they fall
+// back to strict chain order rather than being grouped arbitrarily.
+func (e ModelEndpoint) IntelligenceEqual(other ModelEndpoint) bool {
+	if e.Intelligence == nil || other.Intelligence == nil {
+		return false
+	}
+	return *e.Intelligence == *other.Intelligence
 }
 
 func (e ModelEndpoint) Key() string {
@@ -94,7 +123,42 @@ type ModelConfig struct {
 
 type Preferences struct {
 	NewestFirstOnTie bool `yaml:"newest_first_on_tie"`
+
+	// InitialRotationWindow is how many endpoints at the head of a chain are
+	// rotated between for the first pick of each new session.
+	//
+	// Without rotation every new session starts at depth 0, so one model
+	// serves all traffic and the rest of the chain is idle capacity that only
+	// ever gets used after a failure. With a window of N, consecutive new
+	// sessions start at depths 0, 1, ... N-1, 0, 1, ... spreading load evenly
+	// across the top of the chain.
+	//
+	// This affects ONLY the first endpoint chosen for a brand new session.
+	// Once a session is pinned, later requests in it are sticky; and once a
+	// request is retrying, the chain is walked strictly in configured order.
+	// So rotation can never delay escalation to a better model.
+	//
+	// 0 disables rotation (every new session starts at depth 0); omitting the
+	// key entirely uses DefaultInitialRotationWindow. It is a pointer so those
+	// two states are distinguishable.
+	InitialRotationWindow *int `yaml:"initial_rotation_window,omitempty"`
 }
+
+// RotationWindow returns the effective window size, defaulting to
+// DefaultInitialRotationWindow when the key is absent. An explicit 0 (or a
+// negative value) disables rotation.
+func (p *Preferences) RotationWindow() int {
+	if p == nil || p.InitialRotationWindow == nil {
+		return DefaultInitialRotationWindow
+	}
+	return *p.InitialRotationWindow
+}
+
+// DefaultInitialRotationWindow is the window used when preferences omit one.
+const DefaultInitialRotationWindow = 8
+
+// RotationEnabled reports whether new-session rotation is active.
+func (p *Preferences) RotationEnabled() bool { return p.RotationWindow() > 0 }
 
 type Config struct {
 	Providers   map[string]ProviderConfig `yaml:"providers"`

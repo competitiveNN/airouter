@@ -380,6 +380,7 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                     'provider': prov,
                     'model': m.id,
                     'vision': m.vision,
+                    'intelligence': m.score,
                     'comment': m.get_comment()
                 })
             if m.provider == 'kilocode':
@@ -394,6 +395,7 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                     'provider': prov,
                     'model': m.id,
                     'vision': m.vision,
+                    'intelligence': m.score,
                     'comment': m.get_comment()
                 })
             if m.provider == 'kilocode':
@@ -405,6 +407,7 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                 'provider': m.mapped_provider,
                 'model': m.id,
                 'vision': m.vision,
+                'intelligence': m.score,
                 'comment': m.get_comment()
             })
             if m.provider == 'kilocode':
@@ -434,12 +437,20 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
 
 
 def format_chain_yaml(chain: list[dict], indent: int = 6) -> str:
-    """Format chain as YAML"""
+    """Format chain as YAML.
+
+    The intelligence score is emitted as a real field, not just a trailing
+    comment: the router reads it to decide which endpoints are equally good
+    enough to be rotated for a new session's first pick.
+    """
     lines = []
     for entry in chain:
         lines.append(f"{' ' * indent}- provider: {entry['provider']}")
         lines.append(f"{' ' * (indent + 2)}model: {entry['model']}  {entry['comment']}")
         lines.append(f"{' ' * (indent + 2)}vision: {str(entry['vision']).lower()}")
+        score = entry.get('intelligence')
+        if score is not None:
+            lines.append(f"{' ' * (indent + 2)}intelligence: {score:.1f}")
     return '\n'.join(lines)
 
 

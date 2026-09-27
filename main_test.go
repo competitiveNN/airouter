@@ -19,6 +19,10 @@ import (
 func loadTestConfig(t *testing.T) *Config {
 	t.Helper()
 	cfg := &Config{
+		// Rotation off: these tests assert specific endpoint selection and
+		// stickiness, which is strict chain order. Initial-model rotation is
+		// covered separately in router_initial_test.go.
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
 		Providers: map[string]ProviderConfig{
 			"openai": {
 				URL:       "https://api.openai.com/v1",
@@ -335,6 +339,11 @@ func TestExtractSSEError_TruncatedJSON(t *testing.T) {
 		t.Fatalf("expected nil for unparseable JSON, got: %v", err)
 	}
 }
+
+// noRotation pins the initial-rotation window to 1 (rotation off) so tests
+// that are about fallback, cooldowns or session stickiness keep exercising
+// strict chain order. Rotation itself is covered in router_initial_test.go.
+var noRotation = 1
 
 func TestRouterSessionAssignment(t *testing.T) {
 	cfg := loadTestConfig(t)
@@ -676,16 +685,16 @@ func TestCooldownDurations(t *testing.T) {
 		statusCode int
 		expected   time.Duration
 	}{
-		{429, 30 * time.Second}, // low cooldown
-		{500, 30 * time.Second}, // medium
-		{502, 30 * time.Second}, // medium
-		{503, 30 * time.Second}, // medium
-		{504, 60 * time.Second}, // medium-long
+		{429, 30 * time.Second},   // low cooldown
+		{500, 30 * time.Second},   // medium
+		{502, 30 * time.Second},   // medium
+		{503, 30 * time.Second},   // medium
+		{504, 60 * time.Second},   // medium-long
 		{404, 7 * 24 * time.Hour}, // effectively permanent: 7 days
-		{401, 30 * time.Minute}, // auth failure
-		{403, 30 * time.Minute}, // auth failure
-		{0, 30 * time.Second},   // default (connection error)
-		{999, 30 * time.Second}, // unknown
+		{401, 30 * time.Minute},   // auth failure
+		{403, 30 * time.Minute},   // auth failure
+		{0, 30 * time.Second},     // default (connection error)
+		{999, 30 * time.Second},   // unknown
 	}
 
 	for _, tt := range tests {
@@ -3058,6 +3067,7 @@ func readFile(path string) ([]byte, error) {
 // concurrent requests with the same session ID don't interfere.
 func TestSessionSkipsTriedEndpoints(t *testing.T) {
 	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
 		Providers: map[string]ProviderConfig{
 			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
 			"p2": {URL: "https://p2.example.com/v1", APIKeyEnv: "P2_KEY"},
@@ -3453,6 +3463,7 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 	defer backend2.Close()
 
 	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
 		Providers: map[string]ProviderConfig{
 			"backend1": {URL: backend1.URL},
 			"backend2": {URL: backend2.URL},
@@ -3524,8 +3535,9 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 // the same session ID do not overwrite each other's fallback routing.
 func TestConcurrentStickySessionGuard(t *testing.T) {
 	cfg := &Config{
-		Providers: map[string]ProviderConfig{"p1": {URL: "https://p1"}, "p2": {URL: "https://p2"}},
-		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "p1", Model: "m1"}, {Provider: "p2", Model: "m2"}}}},
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers:   map[string]ProviderConfig{"p1": {URL: "https://p1"}, "p2": {URL: "https://p2"}},
+		Models:      map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "p1", Model: "m1"}, {Provider: "p2", Model: "m2"}}}},
 	}
 	router := NewRouter(cfg, "")
 	sessionID := "sticky-guard"
@@ -3555,6 +3567,7 @@ func TestConcurrentStickySessionGuard(t *testing.T) {
 // forwarding through old provider URLs (misrouting / 404s).
 func TestReloadConfigIsAtomic(t *testing.T) {
 	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
 		Providers: map[string]ProviderConfig{
 			"p1": {URL: "https://p1.example/v1"},
 			"p2": {URL: "https://p2.example/v1"},
