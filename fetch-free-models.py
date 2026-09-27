@@ -47,7 +47,7 @@ KILO_ENDPOINT = "https://api.kilo.ai/api/gateway/v1/models"
 OPENCODE_ENDPOINT = "https://opencode.ai/zen/v1/models"
 GOOGLE_AI_STUDIO_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 NVIDIA_NIM_ENDPOINT = "https://integrate.api.nvidia.com/v1/models"
-COMMANDCODE_ENDPOINT = "http://localhost:3050/v1/models"
+COMMANDCODE_ENDPOINT = "https://api.commandcode.ai/provider/v1/models"
 ARTIFICIAL_ANALYSIS_ENDPOINT = "https://artificialanalysis.ai/api/v2/data/llms/models"
 # arena.ai does not publish a public API for its leaderboard; this mirrors the
 # exact snapshot archived at the repo below (the code-arena leaderboard at
@@ -73,6 +73,54 @@ ELO_TO_INTELLIGENCE = 63.0 / 500.0
 # deterministic default, not a hand-picked override: it keeps unscored models
 # visible in the chains without claiming a benchmark score they never earned.
 SMART_FLOOR = 25.0
+
+# First-seen cache: when a model appears in the free-models list for the
+# first time, we record the fetch date as its "release date" fallback.  The
+# upstream APIs (OpenCode, CommandCode, Kilo Code) return a single
+# placeholder `created` timestamp for every model rather than the actual
+# model release date, and Artificial Analysis does not always have a
+# release date for every model either.  Without this cache, models with no
+# AA date would have `released=None` and would sort to the bottom of every
+# tie band, making them permanently appear "oldest" -- which is wrong when
+# they are genuinely new models that simply haven't been scored yet.
+#
+# The cache key is the model id; the value is the ISO date string of the
+# first run that observed the model.  Once recorded, the date never changes
+# for that model (it is the model's true first-appearance date in this
+# pipeline, not a moving target).
+FIRST_SEEN_CACHE_FILE = Path(__file__).resolve().parent / "first-seen-cache.json"
+FIRST_SEEN_TTL_HOURS = 24 * 365  # effectively permanent; only pruned manually
+
+
+def load_first_seen_cache() -> dict[str, str]:
+    """Load the first-seen cache, or return {} if absent/unreadable.
+
+    The cache file is a JSON object with two keys:
+      - ``fetched_at``: ISO-8601 timestamp of the last save
+      - ``first_seen``: the actual ``{model_id: date_str}`` map
+    """
+    if not FIRST_SEEN_CACHE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(FIRST_SEEN_CACHE_FILE.read_text())
+        if not isinstance(data, dict):
+            return {}
+        inner = data.get("first_seen")
+        if not isinstance(inner, dict):
+            return {}
+        return {str(k): str(v) for k, v in inner.items()}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_first_seen_cache(cache: dict[str, str]) -> None:
+    """Persist the first-seen cache with a timestamp for debugging."""
+    payload = {
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "first_seen": cache,
+    }
+    FIRST_SEEN_CACHE_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
 
 # Meta-router auto-fallback models. They are never real candidates, so they
 # stay unscored (null intelligence) and only ever appear as the trailing
@@ -246,10 +294,6 @@ NVIDIA_NIM_CTX: dict[str, int] = {
     "gpt-oss": 131_072,
 }
 
-COMMANDCODE_FREE_MODELS_CTX: dict[str, int] = {
-    # Add known commandcode free models here as discovered
-}
-
 HEADERS = {
     "User-Agent": "fetch-free-models/1.0 (+https://github.com/defnlnotme/models)",
     "Accept": "application/json",
@@ -327,9 +371,13 @@ NVIDIA_NIM_RELEASE_DATES: dict[str, str] = {
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def fetch_json(url: str, attempt: int = 1) -> dict[str, Any] | list[Any] | None:
+def fetch_json(
+    url: str,
+    attempt: int = 1,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any] | list[Any] | None:
     """Fetch JSON with retry on 429/5xx and timeout handling."""
-    req = urllib.request.Request(url, headers=HEADERS)
+    req = urllib.request.Request(url, headers=headers if headers is not None else HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -360,7 +408,12 @@ def fetch_json(url: str, attempt: int = 1) -> dict[str, Any] | list[Any] | None:
 
 
 def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert Kilo model format to common schema."""
+    """Convert Kilo model format to common schema.
+
+    The Kilo Code API returns a placeholder `created` value (0) for every
+    model rather than the actual model release date.  Leave `released` as
+    None so the Artificial Analysis enrichment can supply the real date.
+    """
     pricing = model.get("pricing", {})
     def to_float(v: Any) -> float:
         try:
@@ -375,8 +428,8 @@ def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
         "context_length": model.get("context_length", 0),
         "intelligence": None,
         "elo": None,
-        "released": model.get("created") or model.get("release_date") or model.get("published_at"),
-          "pricing": {
+        "released": None,
+        "pricing": {
             "input": to_float(pricing.get("prompt", 0)),
             "output": to_float(pricing.get("completion", 0)),
             "cache_read": to_float(pricing.get("input_cache_read", 0)),
@@ -394,7 +447,15 @@ def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def normalize_opencode(model: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert OpenCode model format to common schema."""
+    """Convert OpenCode model format to common schema.
+
+    The OpenCode API returns a single `created` timestamp for every model
+    (the moment the listing was generated), NOT the actual model release
+    date.  Using it as `released` would make every OpenCode model appear
+    brand-new and would defeat recency-based filtering.  We therefore leave
+    `released` as None and let the Artificial Analysis enrichment fill in
+    the real release date when available.
+    """
     model_id = model.get("id", "")
     return {
         "id": model_id,
@@ -403,7 +464,7 @@ def normalize_opencode(model: dict[str, Any]) -> dict[str, Any] | None:
         "context_length": OPENCODE_FREE_MODELS_CTX.get(model_id, 0),
         "intelligence": None,
         "elo": None,
-        "released": model.get("created") or model.get("release_date") or model.get("published_at"),
+        "released": None,
         "pricing": {
             "input": 0,
             "output": 0,
@@ -652,17 +713,83 @@ def fetch_opencode() -> list[dict[str, Any]]:
     return free_models
 
 
+# CommandCode free-tier models.  The provider models list at
+# https://api.commandcode.ai/provider/v1/models is the full catalog and does
+# NOT itself mark free/paid — every model there is billed at its per-token
+# rate unless an active "deal" makes it free.  The authoritative free set is
+# the one published on the CommandCode pricing page
+# (https://commandcode.ai/docs/resources/pricing-limits), which lists exactly
+# four free models, each with a "Free while capacity lasts" / "Free while the
+# stealth preview lasts" deal:
+#   - stealth/space-bunny-alpha        (stealth preview, 1M ctx, free)
+#   - poolside/laguna-s-2.1-free       (free while capacity lasts, 256K ctx)
+#   - inclusionai/ling-3.0-flash-sante:free  (free while it lasts, 262K ctx)
+#   - meituan/longcat-2.0-free         (free while it lasts, 1M ctx)
+# Anything else returned by the provider endpoint is metered (per-token),
+# so we never route to it as a free model.  Update this set when CommandCode
+# adds or removes a free deal.
+COMMANDCODE_FREE_MODELS: set[str] = {
+    "stealth/space-bunny-alpha",
+    "poolside/laguna-s-2.1-free",
+    "inclusionai/ling-3.0-flash-sante:free",
+    "meituan/longcat-2.0-free",
+}
+
+# CommandCode context windows, taken from the live provider list.  The
+# endpoint reports context_length per model; this marklist is the offline
+# fallback used when the API is unreachable so the ctx column is never 0.
+COMMANDCODE_FREE_MODELS_CTX: dict[str, int] = {
+    "stealth/space-bunny-alpha":  1_000_000,
+    "poolside/laguna-s-2.1-free":   256_000,
+    "inclusionai/ling-3.0-flash-sante:free": 262_144,
+    "meituan/longcat-2.0-free":    1_048_576,
+}
+
+
+def canonicalize_commandcode_id(model_id: str) -> str:
+    """Map a CommandCode provider endpoint id to its canonical deal id.
+
+    The provider endpoint (https://api.commandcode.ai/provider/v1/models)
+    returns the raw catalog ids, which differ from the deal ids published in
+    the CLI docs / pricing page in two ways:
+      - casing:  "meituan/LongCat-2.0" -> "meituan/longcat-2.0-free"
+      - suffix:  the endpoint omits the "-free" deal suffix on the LongCat
+        free deal (the other three free models carry it verbatim).
+    This folds the endpoint id onto the canonical form so the curated free
+    set matches regardless of how the upstream spells it.
+    """
+    if not model_id:
+        return model_id
+    if model_id in COMMANDCODE_FREE_MODELS:
+        return model_id
+    org, _, name = model_id.partition("/")
+    name = name.lower().replace("_", "-").replace(" ", "-")
+    name = re.sub(r"-+", "-", name).strip("-")
+    canonical = f"{org.lower()}/{name}"
+    if canonical in COMMANDCODE_FREE_MODELS:
+        return canonical
+    if canonical + "-free" in COMMANDCODE_FREE_MODELS:
+        return canonical + "-free"
+    return model_id
+
+
 def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert CommandCode model format to common schema."""
-    model_id = model.get("id", "")
+    """Convert CommandCode provider model format to common schema.
+
+    Like OpenCode, the CommandCode provider endpoint returns a single
+    `created` timestamp for every model (the moment the listing was
+    generated), not the actual model release date.  Leave `released` as
+    None so the Artificial Analysis enrichment can supply the real date.
+    """
+    model_id = canonicalize_commandcode_id(model.get("id", ""))
     return {
         "id": model_id,
-        "name": model_id,
+        "name": model.get("name") or model_id,
         "provider": "commandcode",
-        "context_length": COMMANDCODE_FREE_MODELS_CTX.get(model_id, 0),
+        "context_length": model.get("context_length") or COMMANDCODE_FREE_MODELS_CTX.get(model_id, 0),
         "intelligence": None,
         "elo": None,
-        "released": model.get("created") or model.get("release_date") or model.get("published_at"),
+        "released": None,
         "pricing": {
             "input": 0,
             "output": 0,
@@ -681,22 +808,38 @@ def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def fetch_commandcode() -> list[dict[str, Any]]:
-    """Fetch CommandCode models; free ones end in -free or :free."""
-    print("Fetching from CommandCode API...", file=sys.stderr)
-    data = fetch_json(COMMANDCODE_ENDPOINT)
+    """Fetch CommandCode free models from the provider models endpoint.
+
+    The provider endpoint lists the full catalog (paid and free alike) with
+    no free flag, so the free set is intersected against the curated
+    COMMANDCODE_FREE_MODELS deal list.  The endpoint is unauthenticated in
+    practice, but the Provider API key (COMMANDCODE_API_KEY) is sent when
+    available so rate limits / availability follow the authenticated plan.
+    """
+    print("Fetching from CommandCode provider API...", file=sys.stderr)
+    headers = dict(HEADERS)
+    cc_key = os.getenv("COMMANDCODE_API_KEY")
+    if cc_key:
+        headers["Authorization"] = f"Bearer {cc_key}"
+    data = fetch_json(COMMANDCODE_ENDPOINT, headers=headers)
     if not data or not isinstance(data, dict) or "data" not in data:
         print("CommandCode: no data or unexpected format", file=sys.stderr)
         return []
 
     free_models = []
     for model in data.get("data", []):
-        model_id = model.get("id", "")
-        if model_id.endswith("-free") or model_id.endswith(":free"):
-            normalized = normalize_commandcode(model)
-            if normalized:
-                free_models.append(normalized)
+        model_id = canonicalize_commandcode_id(model.get("id", ""))
+        if model_id not in COMMANDCODE_FREE_MODELS:
+            continue
+        normalized = normalize_commandcode(model)
+        if normalized:
+            free_models.append(normalized)
 
-    print(f"CommandCode: found {len(free_models)} free models ('-free' or ':free' suffix)", file=sys.stderr)
+    print(
+        f"CommandCode: found {len(free_models)} free models "
+        f"(of {len(data.get('data', []))} listed; free set is the curated deal list)",
+        file=sys.stderr,
+    )
     return free_models
 
 
@@ -1211,6 +1354,37 @@ def main() -> None:
     ]
     if len(all_models) < before_hide:
         print(f"Hide list: filtered {before_hide - len(all_models)} models", file=sys.stderr)
+
+    # First-seen cache: for models that still have no release date after AA
+    # enrichment, record the current fetch date as their first-appearance
+    # date.  This is the best available signal for models whose upstream
+    # API returns a placeholder `created` and whose AA entry has no
+    # `released` field.  Once recorded, the date is stable across runs.
+    # Done AFTER the hide-list filter so we don't waste cache entries on
+    # models we would never route to anyway.
+    first_seen = load_first_seen_cache()
+    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+    newly_seen = 0
+    for model in all_models:
+        mid = model.get("id", "")
+        if not mid or mid in AUTO_FALLBACK_MODELS:
+            continue
+        if model.get("released") is not None:
+            continue
+        if mid in first_seen:
+            model["released"] = first_seen[mid]
+            model["released_source"] = "first-seen cache"
+        else:
+            first_seen[mid] = today_str
+            model["released"] = today_str
+            model["released_source"] = "first-seen (this run)"
+            newly_seen += 1
+    save_first_seen_cache(first_seen)
+    print(
+        f"First-seen: {len(first_seen)} cached, {newly_seen} newly recorded "
+        f"(date={today_str})",
+        file=sys.stderr,
+    )
 
     # Per-source breakdown in the summary line
     by_source: dict[str, int] = {}
