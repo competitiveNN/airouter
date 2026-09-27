@@ -141,6 +141,7 @@ func (m ChatCompletionMessage) MarshalJSON() ([]byte, error) {
 		ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
 	}{m.Role, parts, m.Name, m.ToolCalls})
 }
+
 type ChatCompletionResponse struct {
 	ID      string                 `json:"id"`
 	Object  string                 `json:"object"`
@@ -209,8 +210,8 @@ type GatewayContext struct {
 	config        *atomic.Pointer[Config]
 	configPath    string
 	gatewayAPIKey string
-	allowNoAuth   bool            // explicit opt-in to unauthenticated mode (-allow-no-auth)
-	testCooldown  time.Duration   // override for tests: forces all cooldowns to this duration
+	allowNoAuth   bool          // explicit opt-in to unauthenticated mode (-allow-no-auth)
+	testCooldown  time.Duration // override for tests: forces all cooldowns to this duration
 }
 
 func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string, allowNoAuth ...bool) *GatewayContext {
