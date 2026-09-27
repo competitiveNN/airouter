@@ -352,7 +352,6 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	return p.streamSSE(w, flusher, idle)
 }
 
-
 // firstByteReader applies firstCtx (the size-based timeout) to only the first
 // Read call. After the first byte arrives, subsequent reads use the underlying
 // reader directly so the rest of a long stream is not bounded by the timeout.
@@ -607,7 +606,7 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	// more deltas and eventually drops the stream).
 	synthesizeToolCallEvent := func(index int, tc *pendingTC, model string) []byte {
 		delta := map[string]any{
-			"role": "assistant",
+			"role":    "assistant",
 			"content": nil,
 			"tool_calls": []map[string]any{{
 				"index": index,

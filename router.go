@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"hash/fnv"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -536,15 +538,115 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 	}
 
 	// New session
-	for _, ep := range chain.Chain {
-		if r.isEligibleLocked(&ep, requireVision) {
-			log.Printf("[debug] session=%s model=%s -> new session -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
-			r.sessions[sessionID] = sessionEntry{ep: ep, lastUsed: time.Now()}
-			return &ep, 0
-		}
+	if ep := r.selectInitialEndpoint(logicalModel, sessionID, &chain, requireVision); ep != nil {
+		log.Printf("[debug] session=%s model=%s -> new session -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
+		r.sessions[sessionID] = sessionEntry{ep: *ep, lastUsed: time.Now()}
+		return ep, 0
 	}
 
 	return nil, r.minCooldownWait(chain.Chain, requireVision)
+}
+
+// selectInitialEndpoint picks the first endpoint for a brand new session.
+//
+// Without rotation, every new session starts at depth 0, so steady-state
+// traffic lands on a single model while the rest of the chain sits idle --
+// capacity that is only ever reached reactively, after a failure or a
+// cooldown. To make the chain load-bearing, consecutive new sessions are
+// started at successive depths within a bounded window at the head of the
+// chain, so load spreads evenly across the top N endpoints.
+//
+// The rotation is deliberately narrow, because it trades quality for spread:
+//
+//   - It applies ONLY to the very first endpoint of a brand new session. Once
+//     a session is pinned, every later request in it is sticky; and once a
+//     request is retrying, the chain is walked strictly in configured order.
+//     So rotation can never delay escalation to a better model.
+//   - The window is bounded (preferences.initial_rotation_window, default 8),
+//     so a session is never started on a model far down the chain. Only the
+//     top of the chain is load-bearing; the tail remains reactive fallback.
+//   - Only endpoints that are currently eligible participate: one in cooldown
+//     or lacking a required capability is passed over rather than handed to a
+//     new session.
+//
+// The cursor is per logical model and advances by one per new session, so
+// sessions spread across the window and then wrap.
+func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *ModelConfig, requireVision bool) *ModelEndpoint {
+	cfg := r.config.Load()
+	window := cfg.Preferences.RotationWindow()
+	if window <= 0 {
+		// Rotation disabled: strict chain order.
+		for i := range chain.Chain {
+			if r.isEligibleLocked(&chain.Chain[i], requireVision) {
+				ep := chain.Chain[i]
+				return &ep
+			}
+		}
+		return nil
+	}
+
+	// Build the rotation window from the first `window` chain POSITIONS,
+	// dropping any that are currently ineligible. Anchoring to positions
+	// rather than to the first `window` eligible endpoints matters: it means
+	// a cooldown shrinks the rotation set instead of pulling a deeper model
+	// up into it, so the top of the chain stays the load-bearing region and
+	// the quality of a new session's first pick can only improve.
+	candidates := make([]int, 0, window)
+	limit := window
+	if limit > len(chain.Chain) {
+		limit = len(chain.Chain)
+	}
+	for i := 0; i < limit; i++ {
+		if r.isEligibleLocked(&chain.Chain[i], requireVision) {
+			candidates = append(candidates, i)
+		}
+	}
+	if len(candidates) == 0 {
+		// Every endpoint in the window is ineligible. Rather than give up
+		// (which would make the request wait), continue down the chain: this
+		// is the same escalation the fallback loop performs.
+		for i := limit; i < len(chain.Chain); i++ {
+			if r.isEligibleLocked(&chain.Chain[i], requireVision) {
+				ep := chain.Chain[i]
+				return &ep
+			}
+		}
+		return nil
+	}
+
+	// The starting depth is derived from the session ID rather than from a
+	// shared arrival counter.
+	//
+	// A counter would spread load correctly on average, but it breaks the
+	// session-affinity guarantee: concurrent requests sharing a session ID
+	// (client retry storms, parallel sub-requests) each advance the counter
+	// and get a DIFFERENT starting depth, so the first burst of a new session
+	// fans out across several models and the session ends up pinned to
+	// whichever request happened to finish last. That contradicts the
+	// documented invariant that a session is always routed to the same model,
+	// and it also defeats upstream prompt-cache affinity.
+	//
+	// Hashing the session ID gives the same aggregate spread -- distinct
+	// sessions land on different depths, evenly -- while making the choice a
+	// pure function of the session, so every concurrent request of the same
+	// session independently computes the SAME endpoint.
+	//
+	// The logical model is mixed into the hash so the same conversation does
+	// not correlate its depth across profiles, and the window membership is
+	// mixed in so a config reload reshuffles rather than preserving a stale
+	// assignment.
+	h := fnv.New64a()
+	_, _ = io.WriteString(h, logicalModel)
+	_, _ = io.WriteString(h, "\x00")
+	_, _ = io.WriteString(h, sessionID)
+	for _, i := range candidates {
+		_, _ = io.WriteString(h, "\x00")
+		_, _ = io.WriteString(h, chain.Chain[i].Key())
+	}
+	pos := int(h.Sum64() % uint64(len(candidates)))
+
+	ep := chain.Chain[candidates[pos]]
+	return &ep
 }
 
 // ChainLength returns the number of endpoints in a logical model's fallback
