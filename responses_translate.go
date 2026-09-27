@@ -51,18 +51,22 @@ func toChatMessages(req *responsesRequest) ([]ChatCompletionMessage, error) {
 			if role == "" {
 				role = "user"
 			}
-			text := itemText(it)
-			switch role {
-			case "assistant":
-				if err := flushAssistant(); err != nil {
-					return nil, err
-				}
-				msgs = append(msgs, ChatCompletionMessage{Role: "assistant", Content: text})
-			default:
-				if err := flushAssistant(); err != nil {
-					return nil, err
-				}
-				msgs = append(msgs, ChatCompletionMessage{Role: role, Content: text})
+			if err := flushAssistant(); err != nil {
+				return nil, err
+			}
+			// A message carrying image parts must be emitted with array
+			// content so the upstream sees the multimodal form and the
+			// gateway's vision detection (`"type":"image_url"`) fires. A
+			// text-only message keeps the plain string form, which is what
+			// every provider expects and what token estimation assumes.
+			if parts := it.imageParts(); len(parts) > 0 {
+				msgs = append(msgs, ChatCompletionMessage{
+					Role:      role,
+					Content:   itemText(it),
+					ImageURLs: parts,
+				})
+			} else {
+				msgs = append(msgs, ChatCompletionMessage{Role: role, Content: itemText(it)})
 			}
 		case "function_call":
 			pendingToolCalls = append(pendingToolCalls, ChatCompletionToolCall{
@@ -98,13 +102,32 @@ func toChatMessages(req *responsesRequest) ([]ChatCompletionMessage, error) {
 	return msgs, nil
 }
 
-// itemText extracts the concatenated text content of a message item.
+// itemText extracts the concatenated text content of a message item. Image
+// parts contribute no text, so they are skipped here; item.imageParts is what
+// surfaces them.
 func itemText(it item) string {
 	var sb strings.Builder
 	for _, c := range it.Content {
 		sb.WriteString(c.Text)
 	}
 	return sb.String()
+}
+
+// imageParts returns the image references carried by a message item, in order.
+// Both the string form ("image_url": "https://...") and the object form
+// ("image_url": {"url": "..."}) are accepted, since both appear in the wild.
+func (it item) imageParts() []string {
+	var out []string
+	for _, c := range it.Content {
+		if c.ImageURL == "" {
+			continue
+		}
+		switch c.Type {
+		case "input_image", "image", "image_url", "":
+			out = append(out, string(c.ImageURL))
+		}
+	}
+	return out
 }
 
 // parseInputItems parses the Responses input field, which may be a plain

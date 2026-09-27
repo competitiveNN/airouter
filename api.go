@@ -40,6 +40,14 @@ type ChatCompletionMessage struct {
 	Content   string                   `json:"content"`
 	Name      string                   `json:"name,omitempty"`
 	ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+
+	// ImageURLs holds image references for a multimodal message. When it is
+	// non-empty MarshalJSON emits content as the array form
+	// ([{"type":"text",...},{"type":"image_url",...}]) instead of a bare
+	// string, and drops the separate Content string, since the two forms are
+	// mutually exclusive on the wire. It is populated by the Responses
+	// translation, which is the only surface that produces images.
+	ImageURLs []string `json:"-"`
 }
 
 type ChatCompletionToolCall struct {
@@ -59,14 +67,19 @@ type ChatCompletionToolCall struct {
 // raw JSON blob would massively over-count tokens).
 func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 	var a struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-		Name    string          `json:"name,omitempty"`
+		Role      string                   `json:"role"`
+		Content   json.RawMessage          `json:"content"`
+		Name      string                   `json:"name,omitempty"`
+		ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
 	}
 	if err := json.Unmarshal(data, &a); err != nil {
 		return err
 	}
 	m.Role, m.Name = a.Role, a.Name
+	// ToolCalls must be carried through: a custom UnmarshalJSON that ignores
+	// them silently drops every tool call in a decoded response, which breaks
+	// tool-result round trips on both the chat and Responses surfaces.
+	m.ToolCalls = a.ToolCalls
 	if len(a.Content) == 0 || string(a.Content) == "null" {
 		m.Content = ""
 		return nil
@@ -100,6 +113,34 @@ type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
+// MarshalJSON emits the multimodal array form of content when ImageURLs is
+// populated, and the ordinary string form otherwise.
+func (m ChatCompletionMessage) MarshalJSON() ([]byte, error) {
+	if len(m.ImageURLs) == 0 {
+		return json.Marshal(struct {
+			Role      string                   `json:"role"`
+			Content   string                   `json:"content"`
+			Name      string                   `json:"name,omitempty"`
+			ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+		}{m.Role, m.Content, m.Name, m.ToolCalls})
+	}
+	parts := make([]map[string]any, 0, len(m.ImageURLs)+1)
+	if m.Content != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": m.Content})
+	}
+	for _, u := range m.ImageURLs {
+		parts = append(parts, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": u},
+		})
+	}
+	return json.Marshal(struct {
+		Role      string                   `json:"role"`
+		Content   []map[string]any         `json:"content"`
+		Name      string                   `json:"name,omitempty"`
+		ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+	}{m.Role, parts, m.Name, m.ToolCalls})
+}
 type ChatCompletionResponse struct {
 	ID      string                 `json:"id"`
 	Object  string                 `json:"object"`
