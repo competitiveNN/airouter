@@ -49,6 +49,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", gateway.HandleModels)
 	mux.HandleFunc("/v1/chat/completions", gateway.HandleChatCompletions)
+	mux.HandleFunc("/v1/responses", gateway.HandleResponses)
+	mux.HandleFunc("/v1/responses/ws", gateway.HandleResponsesWebSocket)
 	mux.HandleFunc("/health", gateway.HandleHealth)
 	mux.HandleFunc("/admin/providers", gateway.HandleAdminProviders)
 	mux.HandleFunc("/admin/sessions", gateway.HandleAdminSessions)
