@@ -3418,11 +3418,13 @@ func TestCooldownSaveTimerRace(t *testing.T) {
 }
 
 // TestConcurrentMidStreamErrorRecovery verifies that the mid-stream error
-// recovery feature (catching an error during an active SSE stream, migrating the
-// session to the next fallback model, and resuming streaming without client-
-// visible errors) works correctly when many concurrent requests with the same
-// session ID are in flight simultaneously. Each request should independently
-// fail over to the working backend and receive the correct content.
+// recovery feature (catching an error during an active SSE stream, migrating
+// the session to the next fallback model, and resuming streaming without
+// client-visible errors) works correctly when many concurrent requests are in
+// flight simultaneously. Each request gets its own session (unique body) so it
+// independently fails over backend1 -> backend2; using a shared session ID
+// would be self-defeating because the first failure migrates the session and
+// later requests would skip backend1 entirely.
 func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 	var mu sync.Mutex
 	var backend1Hits int
@@ -3480,9 +3482,6 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 	gateway.SetTestCooldown(200 * time.Millisecond)
 
-	// All requests use the same body → same session ID
-	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
-
 	const n = 15
 	var wg sync.WaitGroup
 	errs := make([]error, n)
@@ -3491,6 +3490,10 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			// Unique body → unique session ID, so each request independently
+			// fails over backend1 -> backend2 without session-migration
+			// interference from concurrent requests.
+			body := fmt.Sprintf(`{"model":"smart","messages":[{"role":"user","content":"hi-%d"}],"stream":true}`, idx)
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 			rec := httptest.NewRecorder()
 			gateway.HandleChatCompletions(rec, req)
@@ -4160,3 +4163,66 @@ func TestParseRetryAfterEdgeCases(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkFallbackLatency measures the time-to-first-response when the head
+// of the chain returns 429 and the gateway must fall back to a healthy model.
+// This is the latency budget the client actually experiences on a degraded
+// upstream; it bounds how long the fallback loop + retry wait can take.
+func BenchmarkFallbackLatency(b *testing.B) {
+		noRotation := 0
+		backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(429)
+			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+		}))
+		defer backend1.Close()
+		backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(ChatCompletionResponse{
+				ID: "ok", Object: "chat.completion", Created: 1,
+				Choices: []ChatCompletionChoice{{Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+			})
+		}))
+		defer backend2.Close()
+
+		cfg := &Config{
+			Preferences: &Preferences{InitialRotationWindow: &noRotation},
+			Providers: map[string]ProviderConfig{
+				"a": {URL: backend1.URL},
+				"b": {URL: backend2.URL},
+			},
+			Models: map[string]ModelConfig{
+				"smart": {Chain: []ModelEndpoint{
+					{Provider: "a", Model: "m1"},
+					{Provider: "b", Model: "m2"},
+				}},
+			},
+		}
+		router := NewRouter(cfg, "")
+		proxy := NewProxy(cfg)
+		gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+		body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			// httptest.NewRequest returns a fresh request with a fresh body
+			// reader each iteration, so we must recreate the request rather
+			// than reuse one (MaxBytesReader wraps r.Body and drains it).
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			gateway.HandleChatCompletions(rec, req)
+			if rec.Code != 200 {
+				// After the first iteration a/m1 is in cooldown (30 s), so the
+				// second request can't fall back. Reset before the next attempt
+				// so every iteration measures the fallback path, not a 503.
+				router.ResetCooldown(&ModelEndpoint{Provider: "a", Model: "m1"})
+				rec2 := httptest.NewRecorder()
+				req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+				gateway.HandleChatCompletions(rec2, req2)
+				if rec2.Code != 200 {
+					b.Fatalf("expected 200 after reset, got %d", rec2.Code)
+				}
+				continue
+			}
+		}
+		}
