@@ -987,7 +987,11 @@ start := time.Now()
 		// requests that share the same session ID.
 		tried[ep.Key()] = true
 		g.recordFallback()
-		g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+		if g.testCooldown > 0 {
+			g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+		} else {
+			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+		}
 		g.recordCooldown()
 		// Mid-stream failure after we already flushed content to the client:
 		// resume on the next model by replaying what the client already received
