@@ -21,16 +21,30 @@ type Metrics struct {
 	cooldownsApplied atomic.Int64
 	latencySumNS     atomic.Int64
 	latencyCount     atomic.Int64
-	mu               sync.RWMutex // protects map initialization
+	// latencyBuckets[i] is the count of requests whose latency fell at or
+	// below the boundary defined by latencyBoundaries[i]. The last bucket
+	// (+Inf) catches everything above the largest finite boundary.
+	latencyBuckets    []atomic.Int64
+	latencyBoundaries []float64 // seconds, e.g. 0.005, 0.01, ..., 10, +Inf
+	mu                sync.RWMutex // protects map initialization
+}
+
+// defaultLatencyBuckets are the standard Prometheus histogram boundaries
+// (seconds). The trailing +Inf bucket is implied and appended at serve time.
+var defaultLatencyBuckets = []float64{
+	0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 }
 
 // NewMetrics creates a new Metrics instance with pre-allocated maps.
 func NewMetrics() *Metrics {
-	return &Metrics{
+	m := &Metrics{
 		requestsByModel:  make(map[string]*atomic.Int64),
 		requestsByStatus: make(map[string]*atomic.Int64),
 		failuresByStatus: make(map[string]*atomic.Int64),
 	}
+	m.latencyBoundaries = defaultLatencyBuckets
+	m.latencyBuckets = make([]atomic.Int64, len(defaultLatencyBuckets)+1) // +1 for +Inf
+	return m
 }
 
 // counter returns the atomic counter for the given key, creating it on first
@@ -92,8 +106,17 @@ func (m *Metrics) Request(model string, status int, latency time.Duration) {
 		m.failuresTotal.Add(1)
 		m.counterFailure("failures_by_status_" + strconv.Itoa(status)).Add(1)
 	}
+	secs := latency.Seconds()
 	m.latencySumNS.Add(latency.Nanoseconds())
 	m.latencyCount.Add(1)
+	// Histogram: increment every bucket whose boundary is >= latency.
+	// The last bucket (+Inf) always catches the value.
+	for i, bound := range m.latencyBoundaries {
+		if secs <= bound {
+			m.latencyBuckets[i].Add(1)
+		}
+	}
+	m.latencyBuckets[len(m.latencyBuckets)-1].Add(1) // +Inf
 }
 
 // Fallback records a model fallback during request processing.
@@ -138,13 +161,19 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE airouter_cooldowns_applied_total counter")
 	fmt.Fprintf(w, "airouter_cooldowns_applied_total %d\n", m.cooldownsApplied.Load())
 
-	fmt.Fprintln(w, "# HELP airouter_request_duration_seconds Request latency histogram (sum/count)")
-	fmt.Fprintln(w, "# TYPE airouter_request_duration_seconds gauge")
+	// Latency histogram (Prometheus _bucket / _sum / _count).
+	fmt.Fprintln(w, "# HELP airouter_request_duration_seconds Request latency in seconds")
+	fmt.Fprintln(w, "# TYPE airouter_request_duration_seconds histogram")
+	for i, bound := range m.latencyBoundaries {
+		fmt.Fprintf(w, "airouter_request_duration_seconds_bucket{le=\"%g\"} %d\n",
+			bound, m.latencyBuckets[i].Load())
+	}
+	fmt.Fprintf(w, "airouter_request_duration_seconds_bucket{le=\"+Inf\"} %d\n",
+		m.latencyBuckets[len(m.latencyBuckets)-1].Load())
 	count := m.latencyCount.Load()
 	if count > 0 {
 		sum := float64(m.latencySumNS.Load()) / 1e9
 		fmt.Fprintf(w, "airouter_request_duration_seconds_sum %f\n", sum)
 		fmt.Fprintf(w, "airouter_request_duration_seconds_count %d\n", count)
-		fmt.Fprintf(w, "airouter_request_duration_seconds %f\n", sum/float64(count))
 	}
 }
