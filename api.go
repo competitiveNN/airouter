@@ -202,10 +202,18 @@ type Model struct {
 	Object       string `json:"object"`
 	Created      int64  `json:"created"`
 	OwnedBy      string `json:"owned_by"`
-	// MaxTokens is the advertised output-token ceiling for this logical
-	// model, derived from the smallest context window in its fallback chain.
-	// A zero value means unknown and is omitted from the JSON.
-	MaxTokens *int `json:"max_tokens,omitempty"`
+	// MaxContextTokens is the advertised context window (input capacity) of
+	// this logical model, in tokens. It is derived from the smallest
+	// context_length in the fallback chain, so it is safe for every backend
+	// the profile might relay to, including fallbacks after a failure.
+	//
+	// It is deliberately NOT named max_tokens: in OpenAI's chat-completions
+	// API max_tokens means the OUTPUT ceiling, and we have no output-token
+	// data for any backend (the upstream model lists don't publish one, and
+	// neither does OpenAI's own /v1/models schema). Putting the context
+	// window under max_tokens would be a lie the first time a client used it
+	// to bound its generation.
+	MaxContextTokens *int `json:"max_context_tokens,omitempty"`
 }
 
 type GatewayContext struct {
@@ -480,12 +488,14 @@ func (g *GatewayContext) HandleModels(w http.ResponseWriter, r *http.Request) {
 			Created: now,
 			OwnedBy: "airouter",
 		}
-		// Advertise the conservative output-token ceiling: the smallest
-		// context window in the fallback chain. This is the value that is
+		// Advertise the conservative context window: the smallest
+		// context_length in the fallback chain. This is the value that is
 		// safe for EVERY backend the profile might relay to, including
-		// fallbacks after a failure. Telling the client a larger number
-		// would be a lie the first time the request falls through to a
-		// smaller model.
+		// fallbacks after a failure. It is exposed as
+		// max_context_tokens (not max_tokens) because we have no
+		// output-token data for any backend — the upstream model lists
+		// don't publish one, and neither does OpenAI's own /v1/models
+		// schema.
 		chain, ok := cfg.Models[name]
 		if ok {
 			var minCtx int
@@ -499,7 +509,7 @@ func (g *GatewayContext) HandleModels(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if minCtx > 0 {
-				m.MaxTokens = &minCtx
+				m.MaxContextTokens = &minCtx
 			}
 		}
 		models = append(models, m)
