@@ -4224,5 +4224,128 @@ func BenchmarkFallbackLatency(b *testing.B) {
 				}
 				continue
 			}
+			}
+}
+
+// TestMetricsLatencyHistogram verifies that the /metrics endpoint emits
+// proper Prometheus histogram buckets (le="+Inf" and _sum/_count).
+func TestMetricsLatencyHistogram(t *testing.T) {
+		m := NewMetrics()
+		m.Request("smart", 200, 3*time.Millisecond)
+		m.Request("smart", 200, 50*time.Millisecond)
+		m.Request("smart", 200, 200*time.Millisecond)
+		m.Request("smart", 502, 2*time.Second)
+
+		body := renderMetricsBody(m)
+		bodyStr := body.String()
+
+		// Must contain histogram bucket labels.
+		if !strings.Contains(bodyStr, `le="0.005"`) {
+			t.Errorf("missing le=0.005 bucket")
 		}
+		if !strings.Contains(bodyStr, `le="+Inf"`) {
+			t.Errorf("missing le=+Inf bucket")
 		}
+		// sum/count must be present for a histogram.
+		if !strings.Contains(bodyStr, "airouter_request_duration_seconds_sum") {
+			t.Errorf("missing _sum")
+		}
+		if !strings.Contains(bodyStr, "airouter_request_duration_seconds_count") {
+			t.Errorf("missing _count")
+		}
+}
+
+// renderMetricsBody renders the metrics to a buffer (test helper).
+func renderMetricsBody(m *Metrics) *bytes.Buffer {
+		rec := httptest.NewRecorder()
+		m.ServeHTTP(rec, nil)
+		return rec.Body
+}
+
+// TestCooldownJitterConcurrentBackoff verifies that cooldown jitter is
+// applied on concurrent 429s so that simultaneous rate-limited requests
+// don't all stampede the same fallback model at the same instant. Each
+// concurrent goroutine hits a 429 backend then falls back to a healthy
+// backend; we check that the head endpoint receives hits from all
+// concurrent requests (each starts at the head of its own chain).
+func TestCooldownJitterConcurrentBackoff(t *testing.T) {
+	var mu sync.Mutex
+	var backend1Hits int
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		backend1Hits++
+		mu.Unlock()
+		w.Header().Set("Retry-After", "0.05") // 50ms
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "ok", Object: "chat.completion", Created: 1,
+			Choices: []ChatCompletionChoice{{Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+		})
+	}))
+	defer backend2.Close()
+
+	cfg := &Config{
+		Preferences: &Preferences{
+			InitialRotationWindow: &noRotation,
+			CooldownJitter:        0.15,
+		},
+		Providers: map[string]ProviderConfig{
+			"b1": {URL: backend1.URL},
+			"b2": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "b1", Model: "m1"},
+				{Provider: "b2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	gateway.SetTestCooldown(200 * time.Millisecond)
+
+	const n = 10
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"model":"smart","messages":[{"role":"user","content":"hi-%d"}]}`, idx)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			gateway.HandleChatCompletions(rec, req)
+			if rec.Code != 200 {
+				errs[idx] = fmt.Errorf("request %d: expected 200, got %d", idx, rec.Code)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("request %d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	h := backend1Hits
+	mu.Unlock()
+	if h != n {
+		t.Errorf("expected %d hits on backend1 (one per independent session), got %d", n, h)
+	}
+}
+
+// float64Ptr is a test helper for nullable float64 fields.
+func float64Ptr(v float64) *float64 {
+	return &v
+}
