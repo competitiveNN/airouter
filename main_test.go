@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -4372,4 +4373,111 @@ func TestCooldownJitterConcurrentBackoff(t *testing.T) {
 // float64Ptr is a test helper for nullable float64 fields.
 func float64Ptr(v float64) *float64 {
 	return &v
+}
+
+// TestCooldownPersistenceAudit verifies that cooldown state survives a
+// router restart: a failure recorded in router A is persisted to disk, and
+// a freshly constructed router B (pointing at the same file) loads the
+// cooldown and refuses to route to the failed endpoint.
+func TestCooldownPersistenceAudit(t *testing.T) {
+	dir := t.TempDir()
+	cooldownPath := filepath.Join(dir, "cooldowns.json")
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers:   map[string]ProviderConfig{"p": {URL: "https://p"}},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p", Model: "m1"},
+				{Provider: "p", Model: "m2"},
+			}},
+		},
+	}
+
+	// Router A: record a failure and persist it.
+	routerA := NewRouter(cfg, cooldownPath)
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+	routerA.ApplyCooldownForSession(ep, 429, "rate limited", "sess", 0)
+	// Force an immediate flush (the 5s batch timer would otherwise delay it).
+	routerA.saveCooldowns()
+
+	// The persisted file must exist and contain the cooldown.
+	data, err := os.ReadFile(cooldownPath)
+	if err != nil {
+		t.Fatalf("cooldown file not written: %v", err)
+	}
+	var loaded map[string]CooldownEntry
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("cooldown file not valid JSON: %v", err)
+	}
+	if _, ok := loaded[ep.Key()]; !ok {
+		t.Fatalf("cooldown for %s not persisted: %s", ep.Key(), string(data))
+	}
+
+	// Router B: freshly constructed from the same file must load the cooldown.
+	routerB := NewRouter(cfg, cooldownPath)
+	if routerB.IsAvailable(ep) {
+		t.Errorf("expected %s to be unavailable after restart (cooldown persisted)", ep.Key())
+	}
+
+	// The fallback endpoint must still be available.
+	ep2 := &ModelEndpoint{Provider: "p", Model: "m2"}
+	if !routerB.IsAvailable(ep2) {
+		t.Errorf("expected %s to be available after restart", ep2.Key())
+	}
+
+	// Expired cooldowns must NOT survive restart.
+	routerA.ResetCooldown(ep)
+	routerA.saveCooldowns()
+	routerC := NewRouter(cfg, cooldownPath)
+	if !routerC.IsAvailable(ep) {
+		t.Errorf("expected %s to be available after reset + restart", ep.Key())
+	}
+}
+
+// TestCooldownPersistenceAtomicWrite verifies that a crash mid-write cannot
+// leave a truncated cooldowns.json: the file is written to a temp file and
+// renamed, so a partial write is never observed by a subsequent load.
+func TestCooldownPersistenceAtomicWrite(t *testing.T) {
+	dir := t.TempDir()
+	cooldownPath := filepath.Join(dir, "cooldowns.json")
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers:   map[string]ProviderConfig{"p": {URL: "https://p"}},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p", Model: "m1"},
+				{Provider: "p", Model: "m2"},
+			}},
+		},
+	}
+
+	router := NewRouter(cfg, cooldownPath)
+	router.ApplyCooldownForSession(&ModelEndpoint{Provider: "p", Model: "m1"}, 429, "rl", "sess", 0)
+	router.saveCooldowns()
+
+	// The file must be valid JSON (atomic rename guarantees this).
+	data, err := os.ReadFile(cooldownPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var loaded map[string]CooldownEntry
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("cooldowns.json is not valid JSON after atomic write: %v", err)
+	}
+	if len(loaded) == 0 {
+		t.Fatalf("expected at least one persisted cooldown")
+	}
+
+	// No leftover temp files should exist.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".cooldowns-") {
+			t.Errorf("leftover temp file after atomic write: %s", e.Name())
+		}
+	}
 }
