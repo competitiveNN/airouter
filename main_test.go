@@ -4282,6 +4282,27 @@ func renderMetricsBody(m *Metrics) *bytes.Buffer {
 		return rec.Body
 }
 
+// TestMetricsPerEndpointFallback verifies that the per-endpoint fallback
+// counter is tracked and emitted correctly.
+func TestMetricsPerEndpointFallback(t *testing.T) {
+		m := NewMetrics()
+		m.Fallback("backend1/m1")
+		m.Fallback("backend1/m1")
+		m.Fallback("backend2/m2")
+
+		bodyStr := renderMetricsBody(m).String()
+
+		if !strings.Contains(bodyStr, `airouter_fallbacks_total_by_endpoint{endpoint="backend1/m1"} 2`) {
+			t.Errorf("missing or incorrect backend1/m1 fallback count")
+		}
+		if !strings.Contains(bodyStr, `airouter_fallbacks_total_by_endpoint{endpoint="backend2/m2"} 1`) {
+			t.Errorf("missing or incorrect backend2/m2 fallback count")
+		}
+		if !strings.Contains(bodyStr, "airouter_fallbacks_total") {
+			t.Errorf("missing airouter_fallbacks_total")
+		}
+}
+
 // TestCooldownJitterConcurrentBackoff verifies that cooldown jitter is
 // applied on concurrent 429s so that simultaneous rate-limited requests
 // don't all stampede the same fallback model at the same instant. Each
@@ -4479,5 +4500,101 @@ func TestCooldownPersistenceAtomicWrite(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".cooldowns-") {
 			t.Errorf("leftover temp file after atomic write: %s", e.Name())
 		}
+	}
+}
+
+// TestChaosBackendKilledMidStream verifies the core requirement: when a
+// backend dies mid-stream (connection closed without [DONE] or an SSE error
+// event), the gateway catches the failure, migrates the session to the next
+// model, and resumes streaming without the client ever seeing an error.
+//
+// Unlike TestConcurrentMidStreamErrorRecovery (which uses an explicit SSE
+// error event), this test closes the connection abruptly to simulate a
+// real backend crash — the most adversarial failure mode the gateway must
+// survive.
+func TestChaosBackendKilledMidStream(t *testing.T) {
+	var mu sync.Mutex
+	var backend1Hits int
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		backend1Hits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"id":"b1","object":"chat.completion.chunk","created":1,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello "},"finish_reason":null}]}`+"\n\n")
+		flusher.Flush()
+		// Abruptly close the connection without [DONE] — simulates a crash.
+		// Returning without flushing [DONE] causes the client to see an
+		// io.ErrUnexpectedEOF, which the gateway treats as a mid-stream
+		// failure and falls back from.
+		hijacker, ok := w.(http.Hijacker)
+		if ok {
+			hConn, _, _ := hijacker.Hijack()
+			hConn.Close()
+			return
+		}
+		// Fallback: just return without [DONE]; httptest will close the
+		// connection, producing the same effect.
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"id":"b2","object":"chat.completion.chunk","created":2,"model":"gpt-4-turbo","choices":[{"index":0,"delta":{"content":"World"},"finish_reason":null}]}`+"\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, `data: [DONE]`+"\n\n")
+		flusher.Flush()
+	}))
+	defer backend2.Close()
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers: map[string]ProviderConfig{
+			"backend1": {URL: backend1.URL},
+			"backend2": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "backend1", Model: "gpt-4"},
+				{Provider: "backend2", Model: "gpt-4-turbo"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	gateway.SetTestCooldown(200 * time.Millisecond)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	resp := rec.Body.String()
+	if !strings.Contains(resp, "Hello ") {
+		t.Errorf("expected 'Hello ' in response, got: %s", resp)
+	}
+	if !strings.Contains(resp, "World") {
+		t.Errorf("expected 'World' in response, got: %s", resp)
+	}
+	if !strings.Contains(resp, "[DONE]") {
+		t.Errorf("expected [DONE] in response, got: %s", resp)
+	}
+	if strings.Contains(resp, `"error"`) {
+		t.Errorf("client should not see error, but got: %s", resp)
+	}
+
+	mu.Lock()
+	hits := backend1Hits
+	mu.Unlock()
+	if hits < 1 {
+		t.Errorf("expected at least 1 hit on backend1, got %d", hits)
 	}
 }
