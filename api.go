@@ -198,10 +198,14 @@ type ModelListResponse struct {
 }
 
 type Model struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID           string `json:"id"`
+	Object       string `json:"object"`
+	Created      int64  `json:"created"`
+	OwnedBy      string `json:"owned_by"`
+	// MaxTokens is the advertised output-token ceiling for this logical
+	// model, derived from the smallest context window in its fallback chain.
+	// A zero value means unknown and is omitted from the JSON.
+	MaxTokens *int `json:"max_tokens,omitempty"`
 }
 
 type GatewayContext struct {
@@ -466,15 +470,39 @@ func (g *GatewayContext) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cfg := g.config.Load()
 	models := make([]Model, 0, len(LogicalModels))
 	now := time.Now().Unix()
 	for _, name := range LogicalModels {
-		models = append(models, Model{
+		m := Model{
 			ID:      name,
 			Object:  "model",
 			Created: now,
 			OwnedBy: "airouter",
-		})
+		}
+		// Advertise the conservative output-token ceiling: the smallest
+		// context window in the fallback chain. This is the value that is
+		// safe for EVERY backend the profile might relay to, including
+		// fallbacks after a failure. Telling the client a larger number
+		// would be a lie the first time the request falls through to a
+		// smaller model.
+		chain, ok := cfg.Models[name]
+		if ok {
+			var minCtx int
+			for _, ep := range chain.Chain {
+				w := ep.ContextWindow()
+				if w <= 0 {
+					continue
+				}
+				if minCtx == 0 || w < minCtx {
+					minCtx = w
+				}
+			}
+			if minCtx > 0 {
+				m.MaxTokens = &minCtx
+			}
+		}
+		models = append(models, m)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

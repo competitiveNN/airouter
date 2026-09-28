@@ -227,6 +227,22 @@ nothing populated or read them. All three are now wired end-to-end with tests.
   TestPreferencesCooldownJitterFraction,
   TestConfigWiresCooldownJitterToRouter.
 
+## /v1/models advertises a max_tokens ceiling (2026-09-28)
+
+- `ModelEndpoint` gained a `ContextLength int` field (yaml `context_length`),
+  parsed from config.yaml and surfaced via `ContextWindow()`.
+- `HandleModels` derives each logical model's `max_tokens` as the **smallest**
+  context window in its fallback chain. This is the conservative value that is
+  safe for every backend the profile might relay to, including fallbacks after
+  a failure — telling the client a larger number would be a lie the first time
+  the request falls through to a smaller model.
+- `regenerate_config.py` now emits `context_length` as a real YAML field
+  (previously it was only a trailing comment, so the Go side never saw it).
+  The `large` profile — whose entire purpose is large-context work — is the
+  main beneficiary: it now advertises a real ceiling instead of nothing.
+- Test: `TestHandleModelsAdvertisesMaxTokens` verifies min-of-chain
+  semantics, single-endpoint chains, and the absent-field case.
+
 ## Circuit breaker (2026-09-28) — closed/open/half-open state machine
 
 Replaces the ad-hoc cooldown escalation with a proper circuit breaker that
@@ -338,7 +354,7 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestParseRetryAfterEdgeCases  (new, 2026-09-28)
 
 ## Test summary
-  `go test -race ./...` → 153 passed, 0 failed (2026-09-28)
+  `go test -race ./...` → 155 passed, 0 failed (2026-09-28)
   Both previously-flaky tests now stable:
   - TestHandleStream_ResourceCleanup — passes in full suite
   - TestConcurrentMidStreamErrorRecovery — fixed to only assert the replay
