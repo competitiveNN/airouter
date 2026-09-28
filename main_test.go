@@ -1360,14 +1360,94 @@ func TestHandleModels(t *testing.T) {
 		t.Errorf("expected 4 models, got %d", len(result.Data))
 	}
 
-	modelMap := make(map[string]bool)
+	modelMap := make(map[string]Model)
 	for _, m := range result.Data {
-		modelMap[m.ID] = true
+		modelMap[m.ID] = m
 	}
 	for _, expected := range LogicalModels {
-		if !modelMap[expected] {
+		if _, ok := modelMap[expected]; !ok {
 			t.Errorf("expected model %s in response", expected)
 		}
+	}
+
+	// The advertised max_tokens must be the smallest context window in the
+	// chain, so a client never plans for more than every backend can serve.
+	// loadTestConfig sets no context windows, so the field must be absent.
+	for _, m := range result.Data {
+		if m.MaxTokens != nil {
+			t.Errorf("model %s: expected nil MaxTokens with no ctx configured, got %d", m.ID, *m.MaxTokens)
+		}
+	}
+}
+
+// TestHandleModelsAdvertisesMaxTokens verifies that /v1/models surfaces a
+// max_tokens ceiling derived from the fallback chain's smallest context
+// window. This is the conservative value that is safe for every backend the
+// profile might relay to, including fallbacks after a failure.
+func TestHandleModelsAdvertisesMaxTokens(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"openai": {URL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {
+				Chain: []ModelEndpoint{
+					{Provider: "openai", Model: "gpt-4", ContextLength: 128000},
+					{Provider: "openai", Model: "gpt-4-turbo", ContextLength: 200000},
+					{Provider: "openai", Model: "gpt-3.5-turbo", ContextLength: 16384},
+				},
+			},
+			"large": {
+				Chain: []ModelEndpoint{
+					{Provider: "openai", Model: "gpt-4-turbo", ContextLength: 200000},
+					{Provider: "openai", Model: "gpt-4", ContextLength: 128000},
+				},
+			},
+			"work": {
+				Chain: []ModelEndpoint{
+					{Provider: "openai", Model: "gpt-4", ContextLength: 128000},
+				},
+			},
+			"fast": {
+				Chain: []ModelEndpoint{
+					{Provider: "openai", Model: "gpt-3.5-turbo"}, // no ctx reported
+				},
+			},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	gateway.HandleModels(rec, req)
+
+	var result ModelListResponse
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	byID := make(map[string]Model)
+	for _, m := range result.Data {
+		byID[m.ID] = m
+	}
+
+	// smart: min(128000, 200000, 16384) = 16384
+	if byID["smart"].MaxTokens == nil || *byID["smart"].MaxTokens != 16384 {
+		t.Errorf("smart: expected max_tokens=16384, got %v", byID["smart"].MaxTokens)
+	}
+	// large: min(200000, 128000) = 128000
+	if byID["large"].MaxTokens == nil || *byID["large"].MaxTokens != 128000 {
+		t.Errorf("large: expected max_tokens=128000, got %v", byID["large"].MaxTokens)
+	}
+	// work: only one endpoint, 128000
+	if byID["work"].MaxTokens == nil || *byID["work"].MaxTokens != 128000 {
+		t.Errorf("work: expected max_tokens=128000, got %v", byID["work"].MaxTokens)
+	}
+	// fast: no ctx reported -> field absent
+	if byID["fast"].MaxTokens != nil {
+		t.Errorf("fast: expected nil MaxTokens, got %d", *byID["fast"].MaxTokens)
 	}
 }
 

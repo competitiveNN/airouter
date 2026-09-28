@@ -40,12 +40,15 @@
 # only to vision-capable models). The trailing auto-fallback meta-router is treated
 # as vision-capable (vision: true).
 #
-# Models carry their approximate quality score (intelligence benchmark) and context
-# window (ctx, in tokens) in trailing comments. `elo=` shows the arena.ai code
-# leaderboard ELO when present. Context 0 means "not reported by the source".
-# The score is also emitted as a real `intelligence:` field on every concrete
-# endpoint, which the gateway reads for initial-model rotation (see
-# preferences.initial_rotation_window below).
+# Models carry their approximate quality score (intelligence benchmark) and
+# context window (ctx, in tokens). The score is emitted as a real
+# `intelligence:` field on every concrete endpoint, which the gateway reads
+# for initial-model rotation (see preferences.initial_rotation_window
+# below). The context window is emitted as a real `context_length:` field
+# and surfaced to clients as the logical model's `max_tokens` ceiling in
+# /v1/models: the value advertised is the SMALLEST context window in the
+# chain, so a client never plans for more output than every backend the
+# profile might relay to (including fallbacks after a failure) can serve.
 
 providers:
   nvidia:
@@ -131,14 +134,17 @@ models:
         model: z-ai/glm-5.3  # 44.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 44.8
+        context_length: 131072
       - provider: nvidia2
         model: z-ai/glm-5.3  # 44.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 44.8
+        context_length: 131072
       - provider: nvidia3
         model: z-ai/glm-5.3  # 44.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 44.8
+        context_length: 131072
       - provider: nvidia
         model: moonshotai/kimi-k3  # 43.6  elo=1660
         vision: false
@@ -155,14 +161,17 @@ models:
         model: z-ai/glm-5.3-flash  # 41.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 41.8
+        context_length: 131072
       - provider: nvidia2
         model: z-ai/glm-5.3-flash  # 41.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 41.8
+        context_length: 131072
       - provider: nvidia3
         model: z-ai/glm-5.3-flash  # 41.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 41.8
+        context_length: 131072
       - provider: opencode
         model: muse-spark-1.2-contributor-free  # 39.6
         vision: false
@@ -171,30 +180,37 @@ models:
         model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621  131,072 ctx
         vision: false
         intelligence: 39.5
+        context_length: 131072
       - provider: nvidia2
         model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621  131,072 ctx
         vision: false
         intelligence: 39.5
+        context_length: 131072
       - provider: nvidia3
         model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621  131,072 ctx
         vision: false
         intelligence: 39.5
+        context_length: 131072
       - provider: opencode
         model: deepseek-v4-flash-free  # 34.3  131,072 ctx
         vision: false
         intelligence: 34.3
+        context_length: 131072
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1672  262,144 ctx
         vision: true
         intelligence: 33.7
+        context_length: 262144
       - provider: ollama
         model: minimax-m3  # 29.2  262,144 ctx
         vision: false
         intelligence: 29.2
+        context_length: 262144
       - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
         intelligence: 27.8
+        context_length: 1048576
       - provider: nvidia
         model: moonshotai/kimi-k2.6  # 27.0
         vision: false
@@ -211,10 +227,12 @@ models:
         model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
         intelligence: 25.0
+        context_length: 262144
       - provider: kilocode
         model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
         intelligence: 25.0
+        context_length: 262144
       - provider: opencode
         model: mimo-v2.6-flash-free  # 25.0  floor
         vision: false
@@ -223,14 +241,17 @@ models:
         model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 256000
       - provider: commandcode2
         model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 256000
       - provider: kilocode
         model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
         vision: true
         intelligence: 25.0
+        context_length: 512000
       - provider: opencode
         model: space-bunny-free  # 25.0  floor
         vision: false
@@ -243,13 +264,16 @@ models:
         model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 1000000
       - provider: commandcode2
         model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 1000000
       - provider: opencode
         model: big-pickle  # last: opencode dominates (6 vs 5)
         vision: true
+        context_length: 131072
   work:
     chain:
       - provider: opencode
@@ -260,14 +284,17 @@ models:
         model: z-ai/glm-5.3  # 44.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 44.8
+        context_length: 131072
       - provider: nvidia2
         model: z-ai/glm-5.3  # 44.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 44.8
+        context_length: 131072
       - provider: nvidia3
         model: z-ai/glm-5.3  # 44.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 44.8
+        context_length: 131072
       - provider: nvidia
         model: moonshotai/kimi-k3  # 43.6  elo=1660
         vision: false
@@ -284,14 +311,17 @@ models:
         model: z-ai/glm-5.3-flash  # 41.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 41.8
+        context_length: 131072
       - provider: nvidia2
         model: z-ai/glm-5.3-flash  # 41.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 41.8
+        context_length: 131072
       - provider: nvidia3
         model: z-ai/glm-5.3-flash  # 41.8  elo=1619  131,072 ctx
         vision: false
         intelligence: 41.8
+        context_length: 131072
       - provider: opencode
         model: muse-spark-1.2-contributor-free  # 39.6
         vision: false
@@ -300,30 +330,37 @@ models:
         model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621  131,072 ctx
         vision: false
         intelligence: 39.5
+        context_length: 131072
       - provider: nvidia2
         model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621  131,072 ctx
         vision: false
         intelligence: 39.5
+        context_length: 131072
       - provider: nvidia3
         model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621  131,072 ctx
         vision: false
         intelligence: 39.5
+        context_length: 131072
       - provider: opencode
         model: deepseek-v4-flash-free  # 34.3  131,072 ctx
         vision: false
         intelligence: 34.3
+        context_length: 131072
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1672  262,144 ctx
         vision: true
         intelligence: 33.7
+        context_length: 262144
       - provider: ollama
         model: minimax-m3  # 29.2  262,144 ctx
         vision: false
         intelligence: 29.2
+        context_length: 262144
       - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
         intelligence: 27.8
+        context_length: 1048576
       - provider: nvidia
         model: moonshotai/kimi-k2.6  # 27.0
         vision: false
@@ -340,10 +377,12 @@ models:
         model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
         intelligence: 25.0
+        context_length: 262144
       - provider: kilocode
         model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
         intelligence: 25.0
+        context_length: 262144
       - provider: opencode
         model: mimo-v2.6-flash-free  # 25.0  floor
         vision: false
@@ -352,14 +391,17 @@ models:
         model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 256000
       - provider: commandcode2
         model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 256000
       - provider: kilocode
         model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
         vision: true
         intelligence: 25.0
+        context_length: 512000
       - provider: opencode
         model: space-bunny-free  # 25.0  floor
         vision: false
@@ -372,50 +414,62 @@ models:
         model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 1000000
       - provider: commandcode2
         model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 1000000
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: commandcode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: commandcode2
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: opencode
         model: nemotron-3-ultra-free  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: ollama
         model: nemotron-3-ultra  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia2
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia3
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
         vision: false
         intelligence: 22.6
+        context_length: 262144
       - provider: opencode
         model: ling-3.0-flash-fin-free  # 22.6
         vision: false
@@ -424,26 +478,32 @@ models:
         model: gemini-flash-lite-latest  # 22.2  1,048,576 ctx
         vision: true
         intelligence: 22.2
+        context_length: 1048576
       - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 19.5  262,144 ctx
         vision: true
         intelligence: 19.5
+        context_length: 262144
       - provider: commandcode
         model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
         vision: false
         intelligence: 19.1
+        context_length: 1048576
       - provider: commandcode2
         model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
         vision: false
         intelligence: 19.1
+        context_length: 1048576
       - provider: ollama
         model: gemma4:31b  # 19.0  262,144 ctx
         vision: true
         intelligence: 19.0
+        context_length: 262144
       - provider: gemini
         model: gemma-4-31b-it  # 19.0  262,144 ctx
         vision: false
         intelligence: 19.0
+        context_length: 262144
       - provider: nvidia
         model: google/gemma-4-31b-it  # 19.0
         vision: false
@@ -472,55 +532,68 @@ models:
         model: gemma-4-26b-a4b-it  # 16.7  262,144 ctx
         vision: false
         intelligence: 16.7
+        context_length: 262144
       - provider: kilocode
         model: kilo-auto/free  # last: kilocode dominates (9 vs 8)
         vision: true
+        context_length: 131072
   fast:
     chain:
       - provider: kilocode
         model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
         intelligence: 25.0
+        context_length: 262144
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: commandcode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: commandcode2
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: opencode
         model: nemotron-3-ultra-free  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: ollama
         model: nemotron-3-ultra  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia2
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia3
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
         vision: false
         intelligence: 22.6
+        context_length: 262144
       - provider: opencode
         model: ling-3.0-flash-fin-free  # 22.6
         vision: false
@@ -529,167 +602,209 @@ models:
         model: gemini-flash-lite-latest  # 22.2  1,048,576 ctx
         vision: true
         intelligence: 22.2
+        context_length: 1048576
       - provider: kilocode
         model: kilo-auto/free  # last: kilocode dominates (4 vs 2)
         vision: true
+        context_length: 131072
   large:
     chain:
       - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 27.8  1,048,576 ctx
         vision: true
         intelligence: 27.8
+        context_length: 1048576
       - provider: gemini
         model: gemini-flash-lite-latest  # 22.2  1,048,576 ctx
         vision: true
         intelligence: 22.2
+        context_length: 1048576
       - provider: commandcode
         model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
         vision: false
         intelligence: 19.1
+        context_length: 1048576
       - provider: commandcode2
         model: meituan/longcat-2.0-free  # 19.1  1,048,576 ctx
         vision: false
         intelligence: 19.1
+        context_length: 1048576
       - provider: commandcode
         model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 1000000
       - provider: commandcode2
         model: stealth/space-bunny-alpha  # 25.0  floor  1,000,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 1000000
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: opencode
         model: nemotron-3-ultra-free  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: ollama
         model: nemotron-3-ultra  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia2
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: nvidia3
         model: nvidia/nemotron-3-ultra-550b-a55b  # 22.9  1,000,000 ctx
         vision: false
         intelligence: 22.9
+        context_length: 1000000
       - provider: kilocode
         model: nvidia/nemotron-3.5-lightning:free  # 12.9  1,000,000 ctx
         vision: false
         intelligence: 12.9
+        context_length: 1000000
       - provider: kilocode
         model: dots-studio/dots-3-note-preview:free  # 25.0  floor  512,000 ctx
         vision: true
         intelligence: 25.0
+        context_length: 512000
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1672  262,144 ctx
         vision: true
         intelligence: 33.7
+        context_length: 262144
       - provider: ollama
         model: minimax-m3  # 29.2  262,144 ctx
         vision: false
         intelligence: 29.2
+        context_length: 262144
       - provider: kilocode
         model: poolside/laguna-s-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
         intelligence: 25.0
+        context_length: 262144
       - provider: kilocode
         model: poolside/laguna-xs-2.1:free  # 25.0  floor  262,144 ctx
         vision: false
         intelligence: 25.0
+        context_length: 262144
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: commandcode
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: commandcode2
         model: inclusionai/ling-3.0-flash-sante:free  # 24.9  262,144 ctx
         vision: false
         intelligence: 24.9
+        context_length: 262144
       - provider: kilocode
         model: inclusionai/ling-3.0-flash-fin:free  # 22.6  262,144 ctx
         vision: false
         intelligence: 22.6
+        context_length: 262144
       - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 19.5  262,144 ctx
         vision: true
         intelligence: 19.5
+        context_length: 262144
       - provider: ollama
         model: gemma4:31b  # 19.0  262,144 ctx
         vision: true
         intelligence: 19.0
+        context_length: 262144
       - provider: gemini
         model: gemma-4-31b-it  # 19.0  262,144 ctx
         vision: false
         intelligence: 19.0
+        context_length: 262144
       - provider: gemini
         model: gemma-4-26b-a4b-it  # 16.7  262,144 ctx
         vision: false
         intelligence: 16.7
+        context_length: 262144
       - provider: ollama
         model: nemotron-3-super  # 12.8  262,144 ctx
         vision: false
         intelligence: 12.8
+        context_length: 262144
       - provider: kilocode
         model: nvidia/nemotron-3-super-120b-a12b:free  # 12.8  262,144 ctx
         vision: false
         intelligence: 12.8
+        context_length: 262144
       - provider: nvidia
         model: nvidia/nemotron-3-super-120b-a12b  # 12.8  262,144 ctx
         vision: false
         intelligence: 12.8
+        context_length: 262144
       - provider: nvidia2
         model: nvidia/nemotron-3-super-120b-a12b  # 12.8  262,144 ctx
         vision: false
         intelligence: 12.8
+        context_length: 262144
       - provider: nvidia3
         model: nvidia/nemotron-3-super-120b-a12b  # 12.8  262,144 ctx
         vision: false
         intelligence: 12.8
+        context_length: 262144
       - provider: nvidia
         model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
         vision: true
         intelligence: 10.3
+        context_length: 262144
       - provider: nvidia2
         model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
         vision: true
         intelligence: 10.3
+        context_length: 262144
       - provider: nvidia3
         model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.3  262,144 ctx
         vision: true
         intelligence: 10.3
+        context_length: 262144
       - provider: gemini
         model: gemma-4-2b-it  # 7.8  262,144 ctx
         vision: false
         intelligence: 7.8
+        context_length: 262144
       - provider: commandcode
         model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 256000
       - provider: commandcode2
         model: poolside/laguna-s-2.1-free  # 25.0  floor  256,000 ctx
         vision: false
         intelligence: 25.0
+        context_length: 256000
       - provider: kilocode
         model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  # 10.3  256,000 ctx
         vision: true
         intelligence: 10.3
+        context_length: 256000
       - provider: kilocode
         model: cohere/north-mini-code:free  # 9.9  256,000 ctx
         vision: false
         intelligence: 9.9
+        context_length: 256000
       - provider: kilocode
         model: kilo-auto/free  # last: kilocode dominates (13 vs 1)
         vision: true
+        context_length: 131072
