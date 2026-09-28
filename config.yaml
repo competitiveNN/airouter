@@ -45,10 +45,13 @@
 # `intelligence:` field on every concrete endpoint, which the gateway reads
 # for initial-model rotation (see preferences.initial_rotation_window
 # below). The context window is emitted as a real `context_length:` field
-# and surfaced to clients as the logical model's `max_tokens` ceiling in
-# /v1/models: the value advertised is the SMALLEST context window in the
-# chain, so a client never plans for more output than every backend the
-# profile might relay to (including fallbacks after a failure) can serve.
+# and surfaced to clients as the logical model's `max_context_tokens`
+# floor in /v1/models: the value advertised is the SMALLEST context window
+# in the chain, so a client never plans for more input than every backend
+# the profile might relay to (including fallbacks after a failure) can
+# accept. It is NOT max_tokens (output ceiling): the upstream model lists
+# publish no output-token data for any backend, and neither does OpenAI's
+# own /v1/models schema.
 
 providers:
   nvidia:

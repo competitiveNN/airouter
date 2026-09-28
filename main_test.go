@@ -1370,21 +1370,26 @@ func TestHandleModels(t *testing.T) {
 		}
 	}
 
-	// The advertised max_tokens must be the smallest context window in the
-	// chain, so a client never plans for more than every backend can serve.
-	// loadTestConfig sets no context windows, so the field must be absent.
+	// The advertised max_context_tokens must be the smallest context window
+	// in the chain, so a client never plans for more than every backend can
+	// serve. loadTestConfig sets no context windows, so the field must be absent.
 	for _, m := range result.Data {
-		if m.MaxTokens != nil {
-			t.Errorf("model %s: expected nil MaxTokens with no ctx configured, got %d", m.ID, *m.MaxTokens)
+		if m.MaxContextTokens != nil {
+			t.Errorf("model %s: expected nil MaxContextTokens with no ctx configured, got %d", m.ID, *m.MaxContextTokens)
 		}
 	}
 }
 
-// TestHandleModelsAdvertisesMaxTokens verifies that /v1/models surfaces a
-// max_tokens ceiling derived from the fallback chain's smallest context
-// window. This is the conservative value that is safe for every backend the
+// TestHandleModelsAdvertisesMaxContextTokens verifies that /v1/models surfaces
+// a context-window floor derived from the fallback chain's smallest context
+// length. This is the conservative value that is safe for every backend the
 // profile might relay to, including fallbacks after a failure.
-func TestHandleModelsAdvertisesMaxTokens(t *testing.T) {
+//
+// The field is named max_context_tokens (input capacity), NOT max_tokens
+// (output ceiling): the upstream model lists publish no output-token data,
+// and neither does OpenAI's own /v1/models schema. Advertising an output
+// ceiling we don't have would be a lie.
+func TestHandleModelsAdvertisesMaxContextTokens(t *testing.T) {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
 			"openai": {URL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"},
@@ -1434,20 +1439,20 @@ func TestHandleModelsAdvertisesMaxTokens(t *testing.T) {
 	}
 
 	// smart: min(128000, 200000, 16384) = 16384
-	if byID["smart"].MaxTokens == nil || *byID["smart"].MaxTokens != 16384 {
-		t.Errorf("smart: expected max_tokens=16384, got %v", byID["smart"].MaxTokens)
+	if byID["smart"].MaxContextTokens == nil || *byID["smart"].MaxContextTokens != 16384 {
+		t.Errorf("smart: expected max_context_tokens=16384, got %v", byID["smart"].MaxContextTokens)
 	}
 	// large: min(200000, 128000) = 128000
-	if byID["large"].MaxTokens == nil || *byID["large"].MaxTokens != 128000 {
-		t.Errorf("large: expected max_tokens=128000, got %v", byID["large"].MaxTokens)
+	if byID["large"].MaxContextTokens == nil || *byID["large"].MaxContextTokens != 128000 {
+		t.Errorf("large: expected max_context_tokens=128000, got %v", byID["large"].MaxContextTokens)
 	}
 	// work: only one endpoint, 128000
-	if byID["work"].MaxTokens == nil || *byID["work"].MaxTokens != 128000 {
-		t.Errorf("work: expected max_tokens=128000, got %v", byID["work"].MaxTokens)
+	if byID["work"].MaxContextTokens == nil || *byID["work"].MaxContextTokens != 128000 {
+		t.Errorf("work: expected max_context_tokens=128000, got %v", byID["work"].MaxContextTokens)
 	}
 	// fast: no ctx reported -> field absent
-	if byID["fast"].MaxTokens != nil {
-		t.Errorf("fast: expected nil MaxTokens, got %d", *byID["fast"].MaxTokens)
+	if byID["fast"].MaxContextTokens != nil {
+		t.Errorf("fast: expected nil MaxContextTokens, got %d", *byID["fast"].MaxContextTokens)
 	}
 }
 
