@@ -264,7 +264,7 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestParseRetryAfterEdgeCases  (new, 2026-09-28)
 
 ## Test summary
-  `go test -race ./...` → 139 passed
+  `go test -race ./...` → 141 passed
   `go vet ./...` → no issues
   `go build ./...` → success
   `python3 scripts/validate-config.py` → OK: 4 profiles validated
