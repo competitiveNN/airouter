@@ -18,9 +18,13 @@ type Metrics struct {
 	failuresTotal    atomic.Int64
 	failuresByStatus map[string]*atomic.Int64
 	fallbacksTotal   atomic.Int64
-	cooldownsApplied atomic.Int64
-	latencySumNS     atomic.Int64
-	latencyCount     atomic.Int64
+	// fallbacksByFromEndpoint counts fallbacks triggered by each endpoint
+	// (the model that failed and caused the fail-over). Low-cardinality and
+	// actionable: operators can see which upstreams are the weakest link.
+	fallbacksByFromEndpoint map[string]*atomic.Int64
+	cooldownsApplied        atomic.Int64
+	latencySumNS            atomic.Int64
+	latencyCount            atomic.Int64
 	// latencyBuckets[i] is the count of requests whose latency fell at or
 	// below the boundary defined by latencyBoundaries[i]. The last bucket
 	// (+Inf) catches everything above the largest finite boundary.
@@ -38,9 +42,10 @@ var defaultLatencyBuckets = []float64{
 // NewMetrics creates a new Metrics instance with pre-allocated maps.
 func NewMetrics() *Metrics {
 	m := &Metrics{
-		requestsByModel:  make(map[string]*atomic.Int64),
-		requestsByStatus: make(map[string]*atomic.Int64),
-		failuresByStatus: make(map[string]*atomic.Int64),
+		requestsByModel:           make(map[string]*atomic.Int64),
+		requestsByStatus:          make(map[string]*atomic.Int64),
+		failuresByStatus:          make(map[string]*atomic.Int64),
+		fallbacksByFromEndpoint:   make(map[string]*atomic.Int64),
 	}
 	m.latencyBoundaries = defaultLatencyBuckets
 	m.latencyBuckets = make([]atomic.Int64, len(defaultLatencyBuckets)+1) // +1 for +Inf
@@ -119,9 +124,30 @@ func (m *Metrics) Request(model string, status int, latency time.Duration) {
 	m.latencyBuckets[len(m.latencyBuckets)-1].Add(1) // +Inf
 }
 
-// Fallback records a model fallback during request processing.
-func (m *Metrics) Fallback() {
+// Fallback records a model fallback during request processing. The from
+// endpoint is the model that failed and triggered the fail-over; it is
+// used to expose per-endpoint fallback counts so operators can identify
+// the weakest link in a chain.
+func (m *Metrics) Fallback(fromEndpoint string) {
 	m.fallbacksTotal.Add(1)
+	m.counterFallbackFrom(fromEndpoint).Add(1)
+}
+
+// counterFallbackFrom returns the atomic counter for the given endpoint,
+// creating it on first access.
+func (m *Metrics) counterFallbackFrom(key string) *atomic.Int64 {
+	m.mu.RLock()
+	c, ok := m.fallbacksByFromEndpoint[key]
+	m.mu.RUnlock()
+	if !ok {
+		m.mu.Lock()
+		if c, ok = m.fallbacksByFromEndpoint[key]; !ok {
+			c = &atomic.Int64{}
+			m.fallbacksByFromEndpoint[key] = c
+		}
+		m.mu.Unlock()
+	}
+	return c
 }
 
 // Cooldown records a model cooldown application.
@@ -156,6 +182,16 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# HELP airouter_fallbacks_total Number of model fallbacks")
 	fmt.Fprintln(w, "# TYPE airouter_fallbacks_total counter")
 	fmt.Fprintf(w, "airouter_fallbacks_total %d\n", m.fallbacksTotal.Load())
+
+	// Per-endpoint fallback counts so operators can see which upstreams
+	// trigger the most fail-overs.
+	fmt.Fprintln(w, "# HELP airouter_fallbacks_total_by_endpoint Number of fallbacks triggered by each endpoint")
+	fmt.Fprintln(w, "# TYPE airouter_fallbacks_total_by_endpoint counter")
+	m.mu.RLock()
+	for k, c := range m.fallbacksByFromEndpoint {
+		fmt.Fprintf(w, "airouter_fallbacks_total_by_endpoint{endpoint=\"%s\"} %d\n", k, c.Load())
+	}
+	m.mu.RUnlock()
 
 	fmt.Fprintln(w, "# HELP airouter_cooldowns_applied_total Number of cooldown applications")
 	fmt.Fprintln(w, "# TYPE airouter_cooldowns_applied_total counter")

@@ -254,11 +254,17 @@ func (g *GatewayContext) recordRequest(model string, status int, latency time.Du
 	}
 }
 
-// recordFallback increments the fallback counter. It is a no-op when
-// metrics is nil.
-func (g *GatewayContext) recordFallback() {
+// recordFallback increments the fallback counter. The optional from
+// endpoint is the model that failed and triggered the fail-over; when
+// provided it is recorded per-endpoint so operators can identify the
+// weakest link in a chain.
+func (g *GatewayContext) recordFallback(ep ...*ModelEndpoint) {
 	if g.metrics != nil {
-		g.metrics.Fallback()
+		if len(ep) > 0 && ep[0] != nil {
+			g.metrics.Fallback(ep[0].Key())
+		} else {
+			g.metrics.Fallback("")
+		}
 	}
 }
 
@@ -773,7 +779,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				return
 			}
 			tried[ep.Key()] = true
-			g.recordFallback()
+			g.recordFallback(ep)
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			g.recordCooldown()
 			if g.testCooldown > 0 {
@@ -786,7 +792,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			resp.Body.Close()
 			cancel()
 			tried[ep.Key()] = true
-			g.recordFallback()
+			g.recordFallback(ep)
 			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, ParseRetryAfter(resp.Header.Get("Retry-After")))
 			g.recordCooldown()
 			if g.testCooldown > 0 {
@@ -986,7 +992,7 @@ start := time.Now()
 		// triedKeys approach, this doesn't leak state to other concurrent
 		// requests that share the same session ID.
 		tried[ep.Key()] = true
-		g.recordFallback()
+		g.recordFallback(ep)
 		if g.testCooldown > 0 {
 			g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
 		} else {

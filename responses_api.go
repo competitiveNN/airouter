@@ -141,7 +141,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 				return
 			}
 			tried[ep.Key()] = true
-			g.recordFallback()
+			g.recordFallback(ep)
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			g.recordCooldown()
 			if g.testCooldown > 0 {
@@ -155,7 +155,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		cancel()
 		if readErr != nil {
 			tried[ep.Key()] = true
-			g.recordFallback()
+			g.recordFallback(ep)
 			g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
@@ -164,7 +164,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 
 		if resp.StatusCode != 200 {
 			tried[ep.Key()] = true
-			g.recordFallback()
+			g.recordFallback(ep)
 			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, 0)
 			g.recordCooldown()
 			if g.testCooldown > 0 {
@@ -179,7 +179,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			// A 200 that isn't a usable completion is a provider fault, not a
 			// client error: mark it and fall through to the next model.
 			tried[ep.Key()] = true
-			g.recordFallback()
+			g.recordFallback(ep)
 			g.router.ApplyCooldownForSession(ep, 502, err.Error(), sessionID, 0)
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
@@ -278,7 +278,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		text, toolCalls, err := g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt)
 		if err != nil {
 			tried[ep.Key()] = true
-			g.recordFallback()
+			g.recordFallback(ep)
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			g.recordCooldown()
 			if g.testCooldown > 0 {
