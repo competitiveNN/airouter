@@ -110,6 +110,15 @@ preferences:
   # at the same instant and stampede the provider. 0 disables jitter.
   # Values are clamped to [0, 0.25] regardless of what is written here.
   cooldown_jitter: 0.25
+  # Circuit breaker: after this many consecutive transient failures (429/5xx)
+  # on an endpoint, the circuit opens and the model is hard-blocked until
+  # its cooldown expires and a single half-open probe succeeds. Works
+  # alongside cooldowns; a value of 0 disables it (cooldown escalation alone
+  # handles failures). When the key is omitted the default (5) is used.
+  circuit_breaker_threshold: 5
+  # How many probe requests are allowed through in half-open state before the
+  # circuit re-opens. Default 1 (one probe must succeed to close the circuit).
+  circuit_half_open_probes: 1
 
 models:
   smart:

@@ -30,7 +30,11 @@ type Metrics struct {
 	// (+Inf) catches everything above the largest finite boundary.
 	latencyBuckets    []atomic.Int64
 	latencyBoundaries []float64 // seconds, e.g. 0.005, 0.01, ..., 10, +Inf
-	mu                sync.RWMutex // protects map initialization
+	// circuitTransitions tracks circuit breaker state changes
+	// (from="closed",to="open",endpoint="..."). Low-cardinality and
+	// actionable: operators can see which endpoints are flapping.
+	circuitTransitions map[string]*atomic.Int64
+	mu                 sync.RWMutex // protects map initialization
 }
 
 // defaultLatencyBuckets are the standard Prometheus histogram boundaries
@@ -46,6 +50,7 @@ func NewMetrics() *Metrics {
 		requestsByStatus:          make(map[string]*atomic.Int64),
 		failuresByStatus:          make(map[string]*atomic.Int64),
 		fallbacksByFromEndpoint:   make(map[string]*atomic.Int64),
+		circuitTransitions:        make(map[string]*atomic.Int64),
 	}
 	m.latencyBoundaries = defaultLatencyBuckets
 	m.latencyBuckets = make([]atomic.Int64, len(defaultLatencyBuckets)+1) // +1 for +Inf
@@ -155,6 +160,29 @@ func (m *Metrics) Cooldown() {
 	m.cooldownsApplied.Add(1)
 }
 
+// CircuitTransition records a circuit breaker state change for an endpoint.
+func (m *Metrics) CircuitTransition(from, to CircuitState, endpoint string) {
+	key := fmt.Sprintf("from=\"%s\",to=\"%s\",endpoint=\"%s\"", from, to, endpoint)
+	m.counterCircuitTransition(key).Add(1)
+}
+
+// counterCircuitTransition returns the atomic counter for a circuit state
+// transition key, creating it on first access.
+func (m *Metrics) counterCircuitTransition(key string) *atomic.Int64 {
+	m.mu.RLock()
+	c, ok := m.circuitTransitions[key]
+	m.mu.RUnlock()
+	if !ok {
+		m.mu.Lock()
+		if c, ok = m.circuitTransitions[key]; !ok {
+			c = &atomic.Int64{}
+			m.circuitTransitions[key] = c
+		}
+		m.mu.Unlock()
+	}
+	return c
+}
+
 // ServeHTTP writes Prometheus text format to the response.
 func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
@@ -196,6 +224,15 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# HELP airouter_cooldowns_applied_total Number of cooldown applications")
 	fmt.Fprintln(w, "# TYPE airouter_cooldowns_applied_total counter")
 	fmt.Fprintf(w, "airouter_cooldowns_applied_total %d\n", m.cooldownsApplied.Load())
+
+	// Circuit state transitions: per (from, to, endpoint) counters.
+	fmt.Fprintln(w, "# HELP airouter_circuit_state_transitions Number of circuit breaker state transitions")
+	fmt.Fprintln(w, "# TYPE airouter_circuit_state_transitions counter")
+	m.mu.RLock()
+	for k, c := range m.circuitTransitions {
+		fmt.Fprintf(w, "airouter_circuit_state_transitions{%s} %d\n", k, c.Load())
+	}
+	m.mu.RUnlock()
 
 	// Latency histogram (Prometheus _bucket / _sum / _count).
 	fmt.Fprintln(w, "# HELP airouter_request_duration_seconds Request latency in seconds")
