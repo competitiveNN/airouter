@@ -212,6 +212,7 @@ type GatewayContext struct {
 	gatewayAPIKey string
 	allowNoAuth   bool          // explicit opt-in to unauthenticated mode (-allow-no-auth)
 	testCooldown  time.Duration // override for tests: forces all cooldowns to this duration
+	metrics       *Metrics      // Prometheus-style metrics; nil in tests that don't need it
 }
 
 func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string, allowNoAuth ...bool) *GatewayContext {
@@ -220,6 +221,7 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 		proxy:         proxy,
 		configPath:    configPath,
 		gatewayAPIKey: gatewayAPIKey,
+		metrics:       NewMetrics(),
 	}
 	if len(allowNoAuth) > 0 {
 		g.allowNoAuth = allowNoAuth[0]
@@ -242,6 +244,39 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 // ApplyCooldownForSession for testing. Zero disables the override.
 func (g *GatewayContext) SetTestCooldown(d time.Duration) {
 	g.testCooldown = d
+}
+
+// recordRequest records a request with a known model name. It is a no-op when
+// metrics is nil (test contexts that never construct a real gateway).
+func (g *GatewayContext) recordRequest(model string, status int, latency time.Duration) {
+	if g.metrics != nil {
+		g.metrics.Request(model, status, latency)
+	}
+}
+
+// recordFallback increments the fallback counter. It is a no-op when
+// metrics is nil.
+func (g *GatewayContext) recordFallback() {
+	if g.metrics != nil {
+		g.metrics.Fallback()
+	}
+}
+
+// recordCooldown increments the cooldown counter. It is a no-op when
+// metrics is nil.
+func (g *GatewayContext) recordCooldown() {
+	if g.metrics != nil {
+		g.metrics.Cooldown()
+	}
+}
+
+// HandleMetrics serves the Prometheus text-format metrics endpoint.
+func (g *GatewayContext) HandleMetrics(w http.ResponseWriter, r *http.Request) {
+	if g.metrics == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		return
+	}
+	g.metrics.ServeHTTP(w, r)
 }
 
 func (g *GatewayContext) checkAuth(r *http.Request) bool {
@@ -444,12 +479,15 @@ func (g *GatewayContext) HandleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	if !g.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
+		g.recordRequest("", 401, time.Since(start))
 		return
 	}
 	if r.Method != http.MethodPost {
 		writeAPIError(w, 405, "Method not allowed", "invalid_request_error", "method_not_allowed")
+		g.recordRequest("", 405, time.Since(start))
 		return
 	}
 
@@ -457,17 +495,20 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAPIError(w, 400, "Failed to read request body", "invalid_request_error", "bad_request")
+		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 
 	var req ChatCompletionRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAPIError(w, 400, "Invalid JSON", "invalid_request_error", "bad_json")
+		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 
 	if !IsValidModel(req.Model) {
 		writeAPIError(w, 400, fmt.Sprintf("Unknown model: %s. Available: %s", req.Model, strings.Join(LogicalModels, ", ")), "invalid_request_error", "model_not_found")
+		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 
@@ -637,6 +678,7 @@ func requestTimeout(tokens int) time.Duration {
 }
 
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
+	start := time.Now()
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
@@ -655,6 +697,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	for {
 		if ctx.Err() != nil {
 			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 		if attempts >= maxAttempts {
@@ -665,15 +708,18 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(200)
 					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision not supported"))
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				case VisionUnavailable:
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(200)
 					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision currently not available"))
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 			}
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 		attempts++
@@ -688,11 +734,13 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(200)
 					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision not supported"))
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				case VisionUnavailable:
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(200)
 					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision currently not available"))
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 			}
@@ -702,12 +750,14 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				case <-ctx.Done():
 					timer.Stop()
 					writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+					g.recordRequest(req.Model, 503, time.Since(start))
 					return
 				case <-timer.C:
 				}
 				continue
 			}
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 
@@ -719,10 +769,13 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			cancel()
 			if isClientDisconnect(err) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
+				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
 			tried[ep.Key()] = true
+			g.recordFallback()
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			g.recordCooldown()
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
 			}
@@ -733,13 +786,16 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			resp.Body.Close()
 			cancel()
 			tried[ep.Key()] = true
-			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID)
+			g.recordFallback()
+			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, ParseRetryAfter(resp.Header.Get("Retry-After")))
+			g.recordCooldown()
 			if g.testCooldown > 0 {
 				// Override the cooldown for testing: force the
 				// endpoint's cooldown expiry to now+testCooldown
 				// so the handler doesn't sleep for hours.
 				g.router.ApplyCooldownWithDuration(ep, resp.StatusCode, string(respBody), sessionID, g.testCooldown)
 			}
+			g.recordRequest(req.Model, resp.StatusCode, time.Since(start))
 			continue
 		}
 
@@ -765,13 +821,16 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			// Most likely the client disconnected; log for observability but
 			// don't penalize a healthy model.
 			log.Printf("[debug] session=%s model=%s -> write error (client likely disconnected): %v", sessionID, req.Model, writeErr)
+			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
+		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
 }
 
 func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
+start := time.Now()
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
@@ -783,6 +842,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, 500, "Streaming not supported", "server_error", "streaming_unsupported")
+		g.recordRequest(req.Model, 500, time.Since(start))
 		return
 	}
 
@@ -831,6 +891,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			if cause := context.Cause(ctx); cause != nil {
 				log.Printf("[debug] session=%s model=%s -> context cancelled: %v", sessionID, req.Model, cause)
 			}
+			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
 		if attempts >= maxAttempts {
@@ -840,15 +901,18 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				case VisionUnsupported:
 					writeVisionRejectionSSE(w, flusher, req.Model, "Vision not supported")
 					doneSent = true
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				case VisionUnavailable:
 					writeVisionRejectionSSE(w, flusher, req.Model, "Vision currently not available")
 					doneSent = true
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 			}
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			// sendDone fires via defer
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 		attempts++
@@ -868,6 +932,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				if msg != "" {
 					writeVisionRejectionSSE(w, flusher, req.Model, msg)
 					doneSent = true
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 			}
@@ -878,12 +943,14 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				select {
 				case <-ctx.Done():
 					timer.Stop()
+					g.recordRequest(req.Model, 499, time.Since(start))
 					return
 				case <-timer.C:
 				}
 				continue
 			}
 			writeSSEError(w, flusher, "All models are currently unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 
@@ -904,11 +971,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			// StreamToClient emits [DONE] on success; mark as sent so the
 			// deferred sendDone() doesn't emit a duplicate.
 			doneSent = true
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 
 		if isClientDisconnect(err) {
 			// Client went away; nothing to resume and no point cooling a model.
+			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
 
@@ -917,7 +986,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// triedKeys approach, this doesn't leak state to other concurrent
 		// requests that share the same session ID.
 		tried[ep.Key()] = true
+		g.recordFallback()
 		g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+		g.recordCooldown()
 		// Mid-stream failure after we already flushed content to the client:
 		// resume on the next model by replaying what the client already received
 		// as an assistant message (content and any tool calls), so it continues
@@ -1087,6 +1158,10 @@ func (g *GatewayContext) ReloadConfig(cfg *Config) {
 	// Single atomic store onto the shared pointer; router and proxy read from
 	// the same pointer, so they observe the new config atomically.
 	g.config.Store(cfg)
+	// Jitter is a Router-level knob, not part of the shared config pointer, so
+	// push it across explicitly on every reload. Without this a config change
+	// to cooldown_jitter would silently no-op until restart.
+	g.router.SetCooldownJitter(cfg.Preferences.CooldownJitterFraction())
 	providers := 0
 	models := 0
 	if cfg != nil {

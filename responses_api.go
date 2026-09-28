@@ -23,12 +23,15 @@ import (
 // The response (or SSE stream) is then re-shaped into the Responses envelope
 // the client expects.
 func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	if !g.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
+		g.recordRequest("", 401, time.Since(start))
 		return
 	}
 	if r.Method != http.MethodPost {
 		writeAPIError(w, 405, "Method not allowed", "invalid_request_error", "method_not_allowed")
+		g.recordRequest("", 405, time.Since(start))
 		return
 	}
 
@@ -36,22 +39,26 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAPIError(w, 400, "Failed to read request body", "invalid_request_error", "bad_request")
+		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 
 	var req responsesRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeAPIError(w, 400, "Invalid JSON", "invalid_request_error", "bad_json")
+		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 	if !IsValidModel(req.Model) {
 		writeAPIError(w, 400, fmt.Sprintf("Unknown model: %s. Available: %s", req.Model, strings.Join(LogicalModels, ", ")), "invalid_request_error", "model_not_found")
+		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 
 	chatReq, err := toChatCompletionRequest(&req)
 	if err != nil {
 		writeAPIError(w, 400, "Invalid input items", "invalid_request_error", "bad_input")
+		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 	// body is the Chat Completions JSON actually forwarded upstream. The
@@ -60,6 +67,7 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 	body, err := buildChatBody(chatReq)
 	if err != nil {
 		writeAPIError(w, 500, "Failed to encode upstream request", "server_error", "encode_failed")
+		g.recordRequest("", 500, time.Since(start))
 		return
 	}
 
@@ -79,6 +87,7 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 // loop. It mirrors handleCompletion: select an endpoint, forward, and on
 // failure mark it tried, apply a cooldown, and move to the next in the chain.
 func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
+	start := time.Now()
 	ctx := r.Context()
 	timeout := requestTimeout(estimateTokens(req))
 
@@ -93,10 +102,12 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 	for {
 		if ctx.Err() != nil {
 			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 		if attempts >= maxAttempts {
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 		attempts++
@@ -109,12 +120,14 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 				case <-ctx.Done():
 					timer.Stop()
 					writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+					g.recordRequest(req.Model, 503, time.Since(start))
 					return
 				case <-timer.C:
 				}
 				continue
 			}
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 
@@ -124,10 +137,13 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			cancel()
 			if isClientDisconnect(err) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
+				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
 			tried[ep.Key()] = true
+			g.recordFallback()
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			g.recordCooldown()
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
 			}
@@ -139,16 +155,22 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		cancel()
 		if readErr != nil {
 			tried[ep.Key()] = true
+			g.recordFallback()
 			g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
+			g.recordCooldown()
+			g.recordRequest(req.Model, 502, time.Since(start))
 			continue
 		}
 
 		if resp.StatusCode != 200 {
 			tried[ep.Key()] = true
-			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID)
+			g.recordFallback()
+			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, 0)
+			g.recordCooldown()
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, resp.StatusCode, string(respBody), sessionID, g.testCooldown)
 			}
+			g.recordRequest(req.Model, resp.StatusCode, time.Since(start))
 			continue
 		}
 
@@ -157,7 +179,10 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			// A 200 that isn't a usable completion is a provider fault, not a
 			// client error: mark it and fall through to the next model.
 			tried[ep.Key()] = true
-			g.router.ApplyCooldownForSession(ep, 502, err.Error(), sessionID)
+			g.recordFallback()
+			g.router.ApplyCooldownForSession(ep, 502, err.Error(), sessionID, 0)
+			g.recordCooldown()
+			g.recordRequest(req.Model, 502, time.Since(start))
 			continue
 		}
 
@@ -166,6 +191,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(env)
+		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
 }
@@ -181,6 +207,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 // retry as prior assistant context so the new model continues rather than
 // restarting.
 func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
+	start := time.Now()
 	ctx := r.Context()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -190,6 +217,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, 500, "Streaming not supported", "server_error", "streaming_unsupported")
+		g.recordRequest(req.Model, 500, time.Since(start))
 		return
 	}
 
@@ -211,10 +239,12 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			if cause := context.Cause(ctx); cause != nil {
 				log.Printf("[debug] session=%s model=%s -> responses stream cancelled: %v", sessionID, req.Model, cause)
 			}
+			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
 		if attempts >= maxAttempts {
 			writeSSEError(w, flusher, "All models are currently unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 		attempts++
@@ -226,12 +256,14 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 				select {
 				case <-ctx.Done():
 					timer.Stop()
+					g.recordRequest(req.Model, 499, time.Since(start))
 					return
 				case <-timer.C:
 				}
 				continue
 			}
 			writeSSEError(w, flusher, "All models are currently unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 
@@ -246,7 +278,9 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		text, toolCalls, err := g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt)
 		if err != nil {
 			tried[ep.Key()] = true
+			g.recordFallback()
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			g.recordCooldown()
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
 			}
@@ -262,6 +296,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		log.Printf("[debug] session=%s model=%s -> responses stream -> %s/%s (%d chars)", sessionID, req.Model, ep.Provider, ep.Model, tokens)
 		_ = text
 		_ = toolCalls
+		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
 }
@@ -285,12 +320,12 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b}
+		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b}
+		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	return translateChatSSE(resp.Body, sw)
 }
