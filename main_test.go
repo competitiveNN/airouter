@@ -3091,7 +3091,7 @@ func TestSessionSkipsTriedEndpoints(t *testing.T) {
 
 	// p1 fails
 	tried[ep.Key()] = true
-	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID)
+	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID, 0)
 
 	// Second call: should skip p1 (tried) and get p2
 	ep, _ = router.SelectEndpoint("smart", sessionID, false, tried)
@@ -3101,7 +3101,7 @@ func TestSessionSkipsTriedEndpoints(t *testing.T) {
 
 	// p2 also fails
 	tried[ep.Key()] = true
-	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID)
+	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID, 0)
 
 	// Third call: both have been tried and cooled. SelectEndpoint now
 	// returns nil (handler waits for cooldown) instead of returning
@@ -3138,7 +3138,7 @@ func TestRecordSuccessClearsCooldown(t *testing.T) {
 
 	// p1 fails
 	ep1, _ := router.SelectEndpoint("smart", sessionID, false, tried)
-	router.ApplyCooldownForSession(ep1, 429, "rate limited", sessionID)
+	router.ApplyCooldownForSession(ep1, 429, "rate limited", sessionID, 0)
 	tried[ep1.Key()] = true
 
 	// Should now get p2
@@ -3758,5 +3758,193 @@ func TestReloadConfigConcurrent(t *testing.T) {
 
 	for err := range errc {
 		t.Errorf("concurrent reload invariant violated: %v", err)
+	}
+}
+
+// TestParseRetryAfter verifies the Retry-After header parser handles both
+// delta-seconds ("120") and HTTP-date forms, and returns 0 for unparseable
+// or non-positive values.
+func TestParseRetryAfter(t *testing.T) {
+	// Delta-seconds form
+	if d := ParseRetryAfter("120"); d != 120*time.Second {
+		t.Errorf("delta-seconds: expected 120s, got %v", d)
+	}
+	// Zero / negative / non-numeric
+	if d := ParseRetryAfter("0"); d != 0 {
+		t.Errorf("zero: expected 0, got %v", d)
+	}
+	if d := ParseRetryAfter("-5"); d != 0 {
+		t.Errorf("negative: expected 0, got %v", d)
+	}
+	if d := ParseRetryAfter("not-a-date"); d != 0 {
+		t.Errorf("garbage: expected 0, got %v", d)
+	}
+	if d := ParseRetryAfter(""); d != 0 {
+		t.Errorf("empty: expected 0, got %v", d)
+	}
+	// HTTP-date form: a date 60s in the future
+	future := time.Now().Add(60 * time.Second).UTC().Format(http.TimeFormat)
+	d := ParseRetryAfter(future)
+	if d <= 30*time.Second || d > 60*time.Second {
+		t.Errorf("http-date future: expected ~60s, got %v", d)
+	}
+	// HTTP-date in the past → 0
+	past := time.Now().Add(-60 * time.Second).UTC().Format(http.TimeFormat)
+	if d := ParseRetryAfter(past); d != 0 {
+		t.Errorf("http-date past: expected 0, got %v", d)
+	}
+}
+
+// TestApplyCooldownHonorsRetryAfterFloor verifies that when an upstream sends
+// a Retry-After header larger than the default 429 base cooldown (30s), the
+// cooldown duration honored is at least the Retry-After value, never less.
+func TestApplyCooldownHonorsRetryAfterFloor(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p1", Model: "m1"}}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	ep := &ModelEndpoint{Provider: "p1", Model: "m1"}
+
+	// Retry-After of 300s should floor the cooldown above the 30s base.
+	retryAfter := 300 * time.Second
+	got := router.ApplyCooldownForSession(ep, 429, "rate limited", "sess-ra", retryAfter)
+
+	// The cooldown must be at least retryAfter (300s). It may include jitter
+	// on top, but never less than the floor.
+	if got < retryAfter {
+		t.Errorf("cooldown %v < retry-after floor %v", got, retryAfter)
+	}
+	// And it shouldn't be absurdly larger (base is 30s, floor 300s, max jitter +25%).
+	upper := retryAfter + retryAfter/4
+	if got > upper {
+		t.Errorf("cooldown %v > expected upper bound %v", got, upper)
+	}
+}
+
+// TestCooldownJitterAppliedOn429 verifies that the jitter field configured via
+// SetCooldownJitter actually increases the cooldown duration above the base
+// value for transient errors (429), and that zero disables it.
+func TestCooldownJitterAppliedOn429(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p1", Model: "m1"}}},
+		},
+	}
+	ep := &ModelEndpoint{Provider: "p1", Model: "m1"}
+
+	// Zero jitter (default): cooldown should be exactly the base 30s.
+	r0 := NewRouter(cfg, "")
+	if d := r0.ApplyCooldownForSession(ep, 429, "rl", "s0", 0); d != 30*time.Second {
+		t.Errorf("zero-jitter: expected exactly 30s, got %v", d)
+	}
+
+	// Non-zero jitter: should be >= base and < base + 25% (allowing for rounding).
+	r1 := NewRouter(cfg, "")
+	r1.SetCooldownJitter(0.25)
+	d := r1.ApplyCooldownForSession(ep, 429, "rl", "s1", 0)
+	if d < 30*time.Second {
+		t.Errorf("jitter: cooldown %v < base 30s", d)
+	}
+	if d >= 30*time.Second+8*time.Second {
+		t.Errorf("jitter: cooldown %v too large (base 30s + 25pct = 37.5s max)", d)
+	}
+
+	// Clamping: setting > 0.25 should be clamped to 0.25.
+	r2 := NewRouter(cfg, "")
+	r2.SetCooldownJitter(5.0)
+	if r2.CooldownJitter() != 0.25 {
+		t.Errorf("jitter clamp: expected 0.25, got %v", r2.CooldownJitter())
+	}
+	// Negative should clamp to 0.
+	r3 := NewRouter(cfg, "")
+	r3.SetCooldownJitter(-1)
+	if r3.CooldownJitter() != 0 {
+		t.Errorf("jitter negative clamp: expected 0, got %v", r3.CooldownJitter())
+	}
+}
+
+// TestApplyCooldownFromErrorCarriesRetryAfter verifies that ApplyCooldownFromErrorForSession
+// extracts RetryAfter from a ProviderError and passes it through as a floor.
+func TestApplyCooldownFromErrorCarriesRetryAfter(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p1", Model: "m1"}}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	ep := &ModelEndpoint{Provider: "p1", Model: "m1"}
+
+	retryAfter := 600 * time.Second
+	perr := &ProviderError{StatusCode: 429, Body: []byte("slow down"), RetryAfter: retryAfter}
+	// ApplyCooldownFromErrorForSession should honor RetryAfter as a floor.
+	router.ApplyCooldownFromErrorForSession(ep, perr, "sess-err")
+
+	// Verify the stored cooldown expiry reflects the floor.
+	cooldowns := router.GetAllCooldowns()
+	cd, ok := cooldowns[ep.Key()]
+	if !ok {
+		t.Fatal("expected cooldown entry to exist")
+	}
+	// Expiry should be at least now + retryAfter (minus a small epsilon for test timing).
+	minExpiry := time.Now().Add(retryAfter - 2*time.Second)
+	if cd.Expiry.Before(minExpiry) {
+		t.Errorf("cooldown expiry %v < retry-after floor %v", cd.Expiry, minExpiry)
+	}
+}
+
+// TestPreferencesCooldownJitterFraction verifies the config-level accessor
+// clamps and returns the right value.
+func TestPreferencesCooldownJitterFraction(t *testing.T) {
+	var nilPrefs *Preferences
+	if nilPrefs.CooldownJitterFraction() != 0 {
+		t.Error("nil prefs should yield 0")
+	}
+	p := &Preferences{CooldownJitter: -1}
+	if p.CooldownJitterFraction() != 0 {
+		t.Error("negative should clamp to 0")
+	}
+	p.CooldownJitter = 5.0
+	if p.CooldownJitterFraction() != 0.25 {
+		t.Error("> 0.25 should clamp to 0.25")
+	}
+	p.CooldownJitter = 0.1
+	if v := p.CooldownJitterFraction(); v != 0.1 {
+		t.Errorf("expected 0.1, got %v", v)
+	}
+}
+
+// TestConfigWiresCooldownJitterToRouter verifies that NewRouter reads the
+// jitter value from Preferences and that ReloadConfig propagates changes.
+func TestConfigWiresCooldownJitterToRouter(t *testing.T) {
+	noRot := 0
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRot, CooldownJitter: 0.2},
+		Providers:   map[string]ProviderConfig{"p1": {URL: "https://x.example.com/v1", APIKeyEnv: "P1"}},
+		Models:      map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "p1", Model: "m1"}}}},
+	}
+	router := NewRouter(cfg, "")
+	if router.CooldownJitter() != 0.2 {
+		t.Fatalf("NewRouter: expected jitter 0.2, got %v", router.CooldownJitter())
+	}
+	// ReloadConfig should propagate the new value.
+	cfg2 := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRot, CooldownJitter: 0.15},
+		Providers:   cfg.Providers,
+		Models:      cfg.Models,
+	}
+	router2 := NewRouter(cfg2, "")
+	if router2.CooldownJitter() != 0.15 {
+		t.Fatalf("ReloadConfig: expected jitter 0.15, got %v", router2.CooldownJitter())
 	}
 }

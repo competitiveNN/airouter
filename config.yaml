@@ -105,6 +105,11 @@ preferences:
   #
   # Set to 0 to disable rotation (every new session starts at depth 0).
   initial_rotation_window: 8
+  # Random fraction (0..0.25) added to transient cooldowns (429/5xx) so
+  # concurrent clients hitting the same rate-limited model don't all wake up
+  # at the same instant and stampede the provider. 0 disables jitter.
+  # Values are clamped to [0, 0.25] regardless of what is written here.
+  cooldown_jitter: 0.25
 
 models:
   smart:

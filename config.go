@@ -142,6 +142,12 @@ type Preferences struct {
 	// key entirely uses DefaultInitialRotationWindow. It is a pointer so those
 	// two states are distinguishable.
 	InitialRotationWindow *int `yaml:"initial_rotation_window,omitempty"`
+
+	// CooldownJitter is the random fraction (0..0.25) added to transient
+	// cooldowns (429/5xx) so concurrent clients hitting the same rate-limited
+	// model don't all wake up at the same instant and stampede the provider.
+	// 0 (the default) disables jitter. Values are clamped to [0, 0.25].
+	CooldownJitter float64 `yaml:"cooldown_jitter,omitempty"`
 }
 
 // RotationWindow returns the effective window size, defaulting to
@@ -152,6 +158,22 @@ func (p *Preferences) RotationWindow() int {
 		return DefaultInitialRotationWindow
 	}
 	return *p.InitialRotationWindow
+}
+
+// CooldownJitterFraction returns the jitter fraction to apply to transient
+// cooldowns, clamped to [0, 0.25]. Nil preferences or an unset value yields 0.
+func (p *Preferences) CooldownJitterFraction() float64 {
+	if p == nil {
+		return 0
+	}
+	f := p.CooldownJitter
+	if f < 0 {
+		f = 0
+	}
+	if f > 0.25 {
+		f = 0.25
+	}
+	return f
 }
 
 // DefaultInitialRotationWindow is the window used when preferences omit one.

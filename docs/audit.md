@@ -191,6 +191,44 @@ LOW (cleanup / hardening)
 
 ---
 
+## Cooldown jitter + Retry-After passthrough (2026-09-28)
+
+This audit round implemented two features that were declared "done" in the
+prior session's summary but were actually dead code — the fields existed but
+nothing populated or read them. All three are now wired end-to-end with tests.
+
+• router.go:185-188 — `Router.cooldownJitter` was declared with a comment
+  "It is set via SetCooldownJitter" but no such method existed, and no call
+  site ever assigned it. The `if r.cooldownJitter > 0` branch in
+  ApplyCooldownForSession was unreachable, so no jitter was ever applied.
+  Status: FIXED. Added `Router.SetCooldownJitter` (clamps to [0, 0.25]) and
+  `Router.CooldownJitter()`; wired from `Preferences.CooldownJitterFraction()`
+  in both `NewRouter` and `ReloadConfig` so a config change takes effect
+  without a restart (router.go:191-211, api.go:1157-1174).
+
+• router.go:961 — `ProviderError.RetryAfter` was declared and read by
+  ApplyCooldownFromErrorForSession, but no `ProviderError{...}` literal in the
+  codebase ever set it. The upstream Retry-After header was therefore never
+  parsed, and the cooldown floor was always 0.
+  Status: FIXED. Added `ParseRetryAfter` (router.go:1010-1040) which handles
+  both delta-seconds ("120") and HTTP-date forms via http.ParseTime. Wired
+  into every ProviderError construction site that has an HTTP response:
+  proxy.go:320/326/336, responses_api.go:318/323/328, api.go:790. The
+  non-stream path (api.go:790) was updated to pass
+  `ParseRetryAfter(resp.Header.Get("Retry-After"))` directly rather than 0.
+
+• config.go:124 — `Preferences` had no cooldown_jitter field at all.
+  Status: FIXED. Added `CooldownJitter float64` with a
+  `CooldownJitterFraction()` accessor that clamps to [0, 0.25].
+
+• main_test.go (new) — TestParseRetryAfter,
+  TestApplyCooldownHonorsRetryAfterFloor, TestCooldownJitterAppliedOn429,
+  TestApplyCooldownFromErrorCarriesRetryAfter,
+  TestPreferencesCooldownJitterFraction,
+  TestConfigWiresCooldownJitterToRouter.
+
+---
+
 ## Resource leak audit (2026-09-07) — re-verified 2026-09-20
 
 HTTP Response Bodies — CLEAN
@@ -214,9 +252,15 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestOpencodeHeadersInjected  (new, 2026-09-23)
 • TestOpencodeHeadersNotInjectedForNonOpencode  (new, 2026-09-23)
 • TestOpencodeProviderHeaderOverride  (new, 2026-09-23)
+• TestParseRetryAfter  (new, 2026-09-28)
+• TestApplyCooldownHonorsRetryAfterFloor  (new, 2026-09-28)
+• TestCooldownJitterAppliedOn429  (new, 2026-09-28)
+• TestApplyCooldownFromErrorCarriesRetryAfter  (new, 2026-09-28)
+• TestPreferencesCooldownJitterFraction  (new, 2026-09-28)
+• TestConfigWiresCooldownJitterToRouter  (new, 2026-09-28)
 
 ## Test summary
-  `go test -race ./...` → 105 passed
+  `go test -race ./...` → 135 passed
   `go vet ./...` → no issues
   `go build ./...` → success
   `python3 scripts/validate-config.py` → OK: 4 profiles validated
