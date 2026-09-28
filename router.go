@@ -3,11 +3,14 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,6 +184,36 @@ type Router struct {
 	sessionsDone chan struct{}
 	sessionsWG   sync.WaitGroup
 	cooldownSave *cooldownSaveState
+	// cooldownJitter is the random fraction (0..0.25) added to transient
+	// cooldowns to break thundering herds. It is set via SetCooldownJitter;
+	// zero disables jitter entirely.
+	cooldownJitter float64
+}
+
+// SetCooldownJitter sets the random fraction (0..0.25) added to transient
+// cooldowns to break thundering herds. It is read by ApplyCooldownForSession
+// on every failure; zero (the default) disables jitter entirely.
+//
+// Callers should validate the upper bound themselves; values above 0.25 are
+// silently clamped so a misconfiguration can never produce a cooldown longer
+// than 25% above the base.
+func (r *Router) SetCooldownJitter(f float64) {
+	if f < 0 {
+		f = 0
+	}
+	if f > 0.25 {
+		f = 0.25
+	}
+	r.mu.Lock()
+	r.cooldownJitter = f
+	r.mu.Unlock()
+}
+
+// CooldownJitter returns the currently configured jitter fraction.
+func (r *Router) CooldownJitter() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cooldownJitter
 }
 
 func NewRouter(cfg *Config, cooldownPath string) *Router {
@@ -198,6 +231,7 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 	r.config.Store(cfg)
 	r.loadCooldowns()
 	r.loadPriorities()
+	r.SetCooldownJitter(cfg.Preferences.CooldownJitterFraction())
 	r.sessionsWG.Add(1)
 	go r.sweepSessions()
 	return r
@@ -662,7 +696,7 @@ func (r *Router) ChainLength(logicalModel string) int {
 }
 
 func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string) {
-	r.ApplyCooldownForSession(ep, statusCode, errMsg, "")
+	r.ApplyCooldownForSession(ep, statusCode, errMsg, "", 0)
 }
 
 // ApplyCooldownForSession records a failure for an endpoint. The sessionID
@@ -670,7 +704,12 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 // per-session state — failed-endpoint tracking is now local to each request's
 // fallback loop (see handleStream/handleCompletion) to avoid interference
 // between concurrent requests that share a session ID.
-func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string) time.Duration {
+//
+// retryAfter, when set, is honored as a floor on the computed cooldown so a
+// 429's upstream Retry-After header is never ignored. Transient errors
+// (429/5xx) also receive up to 25% random jitter to break thundering herds when
+// many clients hit the same rate-limited model simultaneously.
+func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string, retryAfter time.Duration) time.Duration {
 	r.mu.Lock()
 	key := ep.Key()
 	cd, ok := r.cooldowns[key]
@@ -685,6 +724,19 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 		cd.ErrorCount = 100
 	}
 	duration := r.cooldownForError(statusCode, cd.ErrorCount)
+	// Honor the upstream's Retry-After as a floor: never cool down for less
+	// than the provider asked, since it knows its own rate-limit windows.
+	if retryAfter > duration {
+		duration = retryAfter
+	}
+	// Add up to 25% random jitter on transient errors (429/5xx) so concurrent
+	// clients hitting the same rate-limited model don't all wake up at the same
+	// instant and stampede the provider again.
+	if statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
+		if r.cooldownJitter > 0 {
+			duration += time.Duration(float64(duration) * r.cooldownJitter)
+		}
+	}
 	cd.Expiry = time.Now().Add(duration)
 	cd.StatusCode = statusCode
 	// Truncate the error message so a verbose provider error body (e.g.
@@ -787,7 +839,11 @@ func (r *Router) ApplyCooldownFromErrorForSession(ep *ModelEndpoint, err error, 
 		statusCode = providerErr.StatusCode
 	}
 	errMsg := err.Error()
-	r.ApplyCooldownForSession(ep, statusCode, errMsg, sessionID)
+	retryAfter := time.Duration(0)
+	if errors.As(err, &providerErr) {
+		retryAfter = providerErr.RetryAfter
+	}
+	r.ApplyCooldownForSession(ep, statusCode, errMsg, sessionID, retryAfter)
 }
 
 func baseCooldownForError(statusCode int) time.Duration {
@@ -925,13 +981,20 @@ func (r *Router) GetAllCooldowns() map[string]CooldownEntry {
 }
 
 type ProviderError struct {
-	StatusCode int
-	Body       []byte
-	Err        error
+	StatusCode  int
+	Body        []byte
+	Err         error
+	// RetryAfter, when set, is the upstream's requested backoff for a 429
+	// (parsed from the Retry-After header). The cooldown logic honors it as a
+	// floor so we never wait less than the provider asked.
+	RetryAfter time.Duration
 }
 
 func (e *ProviderError) Error() string {
 	if e.Err != nil {
+		if e.RetryAfter > 0 {
+			return fmt.Sprintf("%v (retry-after %v)", e.Err, e.RetryAfter)
+		}
 		return e.Err.Error()
 	}
 	if len(e.Body) > 0 {
@@ -942,4 +1005,32 @@ func (e *ProviderError) Error() string {
 
 func (e *ProviderError) Unwrap() error {
 	return e.Err
+}
+
+// ParseRetryAfter parses an HTTP Retry-After header value into a Duration.
+// It accepts both the delta-seconds form (an integer, e.g. "120") and the
+// HTTP-date form (RFC 1123 / RFC 7231). On any parse failure it returns 0 so
+// callers can fall back to their own backoff. A negative or zero value is
+// treated as "no useful hint" and also returns 0.
+func ParseRetryAfter(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	// Delta-seconds form: "120"
+	if secs, err := strconv.Atoi(raw); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	// HTTP-date form: "Wed, 21 Oct 2015 07:28:00 GMT"
+	if t, err := http.ParseTime(raw); err == nil {
+		d := time.Until(t)
+		if d <= 0 {
+			return 0
+		}
+		return d
+	}
+	return 0
 }

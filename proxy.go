@@ -323,7 +323,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes}
+		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
 	// A 200 without an SSE content type means the provider ignored stream:true
@@ -333,7 +333,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes}
+		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
 	// Guard only the first byte with the size-based timeout. Once the stream
