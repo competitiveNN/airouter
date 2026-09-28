@@ -70,6 +70,59 @@ func loadTestConfig(t *testing.T) *Config {
 	return cfg
 }
 
+// intPtr returns a pointer to v, used for pointer-valued Preferences fields
+// (e.g. CircuitBreakerThreshold) where an explicit 0 must be distinguishable
+// from an absent key.
+func intPtr(v int) *int { return &v }
+
+func loadTestConfig2(t *testing.T) *Config {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"openrouter": {
+				URL:       "https://openrouter.ai/api/v1",
+				APIKeyEnv: "OPENROUTER_API_KEY",
+			},
+			"ollama": {
+				URL:       "http://localhost:11434/v1",
+				APIKeyEnv: "OLLAMA_API_KEY",
+			},
+			"openai": {
+				URL:       "https://api.openai.com/v1",
+				APIKeyEnv: "OPENAI_API_KEY",
+			},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {
+				Chain: []ModelEndpoint{
+					{Provider: "openai", Model: "gpt-4"},
+					{Provider: "openrouter", Model: "anthropic/claude-3-opus"},
+					{Provider: "openai", Model: "gpt-4-turbo"},
+				},
+			},
+			"work": {
+				Chain: []ModelEndpoint{
+					{Provider: "openai", Model: "gpt-4-turbo"},
+					{Provider: "openrouter", Model: "anthropic/claude-3-sonnet"},
+					{Provider: "openai", Model: "gpt-4"},
+				},
+			},
+			"fast": {
+				Chain: []ModelEndpoint{
+					{Provider: "ollama", Model: "llama3"},
+					{Provider: "openai", Model: "gpt-3.5-turbo"},
+				},
+			},
+			"large": {
+				Chain: []ModelEndpoint{
+					{Provider: "openai", Model: "gpt-4-turbo"},
+					{Provider: "openrouter", Model: "anthropic/claude-3-opus"},
+				},
+			},
+		},
+	}
+	return cfg
+}
+
 func TestConfigValidation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -344,6 +397,8 @@ func TestExtractSSEError_TruncatedJSON(t *testing.T) {
 // noRotation pins the initial-rotation window to 1 (rotation off) so tests
 // that are about fallback, cooldowns or session stickiness keep exercising
 // strict chain order. Rotation itself is covered in router_initial_test.go.
+// (Declared here; the earlier duplicate declaration near loadTestConfig was
+// removed to avoid a "redeclared" compile error.)
 var noRotation = 1
 
 func TestRouterSessionAssignment(t *testing.T) {
@@ -1684,7 +1739,70 @@ func TestGatewayNoAuth(t *testing.T) {
 	gatewayFailClosed.HandleAdminConfig(rec3, req3)
 
 	if rec3.Code != 401 {
-		t.Errorf("expected status 401 for admin without auth when no key, got %d", rec3.Code)
+		t.Errorf("expected status 401 for admin without auth when no key and allowNoAuth=false, got %d", rec3.Code)
+	}
+	}
+
+	// TestAdminCooldownsIncludesCircuitState verifies that the admin cooldowns
+	// endpoint returns both the cooldown backoff windows and the circuit breaker
+	// state machine for each endpoint in a single response, so operators can
+	// diagnose fail-over behavior from one call.
+	func TestAdminCooldownsIncludesCircuitState(t *testing.T) {
+	cfg := loadTestConfig(t)
+	cfg.Preferences = &Preferences{
+		InitialRotationWindow:     &noRotation,
+		CircuitBreakerThreshold:   intPtr(2),
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "secret-key", "", true)
+
+	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
+
+	// Trip the circuit breaker so it's in a non-closed state.
+	router.ApplyCooldown(ep, 500, "server error")
+	router.ApplyCooldown(ep, 500, "server error")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/cooldowns", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	rec := httptest.NewRecorder()
+	gateway.HandleAdminCooldowns(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Cooldowns []struct {
+			ModelKey   string `json:"model_key"`
+			ErrorCount int    `json:"error_count"`
+		} `json:"cooldowns"`
+		Circuits []struct {
+			ModelKey   string `json:"model_key"`
+			State      string `json:"state"`
+			ProbesSent int    `json:"probes_sent"`
+		} `json:"circuits"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v\nbody: %s", err, rec.Body.String())
+	}
+
+	if len(resp.Cooldowns) != 1 {
+		t.Fatalf("expected 1 cooldown, got %d", len(resp.Cooldowns))
+	}
+	if resp.Cooldowns[0].ErrorCount != 2 {
+		t.Errorf("expected ErrorCount 2, got %d", resp.Cooldowns[0].ErrorCount)
+	}
+
+	if len(resp.Circuits) != 1 {
+		t.Fatalf("expected 1 circuit entry, got %d", len(resp.Circuits))
+	}
+	if resp.Circuits[0].State != "open" {
+		t.Errorf("expected circuit state 'open', got %q", resp.Circuits[0].State)
+	}
+	if resp.Circuits[0].ProbesSent != 2 {
+		t.Errorf("expected ProbesSent 2, got %d", resp.Circuits[0].ProbesSent)
 	}
 }
 
@@ -3436,12 +3554,21 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 	var mu sync.Mutex
 	var backend1Hits int
 	var replayFailures int
+	var backend1Bodies map[string]bool
+	var backend1BodiesMu sync.Mutex
 
 	// backend1: sends a partial chunk then an SSE error event mid-stream
 	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		backend1Hits++
 		mu.Unlock()
+		b, _ := io.ReadAll(r.Body)
+		backend1BodiesMu.Lock()
+		if backend1Bodies == nil {
+			backend1Bodies = map[string]bool{}
+		}
+		backend1Bodies[string(b)] = true
+		backend1BodiesMu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 		flusher := w.(http.Flusher)
@@ -3458,19 +3585,24 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 		flusher := w.(http.Flusher)
-		// Verify the replayed body contains the assistant message. Sessions
-		// that exercised the fail-over path MUST have the partial content
-		// replayed; sessions that arrived after backend1 was cooled skip
-		// backend1 entirely and have nothing to replay.
+		// Verify the replayed body contains the assistant message. Only
+		// sessions that actually exercised the fail-over path (i.e. hit
+		// backend1) must have the partial content replayed; sessions that
+		// arrived after backend1 was cooled skip backend1 entirely and have
+		// nothing to replay.
 		b, _ := io.ReadAll(r.Body)
-		go func(b []byte) {
-			if !strings.Contains(string(b), "Hello ") {
+		bodyStr := string(b)
+		backend1BodiesMu.Lock()
+		hadBackend1 := backend1Bodies != nil && backend1Bodies[bodyStr]
+		backend1BodiesMu.Unlock()
+		go func() {
+			if hadBackend1 && !strings.Contains(bodyStr, "Hello ") {
 				mu.Lock()
 				replayFailures++
 				mu.Unlock()
-				t.Errorf("backend2 did not receive replayed 'Hello ' content: %s", string(b))
+				t.Errorf("backend2 did not receive replayed 'Hello ' content: %s", bodyStr)
 			}
-		}(b)
+		}()
 		fmt.Fprint(w, `data: {"id":"b2","object":"chat.completion.chunk","created":2,"model":"gpt-4-turbo","choices":[{"index":0,"delta":{"content":"World"},"finish_reason":null}]}`+"\n\n")
 		flusher.Flush()
 		fmt.Fprint(w, `data: [DONE]`+"\n\n")
@@ -4422,13 +4554,18 @@ func TestCooldownPersistenceAudit(t *testing.T) {
 	// Force an immediate flush (the 5s batch timer would otherwise delay it).
 	routerA.saveCooldowns()
 
-	// The persisted file must exist and contain the cooldown.
+	// The persisted file must exist and contain the cooldown. The on-disk
+	// shape is the merged envelope {"cooldowns":...,"circuits":...}; try that
+	// first and fall back to the legacy bare map.
 	data, err := os.ReadFile(cooldownPath)
 	if err != nil {
 		t.Fatalf("cooldown file not written: %v", err)
 	}
 	var loaded map[string]CooldownEntry
-	if err := json.Unmarshal(data, &loaded); err != nil {
+	var env cooldownsState
+	if json.Unmarshal(data, &env) == nil && len(env.Cooldowns) > 0 {
+		loaded = env.Cooldowns
+	} else if err := json.Unmarshal(data, &loaded); err != nil {
 		t.Fatalf("cooldown file not valid JSON: %v", err)
 	}
 	if _, ok := loaded[ep.Key()]; !ok {
@@ -4478,13 +4615,18 @@ func TestCooldownPersistenceAtomicWrite(t *testing.T) {
 	router.ApplyCooldownForSession(&ModelEndpoint{Provider: "p", Model: "m1"}, 429, "rl", "sess", 0)
 	router.saveCooldowns()
 
-	// The file must be valid JSON (atomic rename guarantees this).
+	// The file must be valid JSON (atomic rename guarantees this). The shape is
+	// the merged envelope {"cooldowns":...,"circuits":...}; accept the legacy
+	// bare map too so the assertion works regardless of format.
 	data, err := os.ReadFile(cooldownPath)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
 	var loaded map[string]CooldownEntry
-	if err := json.Unmarshal(data, &loaded); err != nil {
+	var env cooldownsState
+	if json.Unmarshal(data, &env) == nil && len(env.Cooldowns) > 0 {
+		loaded = env.Cooldowns
+	} else if err := json.Unmarshal(data, &loaded); err != nil {
 		t.Fatalf("cooldowns.json is not valid JSON after atomic write: %v", err)
 	}
 	if len(loaded) == 0 {
@@ -4596,5 +4738,331 @@ func TestChaosBackendKilledMidStream(t *testing.T) {
 	mu.Unlock()
 	if hits < 1 {
 		t.Errorf("expected at least 1 hit on backend1, got %d", hits)
+	}
+}
+
+// TestCircuitBreakerOpensAfterThreshold verifies that after threshold
+// consecutive failures on transient errors (429/5xx), the circuit opens
+// and transitions to half-open once the cooldown expires.
+func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://p.example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m1"}}},
+		},
+		Preferences: &Preferences{
+			CircuitBreakerThreshold: intPtr(5),
+		},
+	}
+	router := NewRouter(cfg, "")
+
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	// Apply 5 consecutive 500s (transient errors, circuit breaker enabled).
+	for i := 0; i < 5; i++ {
+		router.ApplyCooldown(ep, 500, "server error")
+	}
+
+	// Circuit should be open.
+	cb := router.GetCircuitState(ep)
+	if cb != CircuitOpen {
+		t.Errorf("expected circuit to be Open, got %v", cb)
+	}
+
+	// Model should be unavailable.
+	if router.IsAvailable(ep) {
+		t.Error("expected model to be unavailable with open circuit")
+	}
+
+	// Apply more failures (7 total).
+	for i := 5; i < 7; i++ {
+		router.ApplyCooldown(ep, 500, "server error")
+	}
+
+	// Circuit should still be open.
+	cb = router.GetCircuitState(ep)
+	if cb != CircuitOpen {
+		t.Errorf("expected circuit to still be Open, got %v", cb)
+	}
+}
+
+// TestCircuitBreakerIgnoresPermanentErrors verifies that 404/401/403 do not
+// trip the circuit breaker (they're handled purely by cooldowns).
+func TestCircuitBreakerIgnoresPermanentErrors(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://p.example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m1"}}},
+		},
+		Preferences: &Preferences{
+			CircuitBreakerThreshold: intPtr(3),
+		},
+	}
+	router := NewRouter(cfg, "")
+
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	// Apply 3 404s.
+	for i := 0; i < 3; i++ {
+		router.ApplyCooldown(ep, 404, "not found")
+	}
+
+	// Circuit should still be closed (404 is permanent, doesn't trip circuit).
+	cb := router.GetCircuitState(ep)
+	if cb != CircuitClosed {
+		t.Errorf("expected circuit to remain Closed for 404, got %v", cb)
+	}
+}
+
+// TestCircuitBreakerHalfOpenProbeSuccess verifies that when a half-open
+// probe succeeds, the circuit closes and the model becomes available.
+func TestCircuitBreakerHalfOpenProbeSuccess(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://p.example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m1"}}},
+		},
+		Preferences: &Preferences{
+			CircuitBreakerThreshold: intPtr(2),
+		},
+	}
+	router := NewRouter(cfg, "")
+
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	// Trip the circuit with 2 failures.
+	router.ApplyCooldown(ep, 500, "server error")
+	router.ApplyCooldown(ep, 500, "server error")
+
+	// Simulate a 200ms cooldown and wait for it to expire.
+	router.ApplyCooldownWithDuration(ep, 0, "force open", "", 200*time.Millisecond)
+
+	// Wait for cooldown to expire, triggering half-open.
+	time.Sleep(250 * time.Millisecond)
+
+	// Record a success (simulate a probe success).
+	router.RecordSuccess(ep)
+
+	// Circuit should be closed.
+	cb := router.GetCircuitState(ep)
+	if cb != CircuitClosed {
+		t.Errorf("expected circuit to be Closed after probe success, got %v", cb)
+	}
+
+	// Model should be available.
+	if !router.IsAvailable(ep) {
+		t.Error("expected model to be available after probe success")
+	}
+}
+
+// TestCircuitBreakerDisableViaZeroThreshold verifies that setting the
+// threshold to 0 disables the circuit breaker entirely (ad-hoc cooldown
+// escalation handles failures instead).
+func TestCircuitBreakerDisableViaZeroThreshold(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://p.example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m1"}}},
+		},
+		Preferences: &Preferences{
+			CircuitBreakerThreshold: intPtr(0), // disabled
+		},
+	}
+	router := NewRouter(cfg, "")
+
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	// Apply many failures.
+	for i := 0; i < 10; i++ {
+		router.ApplyCooldown(ep, 500, "server error")
+	}
+
+	// Circuit should remain closed (disabled).
+	cb := router.GetCircuitState(ep)
+	if cb != CircuitClosed {
+		t.Errorf("expected circuit to be Closed when disabled, got %v", cb)
+	}
+}
+
+// TestCircuitBreakerResetManually verifies that ResetCircuit manually
+// closes an open circuit.
+func TestCircuitBreakerResetManually(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://p.example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m1"}}},
+		},
+		Preferences: &Preferences{
+			CircuitBreakerThreshold: intPtr(2),
+		},
+	}
+	router := NewRouter(cfg, "")
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	// Trip the circuit.
+	router.ApplyCooldown(ep, 500, "server error")
+	router.ApplyCooldown(ep, 500, "server error")
+
+	// Open and half-open probes sent should be reset.
+	router.ResetCircuit(ep)
+	cb := router.GetAllCircuits()[ep.Key()]
+	if cb.State != CircuitClosed {
+		t.Errorf("expected circuit to be Closed after reset, got %v", cb.State)
+	}
+	if cb.ProbesSent != 0 {
+		t.Errorf("expected probes_sent to be 0, got %d", cb.ProbesSent)
+	}
+}
+
+// TestCircuitBreakerPersistenceReconstruction verifies that after restart,
+// a circuit that was Open (cooldown active with sufficient failures) is
+// reconstructed correctly.
+func TestCircuitBreakerPersistenceReconstruction(t *testing.T) {
+	dir := t.TempDir()
+	cooldownPath := filepath.Join(dir, "cooldowns.json")
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://p.example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m1"}}},
+		},
+		Preferences: &Preferences{
+			CircuitBreakerThreshold: intPtr(3),
+		},
+	}
+
+	// Router A: apply failures and persist.
+	routerA := NewRouter(cfg, cooldownPath)
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	for i := 0; i < 3; i++ {
+		routerA.ApplyCooldown(ep, 500, "server error")
+	}
+
+	// Force immediate persist.
+	routerA.saveCooldowns()
+
+	// Router B: load from disk.
+	routerB := NewRouter(cfg, cooldownPath)
+
+	// Circuit should be reconstructed as Open.
+	cb := routerB.GetCircuitState(ep)
+	if cb != CircuitOpen {
+		t.Errorf("expected circuit to be Open after restart, got %v", cb)
+	}
+}
+
+// TestCircuitBreakerMetricTransition verifies that circuit state changes
+// are emitted as metrics via the admin handler.
+func TestCircuitBreakerMetricTransition(t *testing.T) {
+	m := NewMetrics()
+	// Record a state transition.
+	m.CircuitTransition(CircuitClosed, CircuitOpen, "p/m1")
+	m.CircuitTransition(CircuitOpen, CircuitHalfOpen, "p/m1")
+	m.CircuitTransition(CircuitHalfOpen, CircuitClosed, "p/m1")
+
+	body := renderMetricsBody(m)
+	bodyStr := body.String()
+
+	// Should contain transition counters.
+	if !strings.Contains(bodyStr, "circuit_state_transitions") {
+		t.Error("expected circuit state transitions metric")
+	}
+	if !strings.Contains(bodyStr, `from="closed"`) {
+		t.Error("expected from=\"closed\" label")
+	}
+	if !strings.Contains(bodyStr, `to="open"`) {
+		t.Error("expected to=\"open\" label")
+	}
+}
+
+// TestCircuitBreakerPersistenceLegacyFormat verifies that a legacy
+// cooldowns.json written as a bare map[string]CooldownEntry (the shape used
+// by older releases before circuits were persisted) is still loaded
+// correctly, and that a subsequent save upgrades the file to the merged
+// envelope without losing the backoff state.
+func TestCircuitBreakerPersistenceLegacyFormat(t *testing.T) {
+	dir := t.TempDir()
+	cooldownPath := filepath.Join(dir, "cooldowns.json")
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: "https://p.example.com/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m1"}}},
+		},
+		Preferences: &Preferences{
+			CircuitBreakerThreshold: intPtr(3),
+		},
+	}
+
+	// Write a legacy bare-map cooldowns.json by hand.
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+	legacy := map[string]CooldownEntry{
+		ep.Key(): {
+			Expiry:     time.Now().Add(time.Hour),
+			StatusCode: 500,
+			ErrorCount: 3,
+			LastError:  "legacy",
+		},
+	}
+	data, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cooldownPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Router B: load from disk — must accept the legacy shape. The cooldown
+	// is still active (1h), so the endpoint is NOT available, but the load
+	// itself must not fail or drop the backoff state.
+	routerB := NewRouter(cfg, cooldownPath)
+	if routerB.IsAvailable(ep) {
+		t.Errorf("expected %s to be unavailable (legacy cooldown still active)", ep.Key())
+	}
+	if routerB.GetCircuitState(ep) != CircuitClosed {
+		t.Errorf("expected circuit Closed after legacy load (no circuit persisted), got %v", routerB.GetCircuitState(ep))
+	}
+
+	// Trigger a failure to open the circuit, then save — the file must now
+	// be the merged envelope and reload must reconstruct the Open state.
+	routerB.ApplyCooldown(ep, 500, "server error")
+	routerB.ApplyCooldown(ep, 500, "server error")
+	routerB.ApplyCooldown(ep, 500, "server error")
+	routerB.saveCooldowns()
+
+	routerC := NewRouter(cfg, cooldownPath)
+	if routerC.GetCircuitState(ep) != CircuitOpen {
+		t.Errorf("expected circuit Open after save+reload, got %v", routerC.GetCircuitState(ep))
+	}
+
+	// The file must be the merged envelope, not the legacy bare map.
+	raw, err := os.ReadFile(cooldownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env cooldownsState
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("expected merged envelope after save, got non-envelope JSON: %v", err)
+	}
+	if len(env.Cooldowns) == 0 {
+		t.Error("expected cooldowns in merged envelope")
+	}
+	if _, ok := env.Circuits[ep.Key()]; !ok {
+		t.Error("expected circuit in merged envelope")
 	}
 }

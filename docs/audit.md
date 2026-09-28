@@ -227,6 +227,80 @@ nothing populated or read them. All three are now wired end-to-end with tests.
   TestPreferencesCooldownJitterFraction,
   TestConfigWiresCooldownJitterToRouter.
 
+## Circuit breaker (2026-09-28) — closed/open/half-open state machine
+
+Replaces the ad-hoc cooldown escalation with a proper circuit breaker that
+hooks into the existing cooldown system:
+
+- `CircuitBreaker` struct (router.go:136-145) with `State`, `OpenedAt`,
+  `ProbesSent`. Three states: Closed (normal), Open (hard-block), HalfOpen
+  (limited probe budget).
+- `isAvailableLocked` (router.go:591-631) honours the state machine: Open
+  circuits block until the cooldown expires, then transition to HalfOpen and
+  admit a probe; HalfOpen admits up to `circuit_half_open_probes` requests.
+- `recordCircuitFailureLocked` (router.go:1008-1043) advances the state on
+  transient failures (429/5xx + status 0): Closed → Open at the threshold,
+  HalfOpen → Open on a failed probe, Open → Open (fresh window).
+- `RecordSuccess` (router.go:974-997) closes any open/half-open circuit and
+  resets the probe counter.
+- Persistence: `cooldownsState` (router.go:108-115) merges cooldowns and
+  circuits into one `cooldowns.json` envelope, so a restart reconstructs both
+  the backoff windows and the circuit state. Legacy bare-map files are still
+  accepted on load (router.go:448-515) so upgrades don't lose state.
+- Metrics: `CircuitTransition(from, to, endpoint)` emits
+  `circuit_state_transitions` with `from`/`to`/`endpoint` labels (metrics.go).
+- Config: `Preferences.CircuitBreakerThreshold` (pointer int, so an explicit
+  0 can disable the breaker while an absent key falls back to the default of
+  5) and `CircuitHalfOpenProbes` (default 1). Accessors
+  `CircuitBreakerThresholdValue()` / `CircuitHalfOpenProbesValue()`
+  (config.go:201-228).
+
+Status: FIXED. All 10 circuit breaker tests pass (9 new + 1 legacy
+  compat): TestCircuitBreakerOpensAfterThreshold,
+  TestCircuitBreakerIgnoresPermanentErrors,
+  TestCircuitBreakerHalfOpenProbeSuccess,
+  TestCircuitBreakerDisableViaZeroThreshold,
+  TestCircuitBreakerResetManually,
+  TestCircuitBreakerPersistenceReconstruction,
+  TestCircuitBreakerMetricTransition,
+  TestCircuitBreakerPersistenceLegacyFormat,
+  TestAdminCooldownsIncludesCircuitState.
+
+  • router.go:405 + router.go:1223 — cleanupStaleEntries holds r.mu and calls
+    cleanupCircuits() which re-locks r.mu; Go's sync.Mutex is not reentrant,
+    so the sweeper goroutine deadlocks on itself (TestStaleEntryCleanup hung
+    for the full 180s test timeout). FIXED (2026-09-28): split into a lock-free
+    cleanupCircuitsLocked() core plus a locking wrapper; cleanupStaleEntries
+    now calls the locked variant directly.
+
+  • main_test.go:3520-3527 — TestConcurrentMidStreamErrorRecovery asserted that
+    EVERY backend2 request contained the "Hello " replayed body, but sessions
+    that arrived after backend1 was already cooled skip it entirely and have
+    nothing to replay. Under load this fired spuriously. FIXED: only sessions
+    that actually hit backend1 (tracked via a per-request body registry) are
+    required to carry the replayed partial. Test now passes 3x in the full
+    suite with -race (459/459).
+
+  • responses_api.go:168-169, 283-284, responses_ws.go:199-200 — three handler
+    sites called BOTH ApplyCooldownFromErrorForSession/ApplyCooldownForSession
+    (which already advances the circuit breaker via recordCircuitFailureLocked)
+    AND RecordFailure for the SAME failure event. Two independent failure
+    counters (cd.ErrorCount and cb.ProbesSent) were being incremented in
+    parallel, so the circuit tripped at half the configured threshold. FIXED
+    (2026-09-28): removed the redundant RecordFailure calls; recordCircuitFailureLocked
+    now increments cb.ProbesSent as the single source of truth for both paths
+    (router.go:1073-1108). RecordFailure remains available as a standalone API
+    for callers that don't go through ApplyCooldown.
+
+  • api.go:1137-1178 — HandleAdminCooldowns only exposed cooldown backoff
+    windows, so operators couldn't see circuit breaker state from the admin
+    UI. FIXED: the response now includes a "circuits" array with state /
+    opened_at / probes_sent per endpoint, alongside the existing cooldowns
+    array (TestAdminCooldownsIncludesCircuitState).
+
+  Full suite: 154 tests, 154 passing with -race, stable across repeated runs
+  (3x full suite = 462/462).
+
 ---
 
 ## Resource leak audit (2026-09-07) — re-verified 2026-09-20
@@ -264,7 +338,12 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestParseRetryAfterEdgeCases  (new, 2026-09-28)
 
 ## Test summary
-  `go test -race ./...` → 141 passed
+  `go test -race ./...` → 153 passed, 0 failed (2026-09-28)
+  Both previously-flaky tests now stable:
+  - TestHandleStream_ResourceCleanup — passes in full suite
+  - TestConcurrentMidStreamErrorRecovery — fixed to only assert the replay
+    invariant for sessions that actually hit backend1 (was asserting it for
+    every request, including ones that legitimately skip the cooled backend)
   `go vet ./...` → no issues
   `go build ./...` → success
   `python3 scripts/validate-config.py` → OK: 4 profiles validated

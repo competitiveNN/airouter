@@ -105,6 +105,63 @@ type CooldownEntry struct {
 	LastError  string    `json:"last_error"`
 }
 
+// cooldownsState is the on-disk envelope for cooldowns.json. Cooldowns and
+// circuits are stored together so a restart reconstructs both the backoff
+// windows and the circuit breaker state machine from a single file. The
+// legacy bare map[string]CooldownEntry shape is still accepted on load (see
+// loadCooldowns) so upgrades from older releases don't lose backoff state.
+type cooldownsState struct {
+	Cooldowns map[string]CooldownEntry  `json:"cooldowns"`
+	Circuits  map[string]CircuitBreaker `json:"circuits"`
+}
+
+// CircuitState describes the state of a circuit breaker for an endpoint.
+type CircuitState int
+
+const (
+	// CircuitClosed is the normal operating state; requests flow through.
+	CircuitClosed CircuitState = iota
+	// CircuitOpen is a failed state; requests are blocked until a probe
+	// succeeds in half-open (or the cooldown expires, triggering half-open).
+	CircuitOpen
+	// CircuitHalfOpen allows a limited number of probe requests through
+	// to test whether the endpoint has recovered.
+	CircuitHalfOpen
+)
+
+// String returns a lowercase label for CircuitState, used in log lines and
+// Prometheus labels.
+func (s CircuitState) String() string {
+	switch s {
+	case CircuitClosed:
+		return "closed"
+	case CircuitOpen:
+		return "open"
+	case CircuitHalfOpen:
+		return "half-open"
+	}
+	return "unknown"
+}
+
+// CircuitBreaker implements the closed/open/half-open state machine that
+// governs endpoint availability after repeated failures. It works alongside
+// the cooldown system: cooldowns prevent immediate retries; the circuit
+// breaker adds a half-open probe phase to safely restore availability.
+type CircuitBreaker struct {
+	State       CircuitState `json:"state"`
+	OpenedAt    time.Time    `json:"opened_at"`
+	ProbesSent  int          `json:"probes_sent"`
+}
+
+const (
+	// defaultCircuitBreakerThreshold is the number of consecutive failures
+	// that trip the circuit from Closed to Open.
+	defaultCircuitBreakerThreshold = 5
+	// defaultCircuitBreakerHalfOpenProbes is the max probes allowed in
+	// half-open state before another request is blocked.
+	defaultCircuitBreakerHalfOpenProbes = 1
+)
+
 type sessionEntry struct {
 	ep       ModelEndpoint
 	lastUsed time.Time
@@ -178,6 +235,7 @@ type Router struct {
 	cooldowns    map[string]CooldownEntry
 	noVision     map[string]bool // endpoints that rejected an image request
 	tps          map[string]float64
+	circuits     map[string]*CircuitBreaker
 	cooldownPath string
 	priorityPath string
 	mu           sync.RWMutex
@@ -186,8 +244,18 @@ type Router struct {
 	cooldownSave *cooldownSaveState
 	// cooldownJitter is the random fraction (0..0.25) added to transient
 	// cooldowns to break thundering herds. It is set via SetCooldownJitter;
-	// zero disables jitter entirely.
+	// zero (the default) disables jitter entirely.
 	cooldownJitter float64
+	// circuitBreakerThreshold is the number of consecutive failures that
+	// trip the circuit from Closed to Open. Zero means circuit breaker
+	// is disabled (default enabled when threshold is set via config).
+	circuitBreakerThreshold int
+	// circuitHalfOpenProbes is the max probes allowed in half-open state.
+	circuitHalfOpenProbes int
+	// metrics is the Prometheus metrics collector. Set via SetMetrics so
+	// circuit state transitions can be observed. Nil in tests that never
+	// construct a real gateway.
+	metrics *Metrics
 }
 
 // SetCooldownJitter sets the random fraction (0..0.25) added to transient
@@ -216,12 +284,68 @@ func (r *Router) CooldownJitter() float64 {
 	return r.cooldownJitter
 }
 
+// SetMetrics attaches a Metrics collector to the router so circuit state
+// transitions are observable via the admin metrics endpoint. Nil disables
+// transition recording (useful for tests that never build a gateway).
+func (r *Router) SetMetrics(m *Metrics) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.metrics = m
+}
+
+// emitCircuitTransition records a circuit state change in the metrics
+// collector, if one is attached. Nil-safe and lock-safe: the metrics
+// collector has its own internal lock, so it can be called while r.mu is
+// held.
+func (r *Router) emitCircuitTransition(from, to CircuitState, endpoint string) {
+	if r.metrics != nil {
+		r.metrics.CircuitTransition(from, to, endpoint)
+	}
+}
+
+// SetCircuitBreakerThreshold sets the number of consecutive failures that
+// trip the circuit from Closed to Open. A value of 0 disables the circuit
+// breaker entirely (ad-hoc cooldown escalation handles failures instead).
+func (r *Router) SetCircuitBreakerThreshold(n int) {
+	if n < 0 {
+		n = 0
+	}
+	r.mu.Lock()
+	r.circuitBreakerThreshold = n
+	r.mu.Unlock()
+}
+
+// CircuitBreakerThreshold returns the effective threshold (0 disables).
+func (r *Router) CircuitBreakerThreshold() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.circuitBreakerThreshold
+}
+
+// SetCircuitHalfOpenProbes sets the max probes allowed in half-open state.
+func (r *Router) SetCircuitHalfOpenProbes(n int) {
+	if n < 1 {
+		n = defaultCircuitBreakerHalfOpenProbes
+	}
+	r.mu.Lock()
+	r.circuitHalfOpenProbes = n
+	r.mu.Unlock()
+}
+
+// CircuitHalfOpenProbes returns the effective half-open probe count.
+func (r *Router) CircuitHalfOpenProbes() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.circuitHalfOpenProbes
+}
+
 func NewRouter(cfg *Config, cooldownPath string) *Router {
 	r := &Router{
 		sessions:     make(map[string]sessionEntry),
 		cooldowns:    make(map[string]CooldownEntry),
 		noVision:     make(map[string]bool),
 		tps:          make(map[string]float64),
+		circuits:     make(map[string]*CircuitBreaker),
 		cooldownPath: cooldownPath,
 		priorityPath: strings.TrimSuffix(cooldownPath, ".json") + ".priority.json",
 		sessionsDone: make(chan struct{}),
@@ -232,6 +356,8 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 	r.loadCooldowns()
 	r.loadPriorities()
 	r.SetCooldownJitter(cfg.Preferences.CooldownJitterFraction())
+	r.SetCircuitBreakerThreshold(cfg.Preferences.CircuitBreakerThresholdValue())
+	r.SetCircuitHalfOpenProbes(cfg.Preferences.CircuitHalfOpenProbesValue())
 	r.sessionsWG.Add(1)
 	go r.sweepSessions()
 	return r
@@ -276,6 +402,7 @@ func (r *Router) cleanupStaleEntries() {
 			delete(r.tps, k)
 		}
 	}
+	r.cleanupCircuitsLocked()
 }
 
 // sweepSessions periodically removes sessions that haven't been accessed in
@@ -330,36 +457,91 @@ func (r *Router) loadCooldowns() {
 		log.Printf("[warn] failed to load cooldowns: %v", err)
 		return
 	}
-	var loaded map[string]CooldownEntry
-	if err := json.Unmarshal(data, &loaded); err != nil {
+	// Two on-disk shapes are supported:
+	//  1. The current merged envelope: {"cooldowns":{...},"circuits":{...}}.
+	//  2. Legacy: a bare map[string]CooldownEntry (older releases). We detect
+	//     the shape by peeking at the first non-whitespace byte: '{' followed
+	//     by '"'cooldowns"'"' is the envelope; '{' followed by anything else
+	//     is the legacy bare map. This lets an upgrade from an older binary
+	//     keep its existing cooldowns.json without losing backoff state.
+	trimmed := strings.TrimLeft(string(data), " \t\r\n")
+	if strings.HasPrefix(trimmed, "{") && !strings.Contains(trimmed[:min(len(trimmed), 200)], "\"cooldowns\"") {
+		var loaded map[string]CooldownEntry
+		if err := json.Unmarshal(data, &loaded); err != nil {
+			log.Printf("[warn] failed to parse legacy cooldowns (state reset): %v", err)
+			return
+		}
+		now := time.Now()
+		for k, v := range loaded {
+			if v.Expiry.After(now) {
+				r.cooldowns[k] = v
+			}
+		}
+		log.Printf("[debug] loaded %d active cooldowns (legacy format)", len(r.cooldowns))
+		return
+	}
+	var state cooldownsState
+	if err := json.Unmarshal(data, &state); err != nil {
 		log.Printf("[warn] failed to parse cooldowns (state reset): %v", err)
 		return
 	}
 	now := time.Now()
-	for k, v := range loaded {
+	for k, v := range state.Cooldowns {
 		if v.Expiry.After(now) {
 			r.cooldowns[k] = v
 		}
 	}
-	log.Printf("[debug] loaded %d active cooldowns", len(r.cooldowns))
+	// Reconstruct circuit state. A circuit is only meaningful if it is Open
+	// or HalfOpen with a still-active window; Closed circuits carry no
+	// information and are omitted. We restore Open only when the cooldown is
+	// still active (otherwise the cooldown-expiry path in isAvailableLocked
+	// would re-open it on the next request anyway). HalfOpen is restored as
+	// written — a half-open circuit with an expired cooldown will immediately
+	// admit a probe, which is the desired behaviour.
+	for k, v := range state.Circuits {
+		cb := v
+		switch cb.State {
+		case CircuitOpen:
+			// Only keep the circuit open if the underlying cooldown is still
+			// active; otherwise the endpoint is effectively healthy again and
+			// the first request will close it.
+			if cd, ok := r.cooldowns[k]; ok && cd.Expiry.After(now) {
+				r.circuits[k] = &cb
+			}
+		case CircuitHalfOpen:
+			r.circuits[k] = &cb
+		}
+	}
+	log.Printf("[debug] loaded %d active cooldowns, %d circuits", len(r.cooldowns), len(r.circuits))
 }
 
 func (r *Router) saveCooldowns() {
 	if r.cooldownPath == "" {
 		return
 	}
-	// Copy active cooldowns under RLock to avoid blocking all routing during disk I/O.
+	// Copy active cooldowns and open/half-open circuits under RLock to avoid
+	// blocking all routing during disk I/O. Closed circuits carry no state
+	// worth persisting (they'd be reconstructed as Closed on load anyway).
 	r.mu.RLock()
 	now := time.Now()
-	active := make(map[string]CooldownEntry)
+	state := cooldownsState{
+		Cooldowns: make(map[string]CooldownEntry),
+		Circuits:  make(map[string]CircuitBreaker),
+	}
 	for k, v := range r.cooldowns {
 		if v.Expiry.After(now) {
-			active[k] = v
+			state.Cooldowns[k] = v
+		}
+	}
+	for k, v := range r.circuits {
+		if v.State == CircuitOpen || v.State == CircuitHalfOpen {
+			cp := *v
+			state.Circuits[k] = cp
 		}
 	}
 	r.mu.RUnlock()
 
-	data, err := json.MarshalIndent(active, "", "  ")
+	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		log.Printf("[debug] failed to marshal cooldowns: %v", err)
 		return
@@ -460,28 +642,67 @@ func (r *Router) RecordTPS(ep ModelEndpoint, tps float64) {
 	r.savePriorities()
 }
 
+// isAvailableLocked reports whether ep can accept a request, considering both
+// cooldowns and the circuit breaker state machine.
+//
+//   - A model whose cooldown hasn't expired is unavailable, UNLESS the circuit
+//     is in half-open and the probe budget is available (a probe request is
+//     allowed through even before a cooldown fully expires — this is how the
+//     breaker safely restores availability).
+//   - A model whose cooldown HAS expired is available again, subject to the
+//     circuit breaker: an Open circuit keeps it blocked (it's still
+//     recovering), and the first request past the open-duration boundary
+//     enters half-open as a probe.
 func (r *Router) isAvailableLocked(ep *ModelEndpoint) bool {
-	cd, ok := r.cooldowns[ep.Key()]
-	if !ok {
+	key := ep.Key()
+	cd, hasCooldown := r.cooldowns[key]
+	cb := r.circuits[key]
+
+	// Half-open: allow up to the probe budget through.
+	if cb != nil && cb.State == CircuitHalfOpen {
+		max := r.circuitHalfOpenProbes
+		if max <= 0 {
+			max = defaultCircuitBreakerHalfOpenProbes
+		}
+		if cb.ProbesSent < max {
+			cb.ProbesSent++
+			r.circuits[key] = cb
+			return true
+		}
+		return false
+	}
+
+	// Active cooldown → unavailable, unless disabled by circuit half-open
+	// (handled above) or the circuit opens the endpoint as a probe.
+	if hasCooldown && time.Now().Before(cd.Expiry) {
+		// Cooldown still active. If the circuit is open, the probe is blocked
+		// by the cooldown too; no need to override.
+		return false
+	}
+
+	// Cooldown expired (or no cooldown): check circuit state.
+	if cb != nil && cb.State == CircuitOpen {
+		// Cooldown elapsed while Open: transition to half-open and admit a probe.
+		r.emitCircuitTransition(CircuitOpen, CircuitHalfOpen, key)
+		cb.State = CircuitHalfOpen
+		cb.ProbesSent = 1
+		cb.OpenedAt = time.Now()
+		r.circuits[key] = cb
+		log.Printf("[debug] circuit %s: open -> half-open", key)
 		return true
 	}
-	if time.Now().After(cd.Expiry) {
-		// Cooldown elapsed: the model is available again. We deliberately do NOT
-		// delete the entry here, so its ErrorCount is preserved across cooldown
-		// windows. Escalation then reflects *consecutive* failures (the count is
-		// only reset on a successful response via RecordSuccess, or explicitly
-		// via ResetCooldown), instead of restarting at 1 every time a cooldown
-		// expires. Expired entries are still ignored by saveCooldowns (they have
-		// a past Expiry, so they are not persisted) and by minCooldownWait, and
-		// in-memory growth is bounded by the number of configured endpoints.
-		return true
-	}
-	return false
+
+	return true
 }
 
+// IsAvailable reports whether ep is currently eligible for non-sticky traffic.
 func (r *Router) IsAvailable(ep *ModelEndpoint) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	// isAvailableLocked may mutate circuit state (Open→HalfOpen, probe
+	// counters), so it must run under a write lock. IsAvailable is not on the
+	// hot request path (SelectEndpoint calls isAvailableLocked directly under
+	// its existing lock); it exists for admin queries and tests.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.isAvailableLocked(ep)
 }
 
@@ -740,13 +961,14 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 	cd.Expiry = time.Now().Add(duration)
 	cd.StatusCode = statusCode
 	// Truncate the error message so a verbose provider error body (e.g.
-	// Gemini's multi-kilobyte JSON) doesn't bloat cooldowns.json on every
+	// Gemini's multi-kilabyte JSON) doesn't bloat cooldowns.json on every
 	// retry. Keep it short; the full detail is in the log line below.
 	cd.LastError = truncateErr(errMsg, 200)
 	r.cooldowns[key] = cd
 	if isVisionUnsupported(errMsg) {
 		r.noVision[key] = true
 	}
+	r.recordCircuitFailureLocked(ep, statusCode, &cd)
 	r.mu.Unlock()
 	// Debounce: coalesce rapid successive failures into a single disk write.
 	// The first failure arms a short timer; subsequent failures reset it. On
@@ -778,6 +1000,7 @@ func (r *Router) ApplyCooldownWithDuration(ep *ModelEndpoint, statusCode int, er
 	if isVisionUnsupported(errMsg) {
 		r.noVision[key] = true
 	}
+	r.recordCircuitFailureLocked(ep, statusCode, &cd)
 	r.mu.Unlock()
 }
 
@@ -810,7 +1033,9 @@ func summarizeError(msg string) string {
 
 // RecordSuccess resets a model's cooldown on a successful response so the
 // error count only reflects *recent* consecutive failures and escalation can't
-// run away.
+// run away. It also closes the circuit breaker (any open/half-open circuit
+// returns to Closed) and clears the probe counter, since a successful request
+// proves the endpoint is healthy.
 func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 	r.mu.Lock()
 	deleted := false
@@ -819,9 +1044,210 @@ func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 		delete(r.cooldowns, key)
 		deleted = true
 	}
+	// Close any open circuit and reset its probe counter.
+	if cb, ok := r.circuits[key]; ok {
+		if cb.State != CircuitClosed {
+			r.emitCircuitTransition(cb.State, CircuitClosed, key)
+			log.Printf("[debug] circuit %s: %d -> closed", key, int(cb.State))
+		}
+		cb.State = CircuitClosed
+		cb.ProbesSent = 0
+		cb.OpenedAt = time.Time{}
+		r.circuits[key] = cb
+	}
 	r.mu.Unlock()
 	if deleted {
 		r.saveCooldowns()
+	}
+}
+
+// recordCircuitFailureLocked is the lock-free core of RecordFailure, usable
+// from within callers that already hold r.mu. It uses cd.ErrorCount as the
+// consecutive-failure counter so the circuit breaker and cooldown escalation
+// share one source of truth.
+//
+// Only transient errors (429/5xx) advance the circuit: 404/401/403 are
+// permanent and are handled purely by cooldowns (opening a circuit on auth
+// errors would just delay a retry that still won't succeed until creds
+// rotate).
+func (r *Router) recordCircuitFailureLocked(ep *ModelEndpoint, statusCode int, cd *CooldownEntry) {
+	if r.circuitBreakerThreshold <= 0 {
+		return
+	}
+	// Only transient errors trip the circuit. Status 0 (connection error,
+	// timeout, DNS failure) is treated as transient because the endpoint is
+	// reachable in principle — the failure is in the network path, not the
+	// model itself. 404/401/403 are permanent and handled purely by cooldowns.
+	if statusCode != 429 && statusCode != 0 && (statusCode < 500 || statusCode > 599) {
+		return
+	}
+	key := ep.Key()
+	cb := r.circuits[key]
+	if cb == nil {
+		cb = &CircuitBreaker{State: CircuitClosed}
+		r.circuits[key] = cb
+	}
+	// ProbesSent is the single source of truth for consecutive failures,
+	// shared by both the cooldown escalation path (ApplyCooldown*) and the
+	// standalone RecordFailure API. Using cd.ErrorCount here instead would
+	// create a second independent counter and trip the circuit at half the
+	// configured threshold.
+	switch cb.State {
+	case CircuitClosed:
+		cb.ProbesSent++
+		if cb.ProbesSent >= r.circuitBreakerThreshold {
+			r.emitCircuitTransition(CircuitClosed, CircuitOpen, key)
+			cb.State = CircuitOpen
+			cb.OpenedAt = time.Now()
+			log.Printf("[debug] circuit %s: closed -> open (failures=%d, status=%d)", key, cb.ProbesSent, statusCode)
+		}
+	case CircuitHalfOpen:
+		// Failed probe → reopen with a fresh open window.
+		cb.ProbesSent++
+		r.emitCircuitTransition(CircuitHalfOpen, CircuitOpen, key)
+		cb.State = CircuitOpen
+		cb.OpenedAt = time.Now()
+		log.Printf("[debug] circuit %s: half-open probe failed -> open", key)
+	case CircuitOpen:
+		// Already open; a failure extends the open window.
+		cb.ProbesSent++
+		cb.OpenedAt = time.Now()
+	}
+}
+
+// RecordFailure records a failed request for ep and, if the circuit breaker
+// is enabled, advances the state machine: Closed → Open after the threshold
+// is reached, Open → Open (with a new open-duration), and HalfOpen → Open on
+// a failed probe.
+//
+// The circuit breaker is opt-in via preferences.circuit_breaker_threshold;
+// a threshold of 0 disables it entirely (ad-hoc cooldown escalation handles
+// failures instead). When disabled this method is a no-op.
+func (r *Router) RecordFailure(ep *ModelEndpoint, statusCode int) {
+	if r.circuitBreakerThreshold <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ep.Key()
+	cb := r.circuits[key]
+	if cb == nil {
+		cb = &CircuitBreaker{State: CircuitClosed}
+		r.circuits[key] = cb
+	}
+
+	switch cb.State {
+	case CircuitClosed:
+		// Count consecutive failures since the last success (which reset
+		// ProbesSent to 0). The threshold is reached only after that many
+		// consecutive failures; a single failure never trips the circuit.
+		cb.ProbesSent++
+		if cb.ProbesSent >= r.circuitBreakerThreshold {
+			r.emitCircuitTransition(CircuitClosed, CircuitOpen, key)
+			cb.State = CircuitOpen
+			cb.OpenedAt = time.Now()
+			log.Printf("[debug] circuit %s: closed -> open (after %d failures, status=%d)", key, cb.ProbesSent, statusCode)
+		}
+	case CircuitOpen:
+		// Still open: a failed probe (shouldn't normally happen since the
+		// cooldown blocks probes, but a half-open probe that fails re-opens
+		// the circuit with a fresh open-time so the backoff restarts).
+		cb.State = CircuitOpen
+		cb.OpenedAt = time.Now()
+		cb.ProbesSent++
+	case CircuitHalfOpen:
+		// A probe failed: re-open the circuit with a fresh open-time so the
+		// backoff restarts. The next cooldown expiry will re-admit a probe.
+		r.emitCircuitTransition(CircuitHalfOpen, CircuitOpen, key)
+		cb.State = CircuitOpen
+		cb.OpenedAt = time.Now()
+		cb.ProbesSent++
+		log.Printf("[debug] circuit %s: half-open probe failed -> open", key)
+	}
+}
+
+// RecordProbeSuccess records that a half-open probe request succeeded: the
+// circuit closes and the probe counter resets. Called by the request path
+// after a successful response from a half-open endpoint.
+func (r *Router) RecordProbeSuccess(ep *ModelEndpoint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ep.Key()
+	if cb, ok := r.circuits[key]; ok && cb.State == CircuitHalfOpen {
+		r.emitCircuitTransition(CircuitHalfOpen, CircuitClosed, key)
+		cb.State = CircuitClosed
+		cb.ProbesSent = 0
+		cb.OpenedAt = time.Time{}
+		log.Printf("[debug] circuit %s: half-open probe succeeded -> closed", key)
+	}
+}
+
+// CircuitState returns the current state of the circuit breaker for ep.
+// If the circuit breaker is disabled (threshold 0) it reports CircuitClosed.
+func (r *Router) CircuitState(ep *ModelEndpoint) CircuitState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.circuitBreakerThreshold <= 0 {
+		return CircuitClosed
+	}
+	if cb, ok := r.circuits[ep.Key()]; ok {
+		return cb.State
+	}
+	return CircuitClosed
+}
+
+// GetCircuitState is an alias for CircuitState (admin/tests).
+func (r *Router) GetCircuitState(ep *ModelEndpoint) CircuitState {
+	return r.CircuitState(ep)
+}
+
+// GetAllCircuits returns a snapshot of every circuit breaker's state, keyed
+// by endpoint. Used by the admin endpoint for observability.
+func (r *Router) GetAllCircuits() map[string]*CircuitBreaker {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]*CircuitBreaker, len(r.circuits))
+	for k, v := range r.circuits {
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
+// ResetCircuit manually resets the circuit breaker for ep to Closed. Used by
+// operators to force an endpoint back into rotation after a transient outage.
+func (r *Router) ResetCircuit(ep *ModelEndpoint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cb, ok := r.circuits[ep.Key()]; ok {
+		cb.State = CircuitClosed
+		cb.ProbesSent = 0
+		cb.OpenedAt = time.Time{}
+	}
+}
+
+// cleanupCircuits removes circuit breaker entries for endpoints that are no
+// longer in the current config. Called periodically by the session sweeper.
+func (r *Router) cleanupCircuits() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cleanupCircuitsLocked()
+}
+
+// cleanupCircuitsLocked is the lock-free core of cleanupCircuits. Callers must
+// already hold r.mu.
+func (r *Router) cleanupCircuitsLocked() {
+	cfg := r.config.Load()
+	valid := map[string]bool{}
+	for _, mc := range cfg.Models {
+		for _, ep := range mc.Chain {
+			valid[ep.Key()] = true
+		}
+	}
+	for k := range r.circuits {
+		if !valid[k] {
+			delete(r.circuits, k)
+		}
 	}
 }
 
@@ -978,6 +1404,50 @@ func (r *Router) GetAllCooldowns() map[string]CooldownEntry {
 		result[k] = v
 	}
 	return result
+}
+
+// CircuitStateSnapshot is a combined view of an endpoint's circuit breaker and
+// cooldown state, returned by the /v1/airouter/state endpoint so operators
+// can diagnose fail-over behavior from a single call.
+type CircuitStateSnapshot struct {
+	ModelKey      string        `json:"model_key"`
+	CircuitState  string        `json:"circuit_state"`
+	OpenedAt      time.Time     `json:"opened_at"`
+	ProbesSent    int           `json:"probes_sent"`
+	CooldownExpiry time.Time    `json:"cooldown_expiry,omitempty"`
+	CooldownIn    time.Duration `json:"cooldown_remaining_ms"`
+	ErrorCount    int           `json:"error_count"`
+	StatusCode    int           `json:"status_code"`
+	LastError     string        `json:"last_error,omitempty"`
+}
+
+// GetAllCircuitsState returns a combined snapshot of every endpoint's circuit
+// breaker and cooldown state, with the cooldown remaining computed against
+// the current wall clock. Used by the /v1/airouter/state endpoint.
+func (r *Router) GetAllCircuitsState() []CircuitStateSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := time.Now()
+	out := make([]CircuitStateSnapshot, 0, len(r.circuits))
+	for key, cb := range r.circuits {
+		snap := CircuitStateSnapshot{
+			ModelKey:     key,
+			CircuitState: cb.State.String(),
+			OpenedAt:     cb.OpenedAt,
+			ProbesSent:   cb.ProbesSent,
+		}
+		if cd, ok := r.cooldowns[key]; ok {
+			snap.CooldownExpiry = cd.Expiry
+			snap.ErrorCount = cd.ErrorCount
+			snap.StatusCode = cd.StatusCode
+			snap.LastError = cd.LastError
+			if cd.Expiry.After(now) {
+				snap.CooldownIn = cd.Expiry.Sub(now)
+			}
+		}
+		out = append(out, snap)
+	}
+	return out
 }
 
 type ProviderError struct {
