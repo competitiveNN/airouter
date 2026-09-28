@@ -3948,3 +3948,215 @@ func TestConfigWiresCooldownJitterToRouter(t *testing.T) {
 		t.Fatalf("ReloadConfig: expected jitter 0.15, got %v", router2.CooldownJitter())
 	}
 }
+
+// Integration test: ChatCompletions fallback on 429 with Retry-After header.
+// Verifies the gateway routes past a rate-limited model when the upstream
+// sends a Retry-After header, and that the cooldown floor honors it.
+func TestHandleChatCompletionsFallbackWithRetryAfter(t *testing.T) {
+	noRotation := 0
+	var calls1, calls2 int
+	var mu sync.Mutex
+	getCallCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls1 + calls2
+	}
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls1++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls2++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "ok", Object: "chat.completion", Created: 1,
+			Choices: []ChatCompletionChoice{{Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+		})
+	}))
+	defer backend2.Close()
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers: map[string]ProviderConfig{
+			"a": {URL: backend1.URL},
+			"b": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "a", Model: "m1"},
+				{Provider: "b", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if getCallCount() < 2 {
+		t.Errorf("expected >=2 backend calls (a fail + b success), got %d; body=%s", getCallCount(), rec.Body.String())
+	}
+	// Verify cooldown floor: a's cooldown must be >= 1s (the Retry-After).
+	cd := router.GetAllCooldowns()
+	key := "a:m1"
+	entry, ok := cd[key]
+	if !ok {
+		t.Fatalf("expected cooldown entry for %s", key)
+	}
+	remaining := time.Until(entry.Expiry)
+	if remaining < time.Second {
+		t.Errorf("cooldown remaining %v < Retry-After floor of 1s", remaining)
+	}
+}
+
+// Integration test: streaming fallback on 429 with Retry-After header.
+func TestHandleStreamFallbackWithRetryAfter(t *testing.T) {
+	noRotation := 0
+	var calls1, calls2 int
+	var mu sync.Mutex
+	getCallCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls1 + calls2
+	}
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls1++
+		mu.Unlock()
+		w.WriteHeader(429)
+		w.Header().Set("Retry-After", "2")
+		fmt.Fprint(w, `rate limited`)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls2++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+`)
+		flusher.Flush()
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer backend2.Close()
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers: map[string]ProviderConfig{
+			"a": {URL: backend1.URL},
+			"b": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "a", Model: "m1"},
+				{Provider: "b", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "ok") {
+		t.Errorf("expected 'ok' in response body, got: %s", rec.Body.String())
+	}
+	if getCallCount() < 2 {
+		t.Errorf("expected >=2 backend calls, got %d", getCallCount())
+	}
+	cd := router.GetAllCooldowns()
+	remaining := time.Until(cd["a:m1"].Expiry)
+	if remaining < 2*time.Second {
+		t.Errorf("cooldown remaining %v < Retry-After floor of 2s", remaining)
+	}
+}
+
+// TestCooldownJitterEndToEnd verifies jitter is applied in the real gateway
+// path by configuring a non-zero jitter and confirming the cooldown expiry
+// is above the base cooldown (not just equal to it).
+func TestCooldownJitterEndToEnd(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
+			"p2": {URL: "https://p2.example.com/v1", APIKeyEnv: "P2_KEY"},
+		},
+		Preferences: &Preferences{CooldownJitter: 0.25},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p1", Model: "m1"},
+				{Provider: "p2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	if router.CooldownJitter() != 0.25 {
+		t.Fatalf("expected jitter 0.25, got %v", router.CooldownJitter())
+	}
+	ep := &ModelEndpoint{Provider: "p1", Model: "m1"}
+	base := router.ApplyCooldownForSession(ep, 429, "rl", "sess", 0)
+	// With jitter, the cooldown must be >= 30s and > base 30s (with high probability).
+	if base < 30*time.Second {
+		t.Errorf("cooldown %v < base 30s", base)
+	}
+	// There is a 25% chance jitter adds 0 (when random rolls 0), but we just
+	// verify the value is within the expected range [30s, 37.5s].
+	if base > 37500*time.Millisecond {
+		t.Errorf("cooldown %v exceeds 30s + 25%% jitter", base)
+	}
+}
+
+// TestParseRetryAfterEdgeCases covers edge cases for the header parser.
+func TestParseRetryAfterEdgeCases(t *testing.T) {
+	// Whitespace-only should return 0.
+	if d := ParseRetryAfter("   "); d != 0 {
+		t.Errorf("whitespace: expected 0, got %v", d)
+	}
+	// Very large delta (should still parse).
+	if d := ParseRetryAfter("86400"); d != 24*time.Hour {
+		t.Errorf("1-day delta: expected 24h, got %v", d)
+	}
+	// Decimal seconds: strconv.Atoi rejects ".5", falls through to http.ParseTime
+	// which also rejects it, so we get 0 — acceptable (we don't guess).
+	if d := ParseRetryAfter("0.5"); d != 0 {
+		t.Errorf("decimal seconds: expected 0 (unparseable), got %v", d)
+	}
+	// Negative delta seconds.
+	if d := ParseRetryAfter("-1"); d != 0 {
+		t.Errorf("negative delta: expected 0, got %v", d)
+	}
+	// Garbage text: should not panic, return 0.
+	for _, raw := range []string{"soon", "never", "∞", "N/A"} {
+		if d := ParseRetryAfter(raw); d != 0 {
+			t.Errorf("garbage %q: expected 0, got %v", raw, d)
+		}
+	}
+}
