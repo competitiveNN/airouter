@@ -85,6 +85,17 @@ type ModelEndpoint struct {
 	// fallback: once a request is in flight the chain is walked strictly in
 	// configured order, so quality ordering is preserved.
 	Intelligence *float64 `yaml:"intelligence,omitempty"`
+
+	// ContextLength is the model's advertised context window in tokens, as
+	// recorded by regenerate_config.py from the upstream model list. It is
+	// optional: a zero value means "not reported" and is omitted from YAML.
+	//
+	// The router does not use it for routing today, but it is surfaced to
+	// clients via /v1/models (as max_tokens on the logical model) so a
+	// client can pick a profile with enough headroom for its prompt. The
+	// `large` profile exists specifically for large-context work, so
+	// advertising nothing for it is the worst case.
+	ContextLength int `yaml:"context_length,omitempty"`
 }
 
 // HasIntelligence reports whether an intelligence score is known. Endpoints
@@ -115,6 +126,12 @@ func (e ModelEndpoint) SupportsVision() bool {
 
 func (e ModelEndpoint) Equal(other ModelEndpoint) bool {
 	return e.Provider == other.Provider && e.Model == other.Model
+}
+
+// ContextWindow reports the advertised context window in tokens. A zero
+// value means the upstream did not report one.
+func (e ModelEndpoint) ContextWindow() int {
+	return e.ContextLength
 }
 
 type ModelConfig struct {

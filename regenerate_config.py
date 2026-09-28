@@ -205,7 +205,8 @@ class Model:
         return self.id in ('kilo-auto/free', 'big-pickle')
 
     def get_comment(self) -> str:
-        """Generate trailing comment with score and context"""
+        """Generate trailing comment with score and elo (no ctx — it is a
+        real field now, surfaced as max_tokens by /v1/models)."""
         parts = []
         if self.score is not None:
             parts.append(f"{self.score:.1f}")
@@ -213,9 +214,6 @@ class Model:
                 parts.append("floor")
         if self.elo is not None:
             parts.append(f"elo={int(self.elo)}")
-        if self.context_length and self.context_length > 0:
-            ctx = f"{self.context_length:,}"
-            parts.append(f"{ctx} ctx")
         return f"# {'  '.join(parts)}" if parts else ""
 
 
@@ -381,6 +379,7 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                     'model': m.id,
                     'vision': m.vision,
                     'intelligence': m.score,
+                    'context_length': m.context_length,
                     'comment': m.get_comment()
                 })
             if m.provider == 'kilocode':
@@ -396,6 +395,7 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                     'model': m.id,
                     'vision': m.vision,
                     'intelligence': m.score,
+                    'context_length': m.context_length,
                     'comment': m.get_comment()
                 })
             if m.provider == 'kilocode':
@@ -408,6 +408,7 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                 'model': m.id,
                 'vision': m.vision,
                 'intelligence': m.score,
+                'context_length': m.context_length,
                 'comment': m.get_comment()
             })
             if m.provider == 'kilocode':
@@ -439,9 +440,10 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
 def format_chain_yaml(chain: list[dict], indent: int = 6) -> str:
     """Format chain as YAML.
 
-    The intelligence score is emitted as a real field, not just a trailing
-    comment: the router reads it to decide which endpoints are equally good
-    enough to be rotated for a new session's first pick.
+    The intelligence score and context window are emitted as real fields,
+    not just trailing comments: the gateway reads them for initial-model
+    rotation and surfaces the context window as the logical model's
+    `max_tokens` ceiling in /v1/models.
     """
     lines = []
     for entry in chain:
@@ -451,6 +453,9 @@ def format_chain_yaml(chain: list[dict], indent: int = 6) -> str:
         score = entry.get('intelligence')
         if score is not None:
             lines.append(f"{' ' * (indent + 2)}intelligence: {score:.1f}")
+        ctx = entry.get('context_length')
+        if ctx and ctx > 0:
+            lines.append(f"{' ' * (indent + 2)}context_length: {ctx}")
     return '\n'.join(lines)
 
 
