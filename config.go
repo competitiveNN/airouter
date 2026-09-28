@@ -148,6 +148,19 @@ type Preferences struct {
 	// model don't all wake up at the same instant and stampede the provider.
 	// 0 (the default) disables jitter. Values are clamped to [0, 0.25].
 	CooldownJitter float64 `yaml:"cooldown_jitter,omitempty"`
+
+	// CircuitBreakerThreshold is the number of consecutive failures that
+	// trip the circuit from Closed to Open. A pointer is used so an explicit
+	// 0 can be distinguished from an absent key: nil (absent) falls back to
+	// DefaultCircuitBreakerThreshold, while an explicit 0 disables the
+	// circuit breaker entirely (ad-hoc cooldown escalation handles failures
+	// instead). Negative values are clamped to 0 (disabled).
+	CircuitBreakerThreshold *int `yaml:"circuit_breaker_threshold,omitempty"`
+
+	// CircuitHalfOpenProbes is the max probes allowed in half-open state
+	// before another request is blocked. DefaultCircuitHalfOpenProbes is
+	// used when the key is absent.
+	CircuitHalfOpenProbes int `yaml:"circuit_half_open_probes,omitempty"`
 }
 
 // RotationWindow returns the effective window size, defaulting to
@@ -178,6 +191,39 @@ func (p *Preferences) CooldownJitterFraction() float64 {
 
 // DefaultInitialRotationWindow is the window used when preferences omit one.
 const DefaultInitialRotationWindow = 8
+
+// DefaultCircuitBreakerThreshold is the number of consecutive failures
+// that trip the circuit from Closed to Open when the config omits the key.
+const DefaultCircuitBreakerThreshold = 5
+
+// DefaultCircuitHalfOpenProbes is the max probes allowed in half-open state
+// when the config omits the key.
+const DefaultCircuitHalfOpenProbes = 1
+
+// CircuitBreakerThresholdValue returns the effective threshold. nil (absent)
+// falls back to DefaultCircuitBreakerThreshold; an explicit 0 disables the
+// circuit breaker entirely; negative values are clamped to 0 (disabled).
+func (p *Preferences) CircuitBreakerThresholdValue() int {
+	if p == nil || p.CircuitBreakerThreshold == nil {
+		return DefaultCircuitBreakerThreshold
+	}
+	if *p.CircuitBreakerThreshold < 0 {
+		return 0
+	}
+	return *p.CircuitBreakerThreshold
+}
+
+// CircuitHalfOpenProbesValue returns the effective half-open probe count,
+// defaulting to DefaultCircuitHalfOpenProbes when the key is absent.
+func (p *Preferences) CircuitHalfOpenProbesValue() int {
+	if p == nil {
+		return DefaultCircuitHalfOpenProbes
+	}
+	if p.CircuitHalfOpenProbes <= 0 {
+		return DefaultCircuitHalfOpenProbes
+	}
+	return p.CircuitHalfOpenProbes
+}
 
 // RotationEnabled reports whether new-session rotation is active.
 func (p *Preferences) RotationEnabled() bool { return p.RotationWindow() > 0 }

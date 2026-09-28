@@ -771,7 +771,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		start := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		resp, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
-		if err != nil {
+		if 		err != nil {
 			cancel()
 			if isClientDisconnect(err) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
@@ -1135,6 +1135,7 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 	}
 
 	cooldowns := g.router.GetAllCooldowns()
+	circuits := g.router.GetAllCircuits()
 	type CooldownInfo struct {
 		ModelKey   string    `json:"model_key"`
 		Expiry     time.Time `json:"expiry"`
@@ -1152,11 +1153,49 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 			LastError:  cd.LastError,
 		})
 	}
+	type CircuitInfo struct {
+		ModelKey   string       `json:"model_key"`
+		State      string       `json:"state"`
+		OpenedAt   time.Time    `json:"opened_at"`
+		ProbesSent int          `json:"probes_sent"`
+	}
+	circuitsResult := make([]CircuitInfo, 0, len(circuits))
+	for key, cb := range circuits {
+		circuitsResult = append(circuitsResult, CircuitInfo{
+			ModelKey:   key,
+			State:      cb.State.String(),
+			OpenedAt:   cb.OpenedAt,
+			ProbesSent: cb.ProbesSent,
+		})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"cooldowns": result,
-		"count":     len(result),
+		"cooldowns":  result,
+		"circuits":   circuitsResult,
+		"count":      len(result),
+	})
+}
+
+// HandleAirouterState returns a unified snapshot of every endpoint's circuit
+// breaker state, cooldown backoff window, and remaining cooldown duration,
+// computed against the current wall clock. Unlike /admin/cooldowns (raw
+// cooldown entries) and /admin/sessions (sticky routing), this endpoint
+// answers "is this model currently failing and how long until it recovers?"
+// in a single call.
+//
+// This is an unauthenticated convenience endpoint (like /health) because it
+// carries no secrets — only operational state. Operators that need auth on
+// every endpoint should sit a reverse proxy in front.
+func (g *GatewayContext) HandleAirouterState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, 405, "Method not allowed", "invalid_request_error", "method_not_allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"circuits": g.router.GetAllCircuitsState(),
+		"count":    len(g.router.GetAllCircuitsState()),
 	})
 }
 
@@ -1165,8 +1204,6 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 // sticky routing and backoff state survive a reload. Used by the admin config
 // endpoint and the on-disk config file watcher.
 func (g *GatewayContext) ReloadConfig(cfg *Config) {
-	// Single atomic store onto the shared pointer; router and proxy read from
-	// the same pointer, so they observe the new config atomically.
 	g.config.Store(cfg)
 	// Jitter is a Router-level knob, not part of the shared config pointer, so
 	// push it across explicitly on every reload. Without this a config change

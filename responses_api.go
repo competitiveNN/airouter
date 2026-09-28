@@ -165,6 +165,11 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		if resp.StatusCode != 200 {
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
+			// ApplyCooldownForSession already advances the circuit breaker
+			// state machine via recordCircuitFailureLocked, so do NOT also
+			// call RecordFailure here — that would double-count the failure
+			// against a separate counter and trip the circuit at half the
+			// configured threshold.
 			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, 0)
 			g.recordCooldown()
 			if g.testCooldown > 0 {
@@ -279,6 +284,10 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		if err != nil {
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
+			// ApplyCooldownFromErrorForSession already advances the circuit
+			// breaker state machine; the redundant RecordFailure call would
+			// double-count this failure and trip the circuit at half the
+			// configured threshold.
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			g.recordCooldown()
 			if g.testCooldown > 0 {
