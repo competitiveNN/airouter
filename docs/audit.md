@@ -258,9 +258,13 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestApplyCooldownFromErrorCarriesRetryAfter  (new, 2026-09-28)
 • TestPreferencesCooldownJitterFraction  (new, 2026-09-28)
 • TestConfigWiresCooldownJitterToRouter  (new, 2026-09-28)
+• TestHandleChatCompletionsFallbackWithRetryAfter  (new, 2026-09-28)
+• TestHandleStreamFallbackWithRetryAfter  (new, 2026-09-28)
+• TestCooldownJitterEndToEnd  (new, 2026-09-28)
+• TestParseRetryAfterEdgeCases  (new, 2026-09-28)
 
 ## Test summary
-  `go test -race ./...` → 135 passed
+  `go test -race ./...` → 139 passed
   `go vet ./...` → no issues
   `go build ./...` → success
   `python3 scripts/validate-config.py` → OK: 4 profiles validated
