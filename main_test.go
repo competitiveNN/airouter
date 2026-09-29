@@ -2001,17 +2001,17 @@ func TestGatewayNoAuth(t *testing.T) {
 	if rec3.Code != 401 {
 		t.Errorf("expected status 401 for admin without auth when no key and allowNoAuth=false, got %d", rec3.Code)
 	}
-	}
+}
 
-	// TestAdminCooldownsIncludesCircuitState verifies that the admin cooldowns
-	// endpoint returns both the cooldown backoff windows and the circuit breaker
-	// state machine for each endpoint in a single response, so operators can
-	// diagnose fail-over behavior from one call.
-	func TestAdminCooldownsIncludesCircuitState(t *testing.T) {
+// TestAdminCooldownsIncludesCircuitState verifies that the admin cooldowns
+// endpoint returns both the cooldown backoff windows and the circuit breaker
+// state machine for each endpoint in a single response, so operators can
+// diagnose fail-over behavior from one call.
+func TestAdminCooldownsIncludesCircuitState(t *testing.T) {
 	cfg := loadTestConfig(t)
 	cfg.Preferences = &Preferences{
-		InitialRotationWindow:     &noRotation,
-		CircuitBreakerThreshold:   intPtr(2),
+		InitialRotationWindow:   &noRotation,
+		CircuitBreakerThreshold: intPtr(2),
 	}
 	router := NewRouter(cfg, "")
 	proxy := NewProxy(cfg)
@@ -3944,9 +3944,9 @@ func TestConcurrentMidStreamErrorRecovery(t *testing.T) {
 	if failures > 0 {
 		t.Errorf("expected 0 replay failures, got %d", failures)
 	}
-	}
+}
 
-	// TestConcurrentStickySessionGuard verifies that concurrent requests with
+// TestConcurrentStickySessionGuard verifies that concurrent requests with
 // the same session ID do not overwrite each other's fallback routing.
 func TestConcurrentStickySessionGuard(t *testing.T) {
 	cfg := &Config{
@@ -4581,118 +4581,118 @@ func TestParseRetryAfterEdgeCases(t *testing.T) {
 // This is the latency budget the client actually experiences on a degraded
 // upstream; it bounds how long the fallback loop + retry wait can take.
 func BenchmarkFallbackLatency(b *testing.B) {
-		noRotation := 0
-		backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(429)
-			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
-		}))
-		defer backend1.Close()
-		backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(ChatCompletionResponse{
-				ID: "ok", Object: "chat.completion", Created: 1,
-				Choices: []ChatCompletionChoice{{Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
-			})
-		}))
-		defer backend2.Close()
+	noRotation := 0
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer backend1.Close()
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "ok", Object: "chat.completion", Created: 1,
+			Choices: []ChatCompletionChoice{{Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+		})
+	}))
+	defer backend2.Close()
 
-		cfg := &Config{
-			Preferences: &Preferences{InitialRotationWindow: &noRotation},
-			Providers: map[string]ProviderConfig{
-				"a": {URL: backend1.URL},
-				"b": {URL: backend2.URL},
-			},
-			Models: map[string]ModelConfig{
-				"smart": {Chain: []ModelEndpoint{
-					{Provider: "a", Model: "m1"},
-					{Provider: "b", Model: "m2"},
-				}},
-			},
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers: map[string]ProviderConfig{
+			"a": {URL: backend1.URL},
+			"b": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "a", Model: "m1"},
+				{Provider: "b", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// httptest.NewRequest returns a fresh request with a fresh body
+		// reader each iteration, so we must recreate the request rather
+		// than reuse one (MaxBytesReader wraps r.Body and drains it).
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		gateway.HandleChatCompletions(rec, req)
+		if rec.Code != 200 {
+			// After the first iteration a/m1 is in cooldown (30 s), so the
+			// second request can't fall back. Reset before the next attempt
+			// so every iteration measures the fallback path, not a 503.
+			router.ResetCooldown(&ModelEndpoint{Provider: "a", Model: "m1"})
+			rec2 := httptest.NewRecorder()
+			req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			gateway.HandleChatCompletions(rec2, req2)
+			if rec2.Code != 200 {
+				b.Fatalf("expected 200 after reset, got %d", rec2.Code)
+			}
+			continue
 		}
-		router := NewRouter(cfg, "")
-		proxy := NewProxy(cfg)
-		gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
-
-		body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
-
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			// httptest.NewRequest returns a fresh request with a fresh body
-			// reader each iteration, so we must recreate the request rather
-			// than reuse one (MaxBytesReader wraps r.Body and drains it).
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-			rec := httptest.NewRecorder()
-			gateway.HandleChatCompletions(rec, req)
-			if rec.Code != 200 {
-				// After the first iteration a/m1 is in cooldown (30 s), so the
-				// second request can't fall back. Reset before the next attempt
-				// so every iteration measures the fallback path, not a 503.
-				router.ResetCooldown(&ModelEndpoint{Provider: "a", Model: "m1"})
-				rec2 := httptest.NewRecorder()
-				req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-				gateway.HandleChatCompletions(rec2, req2)
-				if rec2.Code != 200 {
-					b.Fatalf("expected 200 after reset, got %d", rec2.Code)
-				}
-				continue
-			}
-			}
+	}
 }
 
 // TestMetricsLatencyHistogram verifies that the /metrics endpoint emits
 // proper Prometheus histogram buckets (le="+Inf" and _sum/_count).
 func TestMetricsLatencyHistogram(t *testing.T) {
-		m := NewMetrics()
-		m.Request("smart", 200, 3*time.Millisecond)
-		m.Request("smart", 200, 50*time.Millisecond)
-		m.Request("smart", 200, 200*time.Millisecond)
-		m.Request("smart", 502, 2*time.Second)
+	m := NewMetrics()
+	m.Request("smart", 200, 3*time.Millisecond)
+	m.Request("smart", 200, 50*time.Millisecond)
+	m.Request("smart", 200, 200*time.Millisecond)
+	m.Request("smart", 502, 2*time.Second)
 
-		body := renderMetricsBody(m)
-		bodyStr := body.String()
+	body := renderMetricsBody(m)
+	bodyStr := body.String()
 
-		// Must contain histogram bucket labels.
-		if !strings.Contains(bodyStr, `le="0.005"`) {
-			t.Errorf("missing le=0.005 bucket")
-		}
-		if !strings.Contains(bodyStr, `le="+Inf"`) {
-			t.Errorf("missing le=+Inf bucket")
-		}
-		// sum/count must be present for a histogram.
-		if !strings.Contains(bodyStr, "airouter_request_duration_seconds_sum") {
-			t.Errorf("missing _sum")
-		}
-		if !strings.Contains(bodyStr, "airouter_request_duration_seconds_count") {
-			t.Errorf("missing _count")
-		}
+	// Must contain histogram bucket labels.
+	if !strings.Contains(bodyStr, `le="0.005"`) {
+		t.Errorf("missing le=0.005 bucket")
+	}
+	if !strings.Contains(bodyStr, `le="+Inf"`) {
+		t.Errorf("missing le=+Inf bucket")
+	}
+	// sum/count must be present for a histogram.
+	if !strings.Contains(bodyStr, "airouter_request_duration_seconds_sum") {
+		t.Errorf("missing _sum")
+	}
+	if !strings.Contains(bodyStr, "airouter_request_duration_seconds_count") {
+		t.Errorf("missing _count")
+	}
 }
 
 // renderMetricsBody renders the metrics to a buffer (test helper).
 func renderMetricsBody(m *Metrics) *bytes.Buffer {
-		rec := httptest.NewRecorder()
-		m.ServeHTTP(rec, nil)
-		return rec.Body
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, nil)
+	return rec.Body
 }
 
 // TestMetricsPerEndpointFallback verifies that the per-endpoint fallback
 // counter is tracked and emitted correctly.
 func TestMetricsPerEndpointFallback(t *testing.T) {
-		m := NewMetrics()
-		m.Fallback("backend1/m1")
-		m.Fallback("backend1/m1")
-		m.Fallback("backend2/m2")
+	m := NewMetrics()
+	m.Fallback("backend1/m1")
+	m.Fallback("backend1/m1")
+	m.Fallback("backend2/m2")
 
-		bodyStr := renderMetricsBody(m).String()
+	bodyStr := renderMetricsBody(m).String()
 
-		if !strings.Contains(bodyStr, `airouter_fallbacks_total_by_endpoint{endpoint="backend1/m1"} 2`) {
-			t.Errorf("missing or incorrect backend1/m1 fallback count")
-		}
-		if !strings.Contains(bodyStr, `airouter_fallbacks_total_by_endpoint{endpoint="backend2/m2"} 1`) {
-			t.Errorf("missing or incorrect backend2/m2 fallback count")
-		}
-		if !strings.Contains(bodyStr, "airouter_fallbacks_total") {
-			t.Errorf("missing airouter_fallbacks_total")
-		}
+	if !strings.Contains(bodyStr, `airouter_fallbacks_total_by_endpoint{endpoint="backend1/m1"} 2`) {
+		t.Errorf("missing or incorrect backend1/m1 fallback count")
+	}
+	if !strings.Contains(bodyStr, `airouter_fallbacks_total_by_endpoint{endpoint="backend2/m2"} 1`) {
+		t.Errorf("missing or incorrect backend2/m2 fallback count")
+	}
+	if !strings.Contains(bodyStr, "airouter_fallbacks_total") {
+		t.Errorf("missing airouter_fallbacks_total")
+	}
 }
 
 // TestCooldownJitterConcurrentBackoff verifies that cooldown jitter is
