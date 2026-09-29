@@ -211,6 +211,18 @@ jobs:
       - name: dist freshness self-test
         run: bash scripts/dist-freshness-selftest.sh
 
+      # recovery-check.sh is the LOCAL gate: it proves the generated bundle and
+      # patch really recover the tree, on the machine that generated them. CI
+      # cannot run it, for the same reason dist-freshness-check.sh cannot: the
+      # artifacts are generated and gitignored, and a CI checkout has none and
+      # no unpushed commits to recover. What CI gates is the LOGIC, and this
+      # self-test builds throwaway fixtures with healthy, stale, corrupt,
+      # inapplicable, missing and over-specified artifacts, then asserts each is
+      # classified correctly -- including two negative controls that neuter the
+      # check and require the neutered copy to change its verdict.
+      - name: recovery check self-test
+        run: bash scripts/recovery-check-selftest.sh
+
   config:
     runs-on: ubuntu-latest
     continue-on-error: false
