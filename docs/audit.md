@@ -1149,10 +1149,10 @@ gate's discovery had been. Verified by moving `router.go` into `./subpkg`: the
 check failed with `summarizeError: not found in any .go file` for symbols
 sitting in a subdirectory, and the remediation it printed is to add an entry to
 `ALLOWLIST` — a wrong fix, and a permanent one, for a symbol that was never
-deleted. Now `rglob`, skipping `.git` and `vendor`. Re-verified in both
-directions: the subpackage layout passes, and a genuinely deleted symbol is
-still caught (an anchor was renamed to a non-existent symbol and the check
-failed as it should).
+deleted. Fixed in `56dfbdf`, not in this round — see "a claim that outlived its
+commit" below, which is why it is named here rather than folded in. The fix is
+`rglob`, skipping `.git` and `vendor`, sorted because the sources are joined
+into one corpus and `rglob`'s ordering is filesystem-dependent.
 
 **2. `scripts/fuzz-gate-selftest.sh`.** Builds throwaway two-package
 repositories with a stubbed `go` and asserts the gate's behaviour in them, so
@@ -1193,6 +1193,39 @@ produced a *passing* case for the wrong reason:
 
 No production code changed. As with the three previous rounds, every finding is
 in the test and gate layer.
+
+### A claim that outlived its commit
+
+The `audit-drift-check.py` fix above was written, verified, and then lost. A
+`git reset --hard` run while probing a different script reverted it, and the
+round's summary and this document both went on describing it as done. It was
+caught by review — the file at `HEAD` still read `ROOT.glob("*.go")`, `grep -rn
+rglob scripts/ .github/` returned nothing, and the file's last commit was three
+rounds old.
+
+Two things are worth recording, because both are the same failure wearing
+different clothes.
+
+The first is that `git reset --hard` destroys uncommitted work, including work
+that has already been verified. This repository's own operating rule forbids it
+while uncommitted work exists, and the rule was broken anyway — twice earlier
+in the same session, and once more here. Every reset since has been preceded by
+copying the file to `/tmp` first. A constraint that is written down but not
+enforced is worth exactly as much as the memory of whoever is holding it.
+
+The second is more specific to this document. A finding recorded in past tense
+is indistinguishable from a finding that shipped. Nothing in the doc asserted
+whether the code at that commit contained the fix, and `audit-drift-check.py`
+— the one script with no self-test — could not catch it either. The anchor
+drift check validates that *symbols named in findings* still exist; it says
+nothing about whether a *fix* a finding describes was applied.
+
+So the remaining gap is named rather than glossed: `scripts/fuzz-gate-selftest.sh`
+guards the fuzz gate against this round's bug class, and
+`scripts/audit-drift-check.py` has no equivalent. The natural follow-up is to
+extend that harness to build a two-package layout and assert the drift check
+behaves correctly in it — the same technique, pointed at the other script. Until
+then, this class can recur there undetected, exactly as it did.
 
 Verification this round:
 

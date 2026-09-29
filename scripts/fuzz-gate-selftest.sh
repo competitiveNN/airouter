@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # Self-test for scripts/fuzz-gate.sh.
 #
+# KNOWN GAP, STATED HERE SO IT IS FOUND BY THE NEXT PERSON
+#
+# This covers ONE script. `scripts/audit-drift-check.py` had the identical
+# root-only-glob bug (fixed in 56dfbdf) and has no equivalent test: nothing
+# asserts that it still walks subdirectories, and the bug it had was invisible
+# for exactly the reason this file exists. The anchor drift check validates that
+# symbols NAMED IN FINDINGS still resolve; it does not validate that a FIX a
+# finding describes was applied, which is how a reverted fix survives a round
+# that documents it as done.
+#
+# The extension is mechanical: build the same two-package fixture, move a .go
+# file into the subpackage, and assert the drift check still resolves its
+# anchors. Do that before trusting the script again after any refactor.
+#
 # WHY THIS EXISTS
 #
 # The gate exists to catch failures that "look like coverage": a target nothing
