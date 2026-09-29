@@ -112,6 +112,7 @@ The unpushed commits, oldest first:
 - `6ca056f` Make the attribution checker's output ASCII, and record where it must fail
 - `0a27c9b` Narrow the exemption, make the checker work in a recovered tree, and test it
 - `2a71fcf` Make the attribution self-test honest about the environments it cannot run in
+- `907e01d` Make the handoff artifact's staleness a gate instead of a note
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
