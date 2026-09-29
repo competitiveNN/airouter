@@ -99,6 +99,11 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 	start := time.Now()
 	ctx := r.Context()
 	timeout := requestTimeout(estimateTokens(req))
+	// Wall-clock budget for this request's fallback walk, matching the chat
+	// path (see fallbackBudget). Without it this loop is bounded only by
+	// maxAttempts and the per-retry cooldown sleep below, so a chain of
+	// failing providers can hold the client open for a minute or more.
+	budget := fallbackBudget(timeout)
 
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
@@ -111,6 +116,12 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 	for {
 		if ctx.Err() != nil {
 			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+			g.recordRequest(req.Model, 503, time.Since(start))
+			return
+		}
+		if attempts > 0 && time.Since(start) > budget {
+			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
+			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
@@ -235,6 +246,12 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	timeout := requestTimeout(estimateTokens(req))
+	// Wall-clock budget for this request's fallback walk, matching the chat
+	// path. A long chain of failing providers must not hold the client open
+	// for minutes on the Responses surface either.
+	budget := fallbackBudget(timeout)
+
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
@@ -254,6 +271,16 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 				log.Printf("[debug] session=%s model=%s -> responses stream cancelled: %v", sessionID, req.Model, cause)
 			}
 			g.recordRequest(req.Model, 499, time.Since(start))
+			return
+		}
+		// Wall-clock guard, mirroring the chat streaming path. Every attempt
+		// here is fully buffered and only replayed to the client on success
+		// (see below), so an error written here cannot corrupt a stream that
+		// has already started — the buffer is discarded, not flushed.
+		if attempts > 0 && time.Since(start) > budget {
+			log.Printf("[debug] session=%s model=%s -> responses stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
+			writeSSEError(w, flusher, "All models are currently unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
 		if attempts >= maxAttempts {
