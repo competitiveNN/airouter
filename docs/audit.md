@@ -1784,3 +1784,109 @@ Verification this round:
   CI YAML parses; 4 jobs, none `continue-on-error`; the `unpushed-export` job now
   runs the real `recovery-check.sh`, then re-runs the freshness check to prove
   the recovery process did not modify the artifacts it read
+
+
+### Round 15 (2026-09-29) — a hardcoded ref name, and a test that proved nothing
+
+Round 14 left the recovery tooling green. Green is only worth what it covers, so
+this round went looking for the places where a check could pass without the
+property it claims to test. It found one real defect and one test of its own.
+
+**1. `recovery-check.sh` assumed a ref name it had no way to know.**
+The bundle fetch hardcoded `refs/heads/airouter-unpushed-export`. But
+`export-unpushed.sh` honours an `EXPORT_REF` override (its own line 27 default),
+so a bundle exported under any other name is a bundle a reader can legitimately
+hold — and this check refused it with `bundle could not be fetched`, a message
+pointing at corruption rather than at a name. The same assumption is what made
+an ad-hoc probe of the real bundle report a false "MISMATCH" this session: the
+tip genuinely sits at `refs/heads/airouter-unpushed-export`, the probe looked
+for `refs/heads/master`, and the empty result read as staleness.
+
+FIXED. The tip ref is now discovered from the bundle itself via
+`git bundle list-heads`, which reports the names the bundle actually contains.
+`dist-freshness-check.sh` was already doing this (line 89); the two scripts had
+drifted apart. Verified end to end: a bundle exported under
+`EXPORT_REF=my-handoff-ref` now recovers (9 passed, 0 failed, exit 0), where the
+old code produced `fatal: couldn't find remote ref`.
+
+**2. A corrupted bundle was misdiagnosed by that fix, and the count contract
+caught it.** The first version of the discovery pre-check collapsed two
+different faults into one message. `git bundle list-heads` exits non-zero on a
+bundle it cannot read at all, and exits zero with empty output for a readable
+bundle carrying no head. Treating both as "advertises no head ref" told a reader
+their corrupt bundle had a naming problem. The assertion count caught it: case 3
+(29 → 31 passed, 1 failed) because the corrupted-bundle run no longer produced
+`could not be fetched`. A check that only compares totals would have shipped it.
+
+FIXED. The exit status is captured and the two faults are reported separately —
+an unreadable bundle falls through to the fetch, which produces the canonical
+diagnosis, and a readable-but-empty one is named for what it is. Both paths
+verified.
+
+**3. A new case that could not fail was deleted rather than shipped.** Case 12 was
+first written to assert that `recovery-check.sh` pins `UPSTREAM` before running
+self-tests in the recovered tree. Removing the pin left the run **passing**:
+`dist-freshness-selftest.sh` already pins `UPSTREAM` on its own command line
+(line 120, the round-12 fix), so the boundary pin was redundant
+defense-in-depth, not the fix it was presented as. The assertion was vacuous, and
+a vacuous assertion is worse than none — it reports coverage that does not exist.
+
+REPLACED. The honest, load-bearing contract is narrower: the check honours the
+caller's `UPSTREAM`. That is asserted by running, and the falsifiable half is the
+exit-2 case — a script that ignored `UPSTREAM` and fell back to its own default
+returns 0 where the assertion requires 2. Confirmed against a mutant that
+hardcodes `UPSTREAM=origin/master`. The reduced-environment assertion
+(`env -i`) covers the same refusal without a caller's shell exports. The pin
+itself was kept, and is now commented as defense-in-depth rather than as a fix.
+
+**4. The `unpushed-export` job was replayed locally, step by step.** The job had
+never been run outside CI. Two steps initially reported failure — and the cause
+was the replay harness, not the workflow: it fetched into an empty repository,
+where a bundle legitimately fails with "Repository lacks these prerequisite
+commits". CI seeds the base first (`git clone -b base .`). Corrected to match,
+every step passes and none degrades to a no-op. Notably the recovered-tree
+self-tests ran with **zero skips** in a real clone, which a synthetic fixture
+cannot show.
+
+**5. Negative controls re-verified independently.** Rather than trusting each
+self-test's report of its own controls, eight were reproduced from scratch: a
+stale artifact, an empty (`--allow-empty`) patch, cleanup-on-failure, the
+`while...then` lint rejection, its `while...do` acceptance, and the exit-2
+`UPSTREAM` refusal. All eight fail as they should. (Two initial failures were
+inverted logic in the probe, not defects in the code.)
+
+Coverage: `recovery-check-selftest.sh` is now **37 assertions** (was 29),
+including 3 for the custom-ref case and 5 for the `UPSTREAM` contract.
+
+**6. The handoff document's own recovery command did not work.** `dist/README.md`
+told the reader to run
+`git fetch .../airouter-unpushed.bundle 'HEAD:refs/heads/frombundle'`. That is
+precisely the command Round 13 identified as broken — `git bundle create A..HEAD`
+stores the tip under the ref `HEAD`, and `git fetch` rejects it with `fatal:
+couldn't find remote ref HEAD`. The export script was fixed in Round 13; the
+document that a human actually reads was not, so the one artifact written *for
+the next person* still carried the failure mode that round was about.
+
+FIXED. Both fetch examples now name `refs/heads/airouter-unpushed-export`, with
+an explanation of why the name is load-bearing, a note to substitute a custom
+`EXPORT_REF` if one was used, and the always-correct `git bundle list-heads` as
+the way to ask. Verified by running both the old and new commands: the old one
+fails with `couldn't find remote ref HEAD`, the new one fetches successfully.
+
+**7. The live SSE contract was re-verified end to end.** `sse-contract` is the one
+job here that cannot be reduced to a self-test: it needs a real gateway, a real
+fake upstream, and real HTTP. It was replayed locally — build, start, readiness
+probe, `scripts/sse-check.py` across all four models, then the no-comments
+assertion. Result: 4/4 streams terminated exactly once, last, with no stray
+comments, and the stream still produced data events.
+
+Two rounds of harness failure preceded that result and are recorded because both
+looked like contract violations. The gateway does not read `AIROUTER_API_KEY` for
+its own auth (that is the *client* key for `sse-check.py`); it takes `-api-key`,
+and the upstream key comes from `FAKE_KEY`. And the replay initially probed port
+9090, which another process on the machine already held — so the health check
+passed against a stranger's listener while the real gateway had died on
+`address already in use`, producing four 401s. The harness now uses a dedicated
+gateway port and asserts its own process is alive before trusting a probe. Worth
+recording as a general shape: a readiness probe that succeeds against a port you
+did not bind is not a readiness probe.
