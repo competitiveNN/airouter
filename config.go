@@ -178,6 +178,24 @@ type Preferences struct {
 	// before another request is blocked. DefaultCircuitHalfOpenProbes is
 	// used when the key is absent.
 	CircuitHalfOpenProbes int `yaml:"circuit_half_open_probes,omitempty"`
+
+	// DefaultMaxTokens is the output-token ceiling the gateway applies to
+	// requests that omit max_tokens. It is a pointer so three states are
+	// distinguishable:
+	//   - nil (absent): "auto" — half of the profile's advertised context
+	//     window (max_context_tokens). Conservative and profile-aware.
+	//   - 0: "never default" — the request is sent upstream without
+	//     max_tokens, letting the provider choose.
+	//   - positive: use that absolute value regardless of profile.
+	//
+	// This exists because half-of-context is right for chat models but
+	// wrong for reasoning models (deepseek-r1, gpt-oss, nemotron-3-nano
+	// reasoning, ...): their thinking tokens live OUTSIDE the visible
+	// output and can exceed a half-context budget, so the provider rejects
+	// the request. Operators with reasoning models in a chain should set
+	// this to 0 (or a larger value) rather than let the auto-default
+	// silently break them.
+	DefaultMaxTokens *int `yaml:"default_max_tokens,omitempty"`
 }
 
 // RotationWindow returns the effective window size, defaulting to
@@ -233,13 +251,22 @@ func (p *Preferences) CircuitBreakerThresholdValue() int {
 // CircuitHalfOpenProbesValue returns the effective half-open probe count,
 // defaulting to DefaultCircuitHalfOpenProbes when the key is absent.
 func (p *Preferences) CircuitHalfOpenProbesValue() int {
-	if p == nil {
-		return DefaultCircuitHalfOpenProbes
-	}
-	if p.CircuitHalfOpenProbes <= 0 {
+	if p == nil || p.CircuitHalfOpenProbes <= 0 {
 		return DefaultCircuitHalfOpenProbes
 	}
 	return p.CircuitHalfOpenProbes
+}
+
+// DefaultMaxTokensValue returns the effective default output-token ceiling
+// for requests that omit max_tokens. nil (absent) means "auto" — half of
+// the profile's advertised context window — and is signalled by a negative
+// return value so callers can distinguish it from an explicit 0 (never
+// default) and an explicit positive value.
+func (p *Preferences) DefaultMaxTokensValue() int {
+	if p == nil || p.DefaultMaxTokens == nil {
+		return -1 // auto
+	}
+	return *p.DefaultMaxTokens
 }
 
 // RotationEnabled reports whether new-session rotation is active.
