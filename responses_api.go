@@ -99,18 +99,16 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 	start := time.Now()
 	ctx := r.Context()
 	timeout := requestTimeout(estimateTokens(req))
-	// Wall-clock budget for this request's fallback walk, matching the chat
-	// path (see fallbackBudget). Without it this loop is bounded only by
-	// maxAttempts and the per-retry cooldown sleep below, so a chain of
-	// failing providers can hold the client open for a minute or more.
-	budget := fallbackBudget(timeout)
+	// Wall-clock budget for this request's fallback walk. Shared policy with
+	// the chat loops: this path was the one that shipped unbounded for a
+	// while, so it must use the same bound rather than its own copy.
+	walk := newBudgetState(start, timeout)
 
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
 		maxAttempts = 1
 	}
-	attempts := 0
 	tried := map[string]bool{}
 
 	for {
@@ -119,18 +117,18 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		if attempts > 0 && time.Since(start) > budget {
-			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
+		if walk.exhaustedNow() {
+			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		if attempts >= maxAttempts {
+		if walk.attempts >= maxAttempts {
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		attempts++
+		walk.next()
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
@@ -151,10 +149,14 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			return
 		}
 
+		// attemptStart times this single upstream call; `start` above is the
+		// request-level clock every recordRequest below measures against.
+		attemptStart := time.Now()
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
 		resp, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
 		if err != nil {
 			cancel()
+			g.recordAttempt(ep, time.Since(attemptStart), false)
 			if isClientDisconnect(err) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				g.recordRequest(req.Model, 499, time.Since(start))
@@ -174,6 +176,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		resp.Body.Close()
 		cancel()
 		if readErr != nil {
+			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
 			g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
@@ -183,6 +186,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		}
 
 		if resp.StatusCode != 200 {
+			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
 			// ApplyCooldownForSession already advances the circuit breaker
@@ -203,6 +207,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		if err != nil {
 			// A 200 that isn't a usable completion is a provider fault, not a
 			// client error: mark it and fall through to the next model.
+			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
 			g.router.ApplyCooldownForSession(ep, 502, err.Error(), sessionID, 0)
@@ -212,6 +217,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		}
 
 		g.router.RecordSuccess(ep)
+		g.recordAttempt(ep, time.Since(attemptStart), true)
 		env := buildResponseEnvelope(chat, req.Model)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
@@ -247,17 +253,16 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 	}
 
 	timeout := requestTimeout(estimateTokens(req))
-	// Wall-clock budget for this request's fallback walk, matching the chat
-	// path. A long chain of failing providers must not hold the client open
-	// for minutes on the Responses surface either.
-	budget := fallbackBudget(timeout)
+	// Wall-clock budget for this request's fallback walk. Shared policy with
+	// the chat loops: this path was the one that shipped unbounded for a
+	// while, so it must use the same bound rather than its own copy.
+	walk := newBudgetState(start, timeout)
 
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
 		maxAttempts = 1
 	}
-	attempts := 0
 	tried := map[string]bool{}
 
 	// retryBody is the upstream body for the current attempt. After a
@@ -277,18 +282,18 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		// here is fully buffered and only replayed to the client on success
 		// (see below), so an error written here cannot corrupt a stream that
 		// has already started — the buffer is discarded, not flushed.
-		if attempts > 0 && time.Since(start) > budget {
-			log.Printf("[debug] session=%s model=%s -> responses stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
+		if walk.exhaustedNow() {
+			log.Printf("[debug] session=%s model=%s -> responses stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		if attempts >= maxAttempts {
+		if walk.attempts >= maxAttempts {
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		attempts++
+		walk.next()
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(retryBody), tried)
 		if ep == nil {

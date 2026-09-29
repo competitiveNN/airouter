@@ -1,10 +1,28 @@
+# Security & correctness audit (2026-08-29, updated 2026-09-29)
+
+> **Reading the `file.go:NNN` references.** These are *point-in-time* citations
+> from the audit rounds, recorded so the original finding stays reproducible.
+> They are not maintained and they have drifted: line numbers in this document
+> no longer correspond to the current source. **Cite the symbol, not the line**
+> when you act on a finding — the findings themselves are accurate, the
+> coordinates are not. Where a finding was fixed, the `Status:` line names the
+> function that now carries the fix, and that name is the durable anchor.
+>
+> Status vocabulary used below:
+>
+> - **FIXED** — the defect no longer exists in the code.
+> - **ACCEPTED** — deliberately not fixed; the trade-off is recorded and,
+>   where it matters, pinned by a test. This is not a backlog item.
+> - **N/A** — the code the finding describes no longer exists.
+> - **OPEN** — genuinely unresolved. This list should be short.
+
 CRITICAL (data loss / undefined behavior)
 
-• router.go:96 — isAvailableLocked calls delete(r.cooldowns, ...) while the
-  caller (IsAvailable) only holds RLock. Reader-vs-writer map race;
+• `Router.isAvailableLocked` calls `delete(r.cooldowns, ...)` while the
+  caller (`IsAvailable`) only holds RLock. Reader-vs-writer map race;
   race-detector will flag it.
-  Status: FIXED (2026-09-15). Delete moved to RecordSuccess under the full
-  write lock; isAvailableLocked only reads now.
+  Status: FIXED (2026-09-15). Delete moved to `RecordSuccess` under the full
+  write lock; `isAvailableLocked` only reads now.
 
 • api.go:549-557 — ReloadConfig swaps g.config, g.router.config,
   g.proxy.config with no synchronization. In-flight requests can observe
@@ -43,11 +61,13 @@ HIGH (user-visible correctness)
   Status: FIXED (api.go:890-897). contentDelta strips the accumulatedContent
   prefix before appending.
 
-• router.go:191-198 — SelectNext scans the chain from index 0 after current,
-  so it can reselect a model that already failed this request. Only mitigated
-  by it now being in its own cooldown.
-  Status: N/A. SelectNext is test-only; production uses SelectEndpoint with
-  a per-request tried set (router.go:487-547). Never reselects a tried model.
+• `Router.SelectNext` — scans the chain from index 0 after current, so it can
+  reselect a model that already failed this request. Only mitigated by it now
+  being in its own cooldown.
+  Status: N/A. `SelectNext` no longer exists — it was removed; production uses
+  `Router.SelectEndpoint` with a per-request tried set, which never reselects a
+  tried model. Two tests are still *named* `TestRouterSelectNext*` but call
+  `SelectEndpoint`; the names are historical, the code is not.
 
 • api.go:330-378 — handleCompletion never calls RecordSuccess. Non-stream
   cooldowns are sticky: a model escalates on failures and never clears until
@@ -93,14 +113,13 @@ MEDIUM
   Status: FIXED. firstByteReader.Read closes the underlying reader on
   context timeout to unblock the goroutine (proxy.go:342-388).
 
-• proxy.go:347-348 — bufio.Scanner is capped at 1 MB.
-  Status: FIXED. scanner.Buffer set to 16 MB (proxy.go:531-533).
+• `Proxy.streamSSE` — bufio.Scanner is capped at 1 MB.
+  Status: FIXED. `scanner.Buffer` set to 16 MB.
 
-• proxy.go:424-448 — sseEventIsRelease returns true on unparseable JSON
-  ("fail open").
-  Status: OPEN (intentional). Fail-open avoids stalling the stream;
-  malformed upstream events would otherwise hang the client. Trade-off
-  accepted.
+• `sseEventIsRelease` returns true on unparseable JSON ("fail open").
+  Status: ACCEPTED, not open. Fail-open avoids stalling the stream; a malformed
+  upstream event would otherwise hang the client. The trade-off is deliberate
+  and is pinned by `TestSSEEventIsRelease_FailOpen`.
 
 • proxy.go:344-422 — Final SSE event without a trailing blank line is
   silently dropped.
@@ -116,10 +135,24 @@ MEDIUM
   Status: FIXED. Checks for the canonical "type":"image_url" marker
   (api.go:441-443).
 
-• proxy.go:268 — streamIdleTimeout = 60s is hard-coded.
-  Status: OPEN (low). Default is 60 s but configurable via
-  Proxy.SetStreamIdleTimeout (proxy.go:148-162). No test exercises
-  the override.
+• proxy.go streamSSE — the event that triggers the release was written
+  *after* the buffered pre-release prefix.
+  Status: FIXED. `sseEventIsRelease` only becomes true for an event carrying
+  content or a tool call, so the held prefix is exactly the role-only /
+  reasoning-only opener. processEvent set `released = true` and then tested
+  `if released`, so the releasing event jumped the queue and the client got
+  `role: "assistant"` *after* its first content token. That inverts SSE delta
+  ordering and reads to clients as two separate responses. Now
+  `flushBuffered()` runs before the releasing event is forwarded; pinned by
+  TestStreamSSE_BuffersPreReleaseEventsUntilReleasePoint for both
+  toolCalls modes.
+
+• `Proxy.streamIdleTimeout` = 60s is hard-coded.
+  Status: ACCEPTED, not open. The default is 60 s and is overridable via
+  `Proxy.SetStreamIdleTimeout`; an earlier version of this doc claimed no test
+  exercised the override, which was stale — `TestStreamSSE_IdleTimeoutClosesReader`
+  and the `SetStreamIdleTimeout` validation tests (rejecting 0 and negative
+  values) both do.
 
 • api.go:367-376 — Non-stream path copies upstream Content-Encoding/
   Content-Length to the client.
@@ -153,14 +186,34 @@ LOW (cleanup / hardening)
   ErrInvalidModel declared but unused.
   Status: FIXED. Removed; `go vet` reports no unused symbols.
 
-• router.go:169-199 — SelectNext only used by tests.
-  Status: OPEN (intentional). SelectNext is a test helper; production
-  uses SelectEndpoint. Documented as test-only.
+• `Router.SelectNext` only used by tests.
+  Status: RESOLVED. `SelectNext` has been deleted outright; only the
+  misleadingly-named `TestRouterSelectNext*` tests remain, and they exercise
+  `SelectEndpoint`. No production or test code calls a `SelectNext` symbol.
 
-• api.go:438-449 — /health is unauthenticated.
-  Status: OPEN (intentional). Returns only {"status":"ok"} — no
-  config, sessions, cooldowns, provider URLs or keys — safe for load
-  balancers. See memory/auth_harden_notes.md.
+• `HandleHealth` (/health) is unauthenticated.
+  Status: ACCEPTED, not open. It returns only `{"status":"ok"}` — no config,
+  sessions, cooldowns, provider URLs or keys — so it is safe for load balancers
+  and is the documented liveness probe. Contrast with /metrics, which IS
+  authenticated (see below), because its series are labelled by provider and
+  model.
+
+• main.go — /metrics was implemented but never registered in the mux.
+  Status: FIXED. HandleMetrics existed in api.go and the full Metrics
+  collector (requests, fallbacks, cooldowns, circuit transitions) was
+  written, but no `mux.HandleFunc("/metrics", ...)` existed, so the endpoint
+  404'd in every deployment. docs/RUNBOOK.md even claimed the handler was
+  "wired into all four request surfaces" — the claim was never verified.
+  Lesson: an unwired handler is indistinguishable from a working one until
+  something actually scrapes it. The `sse-contract` CI job now scrapes it.
+
+• main.go / api.go — /metrics served with no authentication.
+  Status: FIXED. The series are labelled by provider and model
+  (`endpoint="provider:model"`) and expose routing behaviour, so an
+  unauthenticated scrape let anyone on the network enumerate configured
+  upstreams and watch them fail. Now gated behind checkAuth like /admin.
+  Pinned by TestHandleMetricsServesAttemptTelemetryWithAuth and by a CI
+  assertion that an unauthenticated scrape is refused.
 
 • api.go:157 — API-key comparison via == is not constant-time.
   Status: FIXED. checkAuth uses subtle.ConstantTimeCompare with
@@ -185,9 +238,12 @@ LOW (cleanup / hardening)
   Status: FIXED. watchConfig selects on ctx.Done() and returns
   (main.go:134-163). main calls cancel() on signal.
 
-• main.go:128-134 — Whole-file SHA-256 every 3 s; fsnotify/mtime cheaper.
-  Status: PARTIALLY OPEN. watchConfig uses mtime+size polling (no
-  hashing), so the SHA-256 concern is moot. The 3 s ticker is acceptable.
+• `watchConfig` — Whole-file SHA-256 every 3 s; fsnotify/mtime cheaper.
+  Status: ACCEPTED, not open. `watchConfig` uses mtime+size polling and never
+  hashes the file, so the SHA-256 cost concern is moot. The remaining 3 s ticker
+  latency is a deliberate trade-off: fsnotify would add a platform-dependent
+  dependency for a config that changes a few times a month at most, and a
+  missed event silently fails to reload where a poll cannot.
 
 ---
 

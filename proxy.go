@@ -24,6 +24,35 @@ type Proxy struct {
 	config            *atomic.Pointer[Config]
 	toolCalls         atomic.Bool
 	streamIdleTimeout time.Duration
+	// metrics is the shared collector, set after construction (the gateway
+	// owns the instance, and the proxy is built before the gateway exists).
+	// Guarded by metricsMu because SetMetrics runs on the main goroutine
+	// while streamSSE reads it from request goroutines.
+	metricsMu sync.RWMutex
+	metrics   *Metrics
+}
+
+// SetMetrics attaches the shared metrics collector to the proxy so stream-level
+// signals (SSE comment routing) are recorded. Nil disables recording, which is
+// the case for the many unit tests that build a bare &Proxy{}.
+func (p *Proxy) SetMetrics(m *Metrics) {
+	p.metricsMu.Lock()
+	p.metrics = m
+	p.metricsMu.Unlock()
+}
+
+// recordSSEComments reports SSE comment lines that were routed out of the event
+// path. Nil-safe.
+func (p *Proxy) recordSSEComments(n int) {
+	if n <= 0 {
+		return
+	}
+	p.metricsMu.RLock()
+	m := p.metrics
+	p.metricsMu.RUnlock()
+	if m != nil {
+		m.SSECommentRoutedOut(n)
+	}
 }
 
 func NewProxy(cfg *Config) *Proxy {
@@ -564,6 +593,16 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	tcs := []streamToolCall{}
 	released := false
 	completionTokens := 0
+	// sseComments counts the comment lines dropped by the scan loop below, so
+	// the router can expose how much upstream chatter is being filtered out of
+	// the event path. Reported to metrics after the loop, on every return path
+	// that touches the scanner.
+	sseComments := 0
+	// Deferred rather than reported at each return: the drop can happen on a
+	// clean finish, a mid-stream error that triggers fallback, or a flush
+	// failure, and an error path is exactly when the upstream chatter is
+	// worth knowing about.
+	defer func() { p.recordSSEComments(sseComments) }()
 
 	// When toolCalls is disabled, forward all events verbatim without any
 	// coalescing. This preserves compatibility with clients that handle raw
@@ -673,8 +712,23 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 		if bytes.Equal(sseDataPayload(raw), []byte("[DONE]")) {
 			return flushBuffered()
 		}
+		// An event that satisfies sseEventIsRelease ends the hold-and-discard
+		// window: everything after it is real output. Flush what we held
+		// BEFORE forwarding this event.
+		//
+		// Without this ordering the releasing event itself jumped ahead of the
+		// buffered prefix. sseEventIsRelease only becomes true for an event
+		// carrying content or a tool call, so the pre-release prefix is exactly
+		// the role-only / reasoning-only opener — and the client received its
+		// `role: "assistant"` delta *after* the first content token. That
+		// inverts SSE delta ordering and breaks clients that treat a late role
+		// marker as the start of a new message, so the output looked like two
+		// responses.
 		if !released && sseEventIsRelease(raw) {
 			released = true
+			if err := flushBuffered(); err != nil {
+				return err
+			}
 		}
 		// Capture completion token usage from SSE usage events emitted before
 		// [DONE] so we can report TPS for streaming requests.
@@ -760,6 +814,7 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 		// inflates the buffer with bytes the client has no use for. Observed live
 		// 2026-09-29: commandcode2 relays emit ": keepalive" between chunks.
 		if len(bytes.TrimSpace(line)) > 0 && bytes.HasPrefix(bytes.TrimSpace(line), []byte(":")) {
+			sseComments++
 			continue
 		}
 

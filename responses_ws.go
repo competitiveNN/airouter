@@ -156,15 +156,22 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 
 	// A WebSocket turn is always streamed: the socket is a persistent
 	// transport and the client expects incremental events.
+	turnStart := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), wsTurnTimeout)
 	defer cancel()
+
+	// Wall-clock budget for this turn's fallback walk, using the same policy as
+	// the HTTP surfaces. wsTurnTimeout (10 minutes) is only a backstop for a
+	// genuinely long single generation; without a fallback budget a chain of
+	// failing providers holds the socket for all ten minutes, which is far
+	// beyond what any of those attempts could justify.
+	walk := newBudgetState(turnStart, requestTimeout(estimateTokens(chatReq)))
 
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
 		maxAttempts = 1
 	}
-	attempts := 0
 	tried := map[string]bool{}
 
 	// wsEvents is a flushWriter that ships each Responses event to the client
@@ -176,11 +183,16 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 			g.wsSendError(conn, corrID, "Request cancelled", "server_error", "cancelled")
 			return
 		}
-		if attempts >= maxAttempts {
+		if walk.exhaustedNow() {
+			log.Printf("[debug] session=%s model=%s -> ws turn fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			return
 		}
-		attempts++
+		if walk.attempts >= maxAttempts {
+			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			return
+		}
+		walk.next()
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {

@@ -494,6 +494,236 @@ data: [DONE]
 	}
 }
 
+// The comment-drop path is the fix for the "[DONE] released ahead of the real
+// chunks" bug, so it is worth pinning that dropped comments are actually
+// counted: the counter is the only signal that a provider started interleaving
+// keepalives again, and a silently broken counter would remove the early
+// warning without failing anything.
+func TestStreamSSE_CountsCommentLinesRoutedOut(t *testing.T) {
+	const withKeepalives = `: keepalive
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}
+
+: keepalive
+
+: another comment
+
+data: [DONE]
+
+`
+	m := NewMetrics()
+	p := &Proxy{}
+	p.SetMetrics(m)
+	p.SetToolCalls(false)
+
+	buf := &bytes.Buffer{}
+	flusher := &testFlusher{buf}
+	if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(withKeepalives)); err != nil {
+		t.Fatalf("streamSSE: %v", err)
+	}
+	if got := m.sseCommentsRoutedOut.Load(); got != 3 {
+		t.Errorf("comment counter = %d, want 3 (the three ':' lines)", got)
+	}
+
+	// A stream with no comments must not move the counter.
+	if _, _, _, err := p.streamSSE(flusher, flusher,
+		strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n")); err != nil {
+		t.Fatalf("streamSSE (no comments): %v", err)
+	}
+	if got := m.sseCommentsRoutedOut.Load(); got != 3 {
+		t.Errorf("comment counter = %d after a comment-free stream, want 3", got)
+	}
+
+	// The counter must also survive the error path: a mid-stream upstream error
+	// is exactly the case where the chatter matters.
+	m2 := NewMetrics()
+	p2 := &Proxy{}
+	p2.SetMetrics(m2)
+	errStream := ": keepalive\n\ndata: {\"error\":{\"message\":\"boom\"}}\n\n"
+	if _, _, _, err := p2.streamSSE(flusher, flusher, strings.NewReader(errStream)); err == nil {
+		t.Fatal("want an error from an upstream SSE error event")
+	}
+	if got := m2.sseCommentsRoutedOut.Load(); got != 1 {
+		t.Errorf("comment counter on the error path = %d, want 1", got)
+	}
+}
+
+// A pre-release event (role-only, empty content) must reach the client BEFORE
+// the content chunks, in its original position in the stream.
+//
+// The release heuristic exists so an early upstream error can be discarded
+// instead of shown to the client, which means events before the first
+// content-bearing delta are held in `buffered`. But the event that triggers
+// the release is itself held: processEvent sets released=true and only then
+// checks `if released`, so a role-only delta arriving just before the first
+// real content token is written *after* it. The client then sees content
+// first and a stray role marker last, which violates SSE delta ordering
+// (role is expected to open the assistant turn) and confuses clients that
+// treat a late `role` as a new message.
+func TestStreamSSE_BuffersPreReleaseEventsUntilReleasePoint(t *testing.T) {
+	const roleFirst = `data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"hello"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":" world"}}]}
+
+data: [DONE]
+
+`
+	for _, toolCalls := range []bool{false, true} {
+		buf := &bytes.Buffer{}
+		flusher := &testFlusher{buf}
+		p := &Proxy{}
+		p.SetToolCalls(toolCalls)
+
+		if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(roleFirst)); err != nil {
+			t.Fatalf("toolCalls=%v: streamSSE: %v", toolCalls, err)
+		}
+		out := buf.String()
+
+		role := strings.Index(out, `"role":"assistant"`)
+		firstContent := strings.Index(out, `"content":"hello"`)
+		if role < 0 {
+			t.Errorf("toolCalls=%v: the role-only delta was dropped entirely:\n%s", toolCalls, out)
+		} else if firstContent < 0 {
+			t.Errorf("toolCalls=%v: content chunk missing:\n%s", toolCalls, out)
+		} else if role > firstContent {
+			t.Errorf("toolCalls=%v: role delta emitted at byte %d, AFTER the first content chunk at byte %d; the buffered prefix must be flushed before the releasing event:\n%s",
+				toolCalls, role, firstContent, out)
+		}
+	}
+}
+
+// sseDeltaAtKind is a structural, implementation-independent view of a
+// forwarded SSE stream: for each data chunk, what kind of delta it carried.
+// The ordering test below asserts on this rather than on byte offsets in the
+// raw body, so it keeps working no matter how the buffering is refactored.
+type sseDeltaKind struct {
+	role      string // "assistant" if the delta opens the turn
+	content   string // delta.content, "" when absent
+	hasFinish bool   // delta carries a non-null finish_reason
+	toolCalls int    // len(delta.tool_calls)
+}
+
+// parseSSEKinds decodes a captured client-visible SSE body into the ordered
+// list of delta kinds it delivered. It deliberately fails the test on
+// unparseable payloads rather than skipping them: a chunk the gateway cannot
+// round-trip is itself a contract violation.
+func parseSSEKinds(t *testing.T, out string) []sseDeltaKind {
+	t.Helper()
+	var kinds []sseDeltaKind
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Role      string            `json:"role"`
+					Content   string            `json:"content"`
+					ToolCalls []json.RawMessage `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("gateway forwarded an unparseable chunk to the client: %v\n%s", err, payload)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		k := sseDeltaKind{
+			role:      chunk.Choices[0].Delta.Role,
+			content:   chunk.Choices[0].Delta.Content,
+			hasFinish: chunk.Choices[0].FinishReason != nil,
+			toolCalls: len(chunk.Choices[0].Delta.ToolCalls),
+		}
+		kinds = append(kinds, k)
+	}
+	return kinds
+}
+
+// TestStreamSSE_WireLevelDeltaOrdering asserts the client-visible ordering
+// invariant directly, with no reference to how the proxy buffers internally:
+//
+//  1. the delta that opens the assistant turn (role=assistant) must come
+//     BEFORE the first content-bearing delta, not after it;
+//  2. reassembling the content deltas in delivery order must reproduce the
+//     upstream text exactly, with no chunk duplicated, reordered or dropped.
+//
+// This is deliberately stronger than TestStreamSSE_BuffersPreReleaseEventsUntil
+// ReleasePoint, which pins the specific processEvent bug. That test asserts a
+// byte relationship in one input; this one asserts the contract on the parsed
+// stream, so a future refactor that reorders the hold-and-release machinery is
+// caught here even if the old byte relationship no longer holds. Ordering
+// between event *kinds* is the thing clients depend on, and it is exactly what
+// a [DONE]-position check cannot see.
+func TestStreamSSE_WireLevelDeltaOrdering(t *testing.T) {
+	const upstream = `data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"The"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":" quick"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":" brown"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	const want = "The quick brown"
+	for _, toolCalls := range []bool{false, true} {
+		buf := &bytes.Buffer{}
+		flusher := &testFlusher{buf}
+		p := &Proxy{}
+		p.SetToolCalls(toolCalls)
+
+		if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(upstream)); err != nil {
+			t.Fatalf("toolCalls=%v: streamSSE: %v", toolCalls, err)
+		}
+		kinds := parseSSEKinds(t, buf.String())
+
+		// Invariant 2 first: content must survive intact. If the content is
+		// wrong, the ordering assertions below would be reporting on garbage.
+		var rebuilt strings.Builder
+		for _, k := range kinds {
+			rebuilt.WriteString(k.content)
+		}
+		if got := rebuilt.String(); got != want {
+			t.Errorf("toolCalls=%v: reassembled content = %q, want %q (chunks duplicated, reordered or dropped)\ndeltas: %+v",
+				toolCalls, got, want, kinds)
+		}
+
+		// Invariant 1: the opening role delta must precede all content.
+		roleIdx, firstContentIdx := -1, -1
+		for i, k := range kinds {
+			if roleIdx < 0 && k.role == "assistant" {
+				roleIdx = i
+			}
+			if firstContentIdx < 0 && k.content != "" {
+				firstContentIdx = i
+			}
+		}
+		if roleIdx < 0 {
+			t.Errorf("toolCalls=%v: no role=assistant delta reached the client; the assistant turn is never opened\n%+v", toolCalls, kinds)
+		} else if firstContentIdx >= 0 && roleIdx > firstContentIdx {
+			t.Errorf("toolCalls=%v: role delta at index %d arrives AFTER the first content delta at index %d; a client that opens a turn on role will treat this as a second message\n%+v",
+				toolCalls, roleIdx, firstContentIdx, kinds)
+		}
+
+		// The terminal chunk must remain last, before [DONE].
+		if n := len(kinds); n == 0 || !kinds[n-1].hasFinish {
+			t.Errorf("toolCalls=%v: the finish_reason chunk must be the final delta; got %+v", toolCalls, kinds)
+		}
+	}
+}
+
 // assertSSEWellFormed checks the termination contract on a captured stream
 // body: exactly one [DONE], it is the final data event, and it comes after
 // every content chunk. Shared by the fallback tests below.
@@ -696,5 +926,89 @@ func TestSSEEventIsRelease_FailOpen(t *testing.T) {
 				t.Errorf("sseEventIsRelease(%q) = %v, want %v", tc.raw, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAllFallbackLoopsAreBudgetBounded guards the invariant that every fallback
+// walk in the gateway is wall-clock bounded.
+//
+// This is a structural test, not a behavioural one. It parses the source and
+// requires that any function which loops on `maxAttempts = chainLen*3+1` also
+// constructs a budgetState. The reason is history: the budget was added to the
+// two chat loops, and the two Responses loops in responses_api.go were simply
+// missed. Nothing failed — they just held a client open for 2m30s while the
+// chat path capped out at 12s. A behavioural test cannot catch that, because
+// each loop is individually correct; only a whole-codebase check can.
+//
+// If you add a fifth fallback loop, this test fails until it constructs a
+// budget. That is the intended friction.
+func TestAllFallbackLoopsAreBudgetBounded(t *testing.T) {
+	sources := map[string]string{
+		"api.go":           "api.go",
+		"responses_api.go": "responses_api.go",
+		"responses_ws.go":  "responses_ws.go",
+		"proxy.go":         "proxy.go",
+	}
+	found := 0
+	for name, path := range sources {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		src := string(data)
+		if !strings.Contains(src, "chainLen*3 + 1") && !strings.Contains(src, "chainLen*3+1") {
+			continue
+		}
+		found++
+		if !strings.Contains(src, "newBudgetState(") {
+			t.Errorf("%s runs a fallback loop (chainLen*3+1) but never calls "+
+				"newBudgetState — its walk is unbounded in wall-clock terms. "+
+				"Construct a budgetState and gate the loop on it.", name)
+		}
+	}
+	if found == 0 {
+		t.Fatal("no fallback loops found — the source layout changed, so this " +
+			"test is no longer checking what it claims to check")
+	}
+	t.Logf("checked %d files containing a fallback loop", found)
+}
+
+// TestBudgetStateAllowsFirstAttempt pins the one behaviour every loop depends
+// on: a request is never failed before it has been tried at least once.
+// Without it, a slow first endpoint could trip the budget and return an error
+// without the gateway ever trying anything.
+func TestBudgetStateAllowsFirstAttempt(t *testing.T) {
+	// A start far in the past, so the budget is already spent.
+	walk := newBudgetState(time.Now().Add(-time.Hour), time.Second)
+	if walk.exhaustedNow() {
+		t.Error("a request must be allowed one attempt even with no time left")
+	}
+	walk.next()
+	if !walk.exhaustedNow() {
+		t.Error("after one attempt against an already-spent budget, the walk must stop")
+	}
+	// exhaustedNow must be idempotent so callers can call it in a loop.
+	if !walk.exhaustedNow() || !walk.exhaustedNow() {
+		t.Error("exhaustedNow must keep reporting exhausted once it is")
+	}
+	if walk.attempts != 1 {
+		t.Errorf("attempts = %d, want 1", walk.attempts)
+	}
+}
+
+// TestBudgetStateScaledByRequestSize checks the state carries the same scaled
+// budget as fallbackBudget, so routing a loop through it cannot change
+// behaviour relative to calling the function directly.
+func TestBudgetStateScaledByRequestSize(t *testing.T) {
+	for _, tokens := range []int{0, 4, 25_000, 200_000} {
+		timeout := requestTimeout(tokens)
+		walk := newBudgetState(time.Now(), timeout)
+		if walk.budget != fallbackBudget(timeout) {
+			t.Errorf("tokens=%d: budgetState budget %v != fallbackBudget %v",
+				tokens, walk.budget, fallbackBudget(timeout))
+		}
+		if walk.budget > maxFallbackWallClock {
+			t.Errorf("tokens=%d: budget %v exceeds hard ceiling %v", tokens, walk.budget, maxFallbackWallClock)
+		}
 	}
 }
