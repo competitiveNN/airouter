@@ -803,11 +803,52 @@ func requestTimeout(tokens int) time.Duration {
 // fallback still degrades gracefully; it just stops grinding.
 const maxFallbackWallClock = 45 * time.Second
 
+// fallbackBudget returns the wall-clock ceiling for one request's fallback
+// walk, scaled to the size of the request.
+//
+// The 45s ceiling above is the worst case, appropriate for a large-context
+// request where each attempt legitimately gets a 17s+ per-attempt timeout. A
+// small request is different: requestTimeout() gives it only 5s per attempt, so
+// walking a long chain is 5s of *dead time* per endpoint. That is the case that
+// was measured at 62.6s (4-token `smart` request, 20+ nvidia endpoints) and
+// then 22.9s after the flat bound was added. For a small request 22.9s is still
+// a user staring at a spinner, and it buys very little: the endpoints that
+// matter for a short prompt are near the head of the chain.
+//
+// So scale the budget to what the request can actually justify. A small
+// request gets a short one, and because the per-attempt timeout is also small,
+// the walk still covers many endpoints — just not dozens.
+//
+// The budget always allows at least two full attempts where that fits inside
+// the ceiling, so a single transient failure never ends a request. It is
+// clamped to maxFallbackWallClock: for a very large context a single attempt
+// can already approach 45s on its own, and letting 2*timeout through would put
+// the effective ceiling back at minutes — the exact failure the ceiling exists
+// to prevent.
+func fallbackBudget(timeout time.Duration) time.Duration {
+	budget := maxFallbackWallClock
+	switch {
+	case timeout <= 5*time.Second:
+		// Small request: 12s buys ~2 attempts at 5s plus the fast successes
+		// that usually come back in well under a second.
+		budget = 12 * time.Second
+	case timeout <= 8*time.Second:
+		budget = 20 * time.Second
+	}
+	if min := 2 * timeout; budget < min && min <= maxFallbackWallClock {
+		budget = min
+	}
+	return budget
+}
+
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
 	start := time.Now()
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
+	// Wall-clock budget for this request's fallback walk, scaled to the
+	// per-attempt timeout (small requests get a short budget).
+	budget := fallbackBudget(timeout)
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
@@ -829,8 +870,8 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// Wall-clock guard: stop grinding through the chain once this request
 		// has spent its whole fallback budget, so a client never waits
 		// minutes on a chain of failing providers.
-		if attempts > 0 && time.Since(start) > maxFallbackWallClock {
-			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted after %d attempts in %v", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond))
+		if attempts > 0 && time.Since(start) > budget {
+			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
@@ -969,6 +1010,9 @@ start := time.Now()
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
+	// Wall-clock budget for this request's fallback walk, scaled to the
+	// per-attempt timeout (small requests get a short budget).
+	budget := fallbackBudget(timeout)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1026,8 +1070,8 @@ start := time.Now()
 		// anything to the client, in which case writing a fresh error into the
 		// stream body would corrupt an already-started response — so just
 		// finish the stream cleanly instead.
-		if attempts > 0 && time.Since(start) > maxFallbackWallClock {
-			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted after %d attempts in %v", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond))
+		if attempts > 0 && time.Since(start) > budget {
+			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
 			if accumulatedContent == "" {
 				writeSSEError(w, flusher, "All models are currently unavailable")
 			}

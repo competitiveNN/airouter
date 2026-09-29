@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -276,10 +278,217 @@ func TestFallbackWallClockBoundIsSane(t *testing.T) {
 	if maxFallbackWallClock > time.Minute {
 		t.Errorf("maxFallbackWallClock = %v, want <= 1m", maxFallbackWallClock)
 	}
-	// It must still allow more than one retry, otherwise a single transient
-	// failure ends the request.
-	if maxFallbackWallClock < 2*requestTimeout(0) {
-		t.Errorf("maxFallbackWallClock = %v is too tight: it allows fewer than "+
-			"2 attempts at the %v per-attempt timeout", maxFallbackWallClock, requestTimeout(0))
+}
+
+// TestFallbackBudgetScalesWithRequestSize: a small request gets a much shorter
+// budget than a large one, because its per-attempt timeout is also short, so
+// the walk is nearly all dead time. Measured 2026-09-29: a 4-token `smart`
+// request took 62.6s before the bound and 22.9s with a flat 45s ceiling —
+// still a user staring at a spinner.
+func TestFallbackBudgetScalesWithRequestSize(t *testing.T) {
+	small := fallbackBudget(requestTimeout(4))      // 5s  per attempt -> 12s
+	medium := fallbackBudget(requestTimeout(25000)) // 7s  per attempt -> 20s
+	large := fallbackBudget(requestTimeout(200000)) // 25s per attempt -> 45s (ceiling)
+
+	if small != 12*time.Second {
+		t.Errorf("small-request budget = %v, want 12s", small)
+	}
+	if small >= medium {
+		t.Errorf("small-request budget %v should be shorter than medium %v", small, medium)
+	}
+	if medium >= large {
+		t.Errorf("medium-request budget %v should be shorter than large %v", medium, large)
+	}
+	// The small-request budget exists specifically to cap a spinner at a
+	// tolerable length; a flat 45s is what we are trying to avoid here.
+	if small > 15*time.Second {
+		t.Errorf("small-request budget %v is too long; it defeats the purpose", small)
+	}
+	if large > maxFallbackWallClock {
+		t.Errorf("large-request budget %v exceeds the hard ceiling %v", large, maxFallbackWallClock)
+	}
+}
+
+// TestFallbackBudgetAlwaysAllowsTwoAttempts: whenever two attempts actually
+// fit inside the hard ceiling, the budget must cover both, so a single
+// transient failure never ends a request.
+//
+// For a very large context a single attempt can itself approach the 45s
+// ceiling; there the ceiling wins deliberately (see fallbackBudget) rather
+// than letting the effective budget drift back to minutes.
+func TestFallbackBudgetAlwaysAllowsTwoAttempts(t *testing.T) {
+	for _, tokens := range []int{0, 4, 1000, 10_000, 100_000, 500_000, 2_000_000} {
+		timeout := requestTimeout(tokens)
+		budget := fallbackBudget(timeout)
+		if budget <= 0 {
+			t.Fatalf("tokens=%d: non-positive budget %v", tokens, budget)
+		}
+		if budget > maxFallbackWallClock {
+			t.Errorf("tokens=%d: budget %v exceeds hard ceiling %v", tokens, budget, maxFallbackWallClock)
+		}
+		if 2*timeout <= maxFallbackWallClock && budget < 2*timeout {
+			t.Errorf("tokens=%d: budget %v < 2 x per-attempt timeout %v, but both fit "+
+				"inside the %v ceiling", tokens, budget, timeout, maxFallbackWallClock)
+		}
+	}
+}
+
+// TestStreamSSE_DoneIsAlwaysLastAndEmittedOnce guards the SSE termination
+// contract. A client stops parsing at the first `data: [DONE]`, so a stream
+// that starts with one loses every real chunk that follows.
+//
+// The failure mode this pins: a provider whose deltas carry nothing the
+// client treats as content (kilocode/dots-studio sends role-only deltas with
+// `content:""` and a `reasoning` field) never satisfies the release
+// condition in sseEventIsRelease, so [DONE] is the event that first sets
+// released=true. The old code then buffered the sentinel, and the post-loop
+// flush emitted that buffer ahead of its own [DONE] — [DONE] first, real
+// chunks after, then a duplicate. Observed live 2026-09-29 on `work` and
+// `smart` against dots-studio, where upstream's own stream is well-formed
+// ([DONE] last), confirming the fault was ours.
+//
+// Both tool-call modes are covered: with coalescing on, [DONE] is held back
+// for synthesized tool calls; with it off (the daemon default), [DONE] used
+// to flow straight through the buffer.
+func TestStreamSSE_DoneIsAlwaysLastAndEmittedOnce(t *testing.T) {
+	// A reasoning-only stream: every delta is role-only with empty content,
+	// so nothing releases until [DONE].
+	const reasoningOnly = `data: {"id":"gen-1","object":"chat.completion.chunk","model":"dots-studio/dots-3-note-preview:free","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"The user"}}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"dots-studio/dots-3-note-preview:free","choices":[{"index":0,"delta":{"content":"","reasoning":" wants"}}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"dots-studio/dots-3-note-preview:free","choices":[{"index":0,"delta":{"content":"","role":"assistant"}}]}
+
+data: [DONE]
+
+`
+
+	for _, tc := range []struct {
+		name      string
+		toolCalls bool
+	}{
+		{"toolCallsDisabled", false}, // the daemon's shipped default
+		{"toolCallsEnabled", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := &bytes.Buffer{}
+			flusher := &testFlusher{buf}
+			p := &Proxy{}
+			p.SetToolCalls(tc.toolCalls)
+
+			if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(reasoningOnly)); err != nil {
+				t.Fatalf("streamSSE returned error: %v", err)
+			}
+
+			out := buf.String()
+			// The content chunks must be flushed BEFORE the sentinel. A
+			// client stops parsing at the first [DONE], so a sentinel that
+			// appears ahead of any chunk truncates the response.
+			firstChunk := strings.Index(out, "data: {")
+			firstDone := strings.Index(out, "data: [DONE]")
+			if firstDone < firstChunk {
+				t.Errorf("[DONE] at byte %d precedes the first chunk at byte %d in:\n%s",
+					firstDone, firstChunk, out)
+			}
+			if n := strings.Count(out, "data: [DONE]"); n != 1 {
+				t.Errorf("want exactly 1 [DONE] sentinel, got %d in:\n%s", n, out)
+			}
+			if !strings.HasSuffix(strings.TrimRight(out, "\n"), "data: [DONE]") {
+				t.Errorf("[DONE] must be the final event; stream ended with:\n%s", out)
+			}
+			// The real chunks must survive: they are what the client is after.
+			if !strings.Contains(out, `"gen-1"`) {
+				t.Errorf("stream lost its content chunks; got:\n%s", out)
+			}
+			if strings.TrimSpace(out) == "" {
+				t.Error("stream produced no output at all")
+			}
+		})
+	}
+}
+
+// TestStreamSSE_EmitsDoneWhenUpstreamOmitsIt covers an upstream that closes the
+// connection without sending [DONE]. Since the sentinel is now emitted
+// unconditionally at the end of streamSSE, the client still gets a properly
+// terminated stream instead of hanging until the connection drops.
+func TestStreamSSE_EmitsDoneWhenUpstreamOmitsIt(t *testing.T) {
+	const noSentinel = `data: {"id":"gen-2","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}
+
+`
+	buf := &bytes.Buffer{}
+	flusher := &testFlusher{buf}
+	p := &Proxy{}
+	p.SetToolCalls(false)
+
+	if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(noSentinel)); err != nil {
+		t.Fatalf("streamSSE returned error: %v", err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "data: [DONE]"); n != 1 {
+		t.Errorf("want exactly 1 [DONE] sentinel, got %d in:\n%s", n, out)
+	}
+	if !strings.HasSuffix(strings.TrimRight(out, "\n"), "data: [DONE]") {
+		t.Errorf("[DONE] must be the final event; stream ended with:\n%s", out)
+	}
+	if !strings.Contains(out, "hello") {
+		t.Errorf("stream lost its content chunk; got:\n%s", out)
+	}
+}
+
+// TestStreamSSE_IgnoresSSECommentLines covers upstreams that interleave `:`
+// comment lines (keepalives) with data events — commandcode2's relay does
+// this. A comment line is not a data event: the SSE spec says to ignore it.
+//
+// The old scanner appended every non-blank line to eventBuf, so a ": keepalive"
+// became a pseudo-event dispatched on the next blank line. sseEventIsRelease
+// cannot JSON-parse it and fails open, so a comment would release the stream
+// and flush the buffer at an arbitrary point, and the comment itself was
+// forwarded to the client. Observed live 2026-09-29 as `fast` streams where a
+// keepalive mid-stream produced a [DONE] ahead of the remaining chunks.
+func TestStreamSSE_IgnoresSSECommentLines(t *testing.T) {
+	const withKeepalives = `: keepalive
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"he"}}]}
+
+: keepalive
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"llo"}}]}
+
+: keepalive
+
+data: [DONE]
+
+`
+	for _, toolCalls := range []bool{false, true} {
+		buf := &bytes.Buffer{}
+		flusher := &testFlusher{buf}
+		p := &Proxy{}
+		p.SetToolCalls(toolCalls)
+
+		acc, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(withKeepalives))
+		if err != nil {
+			t.Fatalf("toolCalls=%v: streamSSE returned error: %v", toolCalls, err)
+		}
+		out := buf.String()
+
+		if strings.Contains(out, ": keepalive") {
+			t.Errorf("toolCalls=%v: SSE comment line leaked to the client:\n%s", toolCalls, out)
+		}
+		if n := strings.Count(out, "data: [DONE]"); n != 1 {
+			t.Errorf("toolCalls=%v: want exactly 1 [DONE], got %d in:\n%s", toolCalls, n, out)
+		}
+		if !strings.HasSuffix(strings.TrimRight(out, "\n"), "data: [DONE]") {
+			t.Errorf("toolCalls=%v: [DONE] must be last; stream ended with:\n%s", toolCalls, out)
+		}
+		if acc != "hello" {
+			t.Errorf("toolCalls=%v: accumulated content = %q, want %q", toolCalls, acc, "hello")
+		}
+		// The chunks must appear before the sentinel, in order.
+		hi, lo := strings.Index(out, `"he"`), strings.Index(out, `"llo"`)
+		done := strings.Index(out, "data: [DONE]")
+		if hi < 0 || lo < 0 || !(hi < lo && lo < done) {
+			t.Errorf("toolCalls=%v: chunks out of order (he=%d llo=%d done=%d):\n%s",
+				toolCalls, hi, lo, done, out)
+		}
 	}
 }

@@ -563,7 +563,6 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	var acc strings.Builder
 	tcs := []streamToolCall{}
 	released := false
-	sawDone := false
 	completionTokens := 0
 
 	// When toolCalls is disabled, forward all events verbatim without any
@@ -647,14 +646,32 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 			// caller to fall back.
 			return err
 		}
-		// [DONE] is intercepted below (when toolCalls is enabled) so that
-		// synthesized tool calls can be emitted before it. When toolCalls
-		// is disabled, [DONE] flows through normally and we record that we
-		// saw it so the post-loop code doesn't emit a duplicate.
+		// The [DONE] sentinel is intercepted here and NEVER forwarded. The
+		// post-loop code emits the single sentinel that terminates the client
+		// stream, so any sentinel that reached the write path would be a
+		// duplicate — and a client stops parsing at the FIRST [DONE], so a
+		// duplicate (or an early one) truncates the response.
+		//
+		// Two distinct bugs came from forwarding it, both observed live
+		// 2026-09-29 and both fixed here:
+		//
+		//  1. Early, when the stream had not yet been released. A provider
+		//     whose deltas carry nothing the client counts as content
+		//     (kilocode/dots-studio: role-only deltas, `content:""`, plus a
+		//     `reasoning` field) never satisfies sseEventIsRelease, so [DONE]
+		//     was the event that first set released=true. It then got buffered
+		//     and the post-loop flush emitted that buffer ahead of its own
+		//     [DONE] — a stream STARTING with [DONE], with every real chunk
+		//     after it, silently dropped by the client.
+		//
+		//  2. Duplicated, when the stream was already released. With
+		//     toolCalls disabled (the daemon's shipped default) the write
+		//     path forwards every event verbatim, so upstream's [DONE] went
+		//     out AND the post-loop one followed: two sentinels.
+		//
+		// Flush the pending buffer first so ordering is preserved, then stop.
 		if bytes.Equal(sseDataPayload(raw), []byte("[DONE]")) {
-			if !toolCalls {
-				sawDone = true
-			}
+			return flushBuffered()
 		}
 		if !released && sseEventIsRelease(raw) {
 			released = true
@@ -675,7 +692,6 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 			}
 		}
 		if released {
-			isDone := bytes.Equal(sseDataPayload(raw), []byte("[DONE]"))
 			if toolCalls {
 				// Fold any tool call deltas from this event into our per-index
 				// accumulators. Tool-only delta events are suppressed from the
@@ -685,15 +701,12 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 				// arguments are known. This guarantees the client only ever
 				// receives complete, well-formed tool call events (no partial
 				// deltas, no duplicates).
+				//
+				// [DONE] never reaches here: processEvent returns early for it
+				// so the post-loop code can emit synthesized tool calls first
+				// and then the single terminating sentinel. Clients finalize
+				// parsing at [DONE], so a tool call after it would be dropped.
 				mergeToolCallDeltas(raw, pendingToolCalls)
-				if isDone {
-					// Don't forward [DONE] yet. The post-loop code will
-					// emit synthesized tool calls first, then emit [DONE]
-					// after them. Clients finalize parsing at [DONE], so a
-					// tool call arriving after it would be silently
-					// ignored.
-					return nil
-				}
 				if !sseEventIsToolDeltaOnly(raw) {
 					accumulateDelta(&acc, &tcs, raw)
 					// If this content-bearing event also carries tool call
@@ -735,6 +748,20 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
+
+		// SSE comment lines (":" prefixed) carry no payload — they are keepalives
+		// or upstream hints. Per the SSE spec they are ignored entirely.
+		//
+		// They must not be appended to eventBuf: an event is dispatched on the
+		// next blank line, so a buffered ": keepalive" would be dispatched as
+		// if it were a complete event. sseEventIsRelease cannot parse it (it is
+		// not JSON), so it releases and the accumulated buffer — including any
+		// real chunks — gets flushed at a moment dictated by a comment. It also
+		// inflates the buffer with bytes the client has no use for. Observed live
+		// 2026-09-29: commandcode2 relays emit ": keepalive" between chunks.
+		if len(bytes.TrimSpace(line)) > 0 && bytes.HasPrefix(bytes.TrimSpace(line), []byte(":")) {
+			continue
+		}
 
 		if len(line) == 0 {
 			if eventBuf.Len() > 0 {
@@ -811,14 +838,17 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 		}
 	}
 
-	// Emit the [DONE] sentinel. Clients finalize parsing here, after they
-	// have received any synthesized tool calls.
-	if !sawDone {
-		if _, err := w.Write([]byte("data: [DONE]\n\n")); err != nil {
-			return acc.String(), tcs, completionTokens, err
-		}
-		flusher.Flush()
+	// Emit the [DONE] sentinel exactly once, always last. Clients finalize
+	// parsing here, after any synthesized tool calls.
+	//
+	// This is unconditional (it no longer checks sawDone): [DONE] is no
+	// longer forwarded by the streaming path at all, so this is the single
+	// point that terminates the response. Emitting it unconditionally also
+	// covers an upstream that closed the stream without sending [DONE].
+	if _, err := w.Write([]byte("data: [DONE]\n\n")); err != nil {
+		return acc.String(), tcs, completionTokens, err
 	}
+	flusher.Flush()
 	return acc.String(), tcs, completionTokens, nil
 }
 
