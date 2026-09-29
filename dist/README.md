@@ -8,19 +8,28 @@
 > bundle" commits to undo; the script exists so the next person does not repeat
 > it. `dist/README.md` and the script are the committed parts.
 
-`origin` is `https://github.com/competitiveNN/airouter`. The token in use
-authenticates but has `push: false` on the repository, and neither
-`defnlnotme` nor `papersplx` has write access — checked with
-`gh api repos/competitiveNN/airouter --jq .permissions.push`.
+`origin` is `https://github.com/competitiveNN/airouter`. For most of this work's
+life the token in use authenticated but had `push: false`, so these commits existed
+only here and `dist/` was the only copy of them. That is no longer reliably true:
+another account or process is advancing `origin/master`, and during the round that
+wrote this sentence the unpushed set went from 37 commits to 0 with no edit to the
+commits or to this file.
 
-So the work is committed locally and **not** on the remote. These two files in
-`dist/` carry the commits that `origin/master` is missing, so nothing is lost
-if this checkout goes away.
+Two consequences, both worth internalising before using anything below:
 
-> **The work is local-only.** 41 commits ahead of `origin/master`, push
-> permission `false`. If you are reading this in a clone, you are looking at
-> `origin/master` and **not** at the work. The bundle and the patch below are
-> the only copies of it. Do not treat a fresh clone as the handoff.
+  - The artifacts are still the point. They carry the commits the remote does not
+    have yet, and the script below regenerates them in seconds.
+  - **A list of "what is unpushed" written in a document is a snapshot of a thing
+    that moves.** Do not read the list; run the check that compares it against the
+    repository (`./scripts/audit-attribution-check.py`), or ask git directly
+    (`git rev-list --reverse origin/master..HEAD`). The checker exists so that a
+    stale list is a failure, not a surprise handed to the next person.
+
+> **Do not embed a token in a remote URL to push.** `.git/config` is plaintext,
+> and the token then appears in every `git remote -v` and in the process table of
+> every push. This repository has already had to remediate one left there; the
+> remediation was undone by following the push instructions below with a token in
+> the URL instead of a username. Use a credential helper, or let git prompt.
 
 ## Before you trust either file
 
@@ -106,18 +115,32 @@ git am --3way /path/to/airouter-unpushed.patch
 `--3way` is worth using: it falls back to a three-way merge if any context has
 drifted, instead of failing outright.
 
-## Pushing once write access exists
+## Pushing
 
-Nothing needs rebasing — the history is linear on `origin/master`. Get write
-access granted for whichever account should push, then:
+Nothing needs rebasing — the history is linear on `origin/master`. That sentence
+is an assertion about the shape of the history, and it is now *executed* rather
+than asserted: `scripts/doc-verify.sh` fetches the bundle into a clone standing
+on the base and runs the `--ff-only` merge below, which fails outright if the
+history turns out to be divergent. A plain merge would have accepted that by
+adding a merge commit, which is exactly what this sentence promises will not
+happen.
+
+Write access used to be the blocker, and "nobody has it" is no longer reliably
+teither way, so check rather than assume:
+
+```sh
+gh api repos/competitiveNN/airouter --jq .permissions.push
+```
+
+Then:
 
 ```sh
 git push origin master
 ```
 
-If you prefer to push from here instead, grant write access to the account whose
-token is configured, or add a token with the `repo` scope to a remote that
-already has write access:
+If the configured account cannot push, grant it write access, or push over a
+remote you control. Put a **username** in the URL, not a token — see the warning
+at the top of this file:
 
 ```sh
 git remote set-url --push origin https://<user>@github.com/competitiveNN/airouter
@@ -126,113 +149,34 @@ git push origin master
 
 ## Contents
 
-The unpushed commits, oldest first:
+What `origin/master` is missing, oldest first:
 
-- `0100387` fix: start airouter with provider API keys in its environment
-- `a515364` feat: resilient cooldown state, DELETE /admin/cooldowns, bounded fallback
-- `0cc4e34` fix: stop config regeneration destroying the config header and re-adding dead models
-- `b097b1f` fix: never truncate or double-terminate an SSE stream
-- `dd167d7` style: gofmt the four drifted files
-- `d834215` test: cover the mid-stream fallback [DONE] path and add an SSE integrity harness
-- `8f65531` fix: bound the Responses API fallback walk by wall clock
-- `1943655` feat: mount /metrics, add attempt telemetry, and assert the SSE contract in CI
-- `9a6485d` test: rename stale SelectNext tests, add secret scan and SSE negative check
-- `5f9a6fa` test: add audit anchor drift check and harden the SSE negative check
-- `d04f86d` fix: bound metrics label cardinality, escape label values, drop key leakage
-- `a0daa56` fix: recycle metrics labels instead of starving, fix malformed overflow sample
-- `7a34f23` fix: remove the two-key-convention bug class, bound the status maps
-- `fa9aeeb` docs: add README config reference; ship bundle+patch for the unpushed commits
-- `8715b82` chore: refresh unpushed bundle to include the README commit
-- `c746484` chore: make the unpushed bundle a generated artifact, not a committed one
-- `a861dd5` docs: list unpushed commits in dist/README, and note the two loop commits
-- `12f6319` Stop exporting the overflow bucket as a histogram; fix unfetchable bundle
-- `4c03ed2` Assert the histogram invariants across the whole exposition, not one family
-- `647c3d3` Harden the histogram guard: pin its threshold, kill no-op mutations, fuzz it
-- `b7cccda` Make the histogram guard's coverage durable: golden fixtures + CI fuzzing
-- `cb4e826` Audit the gate: FROZEN=1 was the broken invocation, not the working one
-- `c40f0eb` docs: refresh dist/README for the unpushed commits
-- `ba4a6c4` docs: note that the unpushed count in dist/README is self-referential
-- `119e998` Fuzz the target's own package: the recursive gate could never have worked
-- `c941f23` docs: refresh dist/README for the fuzz-gate package fix
-- `5437846` Test the gate in the layout that hid its bugs
-- `979dcf6` docs: refresh dist/README for the fuzz-gate self-test
-- `56dfbdf` Walk every .go file, not just the ones in the root
-- `aaad4dd` Correct the round-10 record: the drift fix shipped in 56dfbdf, not here
-- `ee4bf69` docs: refresh dist/README for the audit-drift-check glob fix
-- `b950b3a` Close the two gaps round 10 named, and stop the guard going blind in CI
-- `6ca056f` Make the attribution checker's output ASCII, and record where it must fail
-- `0a27c9b` Narrow the exemption, make the checker work in a recovered tree, and test it
-- `2a71fcf` Make the attribution self-test honest about the environments it cannot run in
-- `907e01d` Make the handoff artifact's staleness a gate instead of a note
-- `7289e7e` Require cited commits to be reachable, not merely present
-- `482dee7` Prove the handoff actually recovers, and test that it does
-- `179d165` Run the recovery check in CI, and fix the two bugs it found
-- `a9d7c11` Make the real-repository assertion independent of its environment
-- `ebdd8d5` Discover the bundle tip ref instead of assuming it
-- `38114f3` Remove dead code, and execute the handoff doc instead of grepping it
-- `2650191` Execute the handoff document's remaining claims, and prove the check can fail
-- `5f2cb0c` Execute the handoff document's remaining executable claims
-- `e31a7cf` Run the document self-test in CI
-- `2a8d80a` audit: Round 17 -- the gate that could lie, and the doc nobody executed twice
+- `aa61d01` gate: stop on stale artifacts, execute the last two doc claims, and
+  give the Go suite a size contract
 
-The middle two are the self-reference loop described at the top of this file:
-`fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
-contain itself, and `c746484` replaced the approach. They are kept because
-rewriting published history is worse than three honest commits, but nothing
-needs doing with them.
+Nothing else, as of this writing. The list is checked rather than trusted:
+`scripts/audit-attribution-check.py` compares it as a **set** against
+`git rev-list origin/master..HEAD` -- not as a count, because a count is satisfied
+by any equally-wrong list of the same length -- and fails when the two disagree in
+either direction. `gate.sh` runs it, so a stale list here is a red gate.
 
-The commit count has the same self-reference problem in miniature: writing a
-number here creates the commit that makes it one larger. Read the number off
-`git rev-list --count origin/master..HEAD` rather than trusting any number
-written in this file. The bundle and patch in this directory are always
-regenerated, so they are never stale.
+Two properties make any such list awkward, and neither is a bug to be fixed:
 
-`cb4e826` audits `b7cccda`: it found the fuzz gate's documented `FROZEN=1`
-invocation was the one that failed (fabricating a counterexample from a usage
-error), that a committed corpus made the gate permanently red, that discovery
-was root-only, and that the threshold study was measuring a code path that never
-executes. No production code changed.
+  - A commit that updates this list cannot contain its own hash. The checker
+    exempts commits whose entire diff is confined to `dist/`, so the commits that
+    maintain this file are self-exempt. The exemption is by *confinement*, not by
+    presence: a code change that also edits this file is still required to be
+    listed, so nothing real can be laundered out of the handoff.
+  - `origin/master` can advance underneath the list. When it does, the checker
+    reports every entry as "not an unpushed commit (it may have been pushed or
+    rewritten)". That is the check being right, and it means something far more
+    mundane than a corrupted handoff: someone else pushed.
 
-`119e998` audits `cb4e826` the same way, and the result is that the recursive
-discovery it added could never have worked: the fuzz phase still passed
-`./...`, which Go refuses outright once a module has two packages, and the
-refusal was reported as a counterexample pointing at a file that did not exist.
-Three further defects sat behind it (a `dirname` result read as a stdlib import,
-a crasher check scoped to the root instead of the package that owns it, and a
-count comparison where a set diff was needed). It is the third commit in a row
-whose findings are all in the gate rather than in the code, and each one was
-only found by running the gate in the configuration it was written for.
+To rebuild the list from the repository rather than from this file:
 
-`5437846` stops repeating the excuse. It adds `scripts/fuzz-gate-selftest.sh`,
-which builds throwaway two-package repositories and asserts the gate's behaviour
-in them, so the one condition that hid four consecutive rounds of gate defects is
-reproduced on every CI run. It is verified to fail when each of those defects is
-reintroduced, so a pass is evidence rather than an absence of output.
-
-`56dfbdf` fixes the same root-only glob in `scripts/audit-drift-check.py`, which
-reported a symbol that had merely moved to a subdirectory as "no longer exists" —
-with a remediation (add it to the ALLOWLIST) that is both wrong and permanent. Note
-the separate commit: that fix was written during `5437846`, then destroyed by a
-`git reset --hard` run while probing a different script, and the round's summary
-and the audit document both went on describing it as shipped. It was caught in
-review, re-applied, and the record corrected in `aaad4dd`.
-
-`audit-drift-check.py` was the one script here with no self-test guarding it, and
-it is the one that had the bug. `fuzz-gate-selftest.sh` named that gap and spelled
-out the extension; `audit-drift-selftest.sh` is the extension, and
-`audit-attribution-check.py` closes the second gap it left — the one where a
-finding is accurate about the code and wrong about the commit, because the anchor
-check validates symbols and never checked that a fix actually shipped.
-
-That second check needs full history. The `go` CI job now checks out with
-`fetch-depth: 0`, because a shallow single-ref checkout has no `origin/master`
-and the unpushed-list half would skip while still exiting 0 — a guard passing
-because it could not see the thing it guards.
-
-The list above omits the commits that deliver it, on purpose: a commit cannot
-contain its own hash, so requiring it to would be unsatisfiable. `audit-attribution-check.py`
-exempts exactly the commits whose diff touches this file, derived from their diffs
-rather than from this prose, so nothing real can hide behind the exemption.
+```sh
+git rev-list --reverse --pretty=format:'- `%h` %s' origin/master..HEAD
+```
 
 ## Verification
 
@@ -264,10 +208,12 @@ itself matters.
 
 ## Before trusting the recovery path
 
-`push` is still `false`, so these commits exist only here and in `dist/`. If you
-are reading this to pick the work up, check the artifacts against the checkout
-before relying on them — a stale bundle looks exactly as authoritative as a
-fresh one:
+`push` permission has been `false` for most of this work's life, which is the
+whole reason `dist/` exists. It is no longer safe to assume that in either
+direction — someone with access is pushing, occasionally from another process.
+Verify before relying on either story, and check these artifacts against the
+checkout in the same breath, because a stale bundle looks exactly as
+authoritative as a fresh one:
 
 ```sh
 ./scripts/dist-freshness-check.sh --verbose   # exits 1 if they are stale
