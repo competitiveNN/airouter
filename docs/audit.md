@@ -1031,7 +1031,10 @@ Verification for this round:
     counterexample)
   Four negative controls on the gate's new checks, each verified to fail: a
     committed corpus file, an uncommitted crasher, an untracked `*_test.go`, and
-    a non-integer duration argument.
+    a non-integer duration argument. NOTE: the `*_test.go` and crasher controls
+    were only ever run in a one-package repository, where the round-9 defects
+    below cannot manifest — see Round 9 for what re-testing them in the
+    configuration they were written for turned up.
 
 Tests added this round: `TestInvariantSixThresholdMatchesProductionCheck`
 (extended to the whole corpus), `TestInvariantSixThresholdHasNoHeadroom`
@@ -1039,6 +1042,98 @@ Tests added this round: `TestInvariantSixThresholdMatchesProductionCheck`
 `goldenMetricsFixtures`, `invariantSixEligibility`, `tightestKThatFiresOnReal`
 and `truncate`. No production code changed this round — every finding was in the
 test and gate layer that was supposed to be providing the coverage.
+
+### Round 9 (2026-09-29) — the recursive discovery that could never have worked
+
+Round 8 made `scripts/fuzz-gate.sh` discover fuzz targets recursively. That
+change was the right idea and it was not tested in the situation it existed for:
+the repository has exactly one package, so every check of the script ran in the
+one configuration where the new code path could not fail. Three defects were
+sitting in it, all of which activate the moment a second package exists — which
+is precisely the case the recursion was added to handle.
+
+**1. `go test -fuzz ./...` cannot work in a multi-package module.** The fuzz
+phase still passed `./...` after discovery became recursive. Go rejects that
+combination outright:
+
+    cannot use -fuzz flag with multiple packages
+
+The gate reported it as a counterexample, so the failure pointed at
+`testdata/fuzz/FuzzHistogramInvariantsSurviveGarbage/` — a file that does not
+exist — and told the reader to commit it. The seed-replay phase uses
+`go test -run ... ./...`, which *is* correct across packages, so the two phases
+disagreed about what `./...` means and only the one that could break was tested.
+Fixed by recording each target together with the directory that owns it
+(`TARGET_PAIRS`, `"<dir><TAB><Target>"`) and fuzzing one package per invocation,
+which is also what Go documents. The flat `TARGETS` list is kept for the summary
+lines only; the paired list is what the loops consume, so there is no longer a
+way to invoke a target without naming its package.
+
+**2. `dirname` output is a package path, not a filesystem path.** The first
+version of the fix passed `$(dirname ...)` straight to `go test`, producing
+`go test probesub`, which Go reads as a stdlib import:
+
+    package probesub is not in std (/usr/lib/golang/src/probesub)
+
+That is a build failure reported as a counterexample — the failure mode this
+file exists to prevent, reintroduced inside the fix for finding 1. The
+directory is now spelled `./probesub` (and `.` at the root, which resolves as
+both). Also added: a tracked-but-missing test file is skipped during discovery,
+because otherwise sed's own `No such file` reached the log before the clean
+error that the set diff produces.
+
+**3. The untracked-crasher check was scoped to the repository root.** Go writes
+a crasher beside the package that produced it, so a target in `./probesub`
+lands in `./probesub/testdata/fuzz/` — which `git ls-files -- testdata/fuzz`
+never sees. Confirmed directly: with a crasher sitting in the subpackage, the
+root-only check returned empty and the new per-package check returned it. The
+check now iterates the same `TARGET_PAIRS` the fuzz phase uses, so the two can
+not drift apart again.
+
+**4. The untracked-test-file cross-check compared lengths, not sets.** It
+fired only when the count of on-disk test files differed from the count git
+tracks. Deleting one tracked test file while adding one untracked test file
+keeps the counts equal and passes, on a tree carrying precisely the gap the
+check exists to detect. Replaced with `comm` in both directions, which also
+covers the previously unhandled "tracked but deleted" direction: such a file
+keeps its target in the list, and the fuzz phase then fails on a package that
+no longer builds, far from the cause. Verified by deleting
+`probesub/probe_test.go` and adding `untracked_new_test.go` at the same time:
+old logic passed, new logic reported both.
+
+No Go code changed. Every finding is in the gate that was supposed to be
+providing the coverage — the third consecutive round in which the test and gate
+layer, not the code, held the defect.
+
+Verification this round (all re-run on the committed tree):
+
+  `go test -race -count=1 ./...` → ok, 0 failed
+  `gofmt -l .` → clean; `go vet ./...` → no issues
+  `scripts/sse-negative-check.sh` → PASS (guard has teeth; proxy.go
+    byte-identical to HEAD afterwards)
+  `scripts/sse-check.py --rounds 3` → PASS, 12/12 streams
+  `scripts/secret-scan.sh` → clean
+  `scripts/audit-drift-check.py` → 53 anchors checked, all resolve
+  CI YAML parses; four jobs, none `continue-on-error`
+  `FROZEN=1 scripts/fuzz-gate.sh` → PASS, 2 targets
+  `scripts/fuzz-gate.sh 2` → PASS, 2 targets, both fuzzed in `.`
+
+Negative controls for this round, each verified to fail against the
+unfixed gate on a deliberately added second package:
+
+  - old gate + second package → `cannot use -fuzz flag with multiple
+    packages`, reported as a counterexample (finding 1)
+  - `dirname`-spelled package path → `package probesub is not in std`,
+    reported as a counterexample (finding 2)
+  - crasher in `./probesub/testdata/fuzz/` → old root-only check returns
+    empty and passes; new check names the file (finding 3)
+  - one deleted tracked test file + one untracked test file → old
+    count-based check passes; new set diff reports both (finding 4)
+  - `FROZEN=1` / `30s` / `20x` / `-5` as a duration → exit 2, usage error,
+    no fabricated counterexample
+
+The probe package used for these controls was removed afterwards; the tree is
+byte-identical to `ba4a6c4` apart from the three files this round changed.
 
 Tests added this round: `TestEveryExportedHistogramIsWellFormed`,
 `TestEachHistogramInvariantHasTeeth`, plus `checkHistogramInvariants`,

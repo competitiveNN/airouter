@@ -80,6 +80,11 @@ jobs:
       #
       # FROZEN=1 would replay seeds without fuzzing; not used here, because a
       # gate that has quietly stopped exploring looks exactly like a passing one.
+      #
+      # The duration is an argument, not an env var, and the script rejects a
+      # non-integer one as a usage error. It used to pass the value straight to
+      # -fuzztime, where "FROZEN=1" became a silently-invalid duration that Go
+      # reported as "invalid duration" — indistinguishable from a fuzz failure.
       - name: fuzz gate (all targets, 20s each)
         run: bash scripts/fuzz-gate.sh 20
 
