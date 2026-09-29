@@ -170,6 +170,10 @@ The unpushed commits, oldest first:
 - `a9d7c11` Make the real-repository assertion independent of its environment
 - `ebdd8d5` Discover the bundle tip ref instead of assuming it
 - `38114f3` Remove dead code, and execute the handoff doc instead of grepping it
+- `2650191` Execute the handoff document's remaining claims, and prove the check can fail
+- `5f2cb0c` Execute the handoff document's remaining executable claims
+- `e31a7cf` Run the document self-test in CI
+- `2a8d80a` audit: Round 17 -- the gate that could lie, and the doc nobody executed twice
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
