@@ -1135,6 +1135,77 @@ unfixed gate on a deliberately added second package:
 The probe package used for these controls was removed afterwards; the tree is
 byte-identical to `ba4a6c4` apart from the three files this round changed.
 
+### Round 10 (2026-09-29) — making the gate's blind spot permanent
+
+Round 9's four defects shared one cause: the repository is a single Go package,
+so the code paths that handle a second one were never executed by any check.
+Fixing them left that unchanged. A gate that "passes" while covering one
+package looks exactly like one covering two, which is the failure mode the whole
+script exists to detect — applied to the script itself.
+
+**1. The same bug class, in `scripts/audit-drift-check.py`.** It collected
+sources with `ROOT.glob("*.go")` — root-only, for the same reason the fuzz
+gate's discovery had been. Verified by moving `router.go` into `./subpkg`: the
+check failed with `summarizeError: not found in any .go file` for symbols
+sitting in a subdirectory, and the remediation it printed is to add an entry to
+`ALLOWLIST` — a wrong fix, and a permanent one, for a symbol that was never
+deleted. Now `rglob`, skipping `.git` and `vendor`. Re-verified in both
+directions: the subpackage layout passes, and a genuinely deleted symbol is
+still caught (an anchor was renamed to a non-existent symbol and the check
+failed as it should).
+
+**2. `scripts/fuzz-gate-selftest.sh`.** Builds throwaway two-package
+repositories with a stubbed `go` and asserts the gate's behaviour in them, so
+the configuration that hid round 9's defects is now reproduced on every CI run.
+It needs no Go toolchain and no network; the stub records its arguments and
+enforces the one real constraint that matters (`-fuzz` takes a single package).
+Seven cases: multi-package discovery, usage errors, the set-difference check,
+a subdirectory crasher, a healthy-repo liveness check, the empty-discovery
+error, and a negative control that runs the `cb4e826` gate against the same
+fixtures and requires it to fail.
+
+The liveness case (5) is the one that keeps the rest honest. Every other case
+asserts that the gate *complains*, which a gate that refuses to do anything
+would also satisfy. Case 5 requires it to discover both targets, fuzz both, and
+exit 0 — so "it passes" cannot be achieved by doing nothing.
+
+The self-test was verified to fail against each of the four round-9 defects
+reintroduced one at a time: reverting the fuzz phase to `./...` (5 failures),
+dropping the `./` on the subpackage path (2), a root-only crasher check (2),
+and a count in place of the set diff (3). A test that has never been seen to
+fail is indistinguishable from one that cannot.
+
+Building it also turned up three defects in the test itself, each of which had
+produced a *passing* case for the wrong reason:
+
+  - `local name="$1" dir="$TMPROOT/$name"` expanded `$name` before the
+    assignment took effect, so every repo path was `<TMPROOT>/` and each case
+    failed on `cd: null directory` — a failure about the harness, reported as a
+    failure about the gate. Declarations are now split.
+  - the `go` stub rejected a bare `.` as a multi-package pattern. `.` names
+    exactly one package and is the *correct* argument for a root target, so the
+    stub was stricter than the tool it models, and it was the stub under test
+    rather than the gate. Only `./...` is refused now.
+  - two cases shared one repository, so case 4 asserted against leftovers from
+    case 3: the tracked-but-missing file fired first and the gate exited before
+    reaching the crasher check, and case 4 passed without testing anything. Each
+    case builds its own tree.
+
+No production code changed. As with the three previous rounds, every finding is
+in the test and gate layer.
+
+Verification this round:
+
+  `go test -race -count=1 ./...` → ok, 0 failed
+  `gofmt -l .` → clean; `go vet ./...` → no issues
+  `scripts/fuzz-gate-selftest.sh` → 31 passed, 0 failed
+  `scripts/fuzz-gate.sh 20` → PASS, 2 targets
+  `scripts/audit-drift-check.py` → 53 anchors checked, all resolve
+  `scripts/secret-scan.sh` → clean
+  CI YAML parses; 4 jobs, none `continue-on-error`
+  `scripts/sse-check.py --rounds 3` → PASS, 12/12 streams
+  `scripts/sse-negative-check.sh` → PASS
+
 Tests added this round: `TestEveryExportedHistogramIsWellFormed`,
 `TestEachHistogramInvariantHasTeeth`, plus `checkHistogramInvariants`,
 `histogramIndex`, `countHistogramBuckets` and `renderLabelSet`. Both were
