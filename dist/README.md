@@ -104,6 +104,8 @@ The unpushed commits, oldest first:
 - `119e998` Fuzz the target's own package: the recursive gate could never have worked
 - `c941f23` docs: refresh dist/README for the fuzz-gate package fix
 - `5437846` Test the gate in the layout that hid its bugs
+- `56dfbdf` Walk every .go file, not just the ones in the root
+- `aaad4dd` Correct the round-10 record: the drift fix shipped in 56dfbdf, not here
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
@@ -133,15 +135,24 @@ count comparison where a set diff was needed). It is the third commit in a row
 whose findings are all in the gate rather than in the code, and each one was
 only found by running the gate in the configuration it was written for.
 
-`5437846` removes that excuse rather than repeating it. `scripts/audit-drift-check.py`
-had the same root-only glob the fuzz gate had, and it reported a symbol that had
-merely moved to a subdirectory as "no longer exists" — with a remediation (add it
-to the ALLOWLIST) that is both wrong and permanent. It now walks recursively.
-`scripts/fuzz-gate-selftest.sh` goes further: it builds throwaway two-package
-repositories and asserts the gate's behaviour in them, so the one condition that
-hid four consecutive rounds of gate defects is reproduced on every CI run. It is
-verified to fail when each of those defects is reintroduced, so a pass is
-evidence rather than an absence of output.
+`5437846` stops repeating the excuse. It adds `scripts/fuzz-gate-selftest.sh`,
+which builds throwaway two-package repositories and asserts the gate's behaviour
+in them, so the one condition that hid four consecutive rounds of gate defects is
+reproduced on every CI run. It is verified to fail when each of those defects is
+reintroduced, so a pass is evidence rather than an absence of output.
+
+`56dfbdf` fixes the same root-only glob in `scripts/audit-drift-check.py`, which
+reported a symbol that had merely moved to a subdirectory as "no longer exists" —
+with a remediation (add it to the ALLOWLIST) that is both wrong and permanent. Note
+the separate commit: that fix was written during `5437846`, then destroyed by a
+`git reset --hard` run while probing a different script, and the round's summary
+and the audit document both went on describing it as shipped. It was caught in
+review, re-applied, and the record corrected in `aaad4dd`.
+
+`audit-drift-check.py` is still the one script here with no self-test guarding it,
+and it is the one that had the bug. The header of `fuzz-gate-selftest.sh` names the
+gap and spells out the extension, so it is found by reading the code rather than by
+being surprised a fourth time.
 
 ## Verification
 
