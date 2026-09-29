@@ -199,6 +199,18 @@ jobs:
       - name: audit attribution self-test
         run: bash scripts/audit-attribution-selftest.sh
 
+      # dist-freshness-check.sh itself is NOT run in this job, and deliberately
+      # so. It verifies the local bundle and patch against the local HEAD, and
+      # those artifacts are generated and gitignored -- a CI checkout has none,
+      # so the check would correctly report them missing and the job would be
+      # permanently red. There is nothing for CI to verify about another
+      # machine's unpushed history. What CI can and does gate is the LOGIC, via
+      # this self-test, which builds throwaway repositories with deliberately
+      # fresh, stale, missing and corrupt artifacts and asserts each is
+      # classified correctly.
+      - name: dist freshness self-test
+        run: bash scripts/dist-freshness-selftest.sh
+
   config:
     runs-on: ubuntu-latest
     continue-on-error: false
@@ -670,3 +682,14 @@ jobs:
           if git ls-files --error-unmatch dist/airouter-unpushed.bundle >/dev/null 2>&1; then
             echo "::error::the bundle is tracked; it must stay a build artifact"; exit 1
           fi
+          # And the artifacts that were just written must actually describe the
+          # repository they were written from. This job generates them, so it
+          # is the one place where "fresh" is a real assertion rather than a
+          # hope: everything above checks that the export RAN and that the
+          # bundle carries the right commits, and this checks that the bundle's
+          # tip and the patch's tail are actually HEAD. A generator that
+          # silently wrote yesterday's state would satisfy every other
+          # assertion in this job.
+          # UPSTREAM must match what the export above was run against; the
+          # default (origin/master) is not what this job generated from.
+          UPSTREAM=base bash scripts/dist-freshness-check.sh --verbose
