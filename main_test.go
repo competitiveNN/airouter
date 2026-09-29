@@ -2001,6 +2001,50 @@ func TestGatewayNoAuth(t *testing.T) {
 	if rec3.Code != 401 {
 		t.Errorf("expected status 401 for admin without auth when no key and allowNoAuth=false, got %d", rec3.Code)
 	}
+
+	// /metrics is gated too. Its series are labelled by provider and model and
+	// describe routing behaviour (which endpoint the chain falls back to, how
+	// often each one fails), so it is operator telemetry, not a public health
+	// check. It was previously served with no auth at all.
+	reqM := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	recM := httptest.NewRecorder()
+	gatewayFailClosed.HandleMetrics(recM, reqM)
+	if recM.Code != 401 {
+		t.Errorf("expected status 401 for /metrics without auth when no key and allowNoAuth=false, got %d", recM.Code)
+	}
+}
+
+// /metrics exposes the per-endpoint attempt telemetry (which upstreams are
+// reached, how often they fail, how long they take) that fallback-chain tuning
+// decisions are made from, so it must actually serve it with valid credentials
+// — the new auth guard must not swallow the handler.
+func TestHandleMetricsServesAttemptTelemetryWithAuth(t *testing.T) {
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{"p": {URL: "https://example.invalid"}},
+		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m"}}}},
+	}
+	g := NewGatewayContext(NewRouter(cfg, ""), &Proxy{}, cfg, "", "secret-key")
+	g.metrics.Attempt("p:m", 1500*time.Millisecond, false)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	rec := httptest.NewRecorder()
+	g.HandleMetrics(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 with valid credentials, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"airouter_endpoint_attempts_total{endpoint=\"p:m\"} 1",
+		"airouter_endpoint_attempt_failures_total{endpoint=\"p:m\"} 1",
+		"airouter_endpoint_attempt_duration_seconds_count{endpoint=\"p:m\"} 1",
+		"airouter_sse_comments_routed_out",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in /metrics output:\n%s", want, body)
+		}
+	}
 }
 
 // TestAdminCooldownsIncludesCircuitState verifies that the admin cooldowns

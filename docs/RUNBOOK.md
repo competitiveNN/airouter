@@ -51,8 +51,23 @@ unless `-allow-no-auth` is passed (insecure).
    first eligible endpoint of a new session (with optional rotation across
    the head of the chain).
 4. On failure, the endpoint is marked `tried` (per-request set), a cooldown
-   is applied, and the loop walks the chain. `maxAttempts = chainLen*3 + 1`
-   bounds the total iterations.
+   is applied, and the loop walks the chain.
+
+The walk is bounded twice, by `budgetState`:
+
+- `maxAttempts = chainLen*3 + 1` bounds the total iterations.
+- A **wall-clock budget** bounds elapsed time, because attempts alone is not a
+  bound — an attempt that hangs until its per-attempt timeout costs far more
+  than a fast 429. The budget is `fallbackBudget(timeout)`: 12s for small
+  requests, 20s for mid-size, and `maxFallbackWallClock` otherwise, floored at
+  twice the per-attempt timeout. The first attempt is always allowed, so a
+  request is never failed before it has been tried once.
+
+All five fallback loops (chat completion, chat stream, Responses, Responses
+stream, Responses WebSocket turn) share this policy, and
+`TestAllFallbackLoopsAreBudgetBounded` parses their source and fails if any
+loop ships without a `budgetState`. That test exists because a loop was found
+shipping unbounded, bound only by a loose 10-minute timeout.
 
 ### Cooldowns
 
@@ -75,23 +90,66 @@ clears the entry). Transient errors (429/5xx) receive up to 25% random jitter
 
 ## Metrics
 
-Prometheus text-format metrics are exposed at `/metrics` (authenticated like
-admin). Counters: `airouter_requests_total{model,status}`, `airouter_fallbacks_total`,
-`airouter_cooldowns_applied_total`. The `/metrics` handler is wired into all
-four request surfaces (chat completions, responses, responses-stream, and
-responses-websocket) plus the admin endpoints.
+Prometheus text-format metrics are exposed at `GET /metrics`, authenticated
+with `Authorization: Bearer <key>` like the admin surface. The series are
+labelled by provider and model and describe routing behaviour, so an
+unauthenticated scrape is an information leak, not a health check — use
+`/health` (below) for liveness.
 
-## Admin endpoints
+| Series | Type | Use |
+|--------|------|-----|
+| `airouter_requests_total{model,status}` | counter | Traffic per profile |
+| `airouter_failures_total{status}` | counter | Client-visible failure codes |
+| `airouter_request_duration_seconds` | histogram | End-to-end latency |
+| `airouter_fallbacks_total`, `airouter_fallbacks_total_by_endpoint{endpoint}` | counter | Which endpoint is failing over |
+| `airouter_cooldowns_applied_total` | counter | Cooldown pressure |
+| `airouter_circuit_state_transitions{from,to,endpoint}` | counter | Circuit flapping |
+| `airouter_endpoint_attempts_total{endpoint}` | counter | How often each upstream is reached |
+| `airouter_endpoint_attempt_failures_total{endpoint}` | counter | Failure ratio per upstream |
+| `airouter_endpoint_attempt_duration_seconds{endpoint}` | histogram | Per-attempt cost per upstream |
+| `airouter_sse_comments_routed_out` | counter | Upstream keepalive chatter filtered out of the event path |
 
-All admin endpoints require `Authorization: Bearer <key>` (the gateway API key).
+The `airouter_endpoint_attempt_*` series are the ones to read when deciding
+whether a fallback chain needs reordering: `fallbacks_total` says an endpoint
+misbehaved, but only the attempt series say whether it is worth reaching at
+all. A high attempt count with a high failure ratio means the endpoint is
+reached and broken (demote it); attempts piling into the 12s+ buckets mean the
+chain pays a real timeout for it on every request (reorder or shorten the
+budget). `airouter_sse_comments_routed_out` should normally be non-zero — it
+counts `: keepalive` lines stripped before they could be misread as events.
 
-| Path | Method | Description |
-|------|--------|-------------|
-| `/admin/providers` | GET/POST | List/update providers |
-| `/admin/sessions` | GET | List active sticky sessions |
-| `/admin/cooldowns` | GET/DELETE | Inspect/reset cooldowns |
-| `/admin/config` | GET/POST | View/edit config (JSON); save reloads |
-| `/admin/` | GET | Dashboard HTML |
+All four request surfaces (chat completions, responses, responses-stream, and
+responses-websocket) record the per-endpoint attempt telemetry, so the series
+cover fallback traffic regardless of which surface the client used.
+
+## SSE framing contract
+
+A client stops parsing at the first `data: [DONE]`, so a sentinel that appears
+ahead of the content silently truncates the response while the request still
+returns HTTP 200. `proxy.go streamSSE` therefore guarantees:
+
+- exactly one `data: [DONE]`, always last, emitted by the gateway even when
+  the upstream closes without sending one;
+- upstream `: keepalive` comment lines are dropped before they can be
+  misparsed as an event (counted by `airouter_sse_comments_routed_out`);
+- the pre-release prefix (role-only / reasoning-only openers) is flushed
+  *before* the event that triggers the release, so a late `role` delta cannot
+  follow the first content token;
+- with `--tool-calls`, partial tool-call deltas are coalesced into one complete
+  call emitted immediately before `[DONE]`, never after it.
+
+Verify against a running gateway — this checks captured bytes, not status
+codes:
+
+```sh
+AIROUTER_API_KEY=$KEY python3 scripts/sse-check.py --expect "PING OK" --rounds 3
+```
+
+This is wired into CI as the `sse-contract` job, which boots a real gateway
+against `scripts/fake-sse-upstream.py` (a deliberately hostile SSE upstream
+that interleaves comment lines and omits the trailing blank line) so the
+contract is asserted on every push without provider credentials. The fixture
+config is `testdata/ci-config.yaml`.
 
 ## Health
 

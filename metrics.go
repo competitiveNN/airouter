@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -34,13 +35,47 @@ type Metrics struct {
 	// (from="closed",to="open",endpoint="..."). Low-cardinality and
 	// actionable: operators can see which endpoints are flapping.
 	circuitTransitions map[string]*atomic.Int64
-	mu                 sync.RWMutex // protects map initialization
+	// sseCommentsRoutedOut counts SSE comment (":" prefixed) lines dropped
+	// before they could be mistaken for a data event.
+	//
+	// This is a canary, not a throughput metric. A relay that emits
+	// ": keepalive" lines is a relay whose stream had once already tripped the
+	// "[DONE] released ahead of the real chunks" bug (see proxy.go streamSSE):
+	// a non-zero count means upstream chatter exists and the comment-filtering
+	// path is actively doing its job. A count that climbs while streams look
+	// healthy is the early warning that a provider started interleaving
+	// keepalives mid-chunk again.
+	sseCommentsRoutedOut atomic.Int64
+	// Per-endpoint attempt telemetry: how many times an endpoint was tried
+	// and how those attempts turned out. This is the missing half of the
+	// picture — cooldowns and fallbacks say an endpoint misbehaved, but not
+	// how often it was reached or how long it took, so there is no way to
+	// answer "should I demote this endpoint" or "is 45s the right budget"
+	// from data rather than guesswork.
+	attemptsByEndpoint    map[string]*atomic.Int64
+	attemptFailuresByEnd  map[string]*atomic.Int64
+	attemptLatencyNSByEnd map[string]*atomic.Int64
+	// attemptLatencyBucketsByEnd holds a small fixed histogram per endpoint.
+	// Buckets are cumulative-free (one atomic per (endpoint, bucket)) so the
+	// exporter does not have to sort or merge anything at scrape time.
+	attemptLatencyBounds []float64 // seconds
+	attemptHistByEnd     map[string][]atomic.Int64
+	mu                   sync.RWMutex // protects map initialization
 }
 
 // defaultLatencyBuckets are the standard Prometheus histogram boundaries
 // (seconds). The trailing +Inf bucket is implied and appended at serve time.
 var defaultLatencyBuckets = []float64{
 	0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+}
+
+// attemptLatencyBoundaries are the histogram boundaries for a single upstream
+// attempt, in seconds. They are coarser and shifted higher than the
+// request-level buckets: what matters here is whether an endpoint answers
+// fast, slowly, or not at all, and the interesting range starts where a
+// request-level histogram is already saturated.
+var attemptLatencyBoundaries = []float64{
+	0.25, 0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45,
 }
 
 // NewMetrics creates a new Metrics instance with pre-allocated maps.
@@ -51,7 +86,12 @@ func NewMetrics() *Metrics {
 		failuresByStatus:        make(map[string]*atomic.Int64),
 		fallbacksByFromEndpoint: make(map[string]*atomic.Int64),
 		circuitTransitions:      make(map[string]*atomic.Int64),
+		attemptsByEndpoint:      make(map[string]*atomic.Int64),
+		attemptFailuresByEnd:    make(map[string]*atomic.Int64),
+		attemptLatencyNSByEnd:   make(map[string]*atomic.Int64),
+		attemptHistByEnd:        make(map[string][]atomic.Int64),
 	}
+	m.attemptLatencyBounds = attemptLatencyBoundaries
 	m.latencyBoundaries = defaultLatencyBuckets
 	m.latencyBuckets = make([]atomic.Int64, len(defaultLatencyBuckets)+1) // +1 for +Inf
 	return m
@@ -183,6 +223,85 @@ func (m *Metrics) counterCircuitTransition(key string) *atomic.Int64 {
 	return c
 }
 
+// SSECommentRoutedOut records that an SSE comment line was dropped rather than
+// being treated as part of an event. See the field comment for why this is
+// worth counting at all.
+func (m *Metrics) SSECommentRoutedOut(n int) {
+	if n > 0 {
+		m.sseCommentsRoutedOut.Add(int64(n))
+	}
+}
+
+// Attempt records one upstream attempt against an endpoint: how long it took
+// and whether it succeeded. Every fallback loop calls this around its
+// per-endpoint call, so the resulting series answers the questions the
+// request-level metrics cannot: which endpoints are actually slow, how often
+// the router reaches for them, and how large a share of those reaches fail.
+func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
+	if endpoint == "" {
+		return
+	}
+	m.counterAttempts(endpoint).Add(1)
+	if !ok {
+		m.counterAttemptFailures(endpoint).Add(1)
+	}
+	ns := d.Nanoseconds()
+	if ns < 0 {
+		ns = 0
+	}
+	m.counterAttemptLatencySum(endpoint).Add(ns)
+
+	m.mu.Lock()
+	h, exists := m.attemptHistByEnd[endpoint]
+	if !exists {
+		h = make([]atomic.Int64, len(m.attemptLatencyBounds)+1) // +1 for +Inf
+		m.attemptHistByEnd[endpoint] = h
+	}
+	m.mu.Unlock()
+
+	secs := d.Seconds()
+	idx := len(m.attemptLatencyBounds) // default to the +Inf bucket
+	for i, bound := range m.attemptLatencyBounds {
+		if secs <= bound {
+			idx = i
+			break
+		}
+	}
+	h[idx].Add(1)
+}
+
+func (m *Metrics) counterAttempts(endpoint string) *atomic.Int64 {
+	return m.lazyCounter(m.attemptsByEndpoint, endpoint)
+}
+
+func (m *Metrics) counterAttemptFailures(endpoint string) *atomic.Int64 {
+	return m.lazyCounter(m.attemptFailuresByEnd, endpoint)
+}
+
+func (m *Metrics) counterAttemptLatencySum(endpoint string) *atomic.Int64 {
+	return m.lazyCounter(m.attemptLatencyNSByEnd, endpoint)
+}
+
+// lazyCounter returns the counter for endpoint in store, creating it on first
+// access. The store must be one of the attempt-telemetry maps. Read-locks for
+// the common case and double-checks under a write lock so two goroutines
+// racing on a brand-new endpoint cannot each allocate one.
+func (m *Metrics) lazyCounter(store map[string]*atomic.Int64, endpoint string) *atomic.Int64 {
+	m.mu.RLock()
+	c, ok := store[endpoint]
+	m.mu.RUnlock()
+	if ok {
+		return c
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok = store[endpoint]; !ok {
+		c = &atomic.Int64{}
+		store[endpoint] = c
+	}
+	return c
+}
+
 // ServeHTTP writes Prometheus text format to the response.
 func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
@@ -248,5 +367,85 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sum := float64(m.latencySumNS.Load()) / 1e9
 		fmt.Fprintf(w, "airouter_request_duration_seconds_sum %f\n", sum)
 		fmt.Fprintf(w, "airouter_request_duration_seconds_count %d\n", count)
+	}
+
+	fmt.Fprintln(w, "# HELP airouter_sse_comments_routed_out SSE comment lines dropped instead of being parsed as events")
+	fmt.Fprintln(w, "# TYPE airouter_sse_comments_routed_out counter")
+	fmt.Fprintf(w, "airouter_sse_comments_routed_out %d\n", m.sseCommentsRoutedOut.Load())
+
+	m.serveAttemptMetrics(w)
+}
+
+// serveAttemptMetrics exports the per-endpoint attempt telemetry: how often an
+// endpoint is reached, how often those attempts fail, and how long they take.
+//
+// Read together these answer the tuning questions the request-level metrics
+// cannot. A high attempt count with a high failure ratio means the endpoint is
+// being reached and is broken (demote it). A high attempt count concentrated
+// in the 12s+ buckets means the chain is paying a real timeout for it on every
+// request (reorder it, or shorten the budget).
+func (m *Metrics) serveAttemptMetrics(w http.ResponseWriter) {
+	// Snapshot under one read lock, then format outside it: formatting writes
+	// to the network and must not block the counters other requests update.
+	m.mu.RLock()
+	attempts := make(map[string]int64, len(m.attemptsByEndpoint))
+	for k, c := range m.attemptsByEndpoint {
+		attempts[k] = c.Load()
+	}
+	failures := make(map[string]int64, len(m.attemptFailuresByEnd))
+	for k, c := range m.attemptFailuresByEnd {
+		failures[k] = c.Load()
+	}
+	latSum := make(map[string]int64, len(m.attemptLatencyNSByEnd))
+	for k, c := range m.attemptLatencyNSByEnd {
+		latSum[k] = c.Load()
+	}
+	hists := make(map[string][]int64, len(m.attemptHistByEnd))
+	for k, h := range m.attemptHistByEnd {
+		row := make([]int64, len(h))
+		for i := range h {
+			row[i] = h[i].Load()
+		}
+		hists[k] = row
+	}
+	m.mu.RUnlock()
+
+	if len(attempts) == 0 {
+		return
+	}
+
+	fmt.Fprintln(w, "# HELP airouter_endpoint_attempts_total Upstream attempts made against each endpoint")
+	fmt.Fprintln(w, "# TYPE airouter_endpoint_attempts_total counter")
+	fmt.Fprintln(w, "# HELP airouter_endpoint_attempt_failures_total Upstream attempts against each endpoint that failed")
+	fmt.Fprintln(w, "# TYPE airouter_endpoint_attempt_failures_total counter")
+	fmt.Fprintln(w, "# HELP airouter_endpoint_attempt_duration_seconds Duration of a single upstream attempt")
+	fmt.Fprintln(w, "# TYPE airouter_endpoint_attempt_duration_seconds histogram")
+
+	// Sort keys so the output is stable between scrapes. Prometheus does not
+	// require it, but a diffable /metrics is much easier to read in a
+	// terminal and makes accidental churn visible.
+	endpoints := make([]string, 0, len(attempts))
+	for k := range attempts {
+		endpoints = append(endpoints, k)
+	}
+	sort.Strings(endpoints)
+
+	for _, ep := range endpoints {
+		n := attempts[ep]
+		fmt.Fprintf(w, "airouter_endpoint_attempts_total{endpoint=\"%s\"} %d\n", ep, n)
+		fmt.Fprintf(w, "airouter_endpoint_attempt_failures_total{endpoint=\"%s\"} %d\n", ep, failures[ep])
+
+		sum := float64(latSum[ep]) / 1e9
+		h := hists[ep]
+		var cumulative int64
+		for i, bound := range m.attemptLatencyBounds {
+			if i < len(h) {
+				cumulative += h[i]
+			}
+			fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_bucket{endpoint=\"%s\",le=\"%g\"} %d\n", ep, bound, cumulative)
+		}
+		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_bucket{endpoint=\"%s\",le=\"+Inf\"} %d\n", ep, n)
+		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_sum{endpoint=\"%s\"} %f\n", ep, sum)
+		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_count{endpoint=\"%s\"} %d\n", ep, n)
 	}
 }
