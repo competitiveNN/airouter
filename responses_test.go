@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testGatewayKey is the gateway key the Responses tests authenticate with, so
@@ -18,6 +19,17 @@ const testGatewayKey = "gw-test"
 // existing chat tests do, so the Responses surface is exercised end to end
 // through real routing and proxying rather than in isolation.
 func responsesGateway(t *testing.T, handler http.HandlerFunc, chain ...ModelEndpoint) *httptest.Server {
+	t.Helper()
+	return responsesGatewayWith(t, handler, nil, chain...)
+}
+
+// responsesGatewayWith is responsesGateway plus a hook to adjust the gateway
+// before it starts serving, for tests that need to shorten cooldown backoff
+// or otherwise tune router behaviour.
+//
+// tune receives the *GatewayContext so callers can call SetTestCooldown or
+// similar. Passing nil skips the hook.
+func responsesGatewayWith(t *testing.T, handler http.HandlerFunc, tune func(*GatewayContext), chain ...ModelEndpoint) *httptest.Server {
 	t.Helper()
 	backend := httptest.NewServer(handler)
 	t.Cleanup(backend.Close)
@@ -36,6 +48,9 @@ func responsesGateway(t *testing.T, handler http.HandlerFunc, chain ...ModelEndp
 	router := NewRouter(cfg, "")
 	t.Cleanup(router.Close)
 	g := NewGatewayContext(router, proxy, cfg, "", testGatewayKey, false)
+	if tune != nil {
+		tune(g)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/responses", g.HandleResponses)
@@ -537,4 +552,173 @@ func assertEventSequence(t *testing.T, got, want []string) {
 	if i != len(want) {
 		t.Errorf("event sequence = %v, want it to contain %v in order (matched %d/%d)", got, want, i, len(want))
 	}
+}
+
+// TestResponsesStream_TerminationContract pins the framing of the Responses
+// API stream surface, which has its own emitter (responses_stream.go) and so
+// does not share the chat path's [DONE] handling.
+//
+// The Responses protocol terminates with a `response.completed` event rather
+// than a `[DONE]` sentinel, and a client finalizes on it exactly as a chat
+// client finalizes on [DONE]. So the same two invariants apply:
+//
+//   - `response.completed` appears exactly once
+//   - it is the final event, after every delta
+//
+// Without this the chat-path fix could pass while the Responses surface
+// regresses independently.
+func TestResponsesStream_TerminationContract(t *testing.T) {
+	srv := responsesGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for _, tok := range []string{"Hel", "lo"} {
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", tok)
+			flusher.Flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}, ModelEndpoint{Provider: "openai", Model: "gpt-4"})
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/responses", strings.NewReader(`{"model":"smart","input":"hi","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body := readAllString(t, resp)
+
+	events := sseEventNames(body)
+	completed := 0
+	lastIdx := -1
+	for i, e := range events {
+		if e == evResponseCompleted {
+			completed++
+			lastIdx = i
+		}
+	}
+	if completed != 1 {
+		t.Errorf("want exactly 1 %s, got %d in %v", evResponseCompleted, completed, events)
+	}
+	if completed == 1 && lastIdx != len(events)-1 {
+		t.Errorf("%s must be the final event; it is at %d of %d (%v)", evResponseCompleted, lastIdx, len(events), events)
+	}
+	// The deltas must be present before it, or the client finalizes on an
+	// empty response.
+	if !strings.Contains(body, "Hello") {
+		t.Errorf("stream body missing reassembled text; got:\n%s", body)
+	}
+}
+
+// TestResponsesStream_UpstreamErrorMidStreamFailsOver covers the case where
+// the upstream emits an SSE error after partial content. The attempt must
+// abort so the gateway falls back, rather than finalizing a contentless but
+// successful-looking response.completed that hides the upstream error.
+func TestResponsesStream_UpstreamErrorMidStreamFailsOver(t *testing.T) {
+	// The chain has one endpoint, so the gateway correctly retries it a few
+	// times before giving up. Shorten the cooldown so the retry backoff does
+	// not dominate this test's runtime — at the default it takes ~60s.
+	srv := responsesGatewayWith(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"partial"}}]}`+"\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, `data: {"error":{"message":"upstream died","type":"server_error"}}`+"\n\n")
+		flusher.Flush()
+	}, func(g *GatewayContext) { g.SetTestCooldown(10 * time.Millisecond) },
+		ModelEndpoint{Provider: "openai", Model: "gpt-4"})
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/responses", strings.NewReader(`{"model":"smart","input":"hi","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body := readAllString(t, resp)
+
+	// The only endpoint fails, so the gateway must surface an error rather
+	// than a clean response.completed over partial content. The message is
+	// the generic "All models are currently unavailable" because the chain
+	// is exhausted — correct, since it must not leak one provider's error
+	// text to the client, and it must not masquerade as a successful turn.
+	if strings.Contains(body, evResponseCompleted) {
+		t.Errorf("upstream error was swallowed into a %s; body:\n%s", evResponseCompleted, body)
+	}
+	if !strings.Contains(body, "server_error") {
+		t.Errorf("expected a terminal error event to reach the client; body:\n%s", body)
+	}
+}
+
+// TestResponsesNonStreaming_FallbackRespectsWallClockBudget verifies the
+// Responses completion path honours the same wall-clock budget as the chat
+// path.
+//
+// Both loops are bounded by maxAttempts = chainLen*3+1, which for the shipped
+// config is 82 (smart) / 145 (work). Without a wall-clock guard, a chain of
+// slow-failing providers can hold the client open for minutes. This path
+// previously had no such guard; it was added to match handleCompletion.
+//
+// To exercise the guard the endpoints must fail by TIMING OUT, not by
+// returning an error: a fast error makes the loop move straight to the next
+// endpoint, and once all are in `tried` SelectEndpoint returns the exhausted
+// chain rather than burning wall-clock. A per-attempt timeout is what
+// actually consumes the budget.
+func TestResponsesNonStreaming_FallbackRespectsWallClockBudget(t *testing.T) {
+	release := make(chan struct{})
+
+	// A chain of endpoints that each stall well past the small-request
+	// per-attempt timeout, so every attempt burns real wall-clock.
+	srv := responsesGatewayWith(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			// The gateway's per-attempt deadline fired; return without a body.
+		case <-release:
+			// The test finished; stop stalling so Close() can return.
+		case <-time.After(30 * time.Second):
+			w.WriteHeader(200)
+			fmt.Fprint(w, `{"choices":[{"message":{"content":"too late"}}]}`)
+		}
+	}, nil,
+		ModelEndpoint{Provider: "openai", Model: "a"},
+		ModelEndpoint{Provider: "openai", Model: "b"},
+		ModelEndpoint{Provider: "openai", Model: "c"},
+		ModelEndpoint{Provider: "openai", Model: "d"},
+		ModelEndpoint{Provider: "openai", Model: "e"},
+		ModelEndpoint{Provider: "openai", Model: "f"},
+		ModelEndpoint{Provider: "openai", Model: "g"},
+		ModelEndpoint{Provider: "openai", Model: "h"},
+	)
+	// Registered after the helper so LIFO cleanup order runs this BEFORE the
+	// backend's Close(), which would otherwise block for the full stall.
+	t.Cleanup(func() { close(release) })
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/responses", strings.NewReader(`{"model":"smart","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+
+	began := time.Now()
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body := readAllString(t, resp)
+	elapsed := time.Since(began)
+
+	if resp.StatusCode != 503 {
+		t.Errorf("expected 503 once the chain is exhausted, got %d (body: %s)", resp.StatusCode, body)
+	}
+	// fallbackBudget for a small request is 12s; the hard ceiling is 45s.
+	// Eight endpoints x 5s per attempt is 40s unbounded, so without the guard
+	// this lands far above the budget. Allow scheduling slack.
+	if elapsed > 25*time.Second {
+		t.Errorf("fallback walk took %v, well past the wall-clock budget; the "+
+			"Responses path is not bounded the way the chat path is",
+			elapsed.Round(time.Millisecond))
+	}
+	t.Logf("exhausted the chain in %v", elapsed.Round(time.Millisecond))
 }
