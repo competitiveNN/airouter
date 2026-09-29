@@ -65,6 +65,16 @@ jobs:
       - name: secret scan
         run: bash scripts/secret-scan.sh
 
+      # docs/audit.md cites the *symbol* each finding concerns rather than a
+      # line number, so the citations survive edits above them. That only stays
+      # true if something checks it: an anchor that names a deleted function is
+      # worse than a stale line number, because it sends the reader looking for
+      # code that no longer exists. Cheap to run, and it fails loudly instead of
+      # rotting. Needs only the stdlib, so the runner's preinstalled python3 is
+      # enough (no setup-python step, no dependencies).
+      - name: audit anchors resolve
+        run: python3 scripts/audit-drift-check.py
+
   config:
     runs-on: ubuntu-latest
     steps:
@@ -89,7 +99,7 @@ jobs:
         run: python3 -m pytest scripts/test_regenerate_config.py -q
 
       - name: compile python scripts
-        run: python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py scripts/fake-sse-upstream.py
+        run:           python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py scripts/fake-sse-upstream.py scripts/audit-drift-check.py
 
   # End-to-end assertion of the SSE termination contract. The bug this guards
   # (a `data: [DONE]` released ahead of the real chunks, so the client silently
