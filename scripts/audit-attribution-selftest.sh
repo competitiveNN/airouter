@@ -48,6 +48,16 @@
 # Exit 2 = the harness could not run (no git, no python3, script unreadable).
 set -uo pipefail
 
+# The number of assertions a complete run makes. Pinning it is what makes a
+# silent loss of coverage visible: this suite skips cases in a bare clone (the
+# generated patch is absent, and there are no unpushed commits to check), so the
+# passing total legitimately varies by environment. What must NOT vary is how
+# many assertions run when the environment IS complete. A case that starts
+# skipping for a new reason, or one that stops running, drops this count, and
+# the run reports it rather than quietly looking fine.
+EXPECTED_FULL=14
+EXPECTED_CLONE=9
+
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
 
@@ -67,6 +77,7 @@ trap cleanup EXIT
 PASSED=0
 FAILED=0
 SKIPPED_RECOVERY=0
+SKIPPED_CASE1=0
 ok()  { PASSED=$((PASSED + 1)); printf '  ok   %s\n' "$1"; }
 bad() { FAILED=$((FAILED + 1)); printf '  FAIL %s\n' "$1"; }
 
@@ -141,6 +152,7 @@ UNPUSHED_COUNT=$(git -C "$REPO" rev-list --count origin/master..HEAD 2>/dev/null
 if [ "$UNPUSHED_COUNT" -eq 0 ]; then
   printf '  skip case 1: this checkout has no unpushed commits, so there is no\n'
   printf '           handoff list to be accurate about (a clone with everything)\n' >&2
+  SKIPPED_CASE1=1
 else
   out=$(cd "$REPO" && python3 scripts/audit-attribution-check.py 2>&1); got=$?
   assert_run "real repository passes" 0 "all citations resolve" "$out" "$got"
@@ -292,11 +304,24 @@ assert_run "--against a non-repository exits 2" 2 "is not a" "$out" "$got"
 
 echo ""
 echo "----------------------------------------"
-if [ "$SKIPPED_RECOVERY" -eq 1 ]; then
-  printf 'attribution-selftest: %d passed, %d failed, recovery cases SKIPPED\n' \
-    "$PASSED" "$FAILED"
+
+# A run is "complete" when neither environment-dependent case was skipped. The
+# two expected totals are the contract: a case that starts skipping for a new
+# reason, or one that stops running, changes PASSED and is reported here rather
+# than being absorbed into a smaller number that still looks green.
+if [ "$SKIPPED_RECOVERY" -eq 1 ] || [ "$SKIPPED_CASE1" -eq 1 ]; then
+  expected="$EXPECTED_CLONE"
+  printf 'attribution-selftest: %d passed, %d failed (reduced run: expected %d)\n' \
+    "$PASSED" "$FAILED" "$expected"
 else
-  printf 'attribution-selftest: %d passed, %d failed\n' "$PASSED" "$FAILED"
+  expected="$EXPECTED_FULL"
+  printf 'attribution-selftest: %d passed, %d failed (full run: expected %d)\n' \
+    "$PASSED" "$FAILED" "$expected"
 fi
+
+if [ "$PASSED" -ne "$expected" ]; then
+  bad "assertion count matches the contract (got $PASSED, expected $expected)"
+fi
+
 [ "$FAILED" -eq 0 ] || exit 1
 exit 0
