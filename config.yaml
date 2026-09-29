@@ -125,6 +125,20 @@ preferences:
   # How many probe requests are allowed through in half-open state before the
   # circuit re-opens. Default 1 (one probe must succeed to close the circuit).
   circuit_half_open_probes: 1
+  # Default output-token ceiling applied to requests that omit max_tokens.
+  # A pointer is used so three states are distinguishable:
+  #   nil (absent) -> "auto": half of the profile's advertised context window
+  #                   (max_context_tokens). This is the default.
+  #   0            -> "never default": send the request upstream without
+  #                   max_tokens, letting the provider choose.
+  #   positive      -> use that absolute value regardless of profile.
+  #
+  # Half-of-context is right for chat models but wrong for reasoning models
+  # (deepseek-r1, gpt-oss, nemotron-3-nano reasoning, ...): their thinking
+  # tokens live OUTSIDE the visible output and can exceed a half-context
+  # budget, so the provider rejects the request. Operators with reasoning
+  # models in a chain should set this to 0 (or a larger value) to opt out.
+  # default_max_tokens: 0   # uncomment + set to override the auto behavior
 
 models:
   smart:

@@ -144,6 +144,14 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		g.wsSendError(conn, corrID, "Failed to encode upstream request", "server_error", "encode_failed")
 		return
 	}
+
+	// Default max_tokens if the client omitted it (same rule as the HTTP
+	// surfaces). chatReq.MaxTokens mirrors req.MaxOutputTokens.
+	if chatReq.MaxTokens == nil {
+		if def := g.defaultMaxTokensForModel(req.Model); def > 0 {
+			body = injectMaxTokens(body, def)
+		}
+	}
 	sessionID := bodySessionID(body)
 
 	// A WebSocket turn is always streamed: the socket is a persistent

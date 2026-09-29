@@ -227,6 +227,29 @@ nothing populated or read them. All three are now wired end-to-end with tests.
   TestPreferencesCooldownJitterFraction,
   TestConfigWiresCooldownJitterToRouter.
 
+## Default max_tokens injection (2026-09-28)
+
+- `Preferences.DefaultMaxTokens *int` (yaml `default_max_tokens`) with three
+  distinguishable states via pointer:
+  - nil (absent) → **auto**: inject `max_tokens = min_context / 2` for requests
+    that omit it.
+  - 0 → **never default**: send the request upstream without `max_tokens`,
+    letting the provider choose.
+  - positive → use that absolute value regardless of profile.
+- `defaultMaxTokensForModel` resolves the effective ceiling per profile.
+- `injectMaxTokens` mutates the raw request body (not just the parsed
+  struct), so the injection reaches every path: non-stream, stream,
+  Responses HTTP, and Responses WebSocket. It preserves all other fields
+  and ordering, and returns the body unchanged on parse failure.
+- The injection happens BEFORE `bodySessionID`, so a client that re-sends
+  the same conversation with `max_tokens` toggled still hashes to the same
+  session (max_tokens is not part of the fingerprint — see
+  `bodySessionID` at api.go:361).
+- Tests: `TestDefaultMaxTokensInjectedByHalfContext`,
+  `TestDefaultMaxTokensPreservesClientValue`,
+  `TestDefaultMaxTokensDisabledWhenExplicitZero`,
+  `TestDefaultMaxTokensNoContextSkips`.
+
 ## /v1/models advertises a max_context_tokens floor (2026-09-28)
 
 - `ModelEndpoint` gained a `ContextLength int` field (yaml `context_length`),
@@ -358,7 +381,7 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestParseRetryAfterEdgeCases  (new, 2026-09-28)
 
 ## Test summary
-  `go test -race ./...` → 155 passed, 0 failed (2026-09-28)
+  `go test -race ./...` → 159 passed, 0 failed (2026-09-28)
   Both previously-flaky tests now stable:
   - TestHandleStream_ResourceCleanup — passes in full suite
   - TestConcurrentMidStreamErrorRecovery — fixed to only assert the replay
