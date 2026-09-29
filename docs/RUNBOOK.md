@@ -103,6 +103,24 @@ config, sessions, cooldowns, provider URLs, or keys — safe for load balancers.
 - **"All models are currently unavailable" (503):** every endpoint in the
   chain is in cooldown. Wait for the shortest cooldown to expire (the handler
   sleeps, bounded by `maxAttempts`), or reset cooldowns via `/admin/cooldowns`.
+
+  ```sh
+  # one endpoint
+  curl -X DELETE -H "Authorization: Bearer $KEY" \
+    'http://127.0.0.1:9090/admin/cooldowns?model=opencode:muse-spark-1.2-contributor-free'
+  # everything (drops all backoff protection at once)
+  curl -X DELETE -H "Authorization: Bearer $KEY" \
+    'http://127.0.0.1:9090/admin/cooldowns'
+  ```
+
+  Returns `{"cleared":N,"model":...}`, 404 if the named model has no cooldown.
+
+  **Do not hand-edit `cooldowns.json` while the daemon is running.** The router
+  holds the authoritative state in memory and rewrites the whole file from it on
+  the next failure, so your edit is reverted within seconds. If you must edit,
+  stop the service first. Note `circuits.*.state` is an **int** (0 closed, 1
+  open, 2 half-open), not a string — a bad value there used to abort the whole
+  file parse and silently reset every cooldown.
 - **Sticky session pinned to a dead model:** the session ID is derived from the
   request body, so changing the messages or model moves to a new session.
 - **Cooldowns not expiring:** verify `cooldowns.json` is writable; the router
