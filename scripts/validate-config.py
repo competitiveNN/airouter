@@ -120,6 +120,28 @@ def main() -> int:
                         f"{sorted(missing)} present on other {source} provider(s)"
                     )
 
+    # preferences.max_label_cardinality bounds the metrics label registry.
+    # Out of range is rejected here, at config time, because the Go loader
+    # silently falls back to the default — a mistyped cap would otherwise look
+    # like it took effect while the per-endpoint series quietly aggregate into
+    # __overflow__ (or, worse, stay at the default and the operator concludes the
+    # setting is broken). Keep these bounds in sync with minLabelValues /
+    # maxAllowedLabels in metrics.go; TestValidateConfigRangeMatchesGo asserts it.
+    MIN_LABEL_CARDINALITY = 16
+    MAX_LABEL_CARDINALITY = 65536
+    prefs = cfg.get("preferences") or {}
+    cap = prefs.get("max_label_cardinality")
+    if cap is not None:
+        if not isinstance(cap, int) or isinstance(cap, bool):
+            problems.append(
+                f"preferences.max_label_cardinality must be an integer, got {cap!r}"
+            )
+        elif not (MIN_LABEL_CARDINALITY <= cap <= MAX_LABEL_CARDINALITY):
+            problems.append(
+                f"preferences.max_label_cardinality must be between "
+                f"{MIN_LABEL_CARDINALITY} and {MAX_LABEL_CARDINALITY}, got {cap}"
+            )
+
     if problems:
         for p in problems:
             print(f"FAIL: {p}")

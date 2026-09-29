@@ -249,6 +249,12 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 	g.config = shared
 	g.router.config = shared
 	g.proxy.config = shared
+	// Apply the configured label cap at construction, not only on reload. The
+	// collector is created here, so this is the first chance to honour
+	// max_label_cardinality; ReloadConfig keeps it in sync afterwards.
+	if g.metrics != nil {
+		g.metrics.SetLabelCap(cfg.Preferences.MaxLabelCardinalityValue())
+	}
 	return g
 }
 
@@ -1496,6 +1502,12 @@ func (g *GatewayContext) ReloadConfig(cfg *Config) {
 	// push it across explicitly on every reload. Without this a config change
 	// to cooldown_jitter would silently no-op until restart.
 	g.router.SetCooldownJitter(cfg.Preferences.CooldownJitterFraction())
+	// Same story for the metrics label cap: the collector is built once and
+	// outlives every reload, so a config change to max_label_cardinality has
+	// to be pushed into it or it silently no-ops until restart.
+	if g.metrics != nil {
+		g.metrics.SetLabelCap(cfg.Preferences.MaxLabelCardinalityValue())
+	}
 	providers := 0
 	models := 0
 	if cfg != nil {

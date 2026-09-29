@@ -477,6 +477,108 @@ defects, all in `metrics.go`, all now fixed and pinned.
   `CircuitState.String`, and pinned by
   TestMetricsCircuitTransitionLabelsAreReadable.
 
+### Round 2 (2026-09-29) — eviction, configurability, and the malformed-sample bug
+
+The bound from round 1 was correct but incomplete, and the incompleteness was
+worse than the bug it fixed: it held the line, but it starved.
+
+• `boundLabelValue` (was metrics.go, first-come admission) — the cap admitted
+  the first 512 distinct labels and then refused everything else, permanently.
+  Because config is hot-reloadable, labels belonging to a config that is no
+  longer live hold their slots for the life of the process. A newly hot
+  endpoint appearing afterwards is collapsed into `__overflow__` forever, and
+  the gateway reports a broken upstream as "no data" indefinitely — the single
+  worst failure mode for the series whose entire job is answering "is this
+  upstream healthy?". FIXED: `attemptsByEndpoint` now recycles. An untracked
+  label arriving at a full window evicts the least-recently-admitted tracked
+  endpoint via `rollUpToOverflowLocked` and makes room. Eviction is FIFO by
+  admission, not LRU: re-touching an endpoint does not refresh its position,
+  because doing so would take the global write lock on every observation to
+  protect a distinction that only matters under sustained churn.
+
+  Preserving the totals through an eviction is the part that is easy to get
+  quietly wrong, and it was wrong three times on the way:
+    - attempt counts, failure counts and latency sums must roll into the
+      bucket, or a churn loop quietly deletes history;
+    - the rollup read-then-maybe-wrote, so the *first* label of a kind dropped
+      its failure and latency history on the floor — which is every label that
+      failed on its only attempt, i.e. precisely the labels worth knowing about;
+    - the bucket was originally created in `attemptsByEndpoint` alone, giving a
+      series with a count and no histogram, whose `attempt_duration_seconds`
+      printed a zeroed distribution.
+  Per-bucket *histogram* data is deliberately not merged, and cannot honestly
+  be: after the endpoint is gone, "the 0.25s band held 40 observations, all
+  from a label we evicted" is not representable. `__overflow__`'s `_count` can
+  therefore sit below what its `_sum` implies. That is the design, and the
+  RUNBOOK says so, so nobody later "fixes" it.
+
+• `Attempt` (was metrics.go, admission and update under separate locks) —
+  admission reserved a slot under one critical section and updated the counters
+  under another. A concurrent eviction could remove the key in between, after
+  which the in-flight observation recreated it — pushing the map one over the
+  cap and double-counting. Admission and update are now one atomic operation
+  under a single write lock. The bucket is also pinned *outside* the recycling
+  ring: it was briefly added to the ring and skipped only when picking a victim,
+  which reported one real eviction as two.
+
+• `ServeHTTP` (was metrics.go, raw `%s` of a pre-rendered label set) — the
+  cardinality bound had a failure mode that was strictly worse than the one it
+  fixed. The maps bound labels in two shapes: `attemptsByEndpoint` keys on a
+  bare value, but `circuitTransitions` keys on a pre-rendered label set
+  (`from="..",to="..",endpoint=".."`) that the exporter splices in unquoted.
+  Its overflow key is therefore the bare word `__overflow__`, sitting where a
+  label set belongs, and the output line is
+  `airouter_circuit_state_transitions{__overflow__} 4` — not a legal sample. A
+  Prometheus scrape is all-or-nothing, so hitting the cap would have taken down
+  every dashboard, alert and recording rule on the instance. The bound on
+  cardinality is worthless if the price of reaching it is losing the metrics.
+  FIXED: the bucket renders as `{endpoint="__overflow__"}`. Every earlier test
+  passed while this was broken, because they asserted on map contents and
+  substrings rather than parsing the output;
+  `TestMetricsOverflowNeverEmitsMalformedSamples` now forces the overflow
+  condition on all five bounded maps and asserts the *parsed* output, including
+  that every label name is a legal Prometheus identifier. The test was verified
+  to fail on the unfixed code with exactly the malformed line above.
+
+• `Config.validate` (was config.go, nil deref) — the range check for
+  `preferences.max_label_cardinality` dereferenced `c.Preferences` directly.
+  `Preferences` is a pointer, the key is `omitempty`, and a config without a
+  `preferences:` block is perfectly valid, so the check panicked on the most
+  ordinary config there is and took the whole suite down with it. Every other
+  preference accessor in the file is nil-safe; this one now is too.
+
+• `labelEscape` (was metrics.go, hand-picked cases only) — the injection guard
+  was verified by a table of nasty strings, which is the shape of bug that
+  ships: the test passes, the reviewer concludes the escaper is sound, and the
+  untested case is the one a config author types next. `FuzzExpositionRoundTrip`
+  now asserts the property the guard actually rests on — for *any* label value,
+  what the escaper writes is what `parseExposition` reads back, and the result
+  is still exactly one well-formed sample — driving the parser over the whole
+  line so the brace/quote/escape state machine is explored for panics and
+  non-termination too. 174M executions, no counterexample.
+
+The cap is now configurable rather than a constant, because a memory bound that
+cannot be raised is a bug report waiting to happen: `Preferences.MaxLabelCardinality`
+→ `MaxLabelCardinalityValue` → `SetLabelCap`, applied at construction and again
+on every `ReloadConfig` (the collector is built once and outlives every reload,
+so a change applied only at construction would silently no-op until restart).
+Out-of-range values are **rejected, not clamped** — below the floor destroys
+the series the cap exists to protect, above the ceiling defeats the memory
+bound, and a setting that silently does something other than what it says is
+worse than a startup failure. `scripts/validate-config.py` enforces the same
+bounds before a restart, so the rule is implemented twice; the duplication is
+the point (config is checked before and after a restart) and
+`TestValidateConfigRangeMatchesGo` parses the script's source to assert the two
+constants agree, so they cannot drift apart silently. It was verified to fail
+when the script's ceiling is changed alone.
+
+Tests added this round: TestMetricsEvictionPreventsLabelStarvation,
+TestMetricsEvictionIsFIFONotRandom, TestMetricsEvictionNeverDisplacesTheOverflowBucket,
+TestMetricsEvictedCounterIsExported, TestMetricsSetLabelCap,
+TestMetricsCardinalityBoundaryIsExact, TestMetricsOverflowNeverEmitsMalformedSamples,
+TestConfigValidationRejectsOutOfRangeLabelCap, TestValidateConfigRangeMatchesGo,
+FuzzExpositionRoundTrip.
+
 ---
 
 ## Resource leak audit (2026-09-07) — re-verified 2026-09-20
@@ -514,7 +616,17 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestParseRetryAfterEdgeCases  (new, 2026-09-28)
 
 ## Test summary
-  `go test -race ./...` → 159 passed, 0 failed (2026-09-28)
+  `go test -race ./...` → 250 passed, 0 failed (2026-09-29)
+  `gofmt -l .` → clean; `go vet ./...` → no issues
+  `python3 scripts/validate-config.py` → OK: 4 profiles validated
+  `scripts/audit-drift-check.py` → all anchors resolve
+  `FuzzExpositionRoundTrip` → 60s, 174M execs, no counterexample
+  Negative controls (each verified to FAIL against the unfixed code before
+  being accepted): TestMetricsOverflowNeverEmitsMalformedSamples against the
+  `{__overflow__}` sample; TestValidateConfigRangeMatchesGo against a script
+  whose ceiling no longer matches Go.
+
+  Earlier: `go test -race ./...` → 159 passed, 0 failed (2026-09-28)
   Both previously-flaky tests now stable:
   - TestHandleStream_ResourceCleanup — passes in full suite
   - TestConcurrentMidStreamErrorRecovery — fixed to only assert the replay

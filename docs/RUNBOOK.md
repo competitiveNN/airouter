@@ -108,7 +108,8 @@ unauthenticated scrape is an information leak, not a health check — use
 | `airouter_endpoint_attempt_failures_total{endpoint}` | counter | Failure ratio per upstream |
 | `airouter_endpoint_attempt_duration_seconds{endpoint}` | histogram | Per-attempt cost per upstream |
 | `airouter_sse_comments_routed_out` | counter | Upstream keepalive chatter filtered out of the event path |
-| `airouter_metrics_label_overflow_total` | counter | Label values folded into `__overflow__` because the registry is full |
+| `airouter_metrics_label_overflow_total` | counter | Label observations folded into `__overflow__` because a map was full with nothing recyclable |
+| `airouter_metrics_label_evictions_total` | counter | Endpoint series recycled out of the window into `__overflow__` to make room for a new label |
 
 The `airouter_endpoint_attempt_*` series are the ones to read when deciding
 whether a fallback chain needs reordering: `fallbacks_total` says an endpoint
@@ -131,23 +132,67 @@ and the file watcher hot-reloads every 3s. Without a bound, a config churn loop
 (or a model sync that keeps inventing model ids) grows the registry until the
 gateway is OOM-killed — the metrics endpoint becomes a way to kill the process.
 
-So every label map is capped at `maxLabelValues` (512) in `metrics.go`. Once a
-map is full, a label value that is not already tracked collapses into a single
-`__overflow__` bucket rather than creating a new series. Consequences:
+So every label map is capped in `metrics.go`. The endpoint map (which backs
+`airouter_endpoint_attempt_*`, the series you actually diagnose with)
+**recycles**; the smaller maps (`requests_by_model`, `requests_by_status`,
+`failures_by_status`, `fallbacks_by_from_endpoint`, `circuit_transitions`)
+**collapse**. Both end in a single `__overflow__` bucket.
 
-- **Nothing is silently dropped.** Collapsed observations are still counted, and
-  `airouter_metrics_label_overflow_total` increments. It should be `0` in a
-  healthy deployment.
+**Recycling** (`attemptsByEndpoint`): once the map is full, a new endpoint label
+evicts the least-recently-admitted tracked endpoint and rolls its attempt count,
+failure count and latency sum into `__overflow__`. Recycling rather than
+first-come admission is the whole point: with a never-releasing registry, a
+burst of labels from a config that is no longer live holds its slots
+permanently, and a genuinely hot endpoint that first appears later is
+collapsed forever. The gateway would then report a broken upstream as "no
+data" indefinitely — the worst possible failure for the series whose entire job
+is answering "is this upstream healthy?". Admission is FIFO, not LRU:
+re-touching an endpoint does not refresh its position, which avoids taking the
+global write lock on every single observation.
+
+Two consequences specific to the endpoint map:
+
+- **Attempt counts, failure counts and latency sums are never lost.** They roll
+  into the bucket.
+- **Per-bucket histogram data is *not* merged**, and cannot honestly be. Once
+  the endpoint is gone, "the 0.25s band held 40 observations, all from a label
+  we evicted" is not representable. So `__overflow__`'s `_count` can
+  legitimately be lower than its `_sum` implies. Do not alert on that
+  discrepancy; it is the design, not corruption.
+
+**Collapsing** (the other maps): a label that is not already tracked and finds
+the map full is counted directly against `__overflow__`. This costs no series,
+so `airouter_metrics_label_overflow_total` increments and should be `0` in a
+healthy deployment.
+
 - **Already-tracked labels stay distinct.** A churning config never displaces
   the endpoints that are actually hot; only the tail collapses.
-- **If that counter is non-zero**, either the cap is too low for the deployment
-  (raise `maxLabelValues`) or something is feeding unbounded label values
-  (check for a config rewrite loop). The per-endpoint series are aggregate
-  beyond the cap, so treat the overflow bucket as "unknown endpoints" rather
-  than as one specific provider.
+- **If `airouter_metrics_label_overflow_total` is non-zero**, either the cap is
+  too low (see below) or something is feeding unbounded label values (check for
+  a config rewrite loop). Treat the bucket as "unknown endpoints" rather than
+  as one specific provider.
+- **If `airouter_metrics_label_evictions_total` is climbing steadily**, real
+  endpoints are losing their series to newer ones. Raise the cap.
+
+`__overflow__` appears in the circuit-transition series as
+`{endpoint="__overflow__"}`. The other maps key on a pre-rendered label set
+(`from="..",to="..",endpoint=".."`) that the exporter splices in unquoted, so
+the bucket is rendered as a single explicit label to keep the sample legal.
 
 The cap is a memory bound, not a tuning knob with a correct value: the live
-config has 60 distinct endpoint keys, so 512 leaves ~8x headroom.
+config has 60 distinct endpoint keys, so the 512 default leaves ~8x headroom.
+
+### Tuning the label cap
+
+`preferences.max_label_cardinality` in `config.yaml` overrides the default, in
+`[16, 65536]`. It is applied at construction and re-applied on every config
+reload, so changing it does not need a restart. Out-of-range values are
+**rejected**, not clamped: `scripts/validate-config.py` fails before a restart,
+and `Config.validate` fails again after one. Below the floor destroys the
+per-endpoint series this exists to protect; above the ceiling defeats the memory
+bound, and a setting that silently does something other than what it says is
+worse than a startup failure. `TestValidateConfigRangeMatchesGo` asserts the
+script and Go agree on the bounds, so they cannot drift apart silently.
 
 ## SSE framing contract
 
