@@ -55,8 +55,8 @@ set -uo pipefail
 # many assertions run when the environment IS complete. A case that starts
 # skipping for a new reason, or one that stops running, drops this count, and
 # the run reports it rather than quietly looking fine.
-EXPECTED_FULL=14
-EXPECTED_CLONE=9
+EXPECTED_FULL=16
+EXPECTED_CLONE=11
 
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -167,6 +167,36 @@ git_q "$R" add -A && git_q "$R" commit -qm "cite a fabricated hash"
 out=$(cd "$R" && python3 scripts/audit-attribution-check.py 2>&1); got=$?
 assert_run "fabricated hash fails" 1 "deadbee" "$out" "$got"
 assert_run "fabricated hash is named" 1 "which is not a commit" "$out" "$got"
+
+echo "attribution-selftest: case 2b -- a DANGLING commit is not a valid citation"
+# A commit that was reset away still sits in the object database, and
+# `git cat-file -e` still resolves it. A citation naming one therefore passes in
+# the working tree where it was written and fails in every clone -- green here,
+# red exactly where the work is handed off. This case builds that state and
+# requires the check to reject it, which reachability-from-HEAD does and
+# cat-file alone does not.
+RD=$(new_repo dangling)
+B=$(base_sha "$RD")
+printf '# audit\n' > "$RD/docs/audit.md"
+printf '# unpushed\n' > "$RD/dist/README.md"
+git_q "$RD" add -A && git_q "$RD" commit -qm "add the handoff documents"
+# A commit on a throwaway branch, then abandoned: present in the object
+# database, not reachable from HEAD.
+git_q "$RD" checkout -q -b throwaway
+printf 'gone\n' > "$RD/scratch.txt"
+git_q "$RD" add -A && git_q "$RD" commit -qm "this commit will be abandoned"
+DANGLING=$(base_sha "$RD")
+git_q "$RD" checkout -q master
+git_q "$RD" branch -q -D throwaway
+if ! git_q "$RD" cat-file -e "$DANGLING^{commit}" 2>/dev/null; then
+  printf '  skip case 2b: the abandoned commit was pruned before the check ran\n' >&2
+else
+  printf '# audit\n\nThis cites `%s`, which was abandoned.\n' "$DANGLING" > "$RD/docs/audit.md"
+  git_q "$RD" add -A && git_q "$RD" commit -qm "cite an abandoned commit"
+  out=$(cd "$RD" && python3 scripts/audit-attribution-check.py 2>&1); got=$?
+  assert_run "a dangling commit is rejected" 1 "$DANGLING" "$out" "$got"
+  assert_run "the dangling hash is named" 1 "which is not a commit" "$out" "$got"
+fi
 
 echo "attribution-selftest: case 3 -- a real unpushed commit must be listed"
 R=$(new_repo unpushed)
