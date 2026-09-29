@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -490,5 +491,210 @@ data: [DONE]
 			t.Errorf("toolCalls=%v: chunks out of order (he=%d llo=%d done=%d):\n%s",
 				toolCalls, hi, lo, done, out)
 		}
+	}
+}
+
+// assertSSEWellFormed checks the termination contract on a captured stream
+// body: exactly one [DONE], it is the final data event, and it comes after
+// every content chunk. Shared by the fallback tests below.
+func assertSSEWellFormed(t *testing.T, out string) {
+	t.Helper()
+	if n := strings.Count(out, "data: [DONE]"); n != 1 {
+		t.Errorf("want exactly 1 [DONE] sentinel, got %d in:\n%s", n, out)
+	}
+	firstChunk := strings.Index(out, "data: {")
+	firstDone := strings.Index(out, "data: [DONE]")
+	if firstDone < firstChunk {
+		t.Errorf("[DONE] at byte %d precedes the first chunk at byte %d — the client "+
+			"would drop everything after it:\n%s", firstDone, firstChunk, out)
+	}
+	if !strings.HasSuffix(strings.TrimRight(out, "\n"), "data: [DONE]") {
+		t.Errorf("[DONE] must be the final event; stream ended with:\n%s", out)
+	}
+}
+
+// TestHandleStream_MidStreamFallbackEmitsDoneOnce covers the fallback path at
+// the gateway level, not just inside streamSSE.
+//
+// A failed attempt writes a terminal [DONE] from its own streamSSE post-loop
+// before the caller decides to fall back. If the resumed attempt then writes
+// its own [DONE] — or if handleStream's deferred sendDone() adds a third —
+// the client sees more than one sentinel. A conforming client stops parsing at
+// the first one, so the resumed content that follows is discarded and the
+// response is silently truncated even though the gateway "succeeded".
+//
+// This goes through the real HandleChatCompletions -> handleStream path (the
+// sibling test TestProviderProxyStreamingMidStreamResume drives the proxy loop
+// by hand and so never exercises the deferred sendDone()).
+func TestHandleStream_MidStreamFallbackEmitsDoneOnce(t *testing.T) {
+	noRotation := 0
+
+	// backend1 flushes one content chunk, then an SSE error. It never reaches
+	// [DONE] itself — the error event terminates the attempt.
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"id":"b1","object":"chat.completion.chunk","created":1,"model":"m1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello "},"finish_reason":null}]}`+"\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, `data: {"error":{"message":"upstream died","type":"server_error"}}`+"\n\n")
+		flusher.Flush()
+	}))
+	defer backend1.Close()
+
+	// backend2 completes normally and sends the real [DONE].
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"id":"b2","object":"chat.completion.chunk","created":2,"model":"m2","choices":[{"index":0,"delta":{"role":"assistant","content":"World"},"finish_reason":null}]}`+"\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, `data: {"id":"b2","object":"chat.completion.chunk","created":2,"model":"m2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+		flusher.Flush()
+	}))
+	defer backend2.Close()
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers: map[string]ProviderConfig{
+			"backend1": {URL: backend1.URL},
+			"backend2": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "backend1", Model: "m1"},
+				{Provider: "backend2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	gateway.SetTestCooldown(200 * time.Millisecond)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	out := rec.Body.String()
+
+	// The resume must actually have happened, or this proves nothing.
+	if !strings.Contains(out, "Hello ") || !strings.Contains(out, "World") {
+		t.Fatalf("expected content from both the failed and resumed attempts, got:\n%s", out)
+	}
+	assertSSEWellFormed(t, out)
+}
+
+// TestHandleStream_UpstreamClosesWithoutDoneAcrossFallback is the same
+// invariant for the abrupt-death path: backend1 is killed mid-stream (no [DONE]
+// at all), and the gateway resumes on backend2. Each streamSSE call emits its
+// own sentinel unconditionally, so the question is whether handleStream's
+// deferred sendDone() stacks a further one on top.
+func TestHandleStream_UpstreamClosesWithoutDoneAcrossFallback(t *testing.T) {
+	noRotation := 0
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"id":"b1","object":"chat.completion.chunk","created":1,"model":"m1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello "},"finish_reason":null}]}`+"\n\n")
+		flusher.Flush()
+		// Die without [DONE] and without an error event.
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+			return
+		}
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"id":"b2","object":"chat.completion.chunk","created":2,"model":"m2","choices":[{"index":0,"delta":{"role":"assistant","content":"World"},"finish_reason":null}]}`+"\n\n")
+		flusher.Flush()
+	}))
+	defer backend2.Close()
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers: map[string]ProviderConfig{
+			"backend1": {URL: backend1.URL},
+			"backend2": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "backend1", Model: "m1"},
+				{Provider: "backend2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	gateway.SetTestCooldown(200 * time.Millisecond)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", errCode(rec))
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "World") {
+		t.Fatalf("expected resumed content from backend2, got:\n%s", out)
+	}
+	assertSSEWellFormed(t, out)
+}
+
+func errCode(rec *httptest.ResponseRecorder) int { return rec.Code }
+
+// TestSSEEventIsRelease_FailOpen pins the deliberate fail-open behaviour of the
+// release predicate.
+//
+// sseEventIsRelease returns true for anything it cannot JSON-parse. That is
+// intentional: if the predicate stalled on an unrecognised event shape, the
+// stream would never be released and the client would hang until the
+// connection dropped. Failing open trades a possible premature flush for
+// never hanging.
+//
+// It is worth pinning because fail-open is exactly what made the `: keepalive`
+// bug destructive: a keepalive comment is not JSON, so it released the stream
+// and flushed the buffer at a moment dictated by a comment rather than by
+// content. The real fix was to never route comments into the event path at
+// all (see TestStreamSSE_IgnoresSSECommentLines), NOT to make this predicate
+// fail-closed. A future change that "tightens" this to return false on parse
+// errors would reintroduce silent truncation.
+func TestSSEEventIsRelease_FailOpen(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"doneSentinel", "data: [DONE]\n", true},
+		{"realContent", `data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n", true},
+		{"toolCallDelta", `data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}` + "\n", true},
+		{"roleOnlyDelta", `data: {"choices":[{"delta":{"role":"assistant","content":""}}]}` + "\n", false},
+		{"reasoningOnlyDelta", `data: {"choices":[{"delta":{"reasoning":"thinking","content":""}}]}` + "\n", false},
+		{"emptyChoices", `data: {"choices":[]}` + "\n", false},
+
+		// Fail-open cases: unparseable payloads must still release.
+		{"unparseable", "data: {not json at all\n", true},
+		{"emptyPayload", "data: \n", true},
+		{"bareCommentShape", ": keepalive\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sseEventIsRelease([]byte(tc.raw)); got != tc.want {
+				t.Errorf("sseEventIsRelease(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
 	}
 }
