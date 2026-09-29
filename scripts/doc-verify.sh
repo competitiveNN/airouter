@@ -171,6 +171,8 @@ fi
 #   ./scripts/recovery-check.sh                   do they actually recover?
 #   git am --3way <patch>                         applying the patch
 #   git bundle list-heads <bundle>                reading the recorded tip
+#   git checkout frombundle                       applying the bundle to a clone
+#   git merge --ff-only frombundle                applying it to an existing clone
 #
 # A claim in prose that nothing executes is the same failure as a stale
 # refspec, just quieter. Each is run here against the fixture. The push and
@@ -248,6 +250,135 @@ if [ "$RC_GOT" -eq 0 ]; then
 else
   bad "the documented recovery check FAILED on freshly generated artifacts (exit $RC_GOT)"
   printf '%s\n' "$RC_OUT" | grep -E '^\s+FAIL' | head -4 | sed 's/^/         | /'
+fi
+
+# 5. "Or into an existing clone": fetch the documented refspec, then
+#    `git merge --ff-only frombundle`.
+#
+#    The fetch half was already exercised, and the tree comparison below covers
+#    "did it arrive intact", but `--ff-only` is asserting something none of the
+#    other checks can see. It is the executable form of a PROSE claim several
+#    lines away in "Pushing once write access exists": "Nothing needs rebasing
+#    -- the history is linear on `origin/master`." That sentence is a promise
+#    about the shape of the history, and a reader who follows it and turns out
+#    to be wrong gets `fatal: Not possible to fast-forward` in the middle of a
+#    handoff, with no instruction left to follow.
+#
+#    A plain `git merge` would accept a divergent history with a merge commit
+#    and report success. --ff-only is what makes the check mean the sentence,
+#    so it is what gets run -- taken from the document, not re-typed here.
+# What the document itself says to merge and to check out. Extracted rather than
+# re-typed: a hand-copied ref name here would be a second thing that can drift,
+# and a check that keeps passing after the instruction it verifies was rewritten
+# is the failure this file was written for.
+DOC_CMDS=$(python3 - "$DOC" <<'PY'
+import re, sys
+txt = open(sys.argv[1]).read()
+merge_flags = merge_ref = checkout_ref = ""
+for b in re.findall(r"```sh\n(.*?)```", txt, re.S):
+    joined = b.replace("\\\n", " ")
+    if not merge_ref:
+        m = re.search(r"(git\s+merge\s+[^\n;|&]+)", joined)
+        if m:
+            toks = m.group(1).split()
+            flags = [t for t in toks[1:] if t.startswith("-")]
+            refs = [t for t in toks[1:] if not t.startswith("-")]
+            merge_flags, merge_ref = " ".join(flags), (refs[-1] if refs else "")
+    if not checkout_ref:
+        m = re.search(r"git\s+checkout\s+(-\S+\s+)*([A-Za-z0-9._/-]+)", joined)
+        if m:
+            checkout_ref = m.group(2)
+print("\t".join([merge_flags, merge_ref, checkout_ref]))
+PY
+)
+MERGE_FLAGS=$(printf '%s' "$DOC_CMDS" | cut -f1)
+MERGE_REF=$(printf '%s' "$DOC_CMDS" | cut -f2)
+CHECKOUT_REF=$(printf '%s' "$DOC_CMDS" | cut -f3)
+
+# The fetch refspec that CREATES the short ref the document later merges or
+# checks out. Matched by name, not by the literal `frombundle`: a document that
+# consistently renames the ref stays correct, and a check that greps for one
+# spelling would report that as a handoff failure.
+spec_for() {
+  local s
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    case "${s##*:}" in
+      "$1"|"refs/heads/$1") printf '%s\n' "$s"; return 0 ;;
+    esac
+  done < "$WORK/refspecs"
+  return 1
+}
+
+# 5. "Or into an existing clone": fetch, then `git merge --ff-only frombundle`.
+#
+#    The fetch half was already exercised, and the tree comparison below covers
+#    "did it arrive intact", but `--ff-only` asserts something none of the other
+#    checks can see. It is the executable form of a PROSE claim several lines
+#    away in "Pushing once write access exists": "Nothing needs rebasing -- the
+#    history is linear on `origin/master`." That sentence is a promise about the
+#    shape of the history, and a reader who follows it and turns out to be wrong
+#    gets `fatal: Not possible to fast-forward` mid-handoff, with no instruction
+#    left to follow.
+#
+#    A plain `git merge` would accept a divergent history by adding a merge
+#    commit, which is precisely the outcome the sentence promises will not
+#    happen. So --ff-only is asserted to still BE there before it is run.
+if [ -z "$MERGE_REF" ]; then
+  # The document stopped documenting a merge. That is not a pass; it is this
+  # check silently losing its subject, which is how the fetch refspec drifted.
+  bad "the existing-clone path documents no merge command, so it cannot be exercised"
+elif ! printf '%s' "$MERGE_FLAGS" | grep -q -- '--ff-only'; then
+  bad "the existing-clone path documents '${MERGE_FLAGS:-git merge}', not --ff-only; a plain merge cannot detect a rebased history"
+elif ! FFSPEC=$(spec_for "$MERGE_REF"); then
+  bad "the document merges '$MERGE_REF' but no documented fetch creates that ref"
+else
+  EX="$WORK/existing"
+  git clone -q "$D" "$EX" 2>/dev/null
+  # Stand the "existing clone" on the pushed base. A clone left on `master`
+  # already contains the commits, so fast-forwarding would succeed by doing
+  # nothing and the linearity claim would never be tested.
+  git -C "$EX" checkout -q -B master refs/remotes/origin/master 2>/dev/null
+  git -C "$EX" config user.email reader@example.invalid
+  git -C "$EX" config user.name reader
+  ( cd "$EX" && git fetch -q "$D/dist/airouter-unpushed.bundle" "$FFSPEC" ) >/dev/null 2>&1
+  if FF_ERR=$( cd "$EX" && git merge $MERGE_FLAGS "$MERGE_REF" 2>&1 ); then
+    if [ "$(git -C "$EX" rev-parse HEAD^{tree})" = "$(git -C "$D" rev-parse HEAD^{tree})" ]; then
+      ok "the documented 'git merge $MERGE_FLAGS $MERGE_REF' fast-forwards to the exported tree"
+    else
+      bad "merge succeeded but the resulting tree differs from the working tree"
+    fi
+  else
+    bad "the documented 'merge $MERGE_FLAGS $MERGE_REF' could not fast-forward -- the history is not linear on the upstream base"
+    printf '%s\n' "$FF_ERR" | head -3 | sed 's/^/         | /'
+  fi
+fi
+
+# 6. `git checkout frombundle` -- the last step of the preferred path. Its
+#    sibling fetch is exercised above, but nothing until here proves that
+#    checking the fetched ref out produces the tree that was exported.
+if [ -z "$CHECKOUT_REF" ]; then
+  bad "the preferred path documents no checkout command, so it cannot be exercised"
+elif ! COSPEC=$(spec_for "$CHECKOUT_REF"); then
+  bad "the document checks out '$CHECKOUT_REF' but no documented fetch creates that ref"
+else
+  CO="$WORK/checkout"
+  git clone -q -b master "$D" "$CO" 2>/dev/null
+  git -C "$CO" config user.email reader@example.invalid
+  git -C "$CO" config user.name reader
+  if ( cd "$CO" && git fetch -q "$D/dist/airouter-unpushed.bundle" "$COSPEC" ) >/dev/null 2>&1; then
+    if ( cd "$CO" && git checkout -q "$CHECKOUT_REF" ) >/dev/null 2>&1; then
+      if [ "$(git -C "$CO" rev-parse HEAD^{tree})" = "$(git -C "$D" rev-parse HEAD^{tree})" ]; then
+        ok "the documented 'git checkout $CHECKOUT_REF' reproduces the tree exactly"
+      else
+        bad "checkout $CHECKOUT_REF succeeded but the tree differs from the working tree"
+      fi
+    else
+      bad "the documented 'git checkout $CHECKOUT_REF' failed after a successful fetch"
+    fi
+  else
+    bad "could not fetch the documented refspec for the checkout path"
+  fi
 fi
 
 echo ""

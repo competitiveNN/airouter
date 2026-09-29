@@ -126,6 +126,7 @@ run "audit-attribution-selftest" bash "$REPO/scripts/audit-attribution-selftest.
 run "dist-freshness-selftest"    bash "$REPO/scripts/dist-freshness-selftest.sh"
 run "recovery-check-selftest"    bash "$REPO/scripts/recovery-check-selftest.sh"
 run "doc-verify-selftest"        bash "$REPO/scripts/doc-verify-selftest.sh"
+run "test-suite-selftest"        bash "$REPO/scripts/test-suite-selftest.sh"
 run "shell-lint"                 bash "$REPO/scripts/shell-lint.sh"
 run "shell-lint-control"         bash "$REPO/scripts/shell-lint-control.sh"
 
@@ -138,6 +139,12 @@ run "audit-drift-check"       python3 "$REPO/scripts/audit-drift-check.py"
 run "audit-attribution-check" python3 "$REPO/scripts/audit-attribution-check.py"
 run "dist-freshness-check"    bash "$REPO/scripts/dist-freshness-check.sh"
 run "config pytest"           python3 -m pytest -q "$REPO/scripts/test_regenerate_config.py"
+
+# The Go suite itself, measured rather than run: `go test ./...` is green when a
+# third of the tests have gone missing, and was green once when a test file was
+# truncated. This is the only place the SUITE has a contract, so it is the only
+# place losing a test is a failure rather than a smaller success.
+run "test-suite-check" python3 "$REPO/scripts/test-suite-check.py"
 
 # The handoff document, executed rather than grepped; see the file for why that
 # distinction is the whole point of it.
