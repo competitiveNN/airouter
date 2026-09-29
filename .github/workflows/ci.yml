@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      # gofmt drift is semantically a no-op but hides real diffs, so it is
+      # gated rather than left to rot. Fix with: gofmt -w *.go
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            echo "run: gofmt -w ."
+            exit 1
+          fi
+
+      - name: test
+        run: go test -race ./...
+
+  config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install deps
+        run: pip install pyyaml pytest
+
+      # validate-config.py is the guard that stops the nightly model sync from
+      # writing a config with unroutable profiles, dead providers, or a missing
+      # api_key_env (the cause of the silent 401 incident).
+      - name: validate config
+        run: python3 scripts/validate-config.py config.yaml
+
+      # Regression tests for the config generator, which once destroyed the
+      # whole providers: section on every run via an unanchored regex.
+      - name: test config generator
+        run: python3 -m pytest scripts/test_regenerate_config.py -q
+
+      - name: compile python scripts
+        run: python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py
