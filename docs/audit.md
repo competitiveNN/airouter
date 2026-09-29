@@ -814,6 +814,62 @@ histogram, or in any histogram added later.
   Fixtures used as negative controls have to satisfy the invariants they are
   not testing, or every case passes for the wrong reason.
 
+### Round 6 (2026-09-29) — hardening the guard itself
+
+Round 5 added a general histogram check and found, in the act of writing its
+own negative controls, that the obvious invariants did not catch the bug the
+round was about. This round finishes that job: it pins the threshold choice,
+removes the test class that already produced one false pass, and stops relying
+on hand-picked cases alone.
+
+• `checkHistogramInvariants` (was metrics_cardinality_test.go, threshold
+  unexplained and its guards untested) — invariant (6)'s threshold,
+  `_sum >= above * topBound`, was written without recording *why* it is that
+  bound rather than some other. The comment now states it: `topBound` is a
+  lower bound and never an equality, because the top finite band is
+  `(topBound, +Inf]` and observations just above the bound contribute almost
+  nothing. That makes the check deliberately loose — it catches the categorical
+  case where buckets and sum differ by orders of magnitude, and will not catch
+  a mildly skewed distribution, which cannot be caught at all from exposition
+  text because the observations are not in it. Choosing a tighter bound that
+  "looks stricter" would be a false precision.
+  `TestHistogramInvariantSixBoundaries` pins all four guards (`sum > 0`,
+  `topBound > 0`, `above > 0`, strict `<`) and both equality boundaries, so
+  the behaviour is asserted rather than assumed. Verified to fail when the
+  comparison is loosened to `<=`, which is what makes the "equality is legal"
+  case a fact rather than a hope.
+
+• `seriesFingerprint` (was metrics_cardinality_test.go, no-op mutations) — one
+  case in round 5's table was a no-op from the start: it moved `+Inf` to the
+  end of the slice, where it already was, so the guard correctly reported
+  nothing and the case still read as coverage. Every case now compares a
+  canonical fingerprint of the parsed input before and after its mutation and
+  fails if they are equal. The fingerprint preserves sample *order*, not just
+  the set, because "is `+Inf` last" is precisely a reordering and a set-based
+  comparison would call it unchanged. Verified by restoring the original no-op:
+  the detector reports "changed nothing; this case cannot fail and is not a
+  test", which is the failure a reviewer cannot see by reading the table.
+
+• `FuzzHistogramInvariantsSurviveGarbage` (was metrics_cardinality_test.go,
+  seven hand-written cases) — seven hand-picked cases are still seven
+  hand-picked cases, and hand-picked cases are how the original defect survived
+  three rounds. The checker is now driven by arbitrary exposition text and
+  asserted to never panic, never hang, and never emit an empty or unanchored
+  violation. Nine seeds, including the real pre-fix output verbatim, a
+  single-bucket family, a `_count` that disagrees, and malformed input. 385M
+  executions, no counterexample. The working corpus is gitignored; only
+  minimized crashers under `testdata/fuzz` would be committed.
+
+• `dist/` bundle (was stale, one commit behind) — the exported bundle still
+  pointed at `a861dd5` while HEAD was `4c03ed2`, so the artifact a colleague
+  would have been handed did not contain the two rounds of fixes. Regenerated,
+  and then verified the way it would actually be used: a fresh clone at
+  `origin/master`, a single `git fetch` of the bundle, then `go build` and the
+  full test suite from the recovered tree. The script's own printed recovery
+  instructions are the only test that would have caught a bundle which verifies
+  and is unfetchable or incomplete, which is exactly the bug round 4 found in
+  it.
+
 Tests added this round: `TestEveryExportedHistogramIsWellFormed`,
 `TestEachHistogramInvariantHasTeeth`, plus `checkHistogramInvariants`,
 `histogramIndex`, `countHistogramBuckets` and `renderLabelSet`. Both were
