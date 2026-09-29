@@ -1687,3 +1687,100 @@ Verification this round:
   `scripts/fuzz-gate-selftest.sh` → 31 passed, 0 failed
   Negative control on the new base assertion: `git fetch origin HEAD` instead of
     the base SHA → the new assertions fail (15/18), naming the symptom exactly
+
+### Round 14 (2026-09-29) — the check ran in CI, and immediately found two real bugs
+
+Round 13 added `scripts/recovery-check.sh` and its self-test, and wired the
+self-test into CI. What it did *not* do was ever run the real check in CI, on
+the theory that CI has no generated artifacts to check. That theory was half
+right and the omission was a hole: the `unpushed-export` job generates exactly
+those artifacts, has a real `base` ref to replay onto, and was therefore able to
+run the whole fifteen-assertion path automatically. It does now.
+
+**1. Running the real check in CI found a bug in the CI fixture itself.** The
+`unpushed-export` job built its fixture with `git commit --allow-empty`. An empty
+commit produces a patch containing no diff at all, and `git am` refuses one:
+
+    Patch is empty.
+
+So the job had been generating a handoff no reader could apply — and every other
+assertion in the job still passed, because they all check the *export*, never
+the *replay*. This is precisely the claim round 13 said needed proving, and the
+only way it could be found was by proving it. The fixture now commits real files.
+
+**2. `recovery-check.sh` now explains that failure instead of shrugging.** The
+underlying `git am` output was being discarded, so an empty patch and a genuine
+context conflict produced the same one-line "did not apply cleanly". It now
+captures the output, and names the empty-patch case specifically with the fix
+(`git am --3way --allow-empty`). A check that reports a single cause for two
+different problems sends the reader looking for the wrong one.
+
+**3. The second bug was an environment leak, in a self-test that was "green".**
+`dist-freshness-selftest.sh` pins its fixtures' upstream at
+`refs/remotes/origin/master` but did not clear the `UPSTREAM` environment
+variable when invoking the checker. Invoked as `UPSTREAM=base bash
+scripts/recovery-check.sh` — which is exactly how the new CI step calls it —
+`UPSTREAM=base` propagated into the fixtures, named a ref that does not exist
+there, and produced **twelve failures reading like a broken checker**. The
+self-test was only ever run in a shell where `UPSTREAM` happened to be unset,
+so it had never been wrong in the one way that mattered.
+
+This is the same class of bug the repo has hit repeatedly: a check that is
+correct in isolation and wrong in composition, because nothing ran it in the
+context it actually ships in. `run_check` now sets `UPSTREAM` explicitly. It is
+asserted directly: `UPSTREAM=base bash scripts/dist-freshness-selftest.sh` now
+passes 16/16, and failed 4/16 before.
+
+**4. A new check was added, and the diagnosis behind it was wrong first.** Round
+13 recorded a memory note claiming this host's bash misparses `while [ ... ];
+then` *inside a function body* while accepting it at top level. That was wrong.
+Minimal reproduction — four lines, no repository involved — showed `while [
+... ]; then` is a syntax error at **every** scope. It is plain POSIX: `while`
+and `until` take `do`; `if` and `case` take `then`. The bad diagnosis came from
+a `head`-based bisect that truncated mid-function and manufactured an
+"unexpected end of file" that was an artifact of the extraction, not the file.
+
+The same round established that `printf '# ...'` is **not** a bug in either
+scope; an earlier draft of the linter rejected it, and its own control suite
+caught the false positive by asserting that flagged code must genuinely fail
+`bash -n`. The rule was removed rather than kept, because a linter that fires
+on valid code is worse than none.
+
+`scripts/shell-lint.sh` and `scripts/shell_lint_rules.py` enforce the real rule
+against the *tracked* script set. `scripts/shell-lint-control.sh` proves it can
+fire and can stay quiet: seventeen cases, each asserting against `bash -n`
+itself — flagged code must genuinely fail to parse, unflagged code must
+genuinely parse. `if ... then` and `then` inside strings and comments are all
+explicit near-misses.
+
+Verified to fail: reintroducing `; then` into
+`scripts/dist-freshness-selftest.sh` is caught by the linter, at the same line
+`bash -n` reports (line 90), and turns the control suite red.
+
+**5. A reduced run now says so.** `recovery-check.sh` reports its skip count in
+the summary. A green line reading "13 passed, 0 failed" does not reveal whether
+four checks were skipped for lack of anything to check, and that is the exact
+shape a slow loss of coverage takes. The self-test asserts both directions: a
+synthetic fixture run *must* report skips, and the real repository run *must
+not* — otherwise a check that always printed "SKIPPED" would pass.
+
+**6. Coverage added.** `recovery-check-selftest.sh` is now 29 assertions. Two
+new negative controls, each verified to fail:
+  - removing the empty-patch diagnosis → 24/25
+  - removing the skip reporting → 28/29
+
+Verification this round:
+
+  `go build ./...`, `go vet ./...`, `gofmt -l .` → clean
+  `go test -race -count=1 ./...` → 329 passed; `go test -count=1 ./...` → 329 passed
+  `scripts/recovery-check.sh --quick` → 13 passed, 0 failed (no skips)
+  `scripts/recovery-check-selftest.sh` → 29 passed, 0 failed
+  `scripts/shell-lint.sh` → clean (15 scripts)
+  `scripts/shell-lint-control.sh` → 17 passed, 0 failed
+  `UPSTREAM=base bash scripts/dist-freshness-selftest.sh` → 16 passed, 0 failed
+  `scripts/audit-attribution-selftest.sh` → 18 passed, 0 failed
+  `scripts/audit-drift-selftest.sh` → 11 passed, 0 failed
+  `scripts/fuzz-gate-selftest.sh` → 31 passed, 0 failed
+  CI YAML parses; 4 jobs, none `continue-on-error`; the `unpushed-export` job now
+  runs the real `recovery-check.sh`, then re-runs the freshness check to prove
+  the recovery process did not modify the artifacts it read

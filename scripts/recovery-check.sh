@@ -174,8 +174,23 @@ if [ "$PRE" -ne 0 ]; then
   bad "the base already contained unpushed commits; the replay would prove nothing"
   exit 1
 fi
-if ! git -C "$D" am --3way -q "$PATCH" >/dev/null 2>&1; then
+# The failure output is captured rather than discarded. "git am" has several
+# distinct failure modes that all collapse to the same exit status, and the one
+# that actually bites is "Patch is empty": an unpushed commit that touches no
+# files produces a patch with no diff, which `git am` refuses unless
+# --allow-empty is passed. That is a real, reachable state for a handoff --
+# `--allow-empty` commits and merge commits both produce it -- and reporting it
+# as a generic apply failure sends the reader looking for context drift that
+# isn't there.
+if ! AM_OUT=$(git -C "$D" am --3way -q "$PATCH" 2>&1); then
   bad "patch did not apply cleanly (git am --3way)"
+  if printf '%s' "$AM_OUT" | grep -qi 'patch is empty'; then
+    printf '         | git am refused an EMPTY patch. At least one unpushed\n' >&2
+    printf '         | commit changes no files (an --allow-empty commit, or a\n' >&2
+    printf '         | merge commit). Recover with `git am --3way --allow-empty`,\n' >&2
+    printf '         | or re-export after dropping the empty commit.\n' >&2
+  fi
+  printf '%s\n' "$AM_OUT" | sed 's/^/         | /' | head -8 >&2
   exit 1
 fi
 ok "patch applied with git am --3way onto the true base"
@@ -279,5 +294,17 @@ fi
 echo ""
 echo "----------------------------------------"
 printf 'recovery-check: %d passed, %d failed\n' "$PASSED" "$FAILED"
+
+# Skips are reported in the summary, not only inline. A run that quietly
+# checked less than it appears to is the exact failure mode this repository has
+# been bitten by repeatedly, and a green line reading "13 passed, 0 failed"
+# says nothing about whether four of those were skipped. Stating the count lets
+# a reader tell a full run from a reduced one without scrolling back.
+if [ "${SKIPPED_AUDIT:-0}" -gt 0 ]; then
+  printf 'recovery-check: %d check(s) SKIPPED (nothing to check in this tree)\n' \
+    "$SKIPPED_AUDIT"
+  printf '  This was a reduced run; on a full checkout every check runs.\n'
+fi
+
 [ "$FAILED" -eq 0 ] || exit 1
 exit 0

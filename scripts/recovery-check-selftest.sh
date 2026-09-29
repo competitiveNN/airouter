@@ -41,6 +41,11 @@ set -uo pipefail
 #   case 2  (1)  a stale artifact is refused
 #   case 3  (1)  a corrupted bundle is refused
 #   case 4  (1)  a patch that does not apply is refused
+#   case 4b (4)  an EMPTY patch is diagnosed specifically, not just "failed",
+#                and the underlying git am error is surfaced
+#   case 4c (1)  a failed run leaves no temporary directory behind
+#   case 4d (3)  a reduced run reports its skip count, and a full run does not
+#                claim to be reduced
 #   case 5  (2)  missing artifacts is "cannot run" (exit 2), not a failure
 #   case 6  (1)  no upstream ref is "cannot run" (exit 2)
 #   case 7  (1)  nothing unpushed is a clean exit 0
@@ -52,7 +57,7 @@ set -uo pipefail
 # 1 + 1 + 1 for B. A control that cannot apply reports the run as a FAILURE
 # rather than shrinking the total, because a control that silently did nothing
 # is the one failure mode this file exists to prevent.
-EXPECTED=20
+EXPECTED=29
 
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -200,6 +205,78 @@ printf 'From nobody Mon Sep 17 00:00:00 2001\nSubject: [PATCH] not this history\
   > "$R4/dist/airouter-unpushed.patch"
 out=$(run_check "$R4" --quick); got=$?
 assert_run "an inapplicable patch fails" 1 "git am --3way" "$out" "$got"
+
+echo "recovery-selftest: case 4b -- an EMPTY patch is diagnosed, not just 'failed'"
+# An unpushed commit that changes no files -- an `--allow-empty` commit, or a
+# merge commit -- produces a patch with no diff, and `git am` refuses it with
+# "Patch is empty" unless --allow-empty is passed. That state is genuinely
+# reachable for a handoff, and it is NOT context drift, so reporting it as a
+# generic apply failure sends the reader hunting for a problem that isn't there.
+#
+# This case was written because the CI job that runs recovery-check.sh had
+# exactly this bug: its fixture used `git commit --allow-empty`, so the job was
+# generating a patch no reader could apply, and every other assertion in the
+# job still passed. The check was right; the fixture was wrong, and only a check
+# that actually replays the patch could tell.
+R4B=$(new_repo emptypatch)
+add_unpushed "$R4B" 1
+g "$R4B" commit -q --allow-empty -m "an empty commit"
+write_artifacts "$R4B"
+out=$(run_check "$R4B" --quick); got=$?
+assert_run "an empty patch fails" 1 "git am --3way" "$out" "$got"
+assert_run "an empty patch is diagnosed specifically" 1 "EMPTY patch" "$out" "$got"
+assert_run "the empty-patch advice names the fix" 1 "allow-empty" "$out" "$got"
+# The real git am output must be shown, not swallowed. A check that discards the
+# underlying error and prints only its own summary is the reason this took a
+# round to find.
+if printf '%s' "$out" | grep -qi 'patch is empty'; then
+  ok "the underlying git am error is surfaced"
+else
+  bad "the underlying git am error is surfaced"
+fi
+
+echo "recovery-selftest: case 4c -- a failed run leaves no temporary directory"
+# The throwaway repos are created under $TMPDIR and removed by an EXIT trap. A
+# failure path that exits before the trap is installed -- or that bypasses it --
+# would leave a full clone of the repository in the temp directory on every
+# failed run, which is the kind of leak nobody notices until their disk is full.
+# Counted directly rather than inferred from the absence of a failure.
+BEFORE=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'recovery-check.*' 2>/dev/null | wc -l)
+out=$(run_check "$R4" --quick); got=$?   # known-failing fixture
+AFTER=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'recovery-check.*' 2>/dev/null | wc -l)
+if [ "$AFTER" -eq "$BEFORE" ]; then
+  ok "a failed run leaves no temporary directory behind"
+else
+  bad "a failed run leaked a temporary directory ($BEFORE -> $AFTER)"
+fi
+
+echo "recovery-selftest: case 4d -- a reduced run SAYS it was reduced"
+# A green line reading "13 passed, 0 failed" does not tell the reader whether
+# four of those checks were skipped for lack of anything to check. A run that
+# quietly checked less than it appears to is the failure mode this repository
+# has been bitten by repeatedly, so the summary has to state the skip count.
+# The synthetic fixtures genuinely trigger the skip path -- they have no Go
+# sources and no audit anchors -- which is what makes this case meaningful.
+R4D=$(new_repo reduced)
+add_unpushed "$R4D" 1
+write_artifacts "$R4D"
+out=$(run_check "$R4D" --quick); got=$?
+assert_run "a reduced run still passes" 0 "passed, 0 failed" "$out" "$got"
+if printf '%s' "$out" | grep -qF 'SKIPPED'; then
+  ok "a reduced run reports its skip count in the summary"
+else
+  bad "a reduced run reports its skip count in the summary"
+fi
+# And the converse: the real repository has nothing to skip, so a full run must
+# NOT claim to be reduced. Asserting only one direction would let a check that
+# always prints "SKIPPED" pass.
+out=$(run_check "$REPO" --quick); got=$?
+assert_run "the real repository passes" 0 "passed, 0 failed" "$out" "$got"
+if printf '%s' "$out" | grep -qF 'SKIPPED'; then
+  bad "a full run does not claim to be reduced"
+else
+  ok "a full run does not claim to be reduced"
+fi
 
 echo "recovery-selftest: case 5 -- artifacts missing is 'cannot run', not 'failed'"
 # Exit 2, not 1. A checkout with no generated artifacts has nothing to say

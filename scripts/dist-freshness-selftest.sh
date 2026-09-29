@@ -108,7 +108,16 @@ write_artifacts() {
 run_check() {
   local dir="$1"; shift
   local out got
-  out=$(cd "$dir" && bash scripts/dist-freshness-check.sh "$@" 2>&1)
+  # UPSTREAM is explicitly cleared. These fixtures pin their own upstream at
+  # refs/remotes/origin/master, so an UPSTREAM inherited from the environment
+  # names a ref that does not exist in the fixture, and every case then fails
+  # with "base does not exist" -- 12 failures that look like the check is broken
+  # and are actually this harness leaking its caller's environment.
+  #
+  # It is not a hypothetical: scripts/recovery-check.sh runs this self-test in
+  # a recovered tree, and it is routinely invoked as `UPSTREAM=base
+  # bash scripts/recovery-check.sh`, so `base` propagated straight in here.
+  out=$(cd "$dir" && UPSTREAM=origin/master bash scripts/dist-freshness-check.sh "$@" 2>&1)
   got=$?
   printf '%s' "$out"
   return "$got"
