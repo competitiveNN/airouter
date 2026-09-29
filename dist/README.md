@@ -14,7 +14,7 @@ authenticates but has `push: false` on the repository, and neither
 `gh api repos/competitiveNN/airouter --jq .permissions.push`.
 
 So the work is committed locally and **not** on the remote. These two files in
-`dist/` carry the 13 commits that `origin/master` is missing, so nothing is lost
+`dist/` carry the 22 commits that `origin/master` is missing, so nothing is lost
 if this checkout goes away.
 
 ## Files
@@ -75,7 +75,7 @@ git push origin master
 
 ## Contents
 
-The 16 unpushed commits, oldest first:
+The 22 unpushed commits, oldest first:
 
 - `0100387` fix: start airouter with provider API keys in its environment
 - `a515364` feat: resilient cooldown state, DELETE /admin/cooldowns, bounded fallback
@@ -93,12 +93,24 @@ The 16 unpushed commits, oldest first:
 - `fa9aeeb` docs: add README config reference; ship bundle+patch for the unpushed commits
 - `8715b82` chore: refresh unpushed bundle to include the README commit
 - `c746484` chore: make the unpushed bundle a generated artifact, not a committed one
+- `a861dd5` docs: list unpushed commits in dist/README, and note the two loop commits
+- `12f6319` Stop exporting the overflow bucket as a histogram; fix unfetchable bundle
+- `4c03ed2` Assert the histogram invariants across the whole exposition, not one family
+- `647c3d3` Harden the histogram guard: pin its threshold, kill no-op mutations, fuzz it
+- `b7cccda` Make the histogram guard's coverage durable: golden fixtures + CI fuzzing
+- `cb4e826` Audit the gate: FROZEN=1 was the broken invocation, not the working one
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
 contain itself, and `c746484` replaced the approach. They are kept because
 rewriting published history is worse than three honest commits, but nothing
 needs doing with them.
+
+`cb4e826` audits `b7cccda`: it found the fuzz gate's documented `FROZEN=1`
+invocation was the one that failed (fabricating a counterexample from a usage
+error), that a committed corpus made the gate permanently red, that discovery
+was root-only, and that the threshold study was measuring a code path that never
+executes. No production code changed.
 
 ## Verification
 
