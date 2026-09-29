@@ -870,6 +870,59 @@ on hand-picked cases alone.
   and is unfetchable or incomplete, which is exactly the bug round 4 found in
   it.
 
+### Round 7 (2026-09-29) — making the guard's coverage durable
+
+Round 6 built a fuzzer and ran it once for 385M executions. A one-off run on
+one machine is not coverage: it says nothing about the next commit, and the
+corpus it built is gitignored. This round makes the coverage stand on its own.
+
+• `TestGoldenExpositions` + `testdata/metrics/` (was metrics_cardinality_test.go,
+  fuzz seeds in a gitignored cache) — the single most valuable input here is a
+  specific historical output that no fuzzer is likely to rediscover, and it is
+  precisely the one that survived three audit rounds. It is now committed as
+  `overflow-as-histogram.prom`, transcribed from a real pre-fix scrape, and
+  asserted by a deterministic test. Both directions are pinned: the guard must
+  reject it *and* must accept `valid-histograms.prom`, which is 256 samples of
+  genuine output captured from a running gateway under load with 17 evictions
+  and the `__overflow__` gauges present. A guard that only ever sees the bad
+  case is a guard that also fires on the good one, and would be disabled on
+  first contact with production. Verified to fail when the bad fixture is
+  edited into a valid histogram.
+
+• `FuzzHistogramInvariantsSurviveGarbage` (was metrics_cardinality_test.go,
+  run once by hand) — now two CI steps. One replays the seed corpus explicitly
+  rather than relying on `go test ./...` sweeping it up incidentally, so the
+  dependency is visible and a renamed target fails loudly instead of silently
+  dropping coverage. One runs a bounded 20s fuzz, enough to rediscover a
+  crasher on any PR without slowing a commit down.
+
+• `testdata/fuzz` (was crasher corpus discoverable only by remembering to look)
+  — Go already writes a crashing input to `testdata/fuzz/<Target>/`, which
+  makes it replay as an ordinary part of the corpus on every later run. That
+  only works if it is committed, so CI now fails if a crasher appears in the
+  working tree. A crasher that exists only in a CI log is a regression nobody
+  can reproduce.
+
+• Invariant (6)'s threshold, measured rather than argued. Round 6 claimed a
+  tighter bound would be "false precision" without testing it, which is an
+  argument, not evidence. Two measurements:
+
+  - Sweeping the multiplier over the real-output fixture: `sum >= k * above *
+    topBound` produces **zero** violations all the way to `k = 100`. Genuine
+    gateway traffic satisfies the loose bound with an enormous margin, because
+    the observations in the top band are not sitting just above it.
+  - Comparing `k=1` against `k=2` over the full corpus (both fixtures plus all
+    nine fuzz seeds): the tighter bound finds **zero** additional hits.
+
+  So the loose bound loses no detection power on anything known, and the
+  measurement is stronger than the original claim rather than merely
+  consistent with it. The bound is still left at `k=1`: it is the tightest one
+  that is *sound by construction* rather than tuned, so it cannot become a
+  false positive when a future deployment legitimately clusters observations
+  just above a bucket edge — a case no current fixture covers but which real
+  traffic will eventually produce. Recorded here because "we measured it and it
+  did not help" is a result; "we did not measure it" would not have been.
+
 Tests added this round: `TestEveryExportedHistogramIsWellFormed`,
 `TestEachHistogramInvariantHasTeeth`, plus `checkHistogramInvariants`,
 `histogramIndex`, `countHistogramBuckets` and `renderLabelSet`. Both were

@@ -57,6 +57,48 @@ jobs:
       - name: test
         run: go test -race ./...
 
+      # The seed corpus only, every commit. `go test ./...` above already runs
+      # a FuzzX target's seeds, but it does so only incidentally — if the target
+      # is ever renamed or the seed list emptied, nothing notices, and the fuzz
+      # coverage disappears with no failing test. Naming it explicitly makes the
+      # dependency visible and fails loudly if the target is gone.
+      #
+      # The golden fixtures under testdata/metrics are the durable half of this:
+      # they pin the specific historical output that survived three audit rounds,
+      # which no fuzzer is likely to rediscover. This step is the exploratory
+      # half, and is bounded so it cannot slow a commit down.
+      - name: histogram guard seed corpus
+        run: go test -run '^FuzzHistogramInvariantsSurviveGarbage$' -v ./...
+
+      # A short real fuzz run. 20s is deliberately small: CI's job is to catch
+      # a regression in the guard, not to search. The value is that it re-runs on
+      # every commit and on every PR, so a crash found locally last week is
+      # rediscovered here today, from whatever corpus is cached in the runner.
+      #
+      # A crasher is written to testdata/fuzz by default, which is what makes it
+      # a regression test rather than a one-line note in a log — see the next
+      # step. Failures are not uploaded as artifacts because a crasher file in
+      # the repo is the artifact that matters.
+      - name: bounded fuzz
+        run: go test -run '^$' -fuzz '^FuzzHistogramInvariantsSurviveGarbage$' -fuzztime 20s ./...
+
+      # Go writes a crashing input to testdata/fuzz/<Target>/ automatically, so
+      # the fuzz step is self-perpetuating: the crasher becomes a normal part of
+      # the package's test corpus and `go test ./...` replays it forever after.
+      # This step only confirms that happened, because a crasher silently
+      # dropped on the runner is a regression nobody will ever reproduce.
+      - name: crasher corpus is not silently lost
+        run: |
+          set -euo pipefail
+          if [ -d testdata/fuzz ] && [ -n "$(find testdata/fuzz -type f 2>/dev/null)" ]; then
+            echo "::error::a fuzz crasher was written to the working tree but is not"
+            echo "::error::committed. Commit it — Go replays testdata/fuzz on every"
+            echo "::error::subsequent run, which is what makes it a regression test."
+            find testdata/fuzz -type f
+            exit 1
+          fi
+          echo "no crasher corpus (expected unless a new counterexample was found)"
+
       # Proves the SSE ordering guard has teeth: it reintroduces the historical
       # bug, requires the ordering tests to FAIL, then restores proxy.go and
       # requires them to pass again. A test that passes both ways guards nothing,
