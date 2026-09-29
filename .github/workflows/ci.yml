@@ -223,6 +223,19 @@ jobs:
       - name: recovery check self-test
         run: bash scripts/recovery-check-selftest.sh
 
+      # `while`/`until` take `do`, never `then`. That is plain POSIX, but bash
+      # reports the error at the `done` several lines after the real mistake,
+      # which makes it expensive to find. The control suite is run alongside the
+      # linter on purpose: a linter that has never been seen to reject anything
+      # is not known to work, and one that rejects valid code is worse than
+      # none. The controls assert that flagged code genuinely fails `bash -n`
+      # and that unflagged code genuinely parses.
+      - name: shell lint
+        run: bash scripts/shell-lint.sh
+
+      - name: shell lint self-test
+        run: bash scripts/shell-lint-control.sh
+
   config:
     runs-on: ubuntu-latest
     continue-on-error: false
@@ -649,8 +662,17 @@ jobs:
       - name: real export is complete and correct
         run: |
           set -euo pipefail
-          git commit -q --allow-empty -m "unpushed one"
-          git commit -q --allow-empty -m "unpushed two"
+          # Real content, not --allow-empty. An empty commit produces a patch
+          # with no diff at all, and `git am` refuses one ("Patch is empty")
+          # unless --allow-empty is passed. That made this job's fixture
+          # unreplayable, which the recovery step below caught on its first run.
+          # A handoff fixture must be one a reader can actually apply.
+          echo unpushed-one > change-one.txt
+          git add change-one.txt
+          git commit -q -m "unpushed one"
+          echo unpushed-two > change-two.txt
+          git add change-two.txt
+          git commit -q -m "unpushed two"
           out=$(UPSTREAM=base ./scripts/export-unpushed.sh 2>&1)
           echo "$out"
           echo "$out" | grep -q 'exported 2 commits' || {
@@ -705,3 +727,29 @@ jobs:
           # UPSTREAM must match what the export above was run against; the
           # default (origin/master) is not what this job generated from.
           UPSTREAM=base bash scripts/dist-freshness-check.sh --verbose
+
+      # Everything above proves the artifacts were PRODUCED correctly. This
+      # proves they are USABLE, which is a different claim and the one a
+      # handoff actually depends on: a bundle that verifies and is non-empty
+      # can still be unfetchable, and a patch can apply cleanly and produce a
+      # tree that does not build.
+      #
+      # This is the first place recovery-check.sh runs outside a developer's
+      # machine. It could not before: it needs generated artifacts, and the `go`
+      # job has none. This job has them, and has a real `base` ref to replay
+      # onto, so the whole 15-assertion path is covered automatically.
+      #
+      # --quick skips the build and test suite inside the recovered tree. That
+      # is deliberate: the recovered tree is byte-identical to the checked-out
+      # one (asserted before that point), so the `go` job has already built and
+      # tested that exact content. What is NOT covered elsewhere is whether the
+      # artifacts reproduce it at all.
+      - name: artifacts actually recover
+        run: UPSTREAM=base bash scripts/recovery-check.sh --quick
+
+      # And the freshness check is run AGAIN, after recovery-check.sh ran, to
+      # prove the recovery process did not mutate the artifacts it was reading.
+      # A check that leaves its subject modified is worse than one that does
+      # nothing: the next person trusts a file that a tool rewrote.
+      - name: recovery did not disturb the artifacts
+        run: UPSTREAM=base bash scripts/dist-freshness-check.sh
