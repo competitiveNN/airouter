@@ -1,7 +1,10 @@
 # Golden fixture: output the histogram guard MUST accept.
-# Captured from a running gateway under load with 17 label evictions,
-# so it includes real histograms plus the __overflow__ gauges. Generated
-# rather than hand-written so it cannot be 'fixed' into looking valid.
+# Captured from a running gateway under load, then reduced to the metrics
+# families the histogram guard inspects. It includes the __overflow__ gauges
+# and 15 per-endpoint label sets (fake-fast-*, fake-large-*), with one
+# endpoint (fake-fast-1) missing from the histogram because its label was
+# evicted and its history rolled into those gauges. Generated rather than
+# hand-written so it cannot be 'fixed' into looking valid.
 # HELP airouter_requests_total Total requests by model and status
 # TYPE airouter_requests_total counter
 # HELP airouter_failures_total Total failures by status code
