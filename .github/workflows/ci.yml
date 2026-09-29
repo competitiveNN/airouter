@@ -753,3 +753,12 @@ jobs:
       # nothing: the next person trusts a file that a tool rewrote.
       - name: recovery did not disturb the artifacts
         run: UPSTREAM=base bash scripts/dist-freshness-check.sh
+
+      # The handoff document is the one artifact a human is guaranteed to follow
+      # and the only one nothing else here reads. It once told the reader to run
+      # `git fetch ... 'HEAD:refs/heads/frombundle'`, which git rejects outright
+      # -- the exact defect recovery-check.sh exists to catch in code, left
+      # sitting in the instructions. This executes the document's own commands
+      # against a freshly generated bundle rather than grepping for them.
+      - name: the handoff document's commands actually work
+        run: bash scripts/doc-verify.sh

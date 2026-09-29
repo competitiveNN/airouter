@@ -168,6 +168,7 @@ The unpushed commits, oldest first:
 - `482dee7` Prove the handoff actually recovers, and test that it does
 - `179d165` Run the recovery check in CI, and fix the two bugs it found
 - `a9d7c11` Make the real-repository assertion independent of its environment
+- `ebdd8d5` Discover the bundle tip ref instead of assuming it
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
