@@ -293,30 +293,24 @@ run_in_recovered() {
   fi
 }
 
-# UPSTREAM is PINNED to the recovered tree's own origin/master for every
-# self-test, rather than merely inherited.
+# UPSTREAM is deliberately NOT pinned here, and that is a decision rather than
+# an oversight. This block used to force UPSTREAM=origin/master onto every
+# self-test, on the theory that a caller's UPSTREAM=base (as the unpushed-export
+# CI job sets) would otherwise leak into children running in a recovered tree
+# that has no such ref.
 #
-# This is the same class of bug as the UPSTREAM leak fixed in
-# dist-freshness-selftest.sh, one level up. When a caller sets UPSTREAM=base
-# (as the unpushed-export CI job does) that variable is exported into every
-# child, and the self-tests below run in a RECOVERED tree whose base ref is
-# named origin/master, not base. dist-freshness-selftest.sh happens to pin it
-# internally, so this passed by accident; a self-test that did not would have
-# compared against a ref that does not exist in the tree it just recovered and
-# reported a failure that looked like a broken recovery.
+# Two things make it unnecessary. First, the leak is already fixed where it
+# originated: dist-freshness-selftest.sh pins UPSTREAM on its own command line,
+# and the other three self-tests never read it. Second, the pin could not have
+# worked as written -- the recovered tree contains exactly one ref,
+# refs/heads/recovered, so origin/master never resolves there and the branch
+# always fell through to the unpinned path. Its only effect was a note on every
+# run saying the pin was skipped.
 #
-# Pinning it here makes the contract explicit at the boundary instead of
-# leaving it to each child to defend itself. A child that genuinely needs a
-# different upstream passes it on its own command line, where it is visible.
-RECOVERED_UPSTREAM=origin/master
-if ! git -C "$B" rev-parse --verify --quiet "$RECOVERED_UPSTREAM" >/dev/null 2>&1; then
-  # Not fatal: the self-tests are the thing being exercised, and a tree without
-  # that ref simply reports for itself. Said out loud rather than guessed at.
-  printf '  note: recovered tree has no %s; self-tests use their own defaults\n' \
-    "$RECOVERED_UPSTREAM"
-  RECOVERED_UPSTREAM=
-fi
-
+# The assertion that "justified" it was also vacuous: deleting the pin left the
+# suite green. A mechanism that never executes, guarding a leak that cannot
+# occur, is cost without benefit. The self-tests own their environment; a child
+# that needs a specific upstream sets it where it is visible.
 for selftest in \
   fuzz-gate-selftest \
   audit-drift-selftest \
@@ -328,13 +322,8 @@ do
     SKIPPED_AUDIT=$((SKIPPED_AUDIT + 1))
     continue
   fi
-  if [ -n "$RECOVERED_UPSTREAM" ]; then
-    run_in_recovered "recovered tree: $selftest passes" \
-      env UPSTREAM="$RECOVERED_UPSTREAM" bash "scripts/$selftest.sh"
-  else
-    run_in_recovered "recovered tree: $selftest passes" \
-      bash "scripts/$selftest.sh"
-  fi
+  run_in_recovered "recovered tree: $selftest passes" \
+    bash "scripts/$selftest.sh"
 done
 
 # The checkers themselves must run in the recovered tree. The attribution check
