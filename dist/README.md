@@ -14,7 +14,7 @@ authenticates but has `push: false` on the repository, and neither
 `gh api repos/competitiveNN/airouter --jq .permissions.push`.
 
 So the work is committed locally and **not** on the remote. These two files in
-`dist/` carry the 22 commits that `origin/master` is missing, so nothing is lost
+`dist/` carry the 23 commits that `origin/master` is missing, so nothing is lost
 if this checkout goes away.
 
 ## Files
@@ -75,7 +75,7 @@ git push origin master
 
 ## Contents
 
-The 22 unpushed commits, oldest first:
+The 23 unpushed commits, oldest first:
 
 - `0100387` fix: start airouter with provider API keys in its environment
 - `a515364` feat: resilient cooldown state, DELETE /admin/cooldowns, bounded fallback
@@ -99,12 +99,19 @@ The 22 unpushed commits, oldest first:
 - `647c3d3` Harden the histogram guard: pin its threshold, kill no-op mutations, fuzz it
 - `b7cccda` Make the histogram guard's coverage durable: golden fixtures + CI fuzzing
 - `cb4e826` Audit the gate: FROZEN=1 was the broken invocation, not the working one
+- `c40f0eb` docs: refresh dist/README for the unpushed commits
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
 contain itself, and `c746484` replaced the approach. They are kept because
 rewriting published history is worse than three honest commits, but nothing
 needs doing with them.
+
+The commit count has the same self-reference problem in miniature: stating 23
+creates the commit that makes it 24. Read the number off
+`git rev-list --count origin/master..HEAD` rather than trusting this line. The
+bundle and patch in this directory are always regenerated, so they are never
+stale.
 
 `cb4e826` audits `b7cccda`: it found the fuzz gate's documented `FROZEN=1`
 invocation was the one that failed (fabricating a counterexample from a usage
