@@ -1,5 +1,13 @@
 # Unpushed commits
 
+> The `.bundle` and `.patch` files here are **generated, not committed**. Run
+> `scripts/export-unpushed.sh` to (re)create them. Committing them is
+> self-referential — committing the bundle creates a commit the bundle does not
+> contain, so refreshing it creates another one and it can never converge. An
+> earlier attempt in this repo did exactly that and needed two "refresh the
+> bundle" commits to undo; the script exists so the next person does not repeat
+> it. `dist/README.md` and the script are the committed parts.
+
 `origin` is `https://github.com/competitiveNN/airouter`. The token in use
 authenticates but has `push: false` on the repository, and neither
 `defnlnotme` nor `papersplx` has write access — checked with
@@ -13,8 +21,14 @@ if this checkout goes away.
 
 | File | What it is |
 |---|---|
-| `airouter-unpushed.bundle` | A git bundle of `origin/master..HEAD` (13 commits). Preserves full history, authors and messages. |
-| `airouter-unpushed.patch` | The same 13 commits as a mailbox-format patch, for `git am`. |
+| `airouter-unpushed.bundle` | A git bundle of `origin/master..HEAD`. Preserves full history, authors and messages. |
+| `airouter-unpushed.patch` | The same commits as a mailbox-format patch, for `git am`. |
+
+Regenerate both with:
+
+```sh
+./scripts/export-unpushed.sh
+```
 
 ## Applying the bundle (preferred — keeps authors and messages)
 
