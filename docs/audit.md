@@ -2055,3 +2055,113 @@ case, the existing suite was checked first: ten tests already drive errors
 equivalent, plus idle-timeout and context-cancellation cases. That is the
 project's central requirement, and it is not a gap. Adding an eleventh test
 because it was on a list would have been motion, not coverage.
+
+### Round 18 (2026-09-29) — a stale artifact wearing three costumes, and a test suite with no size
+
+Round 17 made the gate trustworthy about *how* it ran. This round found two ways
+it could still be lied to, one of them by its own bookkeeping.
+
+**1. A stale handoff artifact failed three unrelated checks, and the third one
+blamed the wrong thing.** Committing moves `HEAD`, which instantly makes
+`dist/airouter-unpushed.bundle` and `.patch` stale. That single condition trips
+`dist-freshness-check`, the full `recovery-check` (it recovers from the stale
+bundle, so the recovered tree is not this tree), and
+`scripts/recovery-check-selftest.sh` — whose case 4d short-circuits on the
+failure, so the count contract then reports *"got 36, expected 37"*. That last
+message reads exactly like a lost assertion. It is not one; it is arithmetic
+downstream of an artifact nobody regenerated, and it is the message a tired
+reader acts on.
+
+FIXED as a pre-flight, not as a fix: `scripts/gate.sh` now runs
+`scripts/dist-freshness-check.sh` *before any check at all* and exits 4 with the
+one command to run. It deliberately does not regenerate — the gate fingerprints
+the tree to detect concurrent edits, and a gate that edits the tree it is
+fingerprinting makes its own INVALID check unreachable.
+
+**2. Two documented commands were still never executed.** The handoff document's
+"Or into an existing clone" path ends in `git merge --ff-only frombundle`, and
+the preferred path ends in `git checkout frombundle`. Neither was run anywhere.
+The merge is the interesting one: `--ff-only` is the only executable form of a
+*prose* promise several headings away — "Nothing needs rebasing — the history is
+linear on `origin/master`". A plain merge would accept a divergent history by
+adding a merge commit, which is precisely the outcome that sentence promises will
+not happen. Both now run against the fixture, and both are compared tree-for-tree.
+
+Both flags and ref name are *extracted from the document* rather than re-typed
+here, for the reason this file already gives for the refspecs: a hand-copied
+command is a second thing that can drift, and a check that stays green after the
+instruction it verifies was rewritten is checking nothing. Case 6a of
+`scripts/doc-verify-selftest.sh` proves the point by editing `--ff-only` out of
+the document and requiring red. Case 6c proves the ref names are coupled to the
+fetch rather than grepped: it renames the checked-out ref and requires the check
+to say "no documented fetch creates that ref" — and the match is by *name*, so a
+document that consistently renames the ref everywhere stays correct instead of
+being reported as a broken handoff. doc-verify is now 9 checks, self-test 23
+assertions, up from 7 and 17.
+
+**3. `go test ./...` has no size, and the suite had no contract.** Every
+verification script in this repository carries a count contract and goes red when
+an assertion disappears. The Go suite — by volume the largest body of
+verification here, 205 discovered tests — had none, so the only thing between a
+truncated `main_test.go` and a green gate was someone reading the diff. Worse, a
+test whose assertions are deleted with its name left behind is *greener* than a
+missing one, because the file still says what it tests.
+
+`scripts/test-suite-check.py` closes both, against a baseline of discovered test
+names in `scripts/test-suite-baseline.txt`. Two deliberate choices:
+
+  - The contract is a **superset**, not a count. `EXPECTED=205` is satisfied by
+    205 tests of which forty are different tests, needs editing every time anyone
+    adds one, and names nothing when it fails. Here additions are free (and
+    reported as new), and a loss prints the name and the file it was last in —
+    the same reasoning that made the attribution checker compare commit sets
+    instead of lengths. Discovery uses `go test -list`, the set the toolchain
+    actually runs, not a grep over files, so a test hidden behind a build
+    constraint is caught rather than credited.
+  - Every test body must contain a path on which it can fail (`t.Error`/`Fatal`/
+    `Skip`/`Fail`, a panic, or a call to a local helper that has one; `t.Log` is
+    excluded because it cannot fail anything). One exemption, keyed by name,
+    documented in the file: a benchmark.
+
+**4. That check made two false accusations in its first five minutes, and both
+are now pinned as tests.** It reported `TestMetricsOverflowNeverEmitsMalformed-
+Samples` as *missing from the repository* — it is at `metrics_cardinality_test.go:1147` — because a hand-rolled brace-matching body scan had swallowed
+roughly a thousand lines into a raw string of Prometheus exposition text. It then
+reported `TestLoadCooldownsSurvivesMalformedCircuit` and
+`TestLoadCooldownsValidFileUnchanged` as unable to fail; both contain `t.Fatalf`,
+and their bodies embed JSON in a raw string that contains a line starting with
+`}`, which is where the scan had decided the function ended. A checker that
+invents missing tests and invents vacuous ones costs more time than it saves,
+because each false report sends someone hunting a bug that is not there.
+
+Both bugs are gone and both are pinned: the body scan now rests on gofmt's
+guarantee (a top-level body closes with `}` in column 1) *and* requires the
+closing line to be empty and followed by something legal at top level, returning
+"cannot read this body" rather than guessing if nothing matches. Case 5 of
+`scripts/test-suite-selftest.sh` asserts the *absence* of both verdicts, which is
+the half a self-test that only asserts failures would never have caught. Case 5
+also pins a third bug found the same way: the helper-recognition pattern was
+anchored on the closing paren of the signature, so it saw only helpers taking
+nothing but `t` — every `assert*(t, got, want)` helper in the repository was
+invisible, and its callers looked vacuous.
+
+**5. The self-test earned its keep inside a minute.** Three of its eight cases
+went red on the first run: the "new tests" note was behind `--verbose` so the
+contract's own drift was invisible in normal output, and every "this check cannot
+run" path passed a string to `sys.exit()`, which exits **1** — so a fixture with
+no baseline was indistinguishable from a suite that had lost tests. Both matter:
+exit 1 says "the suite has a problem", exit 2 says "I could not look", and the
+whole convention of this repository is that those are different answers. Cases 7
+and 8 pin them. Final state: 13 assertions, all green.
+
+**6. The concurrent push moved the goal line mid-round, and that is a property,
+not an incident.** Partway through, another process pushed everything: `origin/
+master..HEAD` went from 37 commits to 0, and `audit-attribution-check.py`
+correctly reported all 37 entries in `dist/README.md` as "not an unpushed commit
+(may have been pushed or rewritten)". The check was right and the document went
+stale in the direction nobody exercises — the handoff list is validated against
+`origin/master`, which an external actor is free to move. So the list can be
+correct when written and wrong seconds later with no edit to either the commits
+or the document. Not "fixed", because there is nothing to fix without a lock on
+the remote: the round records it so the next reader does not spend an hour
+diagnosing 37 failures that mean "someone pushed while you were working".

@@ -35,7 +35,10 @@ DOC="$REPO/dist/README.md"
 #   case 5 (6)  the "additional claims" can fail: a corrupted bundle turns both
 #                the documented recovery check and the freshness check red,
 #                and the final "restored byte-for-byte" check closes every case
-EXPECTED=17
+#   case 6 (6)  the merge and checkout paths can fail: dropping --ff-only,
+#                deleting the merge instruction, and checking out a ref that no
+#                documented fetch creates are each caught and each named
+EXPECTED=23
 
 command -v git >/dev/null 2>&1 || { echo "doc-verify-selftest: git not found" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "doc-verify-selftest: python3 not found" >&2; exit 2; }
@@ -263,6 +266,66 @@ if [ "$(fingerprint)" = "$DOC_FP" ]; then
 else
   bad "case 5 MODIFIED dist/README.md"
 fi
+
+# ------------------------------------------------------------------------
+# Case 6: the two bundle-application paths that Round 18 added.
+#
+# "Or into an existing clone" ends in `git merge --ff-only`, which is the only
+# place the document's promise that "nothing needs rebasing -- the history is
+# linear on origin/master" is executable at all, and `git checkout frombundle`
+# is the last step of the preferred path. Both were green on the first run,
+# which is precisely the evidence that proves nothing. Each is broken here by
+# editing the DOCUMENT, because the checks extract the merge flags, the merge
+# ref and the checkout ref from the document: if a mutation to the instruction
+# left the check green, the check would be verifying a command nobody reads.
+echo "doc-verify-selftest: case 6 -- the merge and checkout paths can fail"
+if mutate 'git merge --ff-only frombundle' 'git merge frombundle'; then
+  ok "the case-6a mutation applied"
+else
+  bad "the case-6a mutation did NOT apply; the case would prove nothing"
+fi
+out=$(run_check); got=$?
+if [ "$got" -ne 0 ] && printf '%s' "$out" | grep -q 'not --ff-only'; then
+  ok "dropping --ff-only is caught and named, not silently absorbed"
+else
+  bad "doc-verify accepted a document whose merge cannot detect a rebased history (exit $got)"
+  printf '%s\n' "$out" | tail -4 | sed 's/^/         | /'
+fi
+cp "$ORIG_DOC" "$DOC"
+
+# The other direction: the instruction disappears entirely. A checker that
+# reports "0 failed" because it found nothing to check has stopped checking.
+if mutate 'git merge --ff-only frombundle
+' ''; then
+  ok "the case-6b mutation applied"
+else
+  bad "the case-6b mutation did NOT apply; the case would prove nothing"
+fi
+out=$(run_check); got=$?
+if [ "$got" -ne 0 ] && printf '%s' "$out" | grep -q 'documents no merge command'; then
+  ok "a document that stopped documenting the merge is caught"
+else
+  bad "doc-verify returned $got with the merge instruction deleted"
+  printf '%s\n' "$out" | tail -4 | sed 's/^/         | /'
+fi
+cp "$ORIG_DOC" "$DOC"
+
+# And the ref names are coupled to the fetch: checking out a ref the documented
+# fetch never creates is a document that cannot work, and grepping for one
+# spelling of "frombundle" would have missed it.
+if mutate 'git checkout frombundle' 'git checkout recovered'; then
+  ok "the case-6c mutation applied"
+else
+  bad "the case-6c mutation did NOT apply; the case would prove nothing"
+fi
+out=$(run_check); got=$?
+if [ "$got" -ne 0 ] && printf '%s' "$out" | grep -q 'no documented fetch creates that ref'; then
+  ok "a checkout of a ref no documented fetch creates is caught"
+else
+  bad "doc-verify returned $got when the checkout ref did not match the fetched ref"
+  printf '%s\n' "$out" | tail -4 | sed 's/^/         | /'
+fi
+cp "$ORIG_DOC" "$DOC"
 
 # The document must be exactly as it was found. If it is not, the cases above
 # have left the handoff instructions in a state nobody chose.
