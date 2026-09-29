@@ -64,6 +64,38 @@ jobs:
       - name: test
         run: go test -race ./...
 
+      # The suite has a size, and `go test` cannot report that it changed.
+      #
+      # Green means "the tests that ran passed". It does not mean "the tests that
+      # used to exist ran", and this repository has already had the difference
+      # cost it: a test file was truncated, the suite got smaller, and everything
+      # stayed green because a smaller suite is not a failing suite. Deleting a
+      # test's assertions while leaving its name behind is greener still.
+      #
+      # So the contract is a SUPERSET of the names in
+      # scripts/test-suite-baseline.txt, not a count. A count is satisfied by any
+      # equally-wrong set of the same length, needs editing every time someone
+      # adds a test, and names nothing when it fails. Here adding tests is free,
+      # and losing one prints its name and the file it was last in.
+      #
+      # It also requires every test to contain a path on which it can fail, and
+      # refuses (exit 2) rather than guessing when it cannot read a body or the
+      # suite does not build -- a check that reports "the suite shrank" because
+      # the compiler is unhappy sends the reader to the wrong file.
+      - name: the test suite has not gotten smaller
+        run: python3 scripts/test-suite-check.py
+
+      # Both of this check's first false accusations are pinned here: it once
+      # reported a test as missing from the repository (a raw string of Prometheus
+      # text swallowed a thousand lines of the file into one string literal), and
+      # once reported two asserting tests as unable to fail (a gofmt-clean raw
+      # string containing a line that begins with '}' ended their bodies early).
+      # A checker that invents missing or vacuous tests costs more time than it
+      # saves, so the self-test asserts the absence of those two verdicts as well
+      # as the presence of the ones that should fire.
+      - name: the suite check can actually fail
+        run: bash scripts/test-suite-selftest.sh
+
       # Replays every Fuzz target's seed corpus, then fuzzes each for 20s.
       #
       # This used to be three steps naming one target by hand. That is coverage
