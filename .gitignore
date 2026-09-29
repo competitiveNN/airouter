@@ -25,3 +25,7 @@ cooldowns.priority.json
 # the bundle contains, so it could never converge. See dist/README.md.
 /dist/*.bundle
 /dist/*.patch
+
+# Go fuzzing corpus cache. Only the minimized crashers under testdata/fuzz are
+# worth committing; the working corpus is gigabytes of generated input.
+/fuzzcache/
