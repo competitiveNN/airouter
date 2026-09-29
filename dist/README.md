@@ -108,6 +108,8 @@ The unpushed commits, oldest first:
 - `56dfbdf` Walk every .go file, not just the ones in the root
 - `aaad4dd` Correct the round-10 record: the drift fix shipped in 56dfbdf, not here
 - `ee4bf69` docs: refresh dist/README for the audit-drift-check glob fix
+- `b950b3a` Close the two gaps round 10 named, and stop the guard going blind in CI
+- `6ca056f` Make the attribution checker's output ASCII, and record where it must fail
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
@@ -177,13 +179,36 @@ compared against `HEAD`'s. (`git am` re-creates each commit, so the resulting
 commits have different hashes — the trees are what must match, and they do.)
 The recovered tree builds, and the full test suite passes there:
 
-    go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh && bash scripts/audit-drift-selftest.sh
+    go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh && bash scripts/audit-drift-selftest.sh && bash scripts/audit-attribution-selftest.sh
 
-One check is deliberately excluded from the `git am` half, and the reason is
-worth stating so it is not mistaken for drift later.
-`audit-attribution-check.py` resolves every commit hash the documentation
-cites, and `git am` re-hashes every commit it replays — so in a patch-recovered
-tree all of those citations are absent by construction and the check reports
-every one of them. That is the check working, not a broken recovery. The bundle
-preserves the original hashes, which is why it is the preferred artifact and
-the one to use when the history matters.
+One check is excluded from the `git am` half on purpose, and the reason is
+worth stating so it is not mistaken for drift later. `git am` re-hashes every
+commit it replays, so by hash alone every citation the documentation makes is
+absent in a patch-recovered tree. Rather than leave it broken there, the checker
+grew a mode that matches citations by the change they carry rather than the
+hash they happen to have:
+
+```sh
+python3 scripts/audit-attribution-check.py --recovered --against /path/to/original
+```
+
+It uses `git patch-id --stable`, which fingerprints a commit's diff rather than
+its metadata, so it survives re-hashing. Verified on this repository: all 77
+content fingerprints are identical between `HEAD` and its `git am` replay, and a
+fabricated hash is still rejected in that mode. Use the bundle when the history
+itself matters.
+
+## Before trusting the recovery path
+
+`push` is still `false`, so these commits exist only here and in `dist/`. If you
+are reading this to pick the work up, check the artifacts against the checkout
+before relying on them — they are regenerated per commit, and a stale bundle is
+worse than none because it looks authoritative:
+
+```sh
+git bundle list-heads dist/airouter-unpushed.bundle   # must equal git rev-parse HEAD
+./scripts/export-unpushed.sh                          # if it does not
+```
+
+The first command is the check. A bundle whose tip is not `HEAD` is missing
+whatever was committed since, and the mismatch is the only symptom.

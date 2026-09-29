@@ -182,6 +182,23 @@ jobs:
       - name: audit attributions resolve
         run: python3 scripts/audit-attribution-check.py
 
+      # The attribution check is the guard that catches a claim about a commit
+      # being written from memory rather than from the history -- the exact shape
+      # a lost fix takes. It also carries the only piece of logic here that is
+      # easy to get subtly wrong while still looking correct: the self-reference
+      # exemption. dist/README.md lists the unpushed commits, but writing the list
+      # creates a commit that makes the list wrong. The first exemption was "the
+      # diff touches dist/README.md", which is gameable -- attach a one-line README
+      # tweak to a real code commit and the whole commit escapes the list.
+      #
+      # This is the same technique as the other two self-tests: throwaway
+      # repositories, negative controls against COPIES, and a liveness case. It
+      # additionally replays the unpushed patch with `git am` to produce a
+      # genuinely re-hashed history, so the --recovered path is exercised against
+      # a real recovery rather than asserted about.
+      - name: audit attribution self-test
+        run: bash scripts/audit-attribution-selftest.sh
+
   config:
     runs-on: ubuntu-latest
     continue-on-error: false
