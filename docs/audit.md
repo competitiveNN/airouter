@@ -1317,36 +1317,95 @@ have carried them. Both were added.
 creates a commit, which makes the list wrong, which requires rewriting it. This
 is the loop `dist/README.md` already documents for the bundle and for the count
 in miniature, and left unchecked because it looked unsatisfiable. The
-resolution is to exempt commits whose diff touches `dist/README.md` — a commit
-cannot contain its own hash, so requiring it to is not a constraint but a
-paradox. The exemption is derived from each commit's own diff rather than from
-anything the document says, so it cannot be widened from the prose, and every
-code, test, script and audit commit is still required to appear in the list. A
-real change cannot hide behind it.
+resolution is to exempt the commit that DELIVERS the list — a commit cannot
+contain its own hash, so requiring it to is not a constraint but a paradox.
 
-One consequence is worth recording because it looks like a failure later. The
-citation check resolves every commit hash the documentation names, and `git am`
-re-hashes every commit it replays — so in a patch-recovered tree all those
-citations are absent by construction and the check reports every one of them.
-That is the check working, not a broken recovery: recovery is verified on trees
-rather than hashes, and the bundle preserves the original hashes, which is why
-it stays the preferred artifact. It is recorded in the checker's own docstring
-and in `dist/README.md`, so the next person to run the check in a recovered tree
-recognises it instead of re-investigating.
+That exemption is where the interesting bug was, and it is worth being precise
+about because the first version shipped broken. It read "exempt a commit whose
+diff touches `dist/README.md`", with a comment claiming a real change could not
+hide behind it. That claim is false, and trivially so: attach a one-line README
+tweak to a commit carrying a `main.go` change and the whole commit becomes
+exempt. A code change could be dropped from the handoff list by editing a
+sentence.
 
-Wiring this into CI required `fetch-depth: 0` on the `go` job.
+The shipped rule is **confinement, not presence** — a commit is exempt only
+when every path in its diff is a tracked handoff artifact under `dist/`. Touch
+one code, test, script, CI or audit file and the commit must be listed like any
+other. It is still decided from the commit's own diff, so the prose cannot widen
+it. Case 4 of `scripts/audit-attribution-selftest.sh` is the exploit itself, run
+as a positive assertion: a code commit with a README tweak must be reported.
+Both rules were run against the same fixture, and the old one passes it while
+the new one catches it.
+
+Two real commits were hiding under the loose rule. `b950b3a` and `6ca056f` both
+touched `dist/README.md` alongside real script changes, and neither appeared in
+the handoff list — a handoff built from that document would have missed both.
+Narrowing the rule is what surfaced them, which is the strongest evidence that
+the narrow rule is the correct one.
+
+**3. `--recovered` mode.** The paragraph above records the citation check as
+"expected to fail" in a `git am` tree, and documents why. That is true but it
+leaves a check that can only ever fail there, which is not a useful thing to
+hand the next person. The mode matches each cited hash to the commit carrying
+the same CHANGE, using `git patch-id --stable`, which fingerprints a commit's
+diff rather than its metadata and therefore survives re-hashing. Verified on
+this repository: all 77 content fingerprints are identical between `HEAD` and
+its `git am` replay, so every honest citation resolves in the recovered tree —
+and a fabricated one still matches nothing and still fails, which is what keeps
+the relaxed path from becoming a blanket pass.
+
+Two implementation details are load-bearing and both were got wrong first:
+
+- `git log -p | git patch-id` truncates catastrophically on a large history.
+  Piped directly it reported **1** fingerprint instead of 77 on this
+  repository, and a map that is silently 98% empty looks exactly like "these
+  commits genuinely have no counterpart". The `git log` output is captured
+  into memory and fed to `git patch-id` over a pipe instead.
+- the content check needs a reference repository, because the cited hashes
+  live in the original history that the recovered clone does not have.
+  `--recovered` without `--against` exits 2 rather than guessing.
+
+Wiring the attribution check into CI required `fetch-depth: 0` on the `go` job.
 `actions/checkout@v4` defaults to a shallow single-ref checkout, which has no
 `origin/master`, so the unpushed-list half would have skipped and still exited 0
 — a guard passing because it could not see what it guards. That failure is
 worse than having no guard, and it is the reason the skip path prints a notice
 under `--verbose` rather than failing silently.
 
+**4. `scripts/audit-attribution-selftest.sh`.** Fourteen assertions across seven
+cases, built like the other two self-tests: throwaway repositories, negative
+controls against copies, a liveness case. Unlike the drift self-test this one
+needs a real git repository, because the checker reads history, refs and
+per-commit diffs and there is nothing to stub.
+
+It earns its keep twice over, because two of its cases reproduce the exact
+vacuity that has cost this repository work. The fixtures must carry a
+`refs/remotes/origin/master`, since without one the checker skips the whole
+unpushed-list half and exits 0 — the first version of this harness did exactly
+that and three cases "passed" while asserting nothing. And case 5 builds a
+genuine `git am` replay to exercise `--recovered`, which required fetching the
+base commit by SHA: a clone of the local path tracks this checkout's own master,
+which already contains every unpushed commit, so replaying onto it applies the
+patch on top of commits that are already there and the case then passes for the
+wrong reason. The harness asserts the cited hashes really are unresolvable in
+the replay before relying on them being matched by content.
+
+Building it also exposed a mistake worth recording. The first attempt to
+negative-control `--recovered` — making it accept any content — passed 14/14 and
+so proved nothing. The edit had not applied: the replacement string was indented
+differently from the line in the file, and a Python `str.replace` that matches
+nothing fails silently. Replacing the whole function body fixed it, and the
+control then failed case 6 as it should. A negative control that cannot fail is
+indistinguishable from a passing test, which is the entire reason this repository
+keeps writing them down.
+
 Verification this round:
 
 `go test -race -count=1 ./...` → ok, 0 failed
 `gofmt -l .` → clean; `go vet ./...` → no issues
 `scripts/audit-drift-selftest.sh` → 11 passed, 0 failed
-`scripts/audit-attribution-check.py` → all citations resolve, 31 unpushed
+`scripts/audit-attribution-selftest.sh` → 14 passed, 0 failed
+`scripts/audit-attribution-check.py` → all citations resolve, 33 unpushed
   commit(s) listed accurately
 `scripts/audit-drift-check.py` → 53 anchors checked, all resolve
 `scripts/fuzz-gate-selftest.sh` → 31 passed, 0 failed
@@ -1365,8 +1424,14 @@ nonexistent commit). The fabricated hashes are written here without backticks
 deliberately: the checker treats a backticked hex token as a citation, so
 documenting its own negative control in the document it guards would trip it.
 
-Tests added this round: none in Go. `scripts/audit-drift-selftest.sh` and
-`scripts/audit-attribution-check.py`, both wired into the `go` CI job.
+Negative controls for `scripts/audit-attribution-selftest.sh`, each verified to
+make it fail: reverting the exemption to "touches `dist/README.md`" fails the
+gaming case (12/14), and replacing `_content_present` with an unconditional
+`True` fails the fabrication case (13/14).
+
+Tests added this round: none in Go. `scripts/audit-drift-selftest.sh`,
+`scripts/audit-attribution-selftest.sh` and `scripts/audit-attribution-check.py`,
+all wired into the `go` CI job.
 
 ---
 
