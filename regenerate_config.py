@@ -561,6 +561,15 @@ def validate_config_text(text: str) -> list[str]:
         for name, prov in providers.items():
             if not isinstance(prov, dict) or 'url' not in prov:
                 problems.append(f'provider {name} has no url')
+            # Losing api_key_env is how the 401 incident started: the daemon
+            # starts fine, /v1/models answers, and every provider call fails at
+            # runtime with nothing in the config to explain why. As fatal as a
+            # missing url and just as invisible, so refuse to write without it.
+            elif 'api_key_env' not in prov:
+                problems.append(
+                    f'provider {name} has no api_key_env (the daemon would start '
+                    'with no credentials and every call would 401)'
+                )
     for key in PROTECTED_TOP_LEVEL_KEYS:
         if key not in parsed:
             problems.append(f'top-level {key!r} key was lost')
