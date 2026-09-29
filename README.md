@@ -155,9 +155,10 @@ which providers are configured and how they are behaving.
 
 The local `master` is **13 commits ahead of `origin/master`**. The token in use
 authenticates but has `push: false`, so those commits are not on the remote.
-`dist/` carries them as both a git bundle and a patch, with instructions in
-`dist/README.md`. Both were verified by applying them to `origin/master` in a
-fresh clone and running the suite.
+`scripts/export-unpushed.sh` carries them out as a git bundle and a patch
+(generated, not committed — committing them is self-referential), with
+instructions in `dist/README.md`. Both were verified by applying them to
+`origin/master` in a fresh clone and running the suite.
 
 ## Development
 
