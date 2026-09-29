@@ -44,7 +44,8 @@ from model_utils import (  # noqa: F401
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 KILO_ENDPOINT = "https://api.kilo.ai/api/gateway/v1/models"
-OPENCODE_ENDPOINT = "https://opencode.ai/zen/v1/models"
+OPENCODE_ENDPOINT = "https://opencode.ai/zen/v1"
+OPENCODE_MODELS_URL = OPENCODE_ENDPOINT + "/models"
 GOOGLE_AI_STUDIO_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 NVIDIA_NIM_ENDPOINT = "https://integrate.api.nvidia.com/v1/models"
 COMMANDCODE_ENDPOINT = "https://api.commandcode.ai/provider/v1/models"
@@ -693,23 +694,128 @@ def fetch_kilo() -> list[dict[str, Any]]:
     return free_models
 
 
+def _mark_unverified(models: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+    """Tag models that never got a real probe, so the defect is visible downstream."""
+    for m in models:
+        m["verified"] = False
+        m["unverified_reason"] = f"opencode probe skipped: {reason}"
+    return models
+
+
+def opencode_probe(model_id: str, api_key: str) -> str:
+    """Send one minimal chat completion to OpenCode and classify the result.
+
+    Returns "ok", "freetier" (403 FreeTierError — key is authenticated but not
+    entitled), or "error".
+
+    The /zen/v1/models listing is NOT a reliable free-tier oracle. It happily
+    lists models the current key cannot actually call: as of 2026-09-29 the key
+    resolved 5 models (big-pickle, ling-3.0-flash-fin-free, mimo-v2.5-free,
+    mimo-v2.6-flash-free, muse-spark-1.2-contributor-free) and ALL of them
+    returned 403 FreeTierError, paid ones included. The attribution headers
+    airouter sends (x-opencode-client, x-opencode-session, ...) do not change
+    the outcome. So "listed" != "usable" and only a real call can tell.
+    """
+    body = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }).encode()
+    headers = {
+        **HEADERS,
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        # Mirrors opencodeRequestHeaders() in config.go: OpenCode grants
+        # free-tier access to clients that identify as the OpenCode CLI.
+        "User-Agent": "opencode/1.18.31/cli",
+        "x-opencode-client": "cli",
+        "x-opencode-session": "ses_probe",
+        "x-opencode-request": "msg_probe",
+        "x-opencode-project": "default",
+    }
+    req = urllib.request.Request(
+        OPENCODE_ENDPOINT + "/chat/completions", data=body, headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return "ok" if resp.status == 200 else "error"
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return "freetier"
+        return "error"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return "error"
+
+
 def fetch_opencode() -> list[dict[str, Any]]:
-    """Fetch OpenCode models; free ones end in -free or are in OPENCODE_FREE_MODELS."""
+    """Fetch OpenCode models; free ones end in -free or are in OPENCODE_FREE_MODELS.
+
+    Every candidate is then verified with a real 1-token chat completion, so we
+    only emit endpoints the gateway can actually serve. Without this the
+    nightly sync kept re-adding 19 opencode endpoints across the four profile
+    chains (7 in smart, 8 in work, 2 in fast, 1 in large) that 403 on every
+    call, costing a guaranteed round trip per request that reached them.
+
+    Set SKIP_OPENCODE_PROBE=1 to skip verification and keep the old
+    listing-only behaviour.
+    """
     print("Fetching from OpenCode API...", file=sys.stderr)
-    data = fetch_json(OPENCODE_ENDPOINT)
+    data = fetch_json(OPENCODE_MODELS_URL)
     if not data or not isinstance(data, dict) or "data" not in data:
         print("OpenCode: no data or unexpected format", file=sys.stderr)
         return []
 
-    free_models = []
+    candidates = []
     for model in data.get("data", []):
         model_id = model.get("id", "")
         if model_id.endswith("-free") or model_id in OPENCODE_FREE_MODELS:
+            candidates.append(model)
+
+    api_key = os.environ.get("OPENCODE_API_KEY", "")
+    if not api_key:
+        print(
+            "OpenCode: OPENCODE_API_KEY not set — cannot verify, "
+            f"emitting {len(candidates)} UNVERIFIED candidates",
+            file=sys.stderr,
+        )
+        return _mark_unverified(
+            [n for n in (normalize_opencode(m) for m in candidates) if n],
+            "OPENCODE_API_KEY unset",
+        )
+
+    if os.environ.get("SKIP_OPENCODE_PROBE") == "1":
+        # Escape hatch that re-enables the exact defect this probe exists to
+        # prevent (11 of 12 opencode models 403), so make it loud and mark the
+        # output so downstream consumers can see it was never checked.
+        print(
+            "OpenCode: !!! SKIP_OPENCODE_PROBE=1 — emitting UNVERIFIED models. "
+            "Most will 403 FreeTierError and cost a round trip per request. "
+            "Do not leave this set in a scheduled sync.",
+            file=sys.stderr,
+        )
+        return _mark_unverified(
+            [n for n in (normalize_opencode(m) for m in candidates) if n],
+            "SKIP_OPENCODE_PROBE=1",
+        )
+
+    free_models = []
+    rejected = []
+    for model in candidates:
+        verdict = opencode_probe(model.get("id", ""), api_key)
+        if verdict == "ok":
             normalized = normalize_opencode(model)
             if normalized:
+                normalized["verified"] = True
                 free_models.append(normalized)
+        else:
+            rejected.append(f"{model.get('id', '?')}({verdict})")
 
-    print(f"OpenCode: found {len(free_models)} free models (only '-free' suffix kept)", file=sys.stderr)
+    if rejected:
+        print(
+            "OpenCode: rejected unusable models — " + ", ".join(rejected),
+            file=sys.stderr,
+        )
+    print(f"OpenCode: {len(free_models)}/{len(candidates)} candidates verified usable", file=sys.stderr)
     return free_models
 
 
