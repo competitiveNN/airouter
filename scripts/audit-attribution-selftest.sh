@@ -67,9 +67,14 @@ set -uo pipefail
 #   clone run = 10 + 0     = 11
 #
 # The two leading assertions in case 5 are the base-discovery controls ("the
-# replay base is not HEAD" and "the wrong base is rejected"); they are counted
-# in the 7 above. If a case is moved out of the environment-dependent branch, or
-# one is added, this arithmetic is what goes stale, and the run reports it.
+# replay base is origin/master by SHA" and "the base does not already contain the
+# work"); they are counted in the 7 above. The second used to be "the wrong base
+# is rejected", which replayed the patch onto HEAD and required git am to refuse
+# it -- and that stopped refusing once the unpushed set shrank to two commits,
+# because git recognises an already-applied patch and skips it. The property is
+# the base not containing the work, so that is what is asserted now. If a case is
+# moved out of the environment-dependent branch, or one is added, this arithmetic
+# is what goes stale, and the run reports it.
 EXPECTED_FULL=18
 EXPECTED_CLONE=11
 
@@ -309,18 +314,19 @@ else
   else
     ok "the replay base is origin/master by SHA, not this checkout's HEAD"
   fi
-  # A negative control on that base: replayed onto HEAD, the patch is rejected
-  # outright. If it applied, the base above would be wrong and the case
-  # meaningless, so the failure is asserted rather than assumed.
-  WB="$TMPROOT/wrong-base"
-  git init -q "$WB"
-  git_q "$WB" fetch -q "$REPO" "$(git -C "$REPO" rev-parse HEAD)"
-  git_q "$WB" reset -q --hard FETCH_HEAD
-  if ( cd "$WB" && git -c user.email=t@t -c user.name=t am --3way -q "$PATCH" \
-        >/dev/null 2>&1 ); then
-    bad "the patch is rejected when the base is wrong (it applied onto HEAD)"
+  # A STRUCTURAL negative control on that base, replacing a behavioural one. The
+  # old version replayed the patch onto HEAD and required `git am` to reject it.
+  # That stopped happening when the unpushed set shrank to two commits: git am
+  # recognises an already-applied patch and skips it, and the case went red
+  # describing a property of git rather than of the handoff. The property this
+  # case actually needs is "the base does not already contain the work", which is
+  # what is asserted now -- in terms that do not depend on the size of the patch
+  # or on how chatty the installed git happens to be.
+  PTIP=$(git -C "$REPO" rev-parse HEAD)
+  if git_q "$DST" merge-base --is-ancestor "$PTIP" HEAD 2>/dev/null; then
+    bad "the replay base already contains the patch tip ($PTIP): replaying it reproduces nothing"
   else
-    ok "the patch is rejected when the base is wrong"
+    ok "the replay base does not already contain the work the patch carries"
   fi
 
   # Replay the unpushed commits with git am: content preserved, hashes all new.
@@ -334,14 +340,34 @@ else
   if ! git_q "$DST" rev-parse --verify -q HEAD >/dev/null; then
     bad "recovered tree built (git am replay failed -- cannot test case 5)"
   else
-    # The replay is only meaningful if it really re-hashed the commits. Assert
-    # that the cited hashes are gone from this tree BEFORE relying on them
-    # being matched by content, so the case cannot pass by accident.
-    CITED=$(grep -oE '`[0-9a-f]{7,40}`' "$DST/docs/audit.md" | head -1 | tr -d '`')
-    if git_q "$DST" rev-parse --verify -q "$CITED^{commit}" >/dev/null; then
-      bad "replay re-hashed the commits (sanity: $CITED still resolves)"
+    # The recovered tree's document has to cite commits the patch carried, or
+    # --recovered has nothing to match and the case proves nothing. Grepping the
+    # real docs/audit.md for "the first backticked hash" used to supply that, and
+    # it silently stopped supplying it the moment someone pushed: the cited
+    # commits moved into the replay's own base, where they resolve, so the
+    # premise -- citations the replay has re-hashed -- evaporated underneath the
+    # case while the code stayed correct. Derive the citations from the
+    # repository instead of hoping the document happens to contain one, and
+    # require that every one of them is now unresolvable here.
+    CITED_LIST=$(git -C "$REPO" rev-list origin/master..HEAD)
+    if [ -z "$CITED_LIST" ]; then
+      bad "origin/master..HEAD is empty, so the replay had nothing to reproduce"
     else
-      ok "replay re-hashed the commits (sanity)"
+      for h in $CITED_LIST; do
+        printf '\nThe self-test cites `%s` so recovered mode has something to match.\n' "$h" \
+          >> "$DST/docs/audit.md"
+      done
+      STILL=0
+      for h in $CITED_LIST; do
+        if git_q "$DST" rev-parse --verify -q "$h^{commit}" >/dev/null; then
+          STILL=$((STILL + 1))
+        fi
+      done
+      if [ "$STILL" -ne 0 ]; then
+        bad "replay re-hashed the commits ($STILL replayed commit(s) still resolve here)"
+      else
+        ok "replay re-hashed every commit the patch carried (sanity)"
+      fi
     fi
 
     # Without --recovered, the citations cannot resolve by hash. That is the
