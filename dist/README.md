@@ -153,8 +153,12 @@ What `origin/master` is missing, oldest first:
 
 - `aa61d01` gate: stop on stale artifacts, execute the last two doc claims, and
   give the Go suite a size contract
+- `4ceef1a` attribution self-test: case 5 was passing on an unwritten premise, and
+  a push exposed it
 
-Nothing else, as of this writing. The list is checked rather than trusted:
+That is the whole required list as of this writing — commits that touch only
+`dist/` are exempt by design, so the commits maintaining this file are not
+repeated in it. The list is checked rather than trusted:
 `scripts/audit-attribution-check.py` compares it as a **set** against
 `git rev-list origin/master..HEAD` -- not as a count, because a count is satisfied
 by any equally-wrong list of the same length -- and fails when the two disagree in
