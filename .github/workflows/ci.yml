@@ -36,6 +36,35 @@ jobs:
       - name: test
         run: go test -race ./...
 
+      # Proves the SSE ordering guard has teeth: it reintroduces the historical
+      # bug, requires the ordering tests to FAIL, then restores proxy.go and
+      # requires them to pass again. A test that passes both ways guards nothing,
+      # and this is the only automated way to tell the difference. Skipped if
+      # streamSSE is refactored past the mutation site (exit 2), so a legitimate
+      # refactor does not silently turn this into a no-op.
+      - name: negative-check the SSE ordering guard
+        run: |
+          set +e
+          bash scripts/sse-negative-check.sh
+          code=$?
+          set -e
+          # exit 2 = the mutation site moved because streamSSE was refactored.
+          # That is a signal to update the script, not a failure of the guard.
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::streamSSE was refactored; the negative check needs updating"
+          elif [ "$code" -ne 0 ]; then
+            echo "::error::the SSE ordering guard is toothless — see above"
+            exit 1
+          fi
+
+      # A GitHub PAT was found sitting in plaintext in the origin remote URL.
+      # It had not been committed, but it was on disk, in `git remote -v`, and
+      # in the process table of every push. This scans tracked content, recent
+      # history, and .git/config so the next one is caught at PR time instead of
+      # by accident.
+      - name: secret scan
+        run: bash scripts/secret-scan.sh
+
   config:
     runs-on: ubuntu-latest
     steps:
