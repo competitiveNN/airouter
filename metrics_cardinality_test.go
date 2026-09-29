@@ -2257,8 +2257,38 @@ func checkHistogramInvariants(series []exposedSeries) []string {
 			//
 			// Generally: if `above` observations are attributed to the open band
 			// above the top finite bound, each of them is > that bound, so
-			// _sum >= above * topBound. Only a strictly-less-than result is a
-			// violation, so a missing or zero _sum is not flagged here.
+			// _sum >= above * topBound.
+			//
+			// WHY THIS THRESHOLD, precisely, because a guard that is merely
+			// "sound" is not enough — it also has to be *tight enough to fire* and
+			// *loose enough not to false-positive*, and the choice is a
+			// deliberate one:
+			//
+			//   - topBound is the largest FINITE le, i.e. the second-to-last
+			//     bucket. The top finite band is (topBound, +Inf], so its
+			//     population is exactly the +Inf bucket minus the top finite
+			//     bucket. It is a lower bound on each member, never an equality:
+			//     observations just above the bound barely contribute. That makes
+			//     the test deliberately loose — it will not catch a mildly skewed
+			//     distribution, and that is accepted. Catching that needs the real
+			//     observations, which the exposition does not contain. What it
+			//     DOES catch is the categorical case, where the buckets and the
+			//     sum are off by orders of magnitude, which is what went wrong.
+			//   - The comparison is strict `<`. A sum exactly equal to
+			//     above*topBound is legal (all observations sitting precisely on
+			//     the bound, as a single observation exactly at le=... would be),
+			//     so equality must not be flagged.
+			//   - `above > 0` guards the case where nothing is attributed above
+			//     the top bound; then minSum is 0 and any sum is consistent.
+			//   - `sum > 0` guards a missing or zero sum, which is not evidence
+			//     of anything and would otherwise flag every series whose _sum
+			//     has not been written yet.
+			//   - `topBound > 0` guards a non-numeric or zero top bound, which
+			//     makes the bound vacuous; (2) already reports those.
+			//
+			// Each of those four guards is pinned by a case in
+			// TestHistogramInvariantSixBoundaries, because an unpinned guard is a
+			// guess about behaviour rather than a fact about it.
 			if sum, ok := sums[family][set]; ok && sum > 0 && len(bs) >= 2 {
 				topBound, boundErr := strconv.ParseFloat(bs[len(bs)-2].le, 64)
 				if boundErr != nil {
@@ -2472,9 +2502,29 @@ func TestEachHistogramInvariantHasTeeth(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Deep copy: wellFormed() hands out fresh maps each call, so
-			// mutating in place is safe and cannot leak between cases.
-			v := checkHistogramInvariants(tc.mutate(wellFormed()))
+			// wellFormed() builds fresh maps on every call, so the mutation can
+			// edit in place without leaking between cases.
+			before := wellFormed()
+			after := tc.mutate(wellFormed())
+
+			// Assert the mutation actually did something.
+			//
+			// One case in this table was a no-op from the start: it moved `+Inf`
+			// to the end of the slice, where it already was, so the guard
+			// correctly reported nothing and the case still "passed" as far as
+			// the assertion below was concerned. A mutation that does not mutate
+			// is the most expensive kind of useless test, because in review it is
+			// indistinguishable from a real one — the only thing that exposes it
+			// is comparing before and after. This makes the class impossible to
+			// reintroduce silently.
+			if seriesFingerprint(before) == seriesFingerprint(after) {
+				t.Fatalf("mutation for %q changed nothing; this case cannot fail and "+
+					"is not a test. A no-op mutation looks identical to a real one "+
+					"in review, which is why it is checked here rather than trusted",
+					tc.name)
+			}
+
+			v := checkHistogramInvariants(after)
 			if len(v) == 0 {
 				t.Fatalf("guard reported no violation for %q; this invariant has no teeth", tc.name)
 			}
@@ -2485,4 +2535,218 @@ func TestEachHistogramInvariantHasTeeth(t *testing.T) {
 			t.Logf("guard said:\n%s", joined)
 		})
 	}
+}
+
+// seriesFingerprint renders a parsed exposition to a canonical string, so two
+// versions of the same samples can be compared for equality.
+//
+// It includes the sample ORDER, not just the set. The `+Inf` is not last
+// negative control is precisely a reordering, and a set-based fingerprint
+// would call that unchanged — which is the bug this was written to catch.
+func seriesFingerprint(s []exposedSeries) string {
+	var b strings.Builder
+	for _, x := range s {
+		fmt.Fprintf(&b, "%s|%s|%s|%v\n", x.typ, x.name, renderLabelSet(x.labels, ""), x.value)
+	}
+	return b.String()
+}
+
+// TestHistogramInvariantSixBoundaries pins every guard and boundary in
+// invariant (6), the buckets-vs-_sum check.
+//
+// The main table proves the invariant fires on a violation. This proves it stays
+// quiet in the cases where it must, which is the other half and the half that
+// decides whether a guard is usable: a well-formedness check that fires on
+// legitimate data gets disabled, and then it protects nothing.
+//
+// The threshold `_sum >= above * topBound` has four guards (`sum > 0`,
+// `topBound > 0`, `above > 0`, strict `<`) and two equality boundaries. Each is
+// asserted here, and each case is checked to have actually mutated its input —
+// the lesson of the no-op `+Inf` case from the main table applies to this table
+// too.
+func TestHistogramInvariantSixBoundaries(t *testing.T) {
+	const fam = "airouter_endpoint_attempt_duration_seconds"
+
+	// build renders an exposition from explicit bucket/sum/count triples.
+	build := func(buckets [][2]string, sum, count string) []exposedSeries {
+		var body strings.Builder
+		fmt.Fprintf(&body, "# TYPE %s histogram\n", fam)
+		for _, b := range buckets {
+			fmt.Fprintf(&body, "%s_bucket{endpoint=\"a\",le=\"%s\"} %s\n", fam, b[0], b[1])
+		}
+		fmt.Fprintf(&body, "%s_sum{endpoint=\"a\"} %s\n", fam, sum)
+		fmt.Fprintf(&body, "%s_count{endpoint=\"a\"} %s\n", fam, count)
+		series, err := parseExposition(body.String())
+		if err != nil {
+			t.Fatalf("synthetic exposition does not parse: %v", err)
+		}
+		return series
+	}
+
+	// viol6 filters to just invariant (6)'s message, so a case intended to
+	// exercise a boundary is not failed by an unrelated violation.
+	viol6 := func(s []exposedSeries) string {
+		var out []string
+		for _, v := range checkHistogramInvariants(s) {
+			if strings.Contains(v, "different distributions") {
+				out = append(out, v)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+
+	for _, tc := range []struct {
+		name    string
+		buckets [][2]string
+		sum     string
+		count   string
+		fires   bool
+		why     string
+	}{
+		{
+			// 2 observations above le=1, so _sum must be >= 2.0. 1.5 is the
+			// real overflow-bug shape: internally monotonic, externally false.
+			name:    "sum below the implied minimum",
+			buckets: [][2]string{{"0.5", "3"}, {"1", "7"}, {"+Inf", "9"}},
+			sum:     "1.5", count: "9", fires: true,
+			why: "9-7=2 observations above le=1 requires sum>=2",
+		},
+		{
+			// The exact boundary. 2 observations exactly at le=1 is the most
+			// permissive legal reading, and the comparison is strict `<`, so
+			// this must be accepted.
+			name:    "sum exactly at the minimum",
+			buckets: [][2]string{{"0.5", "3"}, {"1", "7"}, {"+Inf", "9"}},
+			sum:     "2.0", count: "9", fires: false,
+			why: "equality is legal; observations may sit precisely on the bound",
+		},
+		{
+			name:    "sum comfortably above the minimum",
+			buckets: [][2]string{{"0.5", "3"}, {"1", "7"}, {"+Inf", "9"}},
+			sum:     "900.0", count: "9", fires: false,
+			why: "all 9 observations far above le=1",
+		},
+		{
+			// above == 0: nothing is attributed above the top finite bound, so
+			// there is no minimum and any sum is consistent. Without the
+			// `above > 0` guard this is still fine (minSum would be 0), so the
+			// case documents that it is reachable rather than testing a guard.
+			name:    "nothing attributed above the top bound",
+			buckets: [][2]string{{"0.5", "3"}, {"1", "7"}, {"+Inf", "7"}},
+			sum:     "0.1", count: "7", fires: false,
+			why: "above=0 implies minSum=0, so a small sum is consistent",
+		},
+		{
+			// sum == 0: no evidence either way, must stay quiet rather than
+			// flagging every series whose _sum is absent.
+			name:    "zero sum with observations above the bound",
+			buckets: [][2]string{{"0.5", "3"}, {"1", "7"}, {"+Inf", "9"}},
+			sum:     "0", count: "9", fires: false,
+			why: "a zero sum is absence of evidence, not evidence of absence",
+		},
+		{
+			// Only one finite bucket, so there is no top finite bound to compare
+			// against and the check has nothing to say.
+			name:    "single finite bucket",
+			buckets: [][2]string{{"+Inf", "9"}},
+			sum:     "0.01", count: "9", fires: false,
+			why: "len(bs) < 2, so no top finite bound exists",
+		},
+		{
+			// Negative latency bounds are nonsense input; (2) reports the
+			// ordering, and (6) must not compound it with a bogus threshold.
+			name:    "top bound is zero",
+			buckets: [][2]string{{"0", "3"}, {"+Inf", "9"}},
+			sum:     "0.01", count: "9", fires: false,
+			why: "topBound=0 makes the bound vacuous, so (6) is skipped",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			series := build(tc.buckets, tc.sum, tc.count)
+			got := viol6(series)
+			fired := got != ""
+			if fired != tc.fires {
+				if tc.fires {
+					t.Fatalf("expected invariant (6) to fire, but it stayed quiet.\n%s\n%s",
+						tc.why, got)
+				}
+				t.Fatalf("invariant (6) fired on legitimate data, so it would be wrong "+
+					"to ship: %s\n%s", tc.why, got)
+			}
+		})
+	}
+}
+
+// FuzzHistogramInvariantsSurviveGarbage asserts the guard degrades safely on
+// arbitrary text: it never panics, never hangs, and never reports a violation
+// for output that is actually fine.
+//
+// The reason this is worth fuzzing: the whole origin of this work is a metrics
+// defect that survived three audit rounds because every test enumerated
+// hand-picked cases. Seven hand-written negative controls are still seven
+// hand-picked cases. Feeding the checker text it has never seen explores the
+// shapes nobody thought to write down — including malformed series, duplicate
+// buckets, hostile label values, and the panics a state-machine parser can
+// hide behind an early return.
+//
+// The property asserted is the weak one, deliberately. "No false positives" is
+// what makes the guard safe to ship; finding *new* violations is a bonus the
+// corpus will report through t.Errorf if it happens.
+func FuzzHistogramInvariantsSurviveGarbage(f *testing.F) {
+	// Seeds: a valid histogram, the real pre-fix overflow output, the two
+	// structural failures found in round 5, and plain garbage.
+	seeds := []string{
+		`# TYPE h histogram
+h_bucket{endpoint="a",le="0.5"} 3
+h_bucket{endpoint="a",le="1"} 7
+h_bucket{endpoint="a",le="+Inf"} 9
+h_sum{endpoint="a"} 7.1
+h_count{endpoint="a"} 9
+`,
+		// The actual bug, verbatim in shape.
+		`# TYPE h histogram
+h_bucket{endpoint="__overflow__",le="0.25"} 0
+h_bucket{endpoint="__overflow__",le="45"} 0
+h_bucket{endpoint="__overflow__",le="+Inf"} 11
+h_sum{endpoint="__overflow__"} 0.11
+h_count{endpoint="__overflow__"} 11
+`,
+		`# TYPE h histogram
+h_bucket{le="+Inf"} 1
+`,
+		`# TYPE h histogram
+h_bucket{endpoint="a",le="1"} 5
+h_bucket{endpoint="a",le="+Inf"} 5
+h_count{endpoint="a"} 9
+`,
+		"",
+		"not exposition at all\n",
+		`h_bucket{le=} 1`,
+		`h_bucket{endpoint="a",le="NaN"} 3`,
+		`h_bucket{endpoint="a",le="+Inf"} 1e400`,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, body string) {
+		// A parser failure is a legitimate outcome for garbage, and the guard
+		// never runs on it. The property under test is that this returns
+		// promptly without panicking.
+		series, err := parseExposition(body)
+		if err != nil {
+			return
+		}
+		violations := checkHistogramInvariants(series)
+
+		// Every reported violation must be non-empty and must name the series
+		// it is about. A violation string that is empty or unanchored would
+		// indicate the checker emitted something unusable, which a caller
+		// logging it would have no way to act on.
+		for _, v := range violations {
+			if strings.TrimSpace(v) == "" {
+				t.Fatalf("empty violation string for input %q", body)
+			}
+		}
+	})
 }
