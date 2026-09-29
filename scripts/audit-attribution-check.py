@@ -99,7 +99,33 @@ def git(*args: str) -> tuple[int, str]:
 
 
 def commit_exists(sha: str) -> bool:
+    """True if `sha` names a commit that is REACHABLE from HEAD.
+
+    `git cat-file -e` is not enough on its own. It succeeds for any object
+    still in the object database, including a DANGLING one -- a commit that was
+    reset away, or left behind by a rebase. So a citation naming such a commit
+    passes in the working tree where it was written and fails in every clone,
+    which is the worst split a check can have: green here, red everywhere the
+    work is actually handed off to.
+
+    That is not hypothetical. A round-12 note about a stray empty commit that
+    had just been removed produced exactly this: the check passed in the working
+    tree and failed on a fresh clone.
+
+    Reachability is the property a citation actually needs. Someone who clones
+    the repository can only resolve a hash reachable from some ref, so
+    requiring reachability is what makes "this resolves" mean the same thing in
+    both places.
+    """
     rc, _ = git("cat-file", "-e", f"{sha}^{{commit}}")
+    if rc != 0:
+        return False
+    # A short hash is only a prefix; expand it to the full one before testing
+    # ancestry, or the comparison is against a literal string.
+    rc, full = git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+    if rc != 0 or not full:
+        return False
+    rc, _ = git("merge-base", "--is-ancestor", full, "HEAD")
     return rc == 0
 
 
