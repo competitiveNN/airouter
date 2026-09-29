@@ -1602,3 +1602,88 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
   `go vet ./...` → no issues
   `go build ./...` → success
   `python3 scripts/validate-config.py` → OK: 4 profiles validated
+
+### Round 13 (2026-09-29) — the handoff had never actually been tested
+
+Round 12 proved the artifacts were *current*. It did not prove they were
+*usable*, and those are different claims. A bundle whose tip matches `HEAD` can
+still be unfetchable. A patch can apply cleanly and produce a tree that does not
+build. The recovery procedure had been verified by hand — once, in a session,
+against one specific commit. That is the weakest form of verification available:
+true of the commit it was run against and of no other, with nothing to notice
+when it stops being true.
+
+**1. `scripts/recovery-check.sh`.** Proves both artifacts recover, on demand, by
+actually doing it: it fetches the bundle into a throwaway repository, replays
+the patch with `git am --3way`, and asserts each recovered tree is byte-identical
+to the working tree. It then builds and tests the recovered tree and runs the
+audit self-tests inside it, so "it recovered" means "the recovered tree works",
+not "the files arrived". Trees are compared rather than commit hashes, because
+`git am` re-creates every commit and always will.
+
+Two exit codes matter. Exit 1 is a broken recovery. Exit 2 is "could not run" —
+no artifacts, no upstream ref — and the ordering is deliberate: "nothing
+unpushed" is checked *before* the artifacts are required, so a fully-pushed
+checkout exits 0 without being told it is missing files. Demanding artifacts
+first would report a clean tree as broken and push the next person towards
+committing the very artifacts that are meant to stay local.
+
+**2. The base is fetched by SHA, and the check asserts it did.** A clone of this
+repository's path tracks the local `master`, which already contains every
+unpushed commit. Replaying the patch onto that applies it on top of commits that
+are already present, reproduces nothing, and every assertion afterwards passes
+for the wrong reason. This is the third time that exact trap has cost time here.
+`recovery-check.sh` therefore takes the base from `refs/remotes/origin/master`
+and fetches it by SHA — and does not merely do so, it *asserts* the base is not
+`HEAD`, and asserts that the patch is rejected when replayed onto the wrong base.
+Both assertions are new in the attribution self-test too (case 5), so the
+guarantee is tested in the place that made the same mistake.
+
+**3. `scripts/recovery-check-selftest.sh`.** Twenty assertions, ten cases,
+against throwaway fixtures. Fixtures copy the whole `scripts/` directory rather
+than a hand-picked subset: `recovery-check.sh` runs the real self-tests in the
+recovered tree, so a fixture missing `fuzz-gate.sh` or a realistic
+`docs/audit.md` fails for reasons unrelated to recovery. A check that failed
+because the tree it was handed had nothing to check in is now reported as a
+*skip*, with the reason printed — but only for "nothing to check" failures.
+Anything that ran and failed is still a failure.
+
+Two negative controls, each asserted to have *applied* before its result is
+trusted, because a control that silently did nothing is a test that passes for
+the wrong reason:
+
+  - **Control A** removes both staleness detectors (the tree comparison and the
+    bundle-tip comparison) and requires a stale artifact to then pass with exit
+    0. Removing only one proves nothing: the other still catches it, which is
+    exactly what happened on the first attempt and looked like a control
+    failure. Verified to apply: the neutered copy is re-parsed with `bash -n`
+    before use, and both removals are grepped for.
+  - **Control B** removes the `--recovered` verification and requires the
+    re-hashed `git am` tree to then report that it cannot resolve the re-hashed
+    citations.
+
+Verified to fail: control A (19/20 before the second detector was also removed),
+control B (18/20 before the message assertion was corrected to the one the
+neutered path actually emits).
+
+**4. The count contract caught the count contract.** The attribution
+self-test's `EXPECTED_FULL` went 16 → 18 when the two base-discovery assertions
+were added, and the run reported `18 passed, 0 failed (full run: expected 16)` as
+a failure rather than quietly accepting a smaller number. That is the mechanism
+working as intended: a case that stops running changes the total, and the total is
+a claim, not a summary. Both expected values now carry the arithmetic that
+produces them, so the next person adding a case knows the number to update.
+
+Verification this round:
+
+  `go test -race -count=1 ./...` → 329 passed
+  `scripts/recovery-check.sh` → 15 passed, 0 failed (full, incl. build + tests)
+  `scripts/recovery-check.sh --quick` → 13 passed, 0 failed
+  `scripts/recovery-check-selftest.sh` → 20 passed, 0 failed
+  `scripts/audit-attribution-selftest.sh` → 18 passed, 0 failed (full: expected 18)
+  `scripts/audit-attribution-selftest.sh` in a fresh clone → 11 passed (reduced: expected 11)
+  `scripts/dist-freshness-selftest.sh` → 16 passed, 0 failed
+  `scripts/audit-drift-selftest.sh` → 11 passed, 0 failed
+  `scripts/fuzz-gate-selftest.sh` → 31 passed, 0 failed
+  Negative control on the new base assertion: `git fetch origin HEAD` instead of
+    the base SHA → the new assertions fail (15/18), naming the symptom exactly

@@ -55,7 +55,22 @@ set -uo pipefail
 # many assertions run when the environment IS complete. A case that starts
 # skipping for a new reason, or one that stops running, drops this count, and
 # the run reports it rather than quietly looking fine.
-EXPECTED_FULL=16
+#
+# The two cases that vary:
+#
+#   case 1    (1 assertion) runs only when this checkout has unpushed commits.
+#             A clone that already has them all skips it with a stated reason.
+#   cases 5-6 (7 assertions) run only when the generated patch is present.
+#             Cases 2, 2b, 3, 4 and 7 (10 assertions) need nothing but git.
+#
+#   full run  = 1 + 10 + 7 = 18
+#   clone run = 10 + 0     = 11
+#
+# The two leading assertions in case 5 are the base-discovery controls ("the
+# replay base is not HEAD" and "the wrong base is rejected"); they are counted
+# in the 7 above. If a case is moved out of the environment-dependent branch, or
+# one is added, this arithmetic is what goes stale, and the run reports it.
+EXPECTED_FULL=18
 EXPECTED_CLONE=11
 
 KEEP=0
@@ -282,6 +297,32 @@ else
   # present, reproduce nothing, and let the case pass for the wrong reason.
   git_q "$DST" fetch -q origin "$BASE_SHA"
   git_q "$DST" reset -q --hard FETCH_HEAD
+
+  # Assert the base is really the thing it claims to be, by SHA, and that it is
+  # NOT this checkout's HEAD. Fetching `origin` (the local path) would track the
+  # local master, which already contains every unpushed commit: the replay would
+  # then apply on top of commits that are already present, reproduce nothing,
+  # and every remaining assertion in this case would pass for the wrong reason.
+  # This is the third time that trap has cost time in this repository.
+  if [ "$(git_q "$DST" rev-parse HEAD)" = "$(git -C "$REPO" rev-parse HEAD)" ]; then
+    bad "the replay base is not HEAD ($BASE_SHA)"
+  else
+    ok "the replay base is origin/master by SHA, not this checkout's HEAD"
+  fi
+  # A negative control on that base: replayed onto HEAD, the patch is rejected
+  # outright. If it applied, the base above would be wrong and the case
+  # meaningless, so the failure is asserted rather than assumed.
+  WB="$TMPROOT/wrong-base"
+  git init -q "$WB"
+  git_q "$WB" fetch -q "$REPO" "$(git -C "$REPO" rev-parse HEAD)"
+  git_q "$WB" reset -q --hard FETCH_HEAD
+  if ( cd "$WB" && git -c user.email=t@t -c user.name=t am --3way -q "$PATCH" \
+        >/dev/null 2>&1 ); then
+    bad "the patch is rejected when the base is wrong (it applied onto HEAD)"
+  else
+    ok "the patch is rejected when the base is wrong"
+  fi
+
   # Replay the unpushed commits with git am: content preserved, hashes all new.
   ( cd "$DST" && git -c user.email=t@t -c user.name=t am --3way -q "$PATCH" \
       >/dev/null 2>&1 )

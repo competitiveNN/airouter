@@ -17,6 +17,39 @@ So the work is committed locally and **not** on the remote. These two files in
 `dist/` carry the commits that `origin/master` is missing, so nothing is lost
 if this checkout goes away.
 
+> **The work is local-only.** 41 commits ahead of `origin/master`, push
+> permission `false`. If you are reading this in a clone, you are looking at
+> `origin/master` and **not** at the work. The bundle and the patch below are
+> the only copies of it. Do not treat a fresh clone as the handoff.
+
+## Before you trust either file
+
+Both artifacts are **generated, untracked, and only as good as the last
+refresh**. A stale one is not obviously stale: it still exists, still passes
+`git bundle verify`, and carries a plausible set of commits — it just describes
+an older `HEAD`, so a handoff built from it silently omits everything since.
+
+Run both gates before relying on these files. Neither modifies them.
+
+```sh
+./scripts/dist-freshness-check.sh --verbose   # are they current w.r.t. HEAD?
+./scripts/recovery-check.sh                   # do they actually recover?
+```
+
+`dist-freshness-check.sh` compares the bundle tip, the patch's last commit and
+the patch's commit count against `HEAD`; it reports and never regenerates, so a
+broken generator stays visible instead of being papered over. `recovery-check.sh`
+goes further and proves it: it fetches the bundle into a throwaway repo, replays
+the patch with `git am --3way` onto the real upstream base, asserts both
+recovered trees are byte-identical to this one, and builds and tests the result.
+Use `--quick` to skip the build.
+
+If either reports stale, regenerate first:
+
+```sh
+./scripts/export-unpushed.sh
+```
+
 ## Files
 
 | File | What it is |
@@ -29,6 +62,12 @@ Regenerate both with:
 ```sh
 ./scripts/export-unpushed.sh
 ```
+
+> Applying the patch needs the true upstream base. A clone of this
+> repository's *path* tracks the local `master`, which already contains these
+> commits — replaying onto that applies on top of commits that are already
+> present and reproduces nothing. Use a fresh clone of the GitHub URL, as
+> above.
 
 ## Applying the bundle (preferred — keeps authors and messages)
 
