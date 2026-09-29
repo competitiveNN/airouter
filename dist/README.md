@@ -102,6 +102,8 @@ The unpushed commits, oldest first:
 - `c40f0eb` docs: refresh dist/README for the unpushed commits
 - `ba4a6c4` docs: note that the unpushed count in dist/README is self-referential
 - `119e998` Fuzz the target's own package: the recursive gate could never have worked
+- `c941f23` docs: refresh dist/README for the fuzz-gate package fix
+- `5437846` Test the gate in the layout that hid its bugs
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
@@ -131,9 +133,23 @@ count comparison where a set diff was needed). It is the third commit in a row
 whose findings are all in the gate rather than in the code, and each one was
 only found by running the gate in the configuration it was written for.
 
+`5437846` removes that excuse rather than repeating it. `scripts/audit-drift-check.py`
+had the same root-only glob the fuzz gate had, and it reported a symbol that had
+merely moved to a subdirectory as "no longer exists" — with a remediation (add it
+to the ALLOWLIST) that is both wrong and permanent. It now walks recursively.
+`scripts/fuzz-gate-selftest.sh` goes further: it builds throwaway two-package
+repositories and asserts the gate's behaviour in them, so the one condition that
+hid four consecutive rounds of gate defects is reproduced on every CI run. It is
+verified to fail when each of those defects is reintroduced, so a pass is
+evidence rather than an absence of output.
+
 ## Verification
 
-Both artifacts were checked, not just written: the bundle was fetched into a
-fresh clone and the patch was applied with `git am --3way` onto the commit
-`origin/master` points at. Both produce a tree that builds and passes the full
-test suite (`go build ./...`, `go test -count=1 ./...`).
+Both artifacts were checked, not just written. The bundle was fetched into a
+fresh clone and its tip compared against `HEAD`; the patch was applied with
+`git am --3way` onto the commit `origin/master` points at and the resulting tree
+compared against `HEAD`'s. (`git am` re-creates each commit, so the resulting
+commits have different hashes — the trees are what must match, and they do.)
+The recovered tree builds, and the full test suite passes there:
+
+    go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh
