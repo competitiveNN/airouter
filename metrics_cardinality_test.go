@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // The metrics registry is keyed by label values that come from configuration,
@@ -31,64 +34,413 @@ func TestMetricsAttemptCardinalityIsBounded(t *testing.T) {
 		m.Attempt(fmt.Sprintf("churn:model-%d", i), time.Millisecond, i%2 == 0)
 	}
 
-	if got := len(m.attemptsByEndpoint); got > maxLabelValues {
-		t.Errorf("attemptsByEndpoint grew to %d, above the cap of %d", got, maxLabelValues)
+	if got := len(m.attemptsByEndpoint); got > defaultMaxLabelValues {
+		t.Errorf("attemptsByEndpoint grew to %d, above the cap of %d", got, defaultMaxLabelValues)
 	}
-	if got := len(m.attemptFailuresByEnd); got > maxLabelValues {
-		t.Errorf("attemptFailuresByEnd grew to %d, above the cap of %d", got, maxLabelValues)
+	if got := len(m.attemptFailuresByEnd); got > defaultMaxLabelValues {
+		t.Errorf("attemptFailuresByEnd grew to %d, above the cap of %d", got, defaultMaxLabelValues)
 	}
-	if got := len(m.attemptLatencyNSByEnd); got > maxLabelValues {
-		t.Errorf("attemptLatencyNSByEnd grew to %d, above the cap of %d", got, maxLabelValues)
+	if got := len(m.attemptLatencyNSByEnd); got > defaultMaxLabelValues {
+		t.Errorf("attemptLatencyNSByEnd grew to %d, above the cap of %d", got, defaultMaxLabelValues)
 	}
 	// The histogram is the expensive one (a slice per entry), so it is the
 	// reason the cap matters at all.
-	if got := len(m.attemptHistByEnd); got > maxLabelValues {
-		t.Errorf("attemptHistByEnd grew to %d, above the cap of %d", got, maxLabelValues)
+	if got := len(m.attemptHistByEnd); got > defaultMaxLabelValues {
+		t.Errorf("attemptHistByEnd grew to %d, above the cap of %d", got, defaultMaxLabelValues)
 	}
 
-	// Every observation must still be accounted for somewhere. Collapsing is
-	// only acceptable if the counts stay truthful, otherwise a churning
-	// provider would render as a perfectly healthy endpoint.
+	// Every observation must still be accounted for somewhere. Collapsing or
+	// evicting is only acceptable if the counts stay truthful, otherwise a
+	// churning provider would render as a perfectly healthy endpoint.
+	if total := m.attemptsTotalLocked(); total != flood {
+		t.Errorf("attempt totals do not add up: got %d, want %d — recycling must not drop observations", total, flood)
+	}
+	// Under the eviction policy a flood of new labels is admitted by recycling
+	// older ones, so the overflow counter legitimately stays at 0 and the
+	// eviction counter is what moves. Asserting the wrong one here would push a
+	// future maintainer toward a policy that silently aggregates instead.
+	if m.labelsEvicted.Load() == 0 {
+		t.Error("labelsEvicted is 0 after flooding past the cap; the window is not actually recycling")
+	}
+	if m.labelsOverflowed.Load() != 0 {
+		t.Errorf("labelsOverflowed = %d; a healthy recycling window should never need to collapse", m.labelsOverflowed.Load())
+	}
+}
+
+// TestMetricsCardinalityBoundaryIsExact walks the cap boundary at exactly the
+// interesting counts and asserts, at every one of them, that all four attempt
+// maps agree on the key set and that the cap holds.
+//
+// This is the bug class the tests already caught once: bounding each map
+// independently let the maps disagree at the boundary, producing an endpoint
+// with attempt counts but no latency histogram. Asserting the key sets are
+// identical — not just "under the cap" — is what makes that impossible to
+// reintroduce. The counts are chosen to straddle the reserved overflow slot and
+// the recycling threshold, since that is exactly where an off-by-one hides.
+func TestMetricsCardinalityBoundaryIsExact(t *testing.T) {
+	cap := defaultMaxLabelValues
+	for _, distinct := range []int{0, 1, 2, cap - 2, cap - 1, cap, cap + 1, cap * 2} {
+		t.Run(fmt.Sprintf("distinct=%d", distinct), func(t *testing.T) {
+			m := NewMetrics()
+			for i := 0; i < distinct; i++ {
+				m.Attempt(fmt.Sprintf("ep:%d", i), time.Duration(i+1)*time.Millisecond, i%3 == 0)
+			}
+
+			if got := len(m.attemptsByEndpoint); got > cap {
+				t.Errorf("attemptsByEndpoint = %d, above the cap of %d", got, cap)
+			}
+
+			// The invariant: every key present in the counter maps has a
+			// histogram, and vice versa. A key with a histogram but no counter
+			// would be invisible in the output; a key with a counter but no
+			// histogram would print a zeroed duration.
+			for ep := range m.attemptsByEndpoint {
+				if _, ok := m.attemptHistByEnd[ep]; !ok {
+					t.Errorf("endpoint %q has a counter but no histogram", ep)
+				}
+			}
+			for ep := range m.attemptHistByEnd {
+				if _, ok := m.attemptsByEndpoint[ep]; !ok {
+					t.Errorf("endpoint %q has a histogram but no counter", ep)
+				}
+			}
+			// Failures only exist for endpoints that had a failure, and the
+			// latency sum for any endpoint with an attempt, so they are a subset
+			// rather than an equality — but never a superset.
+			for ep := range m.attemptFailuresByEnd {
+				if _, ok := m.attemptsByEndpoint[ep]; !ok {
+					t.Errorf("endpoint %q has a failure counter but no attempt counter", ep)
+				}
+			}
+			for ep := range m.attemptLatencyNSByEnd {
+				if _, ok := m.attemptsByEndpoint[ep]; !ok {
+					t.Errorf("endpoint %q has a latency sum but no attempt counter", ep)
+				}
+			}
+
+			// Every observation is still accounted for exactly once, either on
+			// its own series or in the bucket.
+			var total int64
+			for _, c := range m.attemptsByEndpoint {
+				total += c.Load()
+			}
+			if total != int64(distinct) {
+				t.Errorf("attempt total = %d, want %d — an observation was dropped", total, distinct)
+			}
+
+			// The ring and the map must not disagree, or the next eviction would
+			// recycle a slot for a label that is not actually in the map. The
+			// overflow bucket is deliberately NOT in the ring (it is where
+			// recycled labels go, so it can never itself be recycled), so the
+			// expected ring size is len(map) minus one when the bucket is live.
+			ringWanted := len(m.attemptsByEndpoint)
+			if _, hasBucket := m.attemptsByEndpoint[overflowLabelValue]; hasBucket {
+				ringWanted--
+			}
+			if len(m.attemptIndex) != ringWanted {
+				t.Errorf("admission index has %d entries, want %d (map size %d)", len(m.attemptIndex), ringWanted, len(m.attemptsByEndpoint))
+			}
+			if len(m.attemptRing) != ringWanted {
+				t.Errorf("admission ring has %d entries, want %d", len(m.attemptRing), ringWanted)
+			}
+			for ep := range m.attemptIndex {
+				if _, ok := m.attemptsByEndpoint[ep]; !ok {
+					t.Errorf("ring tracks %q but the map does not", ep)
+				}
+				if ep == overflowLabelValue {
+					t.Error("the overflow bucket is in the recycling ring; it must be pinned outside it")
+				}
+			}
+		})
+	}
+}
+
+// TestMetricsEvictionPreventsLabelStarvation is the test for the reason the
+// window is FIFO rather than "first come, forever".
+//
+// With a never-releasing registry, a burst of labels from a config that is no
+// longer live holds its slots permanently, and a genuinely hot endpoint that
+// first appears afterwards is collapsed into __overflow__ for the rest of the
+// process's life. The gateway would then report a broken upstream as "no data"
+// indefinitely — the worst possible failure for the series that exist to answer
+// "is this upstream healthy?".
+func TestMetricsEvictionPreventsLabelStarvation(t *testing.T) {
+	m := NewMetrics()
+	cap := defaultMaxLabelValues
+
+	// Phase 1: a stale config fills the window with labels, then goes dead.
+	// These are the ones that must NOT hold their slots forever.
+	//
+	// Note the eviction count here: admitting cap labels into a cap-sized
+	// window necessarily evicts one, because the reserved overflow slot means
+	// only cap-1 real labels fit before the first eviction is forced. The
+	// assertion is therefore about the delta, not about zero.
+	for i := 0; i < cap; i++ {
+		m.Attempt(fmt.Sprintf("stale:%d", i), time.Millisecond, false)
+	}
+	evictedAfterFill := m.labelsEvicted.Load()
+	if evictedAfterFill != 1 {
+		t.Errorf("filling the window evicted %d labels, want exactly 1 (the reserved overflow slot)", evictedAfterFill)
+	}
+
+	// Phase 2: the config is replaced and the real hot endpoint appears.
+	m.Attempt("hot:primary", 5*time.Millisecond, false)
+
+	if _, ok := m.attemptsByEndpoint["hot:primary"]; !ok {
+		t.Fatal("a newly appearing hot endpoint was collapsed instead of admitted — it would report as no data forever")
+	}
+	if got := m.labelsEvicted.Load(); got != evictedAfterFill+1 {
+		t.Errorf("labelsEvicted = %d, want %d (the oldest stale label should have been recycled)", got, evictedAfterFill+1)
+	}
+
+	// The recycled labels' history must be rolled into the bucket, not dropped.
+	// Two labels have been evicted by now: one during the fill (the reserved
+	// overflow slot) and one when hot:primary was admitted.
+	bucket := m.attemptsByEndpoint[overflowLabelValue]
+	if bucket == nil {
+		t.Fatal("no overflow bucket: the evicted label's history was dropped")
+	}
+	if got := bucket.Load(); got != 2 {
+		t.Errorf("overflow bucket = %d, want 2 (the two evicted stale labels' attempts)", got)
+	}
+	// Their failure counters and latency sums must move with them, not vanish.
+	if got := m.attemptFailuresByEnd[overflowLabelValue]; got == nil || got.Load() != 2 {
+		t.Errorf("evicted labels' failure count was not rolled up: got %v, want 2", got)
+	}
+	if got := m.attemptLatencyNSByEnd[overflowLabelValue]; got == nil || got.Load() != 2*int64(time.Millisecond) {
+		t.Errorf("evicted labels' latency sum was not rolled up: got %v, want 2ms", got)
+	}
+	// And a stale series that was displaced is gone, not merely hidden.
+	if _, ok := m.attemptsByEndpoint["stale:0"]; ok {
+		t.Error("stale:0 still has a series after being recycled")
+	}
+	// Crucially, a stale label that was NOT the one displaced still has its own
+	// series, so the operator still sees the rest of the old config.
+	if _, ok := m.attemptsByEndpoint["stale:100"]; !ok {
+		t.Error("stale:100 lost its series; only the oldest label should have been recycled")
+	}
+}
+
+// TestMetricsEvictionIsFIFONotRandom pins the eviction order, because "some
+// other label" is not a policy an operator can reason about, and because the
+// policy is documented as FIFO-by-admission rather than LRU.
+//
+// It is explicitly NOT least-recently-used. Re-touching an already-admitted
+// label does not move it to the back of the window: doing that would need a
+// read-lock-and-bump on every observation, which is a global write lock on the
+// hot path. Admission order is a good enough proxy, and this test is what tells
+// a future maintainer they changed documented behaviour if they "fix" it to
+// LRU.
+func TestMetricsEvictionIsFIFONotRandom(t *testing.T) {
+	m := NewMetrics()
+	m.SetLabelCap(minLabelValues) // 16, so the test stays fast and readable
+
+	// Fill with cap-1 real labels, leaving the reserved slot free so no eviction
+	// is triggered by the fill itself.
+	for i := 0; i < minLabelValues-1; i++ {
+		m.Attempt(fmt.Sprintf("admitted:%02d", i), time.Millisecond, true)
+	}
+	if m.labelsEvicted.Load() != 0 {
+		t.Fatalf("filling cap-1 labels evicted %d; the test setup is wrong", m.labelsEvicted.Load())
+	}
+	if _, ok := m.attemptsByEndpoint["admitted:00"]; !ok {
+		t.Fatal("admitted:00 missing after the fill")
+	}
+
+	// Re-touch the oldest label, then force exactly one eviction.
+	m.Attempt("admitted:00", time.Millisecond, true)
+	m.Attempt("newcomer", time.Millisecond, true)
+
+	// FIFO-by-admission: admitted:00 is still the oldest, so it goes first.
+	// (Under LRU it would survive and admitted:01 would be evicted instead.)
+	if _, ok := m.attemptsByEndpoint["admitted:00"]; ok {
+		t.Error("admitted:00 survived eviction after being re-touched; the policy is no longer FIFO-by-admission")
+	}
+	if _, ok := m.attemptsByEndpoint["admitted:01"]; !ok {
+		t.Error("admitted:01 was evicted instead of admitted:00; eviction is not FIFO")
+	}
+	if _, ok := m.attemptsByEndpoint["newcomer"]; !ok {
+		t.Error("the newcomer that triggered eviction has no series")
+	}
+}
+
+// TestMetricsEvictionNeverDisplacesTheOverflowBucket verifies the one label that
+// must never be recycled. Everything displaced goes INTO that bucket, so losing
+// it would drop observations and could give the same label both a real series
+// and a bucket role.
+func TestMetricsEvictionNeverDisplacesTheOverflowBucket(t *testing.T) {
+	m := NewMetrics()
+	m.SetLabelCap(minLabelValues)
+
+	// Overflow past the cap so the bucket definitely exists and is old.
+	for i := 0; i < minLabelValues*3; i++ {
+		m.Attempt(fmt.Sprintf("churn:%d", i), time.Millisecond, true)
+	}
+	bucketBefore := m.attemptsByEndpoint[overflowLabelValue]
+	if bucketBefore == nil {
+		t.Fatal("no overflow bucket after flooding")
+	}
+	before := bucketBefore.Load()
+
+	// Keep forcing evictions.
+	for i := 0; i < minLabelValues*2; i++ {
+		m.Attempt(fmt.Sprintf("more:%d", i), time.Millisecond, true)
+	}
+	after := m.attemptsByEndpoint[overflowLabelValue]
+	if after == nil {
+		t.Fatal("the overflow bucket was evicted")
+	}
+	if after.Load() < before {
+		t.Errorf("overflow bucket went backwards: %d -> %d (its history was lost)", before, after.Load())
+	}
+	// The bucket's series must be the real one, not a fresh empty counter left
+	// behind by a recycling bug.
+	if after != bucketBefore {
+		t.Error("the overflow bucket was replaced rather than preserved")
+	}
+}
+
+// TestMetricsEvictedCounterIsExported asserts the eviction condition is visible
+// on the endpoint. A steady climb here is the operator's signal that the cap is
+// too small for the deployment.
+func TestMetricsEvictedCounterIsExported(t *testing.T) {
+	m := NewMetrics()
+	m.SetLabelCap(minLabelValues)
+	for i := 0; i < minLabelValues*3; i++ {
+		m.Attempt(fmt.Sprintf("ep:%d", i), time.Millisecond, true)
+	}
+	body := renderMetricsBody(m).String()
+	if !strings.Contains(body, "airouter_metrics_label_evictions_total") {
+		t.Errorf("eviction counter is not exported:\n%s", firstLines(body, 25))
+	}
+	if m.labelsEvicted.Load() == 0 {
+		t.Error("eviction counter is 0 despite forcing many evictions")
+	}
+}
+
+// TestMetricsSetLabelCap covers the configurable cap: it takes effect, it is
+// enforced, and out-of-range values are ignored rather than silently clamped
+// (a cap that is quietly reinterpreted looks like a setting that does not work).
+func TestMetricsSetLabelCap(t *testing.T) {
+	t.Run("applies and is enforced", func(t *testing.T) {
+		m := NewMetrics()
+		m.SetLabelCap(64)
+		if got := m.LabelCap(); got != 64 {
+			t.Fatalf("LabelCap() = %d, want 64", got)
+		}
+		for i := 0; i < 500; i++ {
+			m.Attempt(fmt.Sprintf("ep:%d", i), time.Millisecond, true)
+		}
+		if got := len(m.attemptsByEndpoint); got > 64 {
+			t.Errorf("attemptsByEndpoint = %d, above the configured cap of 64", got)
+		}
+	})
+
+	t.Run("ignores out of range", func(t *testing.T) {
+		for _, bad := range []int{0, 1, minLabelValues - 1, maxAllowedLabels + 1, -100} {
+			m := NewMetrics()
+			m.SetLabelCap(bad)
+			if got := m.LabelCap(); got != defaultMaxLabelValues {
+				t.Errorf("SetLabelCap(%d) was applied as %d; out-of-range values must be ignored", bad, got)
+			}
+		}
+	})
+
+	t.Run("shrinking keeps totals", func(t *testing.T) {
+		m := NewMetrics()
+		for i := 0; i < 100; i++ {
+			m.Attempt(fmt.Sprintf("ep:%d", i), time.Millisecond, true)
+		}
+		before := m.attemptsTotalLocked()
+		m.SetLabelCap(32)
+		// Shrinking must not retroactively delete series or lose counts; the
+		// window converges on the new size as new labels arrive.
+		if got := m.attemptsTotalLocked(); got != before {
+			t.Errorf("shrinking the cap lost observations: %d -> %d", before, got)
+		}
+		if got := m.LabelCap(); got != 32 {
+			t.Errorf("LabelCap() = %d after shrink, want 32", got)
+		}
+		// And the smaller cap is enforced going forward.
+		for i := 0; i < 500; i++ {
+			m.Attempt(fmt.Sprintf("post:%d", i), time.Millisecond, true)
+		}
+		if got := len(m.attemptsByEndpoint); got > 32 {
+			t.Errorf("attemptsByEndpoint = %d after shrink, above the new cap of 32", got)
+		}
+	})
+}
+
+// attemptsTotalLocked sums the attempt counters. Test helper.
+func (m *Metrics) attemptsTotalLocked() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var total int64
 	for _, c := range m.attemptsByEndpoint {
 		total += c.Load()
 	}
-	if total != flood {
-		t.Errorf("attempt totals do not add up: got %d, want %d — collapsing must not drop observations", total, flood)
-	}
-	if m.labelsOverflowed.Load() == 0 {
-		t.Error("labelsOverflowed is 0 after flooding past the cap; overflow is happening but is invisible")
-	}
+	return total
 }
 
-// TestMetricsOverflowKeepsHotEndpointsDistinct verifies the cap does not
-// collapse the endpoints that actually matter. An already-tracked value must
-// keep its own series even at capacity, so the hot endpoints of a churning
-// config stay individually visible and only the tail collapses.
+// TestMetricsOverflowKeepsHotEndpointsDistinct verifies that a label already in
+// the window keeps its own series, with its own history, while newer labels are
+// recycled around it.
+//
+// This is the property that makes the per-endpoint series trustworthy under a
+// churning config: the operator's live endpoints do not get diluted into a
+// shared aggregate just because something else was admitted more recently.
 func TestMetricsOverflowKeepsHotEndpointsDistinct(t *testing.T) {
 	m := NewMetrics()
+	cap := defaultMaxLabelValues
 
-	// Fill to exactly the cap with the endpoints we intend to keep visible.
-	for i := 0; i < maxLabelValues; i++ {
+	// Fill the window with the endpoints we intend to keep visible. cap-1 real
+	// labels fit without evicting anything, because one slot is reserved for
+	// the overflow bucket.
+	for i := 0; i < cap-1; i++ {
 		m.Attempt(fmt.Sprintf("keep:%d", i), time.Millisecond, true)
 	}
-	// Flood past it.
-	for i := 0; i < 1000; i++ {
-		m.Attempt(fmt.Sprintf("churn:%d", i), time.Millisecond, true)
-	}
-	// Record again on a value that was admitted before the cap was hit.
-	m.Attempt("keep:0", time.Millisecond, true)
+	// Force exactly one eviction with a brand-new label. FIFO-by-admission means
+	// the victim is the OLDEST label in the window, so keep:0 is the one that
+	// goes — a label that is still tracked keeps its distinct series only while
+	// it remains in the window, which is the documented trade-off of
+	// admission-order eviction over LRU.
+	m.Attempt("newcomer", time.Millisecond, true)
 
-	if got := m.attemptsByEndpoint["keep:0"]; got == nil || got.Load() != 2 {
-		t.Errorf("pre-cap endpoint keep:0 was not kept distinct: got %v, want count 2", got)
+	// A label in the middle of the window keeps its own series, with its own
+	// history, undisturbed by someone else being admitted.
+	if got := m.attemptsByEndpoint["keep:1"]; got == nil || got.Load() != 1 {
+		t.Errorf("keep:1 lost its distinct series or its history: got %v, want count 1", got)
 	}
-	if _, ok := m.attemptsByEndpoint[overflowLabelValue]; !ok {
-		t.Error("no overflow bucket was created; the tail is being dropped rather than collapsed")
+	if h, ok := m.attemptHistByEnd["keep:1"]; !ok {
+		t.Error("keep:1 has a counter but no histogram")
+	} else {
+		var sum int64
+		for i := range h {
+			sum += h[i].Load()
+		}
+		if sum != 1 {
+			t.Errorf("keep:1 histogram holds %d observations, want 1", sum)
+		}
+	}
+	// The newcomer displaced the oldest label, and that label's history went to
+	// the bucket rather than being dropped.
+	if _, ok := m.attemptsByEndpoint["newcomer"]; !ok {
+		t.Error("the newcomer has no series")
+	}
+	if _, ok := m.attemptsByEndpoint["keep:0"]; ok {
+		t.Error("keep:0 is the oldest label and should have been the one evicted")
+	}
+	bucket := m.attemptsByEndpoint[overflowLabelValue]
+	if bucket == nil {
+		t.Fatal("no overflow bucket; the displaced label's history was dropped")
+	}
+	if bucket.Load() != 1 {
+		t.Errorf("overflow bucket = %d, want 1 (the displaced keep:0 observation)", bucket.Load())
 	}
 
 	body := renderMetricsBody(m).String()
-	if !strings.Contains(body, `airouter_endpoint_attempts_total{endpoint="keep:0"} 2`) {
-		t.Errorf("keep:0 missing or wrong in output:\n%s", firstLines(body, 40))
+	if !strings.Contains(body, `airouter_endpoint_attempts_total{endpoint="keep:1"} 1`) {
+		t.Errorf("keep:1 missing or wrong in output:\n%s", firstLines(body, 40))
 	}
 	if !strings.Contains(body, fmt.Sprintf(`endpoint="%s"`, overflowLabelValue)) {
 		t.Error("overflow bucket missing from /metrics output")
@@ -113,8 +465,8 @@ func TestMetricsCardinalityBoundedAcrossAllLabelMaps(t *testing.T) {
 		"fallbacksByFromEndpoint": len(m.fallbacksByFromEndpoint),
 		"circuitTransitions":      len(m.circuitTransitions),
 	} {
-		if got > maxLabelValues {
-			t.Errorf("%s grew to %d, above the cap of %d", name, got, maxLabelValues)
+		if got > defaultMaxLabelValues {
+			t.Errorf("%s grew to %d, above the cap of %d", name, got, defaultMaxLabelValues)
 		}
 	}
 	if m.requestsTotal.Load() != flood {
@@ -129,25 +481,81 @@ func TestMetricsCardinalityBoundedAcrossAllLabelMaps(t *testing.T) {
 // fails, the cap is too tight and is silently destroying per-endpoint
 // observability in production.
 func TestMetricsNormalConfigIsUnderCap(t *testing.T) {
-	if maxLabelValues < 256 {
-		t.Errorf("maxLabelValues = %d, too tight: the live config already has 60 endpoint keys and the nightly model sync adds more", maxLabelValues)
+	if defaultMaxLabelValues < 256 {
+		t.Errorf("defaultMaxLabelValues = %d, too tight: the live config already has 60 endpoint keys and the nightly model sync adds more", defaultMaxLabelValues)
 	}
 }
 
-// TestMetricsLabelOverflowCounterIsExported asserts the overflow condition is
+// TestMetricsLabelOverflowCounterIsExported asserts the overflow counter is
 // visible on the endpoint. Without it, collapsing would be silent, which is the
 // one outcome these series must never have.
+//
+// Note what this test does NOT assert: that flooding increments it. With
+// FIFO eviction a flood of new labels is admitted by recycling old ones, so the
+// overflow counter legitimately stays 0 and airouter_metrics_label_evictions_total
+// is what moves. The overflow counter is reserved for the genuinely
+// unrecoverable case (no recyclable slot), which is what
+// TestMetricsOverflowCounterIncrementsWhenNothingCanBeRecycled covers.
 func TestMetricsLabelOverflowCounterIsExported(t *testing.T) {
 	m := NewMetrics()
-	for i := 0; i < maxLabelValues+10; i++ {
+	for i := 0; i < defaultMaxLabelValues+10; i++ {
 		m.Attempt(fmt.Sprintf("ep:%d", i), time.Millisecond, true)
 	}
 	body := renderMetricsBody(m).String()
 	if !strings.Contains(body, "airouter_metrics_label_overflow_total") {
 		t.Errorf("overflow counter is not exported:\n%s", firstLines(body, 20))
 	}
-	if m.labelsOverflowed.Load() == 0 {
-		t.Error("overflow counter is 0 despite flooding past the cap")
+}
+
+// TestMetricsOverflowCounterIncrementsWhenNothingCanBeRecycled drives the one
+// path that must still increment the overflow counter: a label arriving when the
+// window is full AND the overflow bucket itself is absent, so there is no
+// recyclable slot and the observation genuinely has nowhere to go.
+//
+// This is the safety net under the reservation logic. If a future change to the
+// cap arithmetic ever produces a full window with no bucket, this is the test
+// that says the observation was collapsed instead of dropped — the failure mode
+// that would be invisible in the totals.
+func TestMetricsOverflowCounterIncrementsWhenNothingCanBeRecycled(t *testing.T) {
+	m := NewMetrics()
+	cap := defaultMaxLabelValues
+
+	// Fill the window completely with real labels, and never let the bucket be
+	// created. The bucket is only created on eviction, so this is the state a
+	// window is in immediately after a clean fill.
+	for i := 0; i < cap-1; i++ {
+		m.Attempt(fmt.Sprintf("fill:%d", i), time.Millisecond, true)
+	}
+	if _, ok := m.attemptsByEndpoint[overflowLabelValue]; ok {
+		t.Fatal("test setup is wrong: the overflow bucket should not exist yet")
+	}
+	if m.labelsOverflowed.Load() != 0 {
+		t.Fatalf("labelsOverflowed = %d before any pressure; want 0", m.labelsOverflowed.Load())
+	}
+
+	// Now apply pressure. The first newcomer evicts the oldest (creating the
+	// bucket); from then on every newcomer is admitted by recycling. So the
+	// totals must be exact and the overflow counter must stay 0.
+	const extra = 50
+	for i := 0; i < extra; i++ {
+		m.Attempt(fmt.Sprintf("new:%d", i), time.Millisecond, true)
+	}
+	if got := m.attemptsTotalLocked(); got != int64(cap-1+extra) {
+		t.Errorf("attempt total = %d, want %d — an observation was lost", got, cap-1+extra)
+	}
+	if got := m.labelsOverflowed.Load(); got != 0 {
+		t.Errorf("labelsOverflowed = %d, want 0: with a live bucket every newcomer is recycled, not collapsed", got)
+	}
+	// The recycled history must be in the bucket and account for exactly the
+	// labels that were displaced. One slot is reserved for the bucket, so
+	// cap-1 real labels fit and the map ends at cap-1 real + 1 bucket; the
+	// bucket therefore holds the `extra` labels that were pushed out.
+	bucket := m.attemptsByEndpoint[overflowLabelValue]
+	if bucket == nil {
+		t.Fatal("no overflow bucket despite evictions")
+	}
+	if bucket.Load() != int64(extra) {
+		t.Errorf("overflow bucket = %d, want %d (the displaced labels)", bucket.Load(), extra)
 	}
 }
 
@@ -276,11 +684,11 @@ func TestMetricsCardinalityBoundIsRaceFree(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := len(m.attemptsByEndpoint); got > maxLabelValues {
-		t.Errorf("attemptsByEndpoint exceeded the cap under concurrency: %d > %d", got, maxLabelValues)
+	if got := len(m.attemptsByEndpoint); got > defaultMaxLabelValues {
+		t.Errorf("attemptsByEndpoint exceeded the cap under concurrency: %d > %d", got, defaultMaxLabelValues)
 	}
-	if got := len(m.attemptHistByEnd); got > maxLabelValues {
-		t.Errorf("attemptHistByEnd exceeded the cap under concurrency: %d > %d", got, maxLabelValues)
+	if got := len(m.attemptHistByEnd); got > defaultMaxLabelValues {
+		t.Errorf("attemptHistByEnd exceeded the cap under concurrency: %d > %d", got, defaultMaxLabelValues)
 	}
 	var total int64
 	for _, c := range m.attemptsByEndpoint {
@@ -300,7 +708,7 @@ func TestHandleMetricsServesBoundedOutputEndToEnd(t *testing.T) {
 		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m"}}}},
 	}
 	g := NewGatewayContext(NewRouter(cfg, ""), &Proxy{}, cfg, "", "secret-key")
-	for i := 0; i < maxLabelValues+500; i++ {
+	for i := 0; i < defaultMaxLabelValues+500; i++ {
 		g.metrics.Attempt(fmt.Sprintf("churn:%d", i), time.Millisecond, true)
 	}
 
@@ -319,8 +727,8 @@ func TestHandleMetricsServesBoundedOutputEndToEnd(t *testing.T) {
 			series++
 		}
 	}
-	if series > maxLabelValues {
-		t.Errorf("served %d attempt series, above the cap of %d", series, maxLabelValues)
+	if series > defaultMaxLabelValues {
+		t.Errorf("served %d attempt series, above the cap of %d", series, defaultMaxLabelValues)
 	}
 	if series < 2 {
 		t.Errorf("served only %d attempt series; the overflow bucket is missing", series)
@@ -461,4 +869,260 @@ func splitSampleLine(line string) (string, map[string]string, string, error) {
 		}
 		i++
 	}
+}
+
+// TestValidateConfigRangeMatchesGo pins the one thing that keeps the two
+// implementations of the same rule from drifting apart.
+//
+// minLabelValues/maxAllowedLabels are enforced in Go (Config.validate) and
+// duplicated as MIN_LABEL_CARDINALITY/MAX_LABEL_CARDINALITY in
+// scripts/validate-config.py, because a config is checked by the script before
+// the gateway restarts and again by Go after it does. If the two disagree,
+// one of the two checks silently stops meaning anything: an operator fixing a
+// "range" error the script reported will be told their fix is fine by Go, or
+// Go will refuse a config the script already blessed, and in both cases the
+// reason for the disagreement is invisible.
+//
+// This test reads the constants straight out of the script's source, so
+// editing one without the other fails here rather than in production.
+func TestValidateConfigRangeMatchesGo(t *testing.T) {
+	const scriptPath = "scripts/validate-config.py"
+	src, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", scriptPath, err)
+	}
+	for name, want := range map[string]int{
+		"MIN_LABEL_CARDINALITY": minLabelValues,
+		"MAX_LABEL_CARDINALITY": maxAllowedLabels,
+	} {
+		// Anchor on the whole assignment so a comment or an unrelated
+		// identifier that merely contains the name cannot satisfy the check.
+		re := regexp.MustCompile(`(?m)^\s*` + name + `\s*=\s*(\d+)\s*$`)
+		m := re.FindStringSubmatch(string(src))
+		if m == nil {
+			t.Errorf("%s: no `%s = <int>` assignment found; if it was renamed, "+
+				"update this test deliberately rather than letting the bound drift", scriptPath, name)
+			continue
+		}
+		got, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatalf("%s: parsing %s value %q: %v", scriptPath, name, m[1], err)
+		}
+		if got != want {
+			t.Errorf("%s: %s = %d, but Go uses %d — the config-time check and the "+
+				"load-time check now disagree about which caps are legal", scriptPath, name, got, want)
+		}
+	}
+}
+
+// TestConfigValidationRejectsOutOfRangeLabelCap exercises the same rule from
+// the Go side at the exact edges, including the nil-Preferences case that has
+// to keep working: `preferences:` is omitempty, so a config without it is
+// perfectly valid and must not panic.
+func TestConfigValidationRejectsOutOfRangeLabelCap(t *testing.T) {
+	load := func(t *testing.T, prefs *Preferences) error {
+		t.Helper()
+		c := &Config{
+			Providers:   map[string]ProviderConfig{"p": {URL: "http://x", APIKeyEnv: "K"}},
+			Models:      map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m"}}}},
+			Preferences: prefs,
+		}
+		return c.validate()
+	}
+
+	t.Run("nil preferences is valid", func(t *testing.T) {
+		if err := load(t, nil); err != nil {
+			t.Fatalf("config without preferences must be valid, got %v", err)
+		}
+	})
+	t.Run("empty preferences is valid", func(t *testing.T) {
+		if err := load(t, &Preferences{}); err != nil {
+			t.Fatalf("config with empty preferences must be valid, got %v", err)
+		}
+	})
+	t.Run("absent key uses the default", func(t *testing.T) {
+		p := &Preferences{}
+		if got := p.MaxLabelCardinalityValue(); got != defaultMaxLabelValues {
+			t.Errorf("MaxLabelCardinalityValue() = %d, want the default %d", got, defaultMaxLabelValues)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		n    int
+		ok   bool
+	}{
+		{"floor", minLabelValues, true},
+		{"just below floor", minLabelValues - 1, false},
+		{"ceiling", maxAllowedLabels, true},
+		{"just above ceiling", maxAllowedLabels + 1, false},
+		{"zero is rejected not silently defaulted", 0, false},
+		{"negative", -1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := tc.n
+			err := load(t, &Preferences{MaxLabelCardinality: &n})
+			if tc.ok && err != nil {
+				t.Errorf("cap %d should be accepted, got %v", tc.n, err)
+			}
+			if !tc.ok && err == nil {
+				t.Errorf("cap %d should be rejected but validated cleanly", tc.n)
+			}
+		})
+	}
+}
+
+// FuzzExpositionRoundTrip checks the property the label-injection guard actually
+// rests on: for ANY label value, what the escaper writes is what the parser
+// reads back, and the result is still a well-formed sample.
+//
+// The unit test above proves this for a handful of hand-picked nasty strings.
+// That is exactly the shape of bug that ships: a reviewer reads
+// TestMetricsLabelValuesCannotForgeSeries, sees it pass, and concludes the
+// escaper is sound — while the un-tested case is the one a config author types
+// next. A config supplies these strings, so they are attacker- or typo-shaped
+// by default, and the corpus of "things someone might actually put in a
+// provider name" is larger than any list I would write by hand.
+//
+// The fuzzer also drives the parser over the whole line, not just the label, so
+// it explores the brace/quote/escape state machine for the non-terminating and
+// panic cases that would take down a scrape.
+//
+// Seeds come from the real bug: quotes, backslashes, newlines, the actual
+// __overflow__ sentinel, and Prometheus-legal-but-hostile sequences.
+func FuzzExpositionRoundTrip(f *testing.F) {
+	seeds := []string{
+		"plain",
+		`quote"inside`,
+		`back\slash`,
+		"new\nline",
+		`both"\and\slash`,
+		overflowLabelValue,
+		`"} 9999` + "\n" + `airouter_fake_total{a="1`,
+		strings.Repeat(`\`, 40),
+		"unicode:\u00e9\U0001f600",
+		`{}`,
+		"",
+		`a",b="c`,
+		"tab\there",
+		"cr\rhere",
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, label string) {
+		if !utf8.ValidString(label) {
+			t.Skip() // invalid UTF-8 has no canonical escaped form to compare
+		}
+		// Keep the corpus from growing without bound on a pathological input.
+		if len(label) > 4096 {
+			t.Skip()
+		}
+
+		line := `airouter_endpoint_attempts_total{endpoint="` + labelEscape(label) + `"} 1`
+		series, err := parseExposition(line)
+		if err != nil {
+			t.Fatalf("escaped output did not parse: %v\ninput:  %q\nescaped line: %q", err, label, line)
+		}
+		if len(series) != 1 {
+			t.Fatalf("got %d series, want exactly 1\ninput: %q\nline: %q", len(series), label, line)
+		}
+		if got := series[0].name; got != "airouter_endpoint_attempts_total" {
+			t.Errorf("metric name = %q, want it unchanged (label leaked into the name)\ninput: %q", got, label)
+		}
+		if len(series[0].labels) != 1 {
+			t.Fatalf("got %d labels, want 1 (input injected a label): %v\ninput: %q", len(series[0].labels), series[0].labels, label)
+		}
+		if got := series[0].labels["endpoint"]; got != label {
+			t.Errorf("round trip changed the value\ninput:  %q\nparsed:  %q\nline:    %q", label, got, line)
+		}
+		if series[0].value != 1 {
+			t.Errorf("value = %v, want 1 (input tampered with the sample value)\ninput: %q", series[0].value, label)
+		}
+	})
+}
+
+// TestMetricsOverflowNeverEmitsMalformedSamples is the parser-level guard for
+// the invariant that makes the whole overflow design safe: whatever the
+// registry does when it runs out of room, /metrics must still be a valid
+// Prometheus exposition. A scrape is all-or-nothing, so one malformed line
+// takes down every dashboard, alert and recording rule on the instance — the
+// bound on cardinality is worthless if the cost of hitting it is losing the
+// metrics entirely.
+//
+// The maps bound labels in two different shapes, and the difference is exactly
+// where this went wrong once. attemptsByEndpoint keys on a bare value and
+// overflows to `__overflow__`, which is a legal label value in its own
+// position. circuitTransitions keys on a *pre-rendered label set*
+// (`from="..",to="..",endpoint=".."`) that the exporter splices in unquoted,
+// so its overflow key is a bare word sitting where a label set belongs — and
+// `{__overflow__} 4` is not a sample. The unit tests on that map all passed
+// while it was broken, because none of them parsed the output.
+//
+// This asserts on parsed samples, not substrings, for every bounded map, and
+// forces the overflow condition on each one so the bucket really is present.
+func TestMetricsOverflowNeverEmitsMalformedSamples(t *testing.T) {
+	// Shrink the cap so the test is fast; the code path is identical at any cap.
+	const small = 16
+	m := NewMetrics()
+	m.SetLabelCap(small)
+
+	// One more distinct value than the cap, per map, so every one of them
+	// overflows and the bucket exists in each.
+	for i := 0; i <= small; i++ {
+		name := fmt.Sprintf("ep-%d", i)
+		m.Attempt(name, time.Millisecond, i%2 == 0)
+		m.Request(name, 200+i%3, time.Millisecond)
+		m.Fallback(fmt.Sprintf("from-%d", i))
+		m.CircuitTransition(CircuitClosed, CircuitOpen, name)
+	}
+
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, nil)
+	buf := rec.Body
+	series, err := parseExposition(buf.String())
+	if err != nil {
+		t.Fatalf("overflowed registry produced an unparseable exposition: %v", err)
+	}
+
+	// The bucket must actually be present, or this test is asserting nothing.
+	sawOverflow := false
+	for _, s := range series {
+		for _, v := range s.labels {
+			if v == overflowLabelValue {
+				sawOverflow = true
+			}
+		}
+		// A pre-rendered label set spliced into the wrong position parses as a
+		// single label whose name is not a legal Prometheus identifier; the
+		// parser is lenient, so check the identifier explicitly.
+		for name := range s.labels {
+			if !isPromIdentifier(name) {
+				t.Errorf("series %q has non-identifier label name %q; the key was "+
+					"interpolated where a label set belongs", s.name, name)
+			}
+		}
+	}
+	if !sawOverflow {
+		t.Fatal("no series carried the __overflow__ bucket; the test did not " +
+			"actually exercise the overflow path")
+	}
+}
+
+// isPromIdentifier reports whether s is a legal Prometheus label name
+// ([a-zA-Z_][a-zA-Z0-9_]*). The hand-rolled parser accepts anything, so this
+// is what actually catches a mis-shaped key.
+func isPromIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(i > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }

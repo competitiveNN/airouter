@@ -196,6 +196,42 @@ type Preferences struct {
 	// this to 0 (or a larger value) rather than let the auto-default
 	// silently break them.
 	DefaultMaxTokens *int `yaml:"default_max_tokens,omitempty"`
+
+	// MaxLabelCardinality bounds how many distinct provider/model labels the
+	// metrics registry will track. Endpoint and model labels come from this
+	// config, and the config is hot-reloadable, so without a bound a config
+	// churn loop (or a model sync that keeps inventing ids) grows the registry
+	// until the gateway is OOM-killed — the metrics endpoint would be a way to
+	// kill the process. A pointer so an explicit 0 is distinguishable from an
+	// absent key: nil uses defaultMaxLabelValues.
+	//
+	// Once the window is full, a label that is not already tracked recycles the
+	// least-recently-admitted slot and rolls that label's counters into an
+	// __overflow__ bucket, so totals stay truthful and no observation is lost.
+	// See docs/RUNBOOK.md ("Label cardinality is bounded") for what to watch.
+	//
+	// Values outside [16, 65536] are ignored in favour of the default: too
+	// small destroys the per-endpoint series, too large defeats the memory
+	// bound. scripts/validate-config.py rejects out-of-range values at config
+	// time so the mistake is caught before a restart rather than silently at
+	// load.
+	MaxLabelCardinality *int `yaml:"max_label_cardinality,omitempty"`
+}
+
+// MaxLabelCardinalityValue returns the effective per-map label cap, clamped to
+// the supported range. nil (key absent) yields defaultMaxLabelValues.
+func (p *Preferences) MaxLabelCardinalityValue() int {
+	if p == nil || p.MaxLabelCardinality == nil {
+		return defaultMaxLabelValues
+	}
+	n := *p.MaxLabelCardinality
+	if n < minLabelValues {
+		return minLabelValues
+	}
+	if n > maxAllowedLabels {
+		return maxAllowedLabels
+	}
+	return n
 }
 
 // RotationWindow returns the effective window size, defaulting to
@@ -362,6 +398,25 @@ func (c *Config) validate() error {
 			if _, ok := c.Providers[ep.Provider]; !ok {
 				return fmt.Errorf("model %s chain[%d] references unknown provider %q", name, i, ep.Provider)
 			}
+		}
+	}
+	// Reject an out-of-range label cap at config time rather than silently
+	// clamping it at load. A cap below the floor destroys the per-endpoint
+	// series this exists to protect, and one above the ceiling defeats the
+	// memory bound; both are mistakes worth failing on, and both are invisible
+	// if they are quietly reinterpreted.
+	//
+	// Preferences is a *pointer* and every other preference accessor here is
+	// nil-safe; this one has to be too, because `preferences:` is omitempty and
+	// a config without it is perfectly valid.
+	// A nil Preferences (absent `preferences:` key) is the common case, not an
+	// error, so guard the whole block instead of reaching through the pointer.
+	// Read the pointer once: dereferencing it twice would re-introduce exactly
+	// the panic this is fixing.
+	if p := c.Preferences; p != nil && p.MaxLabelCardinality != nil {
+		if n := *p.MaxLabelCardinality; n < minLabelValues || n > maxAllowedLabels {
+			return fmt.Errorf("preferences.max_label_cardinality must be between %d and %d, got %d",
+				minLabelValues, maxAllowedLabels, n)
 		}
 	}
 	return nil

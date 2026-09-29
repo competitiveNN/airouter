@@ -62,19 +62,37 @@ type Metrics struct {
 	attemptLatencyBounds []float64 // seconds
 	attemptHistByEnd     map[string][]atomic.Int64
 	// labelsCap bounds the number of distinct label values any single
-	// label-value map may hold. See (*Metrics).boundLabel for why this
-	// exists and why the cap is enforced on the value map rather than on
-	// the formatted output.
+	// label-value map may hold. See boundedAttemptKeyLocked for why this exists and
+	// why the cap is enforced on the stored keys rather than on the output.
 	labelsCap int
-	// labelsOverflowed counts observations that were folded into
-	// overflowLabel because their label value was not already tracked and
-	// the map was at capacity. Without it, collapsing silently discards
-	// data and an operator sees a suspiciously flat series with no
-	// indication that anything was dropped.
+	// attemptAdmitted[i] is the index into the attempt admission ring, and
+	// attemptRing[i] is the label that occupied it. Together they implement a
+	// FIFO admission window over attemptsByEndpoint: the label whose slot is
+	// oldest is the one recycled when a new value needs room. See
+	// boundedAttemptKeyLocked for why FIFO beats a purely "first come, never
+	// evicted" set.
+	attemptAdmitted []int64 // counter/clock, monotonically increasing
+	attemptRing     []string
+	// attemptClock is the admission counter that attemptAdmitted entries are
+	// compared against.
+	attemptClock int64
+	// attemptIndex maps an admitted label to its position in attemptRing.
+	attemptIndex map[string]int
+	// labelsEvicted counts labels displaced from the admission window to make
+	// room for a new one. Distinct from labelsOverflowed (collapsed into the
+	// bucket) — this means a previously-named series went away. A non-zero
+	// value is normal after a genuine config change that removes or renames
+	// endpoints; a *steadily climbing* value means the cap is too small for
+	// the deployment, which is the signal to raise it.
+	labelsEvicted atomic.Int64
+	// labelsOverflowed counts observations folded into overflowLabel because
+	// no label could be admitted. Without it, collapsing would silently
+	// discard data and an operator would see a suspiciously flat series with
+	// no indication that anything was dropped.
 	labelsOverflowed atomic.Int64
-	// overflowLabel is the bucket name that unknown, at-capacity label
-	// values collapse into. Chosen to be greppable and obviously not a
-	// real provider so it is never mistaken for a configured endpoint.
+	// overflowLabel is the bucket name that unknown, at-capacity label values
+	// collapse into. Chosen to be greppable and obviously not a real provider
+	// so it is never mistaken for a configured endpoint.
 	overflowLabel string
 	mu            sync.RWMutex // protects map initialization
 }
@@ -85,15 +103,29 @@ type Metrics struct {
 // an overflow bucket and not a misconfigured endpoint.
 const overflowLabelValue = "__overflow__"
 
-// maxLabelValues caps how many distinct values a single label map holds.
+// defaultMaxLabelValues caps how many distinct values a single label map holds.
 //
 // This is a real ceiling, not a guess: the production config already carries 60
 // distinct endpoint keys, and a nightly free-model sync is the kind of job that
-// legitimately grows that list. 512 leaves ~8x headroom over the current
-// config while keeping the worst case bounded and small. A single overflowing
-// endpoint costs one counter plus one 12-bucket histogram, so the absolute
-// memory ceiling is roughly 512 * (a few hundred bytes) — negligible.
-const maxLabelValues = 512
+// legitimately grows that list. 512 leaves ~8x headroom over the current config
+// while keeping the worst case bounded and small. A single overflowing endpoint
+// costs one counter plus one 12-bucket histogram, so the absolute memory
+// ceiling is roughly 512 * (a few hundred bytes) — negligible.
+//
+// It is the *default*, not a constant baked into the behaviour: deployments with
+// many more endpoints can raise it via `metrics.max_label_cardinality` in
+// config.yaml without a rebuild, and validate-config.py enforces the range.
+const defaultMaxLabelValues = 512
+
+// Bounds for the configurable cap. The floor exists because a cap too small to
+// hold the four logical models plus a handful of endpoints makes the per-endpoint
+// series useless, and the ceiling exists because the whole point of the cap is
+// to bound memory: at 65536 the worst case is ~65536 histograms, which is enough
+// to matter.
+const (
+	minLabelValues   = 16
+	maxAllowedLabels = 65536
+)
 
 // defaultLatencyBuckets are the standard Prometheus histogram boundaries
 // (seconds). The trailing +Inf bucket is implied and appended at serve time.
@@ -122,13 +154,73 @@ func NewMetrics() *Metrics {
 		attemptFailuresByEnd:    make(map[string]*atomic.Int64),
 		attemptLatencyNSByEnd:   make(map[string]*atomic.Int64),
 		attemptHistByEnd:        make(map[string][]atomic.Int64),
-		labelsCap:               maxLabelValues,
+		attemptIndex:            make(map[string]int),
+		labelsCap:               defaultMaxLabelValues,
 		overflowLabel:           overflowLabelValue,
 	}
 	m.attemptLatencyBounds = attemptLatencyBoundaries
 	m.latencyBoundaries = defaultLatencyBuckets
 	m.latencyBuckets = make([]atomic.Int64, len(defaultLatencyBuckets)+1) // +1 for +Inf
 	return m
+}
+
+// SetLabelCap sets the per-map label cardinality cap. Values outside
+// [minLabelValues, maxAllowedLabels] are ignored, because a cap that is too
+// small destroys the per-endpoint series and one that is too large defeats the
+// memory bound this exists to provide. Rejects rather than clamps so a bad
+// config value is visible in the log instead of being silently reinterpreted.
+//
+// Only affects labels admitted after the call. Shrinking the cap does not
+// retroactively delete series: doing that would silently drop history, and the
+// next new label will simply evict the oldest admitted one. The effective
+// number of named labels therefore converges on the new cap on its own.
+func (m *Metrics) SetLabelCap(n int) {
+	if n < minLabelValues || n > maxAllowedLabels {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n == m.labelsCap {
+		return
+	}
+	m.labelsCap = n
+	// Prune to the new cap immediately rather than waiting for new labels to
+	// arrive. Rolling a victim's counters into the bucket (instead of dropping
+	// them) is what lets this happen without losing observations, so the totals
+	// are identical either way — but pruning now means the invariant
+	// len(map) <= labelsCap holds immediately, instead of being violated for as
+	// long as the deployment happens to keep using only the old labels.
+	for len(m.attemptsByEndpoint) > n {
+		victim := m.oldestAdmittedLocked()
+		if victim == "" {
+			break
+		}
+		m.rollUpToOverflowLocked(victim)
+		m.labelsEvicted.Add(1)
+	}
+	// The ring may still hold entries for labels that were already gone before
+	// the resize; drop them so the ring and the map stay in agreement.
+	m.syncRingLocked()
+}
+
+// syncRingLocked drops ring entries whose label is no longer in the attempt
+// map. Caller holds m.mu.
+func (m *Metrics) syncRingLocked() {
+	for i := 0; i < len(m.attemptRing); {
+		ep := m.attemptRing[i]
+		if _, live := m.attemptsByEndpoint[ep]; live && ep != m.overflowLabel {
+			i++
+			continue
+		}
+		m.compactRingLocked(i)
+	}
+}
+
+// LabelCap returns the configured per-map cardinality cap.
+func (m *Metrics) LabelCap() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.labelsCap
 }
 
 // counterModel returns the atomic counter for a logical model name, creating it
@@ -286,36 +378,81 @@ func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
 	if endpoint == "" {
 		return
 	}
-	// One decision, four maps. Every attempt-telemetry structure below is
-	// indexed by the returned key, so the cap is enforced once and the key sets
-	// are identical by construction.
-	key := m.boundedAttemptKey(endpoint)
-	m.lazyCounter(m.attemptsByEndpoint, key).Add(1)
-	if !ok {
-		m.lazyCounter(m.attemptFailuresByEnd, key).Add(1)
-	}
 	ns := d.Nanoseconds()
 	if ns < 0 {
 		ns = 0
 	}
-	m.lazyCounter(m.attemptLatencyNSByEnd, key).Add(ns)
-
-	m.mu.Lock()
-	h, exists := m.attemptHistByEnd[key]
-	if !exists {
-		h = make([]atomic.Int64, len(m.attemptLatencyBounds)+1) // +1 for +Inf
-		m.attemptHistByEnd[key] = h
-	}
-	m.mu.Unlock()
-
-	secs := d.Seconds()
 	idx := len(m.attemptLatencyBounds) // default to the +Inf bucket
+	secs := d.Seconds()
 	for i, bound := range m.attemptLatencyBounds {
 		if secs <= bound {
 			idx = i
 			break
 		}
 	}
+
+	// The whole observation is recorded under ONE write lock, rather than
+	// deciding the key under a lock and then updating each map in a separate
+	// critical section. The split version had a real race that the concurrency
+	// test caught: thread A could be handed the key "ep:7", thread B could
+	// evict "ep:7" and recycle its slot, and thread A would then re-create the
+	// entry in the maps afterwards. The result was a key set that exceeded the
+	// cap (the resurrected key plus the recycled one) and an attempt counted
+	// against a series whose history had just been rolled into the bucket, so
+	// the observation was effectively double-counted.
+	//
+	// Holding the lock for the whole update is the fix, and it is cheap: the
+	// critical section is a few map lookups on a map of at most a few hundred
+	// entries. The atomics inside are still needed, because ServeHTTP reads the
+	// counters under a read lock and must not be blocked — but now the counters
+	// can no longer be mutated between being created and being used.
+	m.mu.Lock()
+	key := m.boundedAttemptKeyLocked(endpoint)
+	if c, ok := m.attemptsByEndpoint[key]; ok {
+		c.Add(1)
+	}
+	if !ok {
+		// Create-on-write, not lookup-only. The first version read the map and
+		// incremented only if the entry happened to exist, which meant the very
+		// first failure for an endpoint was silently discarded: the failure
+		// series stayed absent and the endpoint reported a 0% failure rate
+		// forever. The buckets are keyed by the same set as the attempt
+		// counters, so the entry is created here and nowhere else.
+		c := m.attemptFailuresByEnd[key]
+		if c == nil {
+			c = &atomic.Int64{}
+			m.attemptFailuresByEnd[key] = c
+		}
+		c.Add(1)
+	}
+	if c := m.attemptLatencyNSByEnd[key]; c != nil {
+		c.Add(ns)
+	} else {
+		sum := &atomic.Int64{}
+		sum.Add(ns)
+		m.attemptLatencyNSByEnd[key] = sum
+	}
+	h, exists := m.attemptHistByEnd[key]
+	if !exists {
+		h = make([]atomic.Int64, len(m.attemptLatencyBounds)+1) // +1 for +Inf
+		m.attemptHistByEnd[key] = h
+	}
+	// The overflow bucket gets its own (empty) histogram the moment it is
+	// created. rollUpToOverflowLocked admits it into the counter maps partway
+	// through this same critical section, and that path deliberately does not
+	// touch the histogram — so without this the bucket ends up in
+	// attemptsByEndpoint with no histogram at all, and /metrics prints a
+	// zeroed duration distribution for it that is not the one it accumulated.
+	// The bucket's own buckets stay empty until something is recorded directly
+	// against the bucket label; its count and sum come from the rolled-up
+	// counters, which is documented in the exporter.
+	if bh := m.attemptHistByEnd[m.overflowLabel]; bh == nil {
+		if _, live := m.attemptsByEndpoint[m.overflowLabel]; live {
+			m.attemptHistByEnd[m.overflowLabel] = make([]atomic.Int64, len(m.attemptLatencyBounds)+1)
+		}
+	}
+	m.mu.Unlock()
+
 	h[idx].Add(1)
 }
 
@@ -323,15 +460,19 @@ func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
 // actually stored under — the raw endpoint below the cap, overflowLabelValue at
 // or above it.
 //
-// It must be called EXACTLY once per Attempt, before any of the attempt maps are
-// touched, and the returned key is what all of them must be indexed by. An
-// earlier version bounded each map independently inside lazyCounter, which was
-// wrong twice over: the bounded value never propagated back to the caller, so
-// the histogram map was still keyed by the raw label and grew without bound;
-// and bounding each map separately let the maps disagree at the boundary, which
-// could produce an endpoint with attempt counts but no latency histogram.
-// Deciding once, up front, makes the key set identical across all four maps by
-// construction and needs no further coordination.
+// Caller must hold m.mu (write). It must be called EXACTLY once per Attempt,
+// before any of the attempt maps are touched, and the returned key is what all
+// of them must be indexed by. An earlier version bounded each map independently
+// per map, which was wrong twice over: the bounded value never
+// propagated back to the caller, so the histogram map was still keyed by the
+// raw label and grew without bound; and bounding each map separately let the
+// maps disagree at the boundary, which could produce an endpoint with attempt
+// counts but no latency histogram. Deciding once, up front, makes the key set
+// identical across all four maps by construction and needs no further
+// coordination.
+//
+// Requires the write lock, which is what makes admission atomic with respect to
+// eviction: a label cannot be evicted between being admitted and being updated.
 //
 // The cap includes the overflow bucket, because that bucket occupies a slot in
 // the map exactly like a real endpoint does. The first version of this admitted
@@ -345,62 +486,196 @@ func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
 // while there is room for the bucket to follow. That makes len(map) <= labelsCap
 // an invariant, and it also guarantees the bucket is present whenever the map is
 // full, which is what makes the collapse below total (there is always somewhere
-// to put the observation). The cost is labelsCap-1 individually-named endpoints,
-// which maxLabelValues leaves ample room for.
-func (m *Metrics) boundedAttemptKey(endpoint string) string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// to put the observation). The cost is labelsCap-1 individually-named endpoints.
+//
+// The window is FIFO, not "first come, forever". The first implementation
+// admitted labels and never released them, which is correct for memory but wrong
+// for meaning: because label values come from config and config is hot-reloadable,
+// a burst of labels from a config that is no longer live holds its slots
+// permanently, and a genuinely hot endpoint that first appears afterwards is
+// collapsed into __overflow__ for the remaining life of the process. The gateway
+// would report a broken upstream as "no data" indefinitely, which is the worst
+// possible failure for the series that exist to answer "is this upstream
+// healthy?". So a new value recycles the least-recently-admitted slot.
+//
+// "Least recently admitted", not "least recently used". Reordering on use would
+// need a read-lock-and-bump on every single observation — a global write lock on
+// the hot path, for a list of a few hundred strings. Admission order is a good
+// proxy: a label that was admitted long ago and is being used right now is one
+// whose config was just re-added, which is rare, and it will be re-admitted with
+// its history on the next miss regardless.
+//
+// Evicting rolls the victim's counters into __overflow__ rather than dropping
+// them, so the totals stay truthful and airouter_metrics_label_overflow_total
+// remains the single place that says "some of this is aggregated".
+func (m *Metrics) boundedAttemptKeyLocked(endpoint string) string {
 	if _, tracked := m.attemptsByEndpoint[endpoint]; tracked {
 		return endpoint
 	}
 	// Room for a real value plus the reserved slot for the bucket.
 	if len(m.attemptsByEndpoint) < m.labelsCap-1 {
-		m.attemptsByEndpoint[endpoint] = &atomic.Int64{}
+		m.admitLocked(endpoint)
 		return endpoint
 	}
 	// The bucket itself is a legitimate label that any caller may submit, and
-	// it is counted in its own right when it is.
+	// it is counted in its own right when it is. It is never recycled.
 	if endpoint == m.overflowLabel {
-		m.attemptsByEndpoint[endpoint] = &atomic.Int64{}
+		m.admitLocked(endpoint)
 		return endpoint
 	}
-	m.labelsOverflowed.Add(1)
-	key := m.overflowLabel
-	if _, has := m.attemptsByEndpoint[key]; !has {
-		// Unreachable given the reservation above, but the fallback keeps the
-		// invariant true even if the reservation is ever changed: without it a
-		// missing bucket would silently drop the observation.
-		m.attemptsByEndpoint[key] = &atomic.Int64{}
+	// The window is full and this is a genuinely new value. Recycle the slot of
+	// the least-recently-admitted label, and roll its counters into the bucket
+	// first so nothing is lost: the endpoint is disappearing from the output,
+	// but its observations stay in the totals.
+	victim := m.oldestAdmittedLocked()
+	if victim == "" {
+		// No recyclable slot at all. Collapse rather than drop, and count it so
+		// the condition is visible. Reaching here means the ring and the map
+		// have drifted apart, which is a bug rather than a normal state — hence
+		// labelsOverflowed rather than silently admitting a cap+1 key.
+		m.labelsOverflowed.Add(1)
+		m.admitLocked(m.overflowLabel)
+		return m.overflowLabel
 	}
-	return key
+	m.rollUpToOverflowLocked(victim)
+	m.labelsEvicted.Add(1)
+	m.admitLocked(endpoint)
+	return endpoint
 }
 
-// lazyCounter returns the counter for key in store, creating it on first access.
-// The key must already have been through boundedAttemptKey; this function only
-// guarantees the counter allocation is race-free (read-lock fast path, then a
-// double-check under the write lock so two goroutines racing on a brand-new key
-// cannot each allocate one).
-func (m *Metrics) lazyCounter(store map[string]*atomic.Int64, key string) *atomic.Int64 {
-	m.mu.RLock()
-	c, ok := store[key]
-	m.mu.RUnlock()
-	if ok {
+// admitLocked records endpoint in the FIFO admission window and returns its
+// attempt counter, creating it if needed. Caller holds m.mu.
+//
+// Idempotent in the sense that matters: if the label is already present its
+// counter is returned without consuming a new ring slot, so the window cannot
+// be padded with duplicates of a label that is already tracked.
+func (m *Metrics) admitLocked(endpoint string) *atomic.Int64 {
+	if c, exists := m.attemptsByEndpoint[endpoint]; exists {
 		return c
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if c, ok = store[key]; !ok {
-		c = &atomic.Int64{}
-		store[key] = c
+	// The overflow bucket is pinned outside the ring. It is where every
+	// recycled label's history goes, so it must never be a recycling candidate
+	// itself — otherwise it gets evicted into itself, which double-counts.
+	//
+	// Keeping it out of the ring entirely (rather than merely skipping it when
+	// picking a victim) is what makes the window size predictable: the ring
+	// holds exactly the real labels, len(ring) == len(attemptsByEndpoint)-1
+	// once the bucket exists. The first version appended it to the ring and
+	// filtered it at selection time, which meant the ring held one entry too
+	// many and a single eviction reported two.
+	if endpoint == m.overflowLabel {
+		c := &atomic.Int64{}
+		m.attemptsByEndpoint[endpoint] = c
+		return c
 	}
+	m.attemptClock++
+	m.attemptAdmitted = append(m.attemptAdmitted, m.attemptClock)
+	m.attemptRing = append(m.attemptRing, endpoint)
+	m.attemptIndex[endpoint] = len(m.attemptRing) - 1
+	c := &atomic.Int64{}
+	m.attemptsByEndpoint[endpoint] = c
 	return c
+}
+
+// oldestAdmittedLocked returns the label whose slot is next to be recycled, or
+// "" if the window has no recyclable entry. Caller holds m.mu.
+//
+// The overflow bucket is skipped: it is the one label that must never be
+// displaced, because it is where everything being displaced goes. Recycling it
+// would drop observations on the floor and could hand the same label both a real
+// series and a bucket role.
+func (m *Metrics) oldestAdmittedLocked() string {
+	for i, ep := range m.attemptRing {
+		if i >= len(m.attemptAdmitted) {
+			break
+		}
+		if ep == m.overflowLabel {
+			continue
+		}
+		if _, live := m.attemptsByEndpoint[ep]; !live {
+			// Stale ring entry whose label was already removed; skip it.
+			m.compactRingLocked(i)
+			return m.oldestAdmittedLocked()
+		}
+		return ep
+	}
+	return ""
+}
+
+// compactRingLocked drops ring/index entry i, keeping attemptAdmitted aligned
+// with attemptRing. Caller holds m.mu.
+func (m *Metrics) compactRingLocked(i int) {
+	ep := m.attemptRing[i]
+	delete(m.attemptIndex, ep)
+	m.attemptRing = append(m.attemptRing[:i], m.attemptRing[i+1:]...)
+	m.attemptAdmitted = append(m.attemptAdmitted[:i], m.attemptAdmitted[i+1:]...)
+	for j := i; j < len(m.attemptRing); j++ {
+		m.attemptIndex[m.attemptRing[j]] = j
+	}
+}
+
+// recycleLocked removes victim's series from all four attempt maps, rolling its
+// counters into the overflow bucket so no observation is lost. Caller holds m.mu.
+func (m *Metrics) rollUpToOverflowLocked(victim string) {
+	if victim == m.overflowLabel {
+		return
+	}
+	// The bucket is created through the normal admission path, not poked
+	// directly into one map. The first version added it to attemptsByEndpoint
+	// alone, which produced a series with an attempt count but no histogram and
+	// no ring entry — so the boundary test caught an __overflow__ that would
+	// print a zeroed duration distribution in /metrics, and whose slot the ring
+	// did not know about.
+	bucket := m.admitLocked(m.overflowLabel)
+
+	// Attempt counts and the latency sum fold in. The histogram does NOT, and
+	// cannot: the buckets are cumulative-free, so merging a victim's per-bucket
+	// counts into the bucket's would be exact arithmetic on data whose meaning
+	// is now "some unknown endpoint", and there is no way to represent "the
+	// bucket had 40 observations in the 0.25s band, all of them from a label we
+	// evicted" honestly. The sum and count carry the truth; the bucket's
+	// histogram deliberately reports only observations recorded directly against
+	// the bucket itself, which is why _count can legitimately be lower than
+	// _sum implies. Documented in the exporter.
+	if c, ok := m.attemptsByEndpoint[victim]; ok {
+		bucket.Add(c.Load())
+		delete(m.attemptsByEndpoint, victim)
+	}
+	// Create-on-write for the bucket entries too. Reading first and only
+	// adding when the entry happened to exist (the first version) dropped the
+	// rollup on the floor whenever the victim was the first label of its kind —
+	// which is every label that failed on its only attempt — so the bucket's
+	// failure and latency totals silently under-reported.
+	if c, ok := m.attemptFailuresByEnd[victim]; ok {
+		bc := m.attemptFailuresByEnd[m.overflowLabel]
+		if bc == nil {
+			bc = &atomic.Int64{}
+			m.attemptFailuresByEnd[m.overflowLabel] = bc
+		}
+		bc.Add(c.Load())
+		delete(m.attemptFailuresByEnd, victim)
+	}
+	if c, ok := m.attemptLatencyNSByEnd[victim]; ok {
+		bc := m.attemptLatencyNSByEnd[m.overflowLabel]
+		if bc == nil {
+			bc = &atomic.Int64{}
+			m.attemptLatencyNSByEnd[m.overflowLabel] = bc
+		}
+		bc.Add(c.Load())
+		delete(m.attemptLatencyNSByEnd, victim)
+	}
+	delete(m.attemptHistByEnd, victim)
+	if i, ok := m.attemptIndex[victim]; ok {
+		m.compactRingLocked(i)
+	}
 }
 
 // boundLabelValue maps a raw label value onto the value that will actually be
 // used as a map key, folding unknown values into a single overflow bucket once
 // the map is full. Used by the single-key maps (per-model requests, per-endpoint
 // fallbacks, circuit transitions); the attempt telemetry decides once up front
-// in boundedAttemptKey instead, because it spans four maps that must agree.
+// in boundedAttemptKeyLocked instead, because it spans four maps that must
+// agree and has to stay atomic against eviction.
 //
 // Why this is needed. Every label value here comes from configuration
 // (provider:model keys), but the configuration is not fixed for the process
@@ -507,6 +782,21 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE airouter_circuit_state_transitions counter")
 	m.mu.RLock()
 	for k, c := range m.circuitTransitions {
+		// Keys are pre-rendered `from="..",to="..",endpoint=".."` label sets
+		// (see CircuitTransition), and the exporter below interpolates them raw
+		// because escaping already happened at record time. That makes this the
+		// one place where the overflow bucket is NOT a valid label set: an
+		// at-cap transition is stored under the bare `__overflow__` key, and
+		// printing that as the label-set position emits
+		// `airouter_circuit_state_transitions{__overflow__} 4`, which is not a
+		// legal sample — Prometheus rejects the scrape and the operator sees a
+		// dead dashboard, which is the exact failure this overflow work exists
+		// to prevent. Render it as a real label with the same value the other
+		// maps use, so the bucket is greppable across the whole exposition.
+		if k == m.overflowLabel {
+			fmt.Fprintf(w, "airouter_circuit_state_transitions{endpoint=%q} %d\n", m.overflowLabel, c.Load())
+			continue
+		}
 		fmt.Fprintf(w, "airouter_circuit_state_transitions{%s} %d\n", k, c.Load())
 	}
 	m.mu.RUnlock()
@@ -540,6 +830,15 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# HELP airouter_metrics_label_overflow_total Observations folded into the overflow bucket because the label registry is full")
 	fmt.Fprintln(w, "# TYPE airouter_metrics_label_overflow_total counter")
 	fmt.Fprintf(w, "airouter_metrics_label_overflow_total %d\n", m.labelsOverflowed.Load())
+
+	// Labels that lost their slot to a newer label, with their history rolled
+	// into the bucket. A one-off rise is a normal config change (an endpoint
+	// renamed or removed); a steady climb means the cap is smaller than the
+	// deployment's real label set and should be raised via
+	// metrics.max_label_cardinality.
+	fmt.Fprintln(w, "# HELP airouter_metrics_label_evictions_total Labels displaced from the registry to admit a newer one")
+	fmt.Fprintln(w, "# TYPE airouter_metrics_label_evictions_total counter")
+	fmt.Fprintf(w, "airouter_metrics_label_evictions_total %d\n", m.labelsEvicted.Load())
 
 	m.serveAttemptMetrics(w)
 }

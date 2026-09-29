@@ -142,6 +142,22 @@ preferences:
   # models in a chain should set this to 0 (or a larger value) to opt out.
   # default_max_tokens: 0   # uncomment + set to override the auto behavior
 
+  # Maximum distinct provider:model labels the /metrics registry will track.
+  # Endpoint labels come from this file, and this file is hot-reloadable, so
+  # without a bound a config churn loop (or a nightly model sync inventing new
+  # model ids) grows the registry until the gateway is OOM-killed.
+  #
+  # 512 is roughly 8x the current endpoint count, so the default is already
+  # generous; raise it only if `airouter_metrics_label_evictions_total` is
+  # climbing steadily, which means real endpoints are losing their series to
+  # newer ones. When the window is full, a label that is not already tracked
+  # recycles the least-recently-admitted slot and rolls that label's counters
+  # into an `__overflow__` bucket, so totals stay correct either way.
+  #
+  # Must be between 16 and 65536; validate-config.py rejects anything else
+  # rather than letting it be silently clamped at load.
+  # max_label_cardinality: 512   # uncomment to override the default
+
 models:
   smart:
     chain:
