@@ -435,8 +435,9 @@ defects, all in `metrics.go`, all now fixed and pinned.
   12-bucket histogram, so the process grew until it was OOM-killed: a metrics
   endpoint that can be used to kill the gateway is a self-inflicted DoS.
   Measured before the fix: 5000 distinct labels produced 5000 entries and a
-  6.9 MB scrape response. FIXED: every label map is capped at `maxLabelValues`
-  (512, ~8x the 60 endpoint keys in the live config) and unknown values
+  6.9 MB scrape response. FIXED: every label map is capped at
+  `defaultMaxLabelValues` (512, ~8x the 60 endpoint keys in the live config)
+  and unknown values
   collapse into a single `__overflow__` bucket. Collapsed observations are
   still counted, and `airouter_metrics_label_overflow_total` makes the
   condition visible instead of silent (TestMetricsAttemptCardinalityIsBounded,
@@ -572,7 +573,87 @@ the point (config is checked before and after a restart) and
 constants agree, so they cannot drift apart silently. It was verified to fail
 when the script's ceiling is changed alone.
 
-Tests added this round: TestMetricsEvictionPreventsLabelStarvation,
+### Round 3 (2026-09-29) — the bug class, and two defects the new tests found
+
+Round 2's fix was a special case in one exporter. That is the wrong shape of fix
+for a defect that comes from a *convention*, so this round removed the
+convention.
+
+• `labelKey` (was metrics.go, two coexisting key conventions) — the maps did not
+  agree on what a label value is. `attemptsByModel`, `fallbacksByFromEndpoint`
+  and `attemptsByEndpoint` keyed on a BARE value and escaped it at export;
+  `circuitTransitions` keyed on a PRE-RENDERED label set
+  (`from="..",to="..",endpoint=".."`) that the exporter spliced in raw. The
+  second shape means the map key is a whole label SET, so the overflow bucket —
+  a single bare value — no longer fits the key space. Nothing recorded which
+  convention applied where, so a new map would pick one at random and the only
+  symptom would be a scrape that fails to parse, in production, from the cap
+  that exists to make things safer. FIXED: every bounded map keys on a
+  `labelKey` (the exact bytes between the braces), built by `singleLabelKey` /
+  `circuitTransitionKey` and written by `writeSample`. A bare value becomes a
+  one-label set, so the bucket is a legal key everywhere and the exporter has no
+  special case left to forget.
+
+  The general part is `TestEveryBoundedMapHasAWellFormedKeyShape`: one table
+  asserting, for all six maps, that every key parses as a label set, round-trips
+  to the value that produced it, and that each has a well-formed bucket. Adding
+  a map without adding a row fails the test, so "which maps are bounded" stops
+  being something to remember. Writing it immediately found:
+
+• `counterStatus` / `counterFailure` (was metrics.go, unbounded) — these two
+  were the only maps with a cap, a comment claiming they were bounded, and no
+  call enforcing it. The status is `resp.StatusCode` forwarded from the UPSTREAM
+  response, so the value set is whatever a remote server returns; an upstream
+  that varies its status per request drives unbounded labels into both maps.
+  Measured with the guard removed: 640 distinct labels against a cap of 16. This
+  is the same self-inflicted DoS the rest of the file exists to prevent, still
+  open, and it survived two rounds of cardinality work because every prior test
+  asserted on endpoints and models. FIXED, pinned by TestStatusMapsAreBounded
+  (verified to fail without it).
+
+• `admitCollapsible` (was metrics.go, check-then-insert across two locks) — all
+  five collapsing counters decided the key under a read lock, released it, then
+  inserted under a write lock. N goroutines with N new labels could all observe
+  "there is room" and all insert, so the map reached cap+N. The memory bound
+  silently did not apply under exactly the load that generates the most labels.
+  Same defect and same fix as `Attempt` had: one write lock for re-check,
+  decision and insert, with a read-lock fast path for already-tracked keys.
+  `TestConcurrentDistinctLabelsNeverExceedTheCap` samples len() *while* workers
+  run, because the overshoot is what remains at the end and an after-the-fact
+  assertion passes against this bug. (The first version of that watcher read
+  len() without the lock; the race detector caught it, which is the test earning
+  its keep before it ever failed on the product code.)
+
+• `bareKey` (was metrics.go, `%q` on an already-escaped value) — keys are
+  escaped once when built and written verbatim at export, and `%q` is *Go* string
+  quoting, which re-escapes the backslashes. Every label containing a quote or
+  newline came out double-escaped: still valid, still safe, still parsing, but
+  no longer matching the configured value, so the series could never be joined
+  to config.yaml. Silent data corruption that every existing check passed,
+  including the round-trip fuzz target — a double escape unescapes to the
+  original. Fixed by concatenating the quotes by hand.
+
+  This is where the "looks about right" heuristic earned its keep by failing:
+  asserting no `"` in the output flagged every correct seed, and the fuzzer then
+  produced `\\\"` as a false positive. Replaced with `referenceEscape`, an
+  independent naive escaper in the test file that `labelEscape` is compared
+  against byte for byte. An oracle that shares code or early-exit logic with the
+  thing under test can only confirm the bugs they have in common.
+
+• `overflowKeyFor` (was metrics.go, one global bucket key) — the collapsing
+  maps all collapsed into `endpoint="__overflow__"`, including the status maps.
+  That silently changes a metric's label schema, and Prometheus reads a
+  label-set change as a new series: a query grouping by status would lose the
+  bucket entirely, and an alert on a status series would stop covering it. The
+  cap is a safety valve and must not reshape healthy data. Each map now collapses
+  under its own label name — `status="__overflow__"`, `model="__overflow__"`.
+
+Tests added this round: TestEveryBoundedMapHasAWellFormedKeyShape,
+TestFullExpositionParsesUnderOverflow, TestStatusMapsAreBounded,
+TestConcurrentDistinctLabelsNeverExceedTheCap, plus `referenceEscape` as the
+fuzz oracle. Each was verified to fail against the unfixed code.
+
+Tests added last round: TestMetricsEvictionPreventsLabelStarvation,
 TestMetricsEvictionIsFIFONotRandom, TestMetricsEvictionNeverDisplacesTheOverflowBucket,
 TestMetricsEvictedCounterIsExported, TestMetricsSetLabelCap,
 TestMetricsCardinalityBoundaryIsExact, TestMetricsOverflowNeverEmitsMalformedSamples,

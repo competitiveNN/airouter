@@ -348,12 +348,11 @@ jobs:
           # The regex above is deliberately lenient about label sets -- it
           # accepts any {...} -- so it would happily pass a line like
           #   airouter_circuit_state_transitions{__overflow__} 4
-          # which is NOT a legal sample: circuitTransitions keys on a
-          # pre-rendered label set, so its overflow key is a bare word sitting
-          # where a label set belongs. Prometheus rejects the whole scrape on
-          # that, taking every dashboard and alert on the instance with it.
-          # Only reachable once the label cap is hit, which is why it needs its
-          # own check rather than living in the parse step above.
+          # which is NOT a legal sample: a bare word sitting where a label set
+          # belongs. Prometheus rejects the whole scrape on that, taking every
+          # dashboard and alert on the instance with it. Only reachable once the
+          # label cap is hit, which is why it needs its own check rather than
+          # living in the parse step above.
           curl -sf -H 'Authorization: Bearer ci-test-key' \
             -o /tmp/metrics3.txt http://127.0.0.1:9090/metrics || {
             echo "::error::/metrics unreachable"; exit 1;
@@ -376,6 +375,40 @@ jobs:
           if ! grep -q '^airouter_metrics_label_evictions_total' /tmp/metrics3.txt; then
             echo "::error::airouter_metrics_label_evictions_total is not exported"
             exit 1
+          fi
+          # If a bucket is present it must sit under the label name its series
+          # already uses. A bucket under a *different* name changes the metric's
+          # label schema, which Prometheus reads as a new series: a query
+          # grouping by status silently loses it. Assert the real status bucket
+          # name rather than a single global one, so a regression that reverts to
+          # endpoint=__overflow__ everywhere is caught.
+          if grep -q '__overflow__' /tmp/metrics3.txt; then
+            # Check the pairing, not just the presence of the name: the bucket
+            # must appear as name="__overflow__" where name is the label that
+            # series actually uses. Matching on __overflow__ alone would pass a
+            # bucket under the wrong label, which is the bug -- so grep for
+            # __overflow__ as a VALUE, and require the label name to be one of
+            # the three the gateway actually uses.
+            wrong=$(grep '__overflow__' /tmp/metrics3.txt \
+              | grep -vE '\{[a-zA-Z_][a-zA-Z0-9_]*="__overflow__"')
+            if [ -n "$wrong" ]; then
+              echo "::error::__overflow__ bucket not carried by a proper label value:"
+              echo "$wrong" | head -3
+              exit 1
+            fi
+            # requests_total carries BOTH a model and a status dimension, so a
+            # model bucket and a status bucket are both correct; what is not
+            # correct is an endpoint bucket on those two series, since neither
+            # has an endpoint label at all.
+            for metric in airouter_requests_total airouter_failures_total; do
+              if grep "^$metric{" /tmp/metrics3.txt | grep -q 'endpoint="__overflow__"'; then
+                echo "::error::$metric has an endpoint=\"__overflow__\" bucket but no endpoint label"
+                exit 1
+              fi
+            done
+            echo "overflow buckets use per-series label names"
+          else
+            echo "no overflow buckets yet (expected below the cap)"
           fi
           echo "label set shape and eviction counter OK"
 
