@@ -271,7 +271,18 @@ fi
 # NOT claim to be reduced. Asserting only one direction would let a check that
 # always prints "SKIPPED" pass.
 out=$(run_check "$REPO" --quick); got=$?
-assert_run "the real repository passes" 0 "passed, 0 failed" "$out" "$got"
+# Exit 0 and no "passed, 0 failed" message requirement: the real repository
+# legitimately produces a different success message depending on whether it has
+# unpushed commits. A full checkout reports its tally; a fresh clone, where
+# nothing is unpushed, exits 0 early with "nothing to recover". Both are
+# correct, and asserting on the tally made this case fail at 28/29 in a clone --
+# the same class of bug as the UPSTREAM leak, in the assertion rather than the
+# code under test.
+if [ "$got" -eq 0 ]; then
+  ok "the real repository passes"
+else
+  bad "the real repository passes (exit $got, want 0)"
+fi
 if printf '%s' "$out" | grep -qF 'SKIPPED'; then
   bad "a full run does not claim to be reduced"
 else
