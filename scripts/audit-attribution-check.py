@@ -45,6 +45,16 @@ Usage: scripts/audit-attribution-check.py [--verbose]
 Exit 0 = attributions and the unpushed list agree with the repository.
 Exit 1 = at least one does not.
 Exit 2 = the check could not run (not a repository, missing document).
+
+ONE PLACE IT IS EXPECTED TO FAIL
+--------------------------------
+A tree recovered with `git am` reproduces the CONTENT of every commit but
+re-hashes all of them, so every commit the documentation cites is absent by
+construction. The citation check will report all of them there, and that is
+correct behaviour rather than drift: the trees are what recovery is verified
+on, and the bundle -- which preserves the original hashes -- is the artifact
+that keeps the citations resolvable. Use the bundle when the history matters,
+not the patch.
 """
 
 from __future__ import annotations
@@ -210,7 +220,7 @@ def main() -> int:
             file=sys.stderr,
         )
         for p in problems:
-            print(f"  • {p}", file=sys.stderr)
+            print(f"  - {p}", file=sys.stderr)
         print("", file=sys.stderr)
         print(
             "  A citation that names a commit which does not exist is a claim",

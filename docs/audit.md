@@ -1324,6 +1324,16 @@ anything the document says, so it cannot be widened from the prose, and every
 code, test, script and audit commit is still required to appear in the list. A
 real change cannot hide behind it.
 
+One consequence is worth recording because it looks like a failure later. The
+citation check resolves every commit hash the documentation names, and `git am`
+re-hashes every commit it replays — so in a patch-recovered tree all those
+citations are absent by construction and the check reports every one of them.
+That is the check working, not a broken recovery: recovery is verified on trees
+rather than hashes, and the bundle preserves the original hashes, which is why
+it stays the preferred artifact. It is recorded in the checker's own docstring
+and in `dist/README.md`, so the next person to run the check in a recovered tree
+recognises it instead of re-investigating.
+
 Wiring this into CI required `fetch-depth: 0` on the `go` job.
 `actions/checkout@v4` defaults to a shallow single-ref checkout, which has no
 `origin/master`, so the unpushed-list half would have skipped and still exited 0
