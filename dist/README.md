@@ -71,17 +71,29 @@ Regenerate both with:
 
 ## Applying the bundle (preferred — keeps authors and messages)
 
+> The ref name below is not arbitrary. `git bundle create` records whatever
+> ref it was given, and a bundle made with the `A..HEAD` shorthand is stored
+> under the ref `HEAD` — which `git fetch` then rejects outright with
+> `fatal: couldn't find remote ref HEAD`. That is not hypothetical: these
+> instructions once said `'HEAD:refs/heads/frombundle'` and did not work.
+> `export-unpushed.sh` names the tip `airouter-unpushed-export` precisely so
+> there is a real ref to fetch. If you exported under a custom `EXPORT_REF`,
+> substitute that name — or ask the bundle, which is always correct:
+> `git bundle list-heads /path/to/airouter-unpushed.bundle`.
+
 ```sh
 git clone https://github.com/competitiveNN/airouter airouter
 cd airouter
-git fetch /path/to/airouter-unpushed.bundle 'HEAD:refs/heads/frombundle'
+git fetch /path/to/airouter-unpushed.bundle \
+  'refs/heads/airouter-unpushed-export:refs/heads/frombundle'
 git checkout frombundle
 ```
 
 Or into an existing clone:
 
 ```sh
-git fetch /path/to/airouter-unpushed.bundle 'HEAD:refs/heads/frombundle'
+git fetch /path/to/airouter-unpushed.bundle \
+  'refs/heads/airouter-unpushed-export:refs/heads/frombundle'
 git merge --ff-only frombundle
 ```
 

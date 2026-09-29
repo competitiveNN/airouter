@@ -52,12 +52,17 @@ set -uo pipefail
 #   case 8  (1)  an unknown argument is refused (exit 2)
 #   case 9  (2)  --quick really does skip the build, and says so
 #   case 10 (6)  negative controls A and B, each asserted to have applied
+#   case 11 (3)  a bundle exported under a CUSTOM ref name still recovers, and
+#                the discovered ref is named in the output
+#   case 12 (5)  an ambient UPSTREAM is honoured (a real one is actually used, a
+#                missing one is refused with exit 2, and the refusal survives a
+#                reduced environment) rather than silently defaulted or leaked
 #
 # The two controls are counted as 3 + 3 (apply, apply, behave) for A and
 # 1 + 1 + 1 for B. A control that cannot apply reports the run as a FAILURE
 # rather than shrinking the total, because a control that silently did nothing
 # is the one failure mode this file exists to prevent.
-EXPECTED=29
+EXPECTED=37
 
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -151,12 +156,11 @@ add_unpushed() {
 # artifacts are in the real format rather than a hand-rolled stand-in that might
 # diverge from what the check actually parses.
 write_artifacts() {
-  local dir="$1"
-  # No EXPORT_REF override on purpose: recovery-check.sh fetches the bundle by
-  # the default ref name (airouter-unpushed-export), which is what a reader gets.
-  # Exporting under a different name here would make every case below fail for a
-  # reason that has nothing to do with what it is testing.
-  ( cd "$dir" && UPSTREAM=origin/master \
+  local dir="$1" export_ref="${2:-}"
+  # No EXPORT_REF override by default: recovery-check.sh fetches the bundle by
+  # whatever ref the bundle itself advertises, and the default name is what a
+  # reader gets. Case 11 passes an explicit name to prove the discovery holds.
+  ( cd "$dir" && UPSTREAM=origin/master EXPORT_REF="$export_ref" \
       bash scripts/export-unpushed.sh >/dev/null 2>&1 )
 }
 
@@ -336,6 +340,108 @@ if printf '%s' "$out" | grep -qF 'recovered tree builds'; then
 else
   ok "--quick does not build"
 fi
+
+echo "recovery-selftest: case 11 -- a CUSTOM export ref name still recovers"
+# export-unpushed.sh honours EXPORT_REF, so a bundle under any name is a bundle
+# a reader can legitimately hold. recovery-check.sh must therefore ask the
+# bundle which ref its tip is on rather than assuming the script's own default.
+#
+# This is not hypothetical: an ad-hoc probe of the real bundle reported a false
+# "MISMATCH" purely because it looked for refs/heads/master while the tip
+# actually sat at refs/heads/airouter-unpushed-export. A hardcoded name is a
+# guess, and a guess that fails here looks exactly like a stale artifact.
+RC=$(new_repo customref)
+add_unpushed "$RC" 2
+write_artifacts "$RC" "my-handoff-ref"
+# The fixture is only meaningful if the bundle really is under the custom name.
+# Assert the fixture first: a case that passes because the export ignored
+# EXPORT_REF would look identical to one that passes because discovery works.
+bundle_ref=$(git -C "$RC" bundle list-heads "$RC/dist/airouter-unpushed.bundle" 2>/dev/null \
+  | awk 'NR==1{print $2}')
+if [ "$bundle_ref" = "refs/heads/my-handoff-ref" ]; then
+  ok "the fixture bundle really is under the custom ref"
+else
+  bad "the fixture bundle is under '${bundle_ref:-<none>}', not the custom ref"
+fi
+out=$(run_check "$RC" --quick); got=$?
+assert_run "a custom export ref still recovers" 0 "bundle reproduces the working tree" "$out" "$got"
+# And the run must SAY which ref it used, so a reader debugging a differently
+# named bundle is not left to rediscover it.
+if printf '%s' "$out" | grep -qF 'refs/heads/my-handoff-ref'; then
+  ok "the discovered tip ref is named in the output"
+else
+  bad "the discovered tip ref is not named in the output"
+fi
+
+echo "recovery-selftest: case 12 -- the ambient UPSTREAM contract holds"
+# An earlier version of this case asserted that recovery-check.sh pins UPSTREAM
+# before running the self-tests in the recovered tree. That assertion was
+# VACUOUS and was removed: with the pin removed the run still passed, because
+# dist-freshness-selftest.sh pins UPSTREAM on its own command line, so the
+# boundary pin was redundant defense-in-depth rather than the fix it claimed to
+# be. A test that passes with the feature deleted tests nothing.
+#
+# What IS load-bearing, and what this case now checks, is the narrower and
+# honest contract: recovery-check.sh honours the caller's UPSTREAM. Asserting it
+# by reading the code would prove nothing, so it is asserted by running -- and
+# the exit-2 assertions below are the falsifiable half. A script that ignored
+# UPSTREAM and fell back to its own default returns 0 where these require 2,
+# which was confirmed against a mutant that hardcodes the default.
+#
+# The self-tests run in the RECOVERED tree, where the base ref is named
+# origin/master, while a CI caller sets UPSTREAM=base in the ambient
+# environment. That variable is exported into every child, so without an
+# explicit pin at the call boundary a self-test could compare against a ref
+# that does not exist in the tree it just recovered -- and report a failure
+# that looks like a broken recovery but is really a leaked environment.
+#
+# Asserting this by reading the code would prove nothing, so it is asserted by
+# running: give the check an ambient UPSTREAM that is valid in the fixture but
+# is NOT the recovered tree's own upstream, and require the run to still pass.
+R12=$(new_repo poisoned)
+add_unpushed "$R12" 2
+write_artifacts "$R12"
+# A ref that exists in the fixture and is one commit behind HEAD -- a poisoned
+# value that is plausible enough to pass a loose "does this ref exist" check.
+# update-ref, not `branch -f`: `branch -f` on a ref that does not exist yet is
+# refused, which would leave `base` undefined and make the case fail for a reason
+# of its own making. The SHA is resolved from origin/master BEFORE it is walked
+# back, so this does not depend on how many commits the fixture happens to have.
+POISON_SHA=$(git -C "$R12" rev-parse refs/remotes/origin/master)
+g "$R12" update-ref refs/heads/base "$POISON_SHA"
+if g "$R12" rev-parse --verify --quiet refs/heads/base >/dev/null 2>&1; then
+  ok "the poisoned fixture ref really exists"
+else
+  bad "the poisoned fixture ref was not created; case 12 would prove nothing"
+fi
+out=$(cd "$R12" && UPSTREAM=base bash scripts/recovery-check.sh --quick 2>&1); got=$?
+assert_run "a poisoned ambient UPSTREAM does not break the recovered tree" 0 \
+  "bundle reproduces the working tree" "$out" "$got"
+# It must actually have been used, or the case would pass for the wrong reason:
+# the check has to name the base it was given, which is only true if it honoured
+# the caller's UPSTREAM rather than quietly substituting its own default.
+if printf '%s' "$out" | grep -qE 'base [0-9a-f]{7,}'; then
+  ok "the check did run against the ambient UPSTREAM it was given"
+else
+  bad "the check did not report the ambient UPSTREAM base it was given"
+fi
+
+# The same poisoning, but with a ref that does NOT exist. This is the falsifiable
+# half: a check that silently fell back to its own default here would report a
+# full green run, and the case above would still pass -- so only this one can
+# tell a working UPSTREAM contract from a hardcoded one.
+out=$(cd "$R12" && UPSTREAM=refs/heads/does-not-exist \
+  bash scripts/recovery-check.sh --quick 2>&1); got=$?
+assert_run "a nonexistent ambient UPSTREAM is refused, not silently defaulted" 2 \
+  "does not exist; cannot build a recovery base" "$out" "$got"
+# A reduced environment must behave identically. If the contract held only
+# because of something the caller's shell happened to export, a CI runner with a
+# cleaner environment would take a different path through the same code.
+out=$(cd "$R12" && env -i PATH=/usr/bin:/bin HOME="${HOME:-/root}" \
+  UPSTREAM=refs/heads/does-not-exist \
+  bash scripts/recovery-check.sh --quick 2>&1); got=$?
+assert_run "the same refusal holds in a reduced environment" 2 \
+  "does not exist; cannot build a recovery base" "$out" "$got"
 
 echo "recovery-selftest: case 10 -- negative controls"
 # Two edits, each applied to a COPY of the check. A control is only meaningful
