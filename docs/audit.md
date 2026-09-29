@@ -1890,3 +1890,79 @@ passed against a stranger's listener while the real gateway had died on
 gateway port and asserts its own process is alive before trusting a probe. Worth
 recording as a general shape: a readiness probe that succeeds against a port you
 did not bind is not a readiness probe.
+
+### Round 16 (2026-09-29) — a check that never ran, and a doc nobody executed
+
+Round 15 fixed a real defect and left two things unexamined. Both turned out to
+be worse than the defect.
+
+**1. The `UPSTREAM` pin was dead code.** Round 15 kept it, honestly labelled as
+defense-in-depth. It should have been deleted, and measuring it is what showed
+why. The recovered tree contains exactly one ref — `refs/heads/recovered` — so
+`origin/master` never resolves there, the guard's condition was never true, and
+the branch always fell through to the unpinned path. Its only observable effect
+was a note on *every* run reading "recovered tree has no origin/master", which
+is a confusing line to print on every successful run.
+
+REMOVED, with the reasoning recorded in place so nobody re-adds it. A mechanism
+that cannot execute, guarding a leak that cannot occur, is cost without
+benefit. The self-tests own their environment: `dist-freshness-selftest.sh`
+pins `UPSTREAM` on its own command line, and the other three never read it.
+
+**2. The handoff document was still unverified, and the fix is now executable.**
+The `dist/README.md` repair from Round 15 was itself never *run*. It was a grep
+of my own editing, which is the same class of check that let the drift survive in
+the first place. `scripts/doc-verify.sh` now extracts the refspecs from the
+document's own fenced `sh` blocks and **executes** each against a freshly
+generated bundle. It is verified falsifiable: reverting the doc to the broken
+`'HEAD:refs/heads/frombundle'` makes it fail on two independent counts (the
+execution check and the explicit `HEAD:` check) and name the offending block.
+
+Two details the implementation had to get right, both of which produced false
+results first:
+
+  - Only fenced ```sh blocks are scanned. The prose deliberately *quotes* the
+    old broken command to explain why it is wrong, so a text-wide scan flags
+    the explanation as though it were an instruction.
+  - Shell line continuations are joined first, or a refspec written across two
+    lines is invisible and the check reports "no fetch command found" against a
+    document full of them.
+
+Wired into the `unpushed-export` job, which is the one place that already
+generates real artifacts.
+
+**3. Both fixes were confirmed against mutants, not by reading the diff.** The
+Round-15 ref-discovery fix had been verified by hand, so case 11 was checked the
+same way: appending `BUNDLE_REF="refs/heads/airouter-unpushed-export"` after the
+discovery line restores the exact defect, and both custom-ref assertions then
+fail (exit 1) and name the missing message. Recorded in the self-test, because an
+assertion nobody has ever seen fail is a claim, not a check.
+
+**4. The doc was missing a commit from its own handoff list — and the checker
+that noticed was already in the suite.** `audit-attribution-check` failed with
+"commit ebdd8d5 is unpushed but missing from dist/README.md's list". That is the
+attribution checker working exactly as designed on the file it exists to police.
+It is recorded here because the alternative — loosening the checker to make the
+gate green — is the failure mode this repository has hit before.
+
+**5. A readiness probe that succeeds against a port you did not bind is a false
+positive.** The `sse-contract` replay reported four `401 Unauthorized` and
+appeared to be a broken termination contract. It was neither: the gateway had
+died on `address already in use` — a different process on the machine held 9090
+— and the harness's readiness probe passed against *that* process's `/health`.
+The harness never verified it had bound the port it was probing. It now uses a
+dedicated port and asserts its own PID is alive before trusting any probe. This
+belongs in the record because the symptom pointed squarely at the product, and
+the harness was the bug; a probe that reports "the service is up" while the
+service is down produces exactly the kind of confident wrong answer that costs
+the most time. Ownership of the bound port, not mere acceptance of TCP, is what
+makes a readiness check mean anything.
+
+**6. A repo-wide sweep for the same class of defect.** Every hardcoded
+`refs/heads/airouter-unpushed-export` and `EXPORT_REF` reference was
+reconciled. Results: `dist-freshness-check.sh` reads only the SHA from
+`list-heads`, never the ref name, and was confirmed ref-agnostic by running it
+against a bundle exported as `totally-different-name` (passes). The CI job's
+hardcoded ref is legitimate — that job generates with the default ref and
+deliberately exercises the documented reader path. The remaining occurrences are
+prose explaining the ref, or the `export-unpushed.sh` default itself.

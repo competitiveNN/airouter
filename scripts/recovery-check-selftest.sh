@@ -372,6 +372,12 @@ if printf '%s' "$out" | grep -qF 'refs/heads/my-handoff-ref'; then
 else
   bad "the discovered tip ref is not named in the output"
 fi
+# Both assertions above were confirmed against a mutant: appending
+#   BUNDLE_REF="refs/heads/airouter-unpushed-export"
+# after the discovery line restores the exact Round-15 defect, and the run
+# then fails both of them (exit 1) and names the missing message. Without that
+# mutant test this case was, for a few minutes, a claim rather than a check --
+# exactly the round-10 lesson that a control which cannot fail proves nothing.
 
 echo "recovery-selftest: case 12 -- the ambient UPSTREAM contract holds"
 # An earlier version of this case asserted that recovery-check.sh pins UPSTREAM
