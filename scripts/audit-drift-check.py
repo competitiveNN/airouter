@@ -33,7 +33,31 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 AUDIT = ROOT / "docs" / "audit.md"
-GO_SOURCES = list(ROOT.glob("*.go"))
+
+# Recursive, not `ROOT.glob("*.go")`.
+#
+# A root-only glob is the same defect class as the fuzz gate's root-only
+# `ls *_test.go`: the repository is a single flat package today, so the
+# root-only form happens to cover every .go file and nothing is missed. The
+# first commit that moves a file into a subpackage makes every symbol it
+# declares unresolvable, and the failure reports the wrong thing. Verified by
+# moving router.go to ./subpkg: the check failed with "summarizeError: not found
+# in any .go file" for symbols that were sitting right there in a subdirectory
+# -- a reader following that message adds a deletion to ALLOWLIST, which is
+# both wrong and permanent, instead of widening the glob.
+#
+# rglob also descends into testdata/, where Go ignores subdirectories, so
+# nothing there can be a valid package. Skipping .git and any vendored tree
+# keeps a stray checkout from being mistaken for source.
+#
+# Sorted: the sources are joined into one corpus below, and rglob's ordering is
+# filesystem-dependent. Without the sort the same tree can yield different
+# blobs on different machines, which would make any "the corpus changed" diff
+# meaningless.
+GO_SOURCES = sorted(
+    p for p in ROOT.rglob("*.go")
+    if ".git" not in p.parts and "vendor" not in p.parts
+)
 
 # Findings whose subject genuinely no longer exists. Keyed by the literal anchor
 # text; each must say why, so the allowlist cannot quietly grow forever.
