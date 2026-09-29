@@ -923,6 +923,123 @@ corpus it built is gitignored. This round makes the coverage stand on its own.
   traffic will eventually produce. Recorded here because "we measured it and it
   did not help" is a result; "we did not measure it" would not have been.
 
+### Round 8 (2026-09-29) — the gate that was never run, and the measurement that measured nothing
+
+Round 7 added `scripts/fuzz-gate.sh` and wired three hand-named CI steps to it.
+Auditing that work found the script was never actually executed as documented,
+and that two of its checks could not distinguish the case they were written for
+from the case they were not.
+
+**`FROZEN=1` was a trap, and the documented invocation was the broken one.** The
+usage line says `FROZEN=1 scripts/fuzz-gate.sh`, but `FROZEN=1` is a *shell*
+assignment, not a shell word: it sets a variable and passes nothing. The
+universal form — `FROZEN=1 ./fuzz-gate.sh` — binds it to `$1`, so the string
+`FROZEN` became `SECONDS_PER_TARGET`, and the script then reported:
+
+    scripts/fuzz-gate.sh: line 114: [: FROZEN: integer expected
+    --- fuzzing FuzzExpositionRoundTrip for FROZENs
+    invalid value "FROZENs" for flag -test.fuzztime: invalid duration
+    ::error::FuzzExpositionRoundTrip found a counterexample.
+
+A usage error was reported as a fuzz counterexample, pointing the reader at
+`testdata/fuzz/FuzzExpositionRoundTrip/` for a crasher that does not exist, and
+exiting 1. The one invocation a reader is told to use was the one that fails, and
+it fails by fabricating a bug. A typo (`20x`) took the same path. Now the
+duration is validated as a non-negative integer before it reaches `-fuzztime`,
+`FROZEN` is read only from the environment, and `FROZEN=1` combined with an
+explicit duration is a usage error rather than a silent override. Verified: the
+documented form now exits 0, and `abc` exits 2 with a usage message instead of a
+fake crasher.
+
+**A committed corpus made the gate permanently red.** `check_uncommitted_crashers`
+ended with `[ "$n" -gt 0 ] && echo ...` as the last statement of the function, so
+the function returned the *predicate's* status. With no `testdata/fuzz` directory
+yet — the normal state before any crasher exists — the directory is absent, `n`
+is 0, and the function returned 1. Both call sites read non-zero as "a crasher
+was lost". So the gate failed on a clean checkout with an error message naming a
+file that did not exist. This is the same class of bug as the one the function
+was written to prevent, caused by the fix. The informational `echo` no longer
+sets the return value. Verified both directions: a committed corpus file exits
+0 ("1 corpus file(s), all tracked"), an uncommitted one exits 1 and names it.
+
+**Discovery was root-only.** `for f in $(ls *_test.go)` finds the two targets
+that happen to live in the repository root and silently misses every target
+added under a subdirectory — the same coverage-that-looks-like-coverage failure
+as the hardcoded list it replaced, except it also survives auditing the list.
+Discovery now walks every package directory via `git ls-files -z`, with each
+path passed to `sed` as one quoted argument (the unquoted `$(ls ...)` would split
+on whitespace in a filename). Since `git ls-files` skips untracked files, a
+cross-check compares the on-disk `*_test.go` set against the tracked one and
+fails loudly on a difference, so an untracked test file cannot drop its fuzz
+targets off the gate with no signal. Verified: planting an untracked
+`*_test.go` exits 1 and names the file.
+
+**The threshold study was measuring a code path that never executes.** Round 7's
+headroom claim — "zero violations at k=100 on real output" — was true and
+vacuous. On `valid-histograms.prom`, all 16 histogram label sets short-circuit
+invariant (6) on `above <= 0`: every observation lands in the top *finite*
+bucket, so `+Inf - topBound == 0` and the comparison is never reached. The
+sweep could have been run with the guard's arithmetic deleted and it would have
+reported the same thing. `TestInvariantSixThresholdHasNoHeadroom` now asserts
+eligibility first (`invariantSixEligibility`) and fails if no label set in the
+corpus reaches the comparison, and it reports the tightest `k` that would reject
+the real fixture — currently "no k", i.e. the honest answer, logged rather than
+asserted because it is a property of the traffic rather than of the code. The
+load-bearing part of the claim (k=1 vs k=2 over the whole corpus) is unaffected
+and still holds: 7 label sets reach the comparison, k=1 and k=2 both fire on 6
+of 15 inputs.
+
+**The equivalence check agreed with production on one fixture.** It now runs
+over every golden fixture plus every fuzz seed, and asserts per-input equality
+rather than an aggregate, so a helper that fires once too often on one series and
+once too rarely on another cannot report a matching total. It also fails if
+*neither* side fires anywhere, since two functions that both return zero
+everywhere are trivially equal.
+
+**A corpus that could not tell a correct formula from one missing a factor.**
+Every other input fires by such a margin (the overflow fixture's sum is 0.11
+against a minimum of 495) that dropping the `topBound` term from invariant (6)
+still rejects it — the equivalence check was passing for the wrong reason. A seed
+was added whose verdict depends on the `topBound` term itself: 1 observation
+above `le="45"` with `_sum` 40, which is impossible with the term and looks fine
+at 40 against a bound of 1*1 without it. Dropping `topBound` from both the
+production guard and the helper now fails the test.
+
+**Documentation that overstated its evidence.** The `valid-histograms.prom`
+header claimed "17 label evictions", but the
+`airouter_metrics_label_{overflow,evictions}_total` counters that would report
+that are declared in the fixture and carry no sample line, even though
+`metrics.go:978,988` emit them unconditionally — the capture is missing them. The
+header now states what the file actually shows (15 per-endpoint label sets, with
+`fake-fast-1` evicted), and `testdata/metrics/README.md` records the discrepancy
+rather than papering over it. The real eviction evidence is the missing
+`fake-fast-1` label and the zeroed `*_evicted_attempts_latency_*` gauges, not
+the counter.
+
+Verification for this round:
+
+  `go test -race -count=1 ./...` → ok, 0 failed (2026-09-29)
+  `gofmt -l .` → clean; `go vet ./...` → no issues; `go build ./...` → success
+  `python3 scripts/sse-check.py` → 4/4 streams satisfy the termination contract
+  `scripts/sse-negative-check.sh` → PASS (guard demonstrably has teeth; proxy.go
+    byte-identical to HEAD afterwards)
+  `scripts/secret-scan.sh` → clean (tracked content, history, .git/config)
+  `scripts/audit-drift-check.py` → 53 anchors checked, all resolve
+  CI YAML parses; exactly one fuzz-gate step, replacing three hand-named ones
+  `scripts/fuzz-gate.sh 1` → PASS, 2 targets, 113K execs in the 1s window
+  `FROZEN=1 scripts/fuzz-gate.sh` → PASS (was exit 1 with a fabricated
+    counterexample)
+  Four negative controls on the gate's new checks, each verified to fail: a
+    committed corpus file, an uncommitted crasher, an untracked `*_test.go`, and
+    a non-integer duration argument.
+
+Tests added this round: `TestInvariantSixThresholdMatchesProductionCheck`
+(extended to the whole corpus), `TestInvariantSixThresholdHasNoHeadroom`
+(extended to assert eligibility and record the tightest k), plus
+`goldenMetricsFixtures`, `invariantSixEligibility`, `tightestKThatFiresOnReal`
+and `truncate`. No production code changed this round — every finding was in the
+test and gate layer that was supposed to be providing the coverage.
+
 Tests added this round: `TestEveryExportedHistogramIsWellFormed`,
 `TestEachHistogramInvariantHasTeeth`, plus `checkHistogramInvariants`,
 `histogramIndex`, `countHistogramBuckets` and `renderLabelSet`. Both were
