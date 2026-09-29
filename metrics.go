@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,8 +61,39 @@ type Metrics struct {
 	// exporter does not have to sort or merge anything at scrape time.
 	attemptLatencyBounds []float64 // seconds
 	attemptHistByEnd     map[string][]atomic.Int64
-	mu                   sync.RWMutex // protects map initialization
+	// labelsCap bounds the number of distinct label values any single
+	// label-value map may hold. See (*Metrics).boundLabel for why this
+	// exists and why the cap is enforced on the value map rather than on
+	// the formatted output.
+	labelsCap int
+	// labelsOverflowed counts observations that were folded into
+	// overflowLabel because their label value was not already tracked and
+	// the map was at capacity. Without it, collapsing silently discards
+	// data and an operator sees a suspiciously flat series with no
+	// indication that anything was dropped.
+	labelsOverflowed atomic.Int64
+	// overflowLabel is the bucket name that unknown, at-capacity label
+	// values collapse into. Chosen to be greppable and obviously not a
+	// real provider so it is never mistaken for a configured endpoint.
+	overflowLabel string
+	mu            sync.RWMutex // protects map initialization
 }
+
+// overflowLabelValue is the bucket that unrecognised label values collapse into
+// once a label map reaches its cap. Deliberately not a valid
+// "provider:model" pair, so an operator seeing it knows immediately that it is
+// an overflow bucket and not a misconfigured endpoint.
+const overflowLabelValue = "__overflow__"
+
+// maxLabelValues caps how many distinct values a single label map holds.
+//
+// This is a real ceiling, not a guess: the production config already carries 60
+// distinct endpoint keys, and a nightly free-model sync is the kind of job that
+// legitimately grows that list. 512 leaves ~8x headroom over the current
+// config while keeping the worst case bounded and small. A single overflowing
+// endpoint costs one counter plus one 12-bucket histogram, so the absolute
+// memory ceiling is roughly 512 * (a few hundred bytes) — negligible.
+const maxLabelValues = 512
 
 // defaultLatencyBuckets are the standard Prometheus histogram boundaries
 // (seconds). The trailing +Inf bucket is implied and appended at serve time.
@@ -90,6 +122,8 @@ func NewMetrics() *Metrics {
 		attemptFailuresByEnd:    make(map[string]*atomic.Int64),
 		attemptLatencyNSByEnd:   make(map[string]*atomic.Int64),
 		attemptHistByEnd:        make(map[string][]atomic.Int64),
+		labelsCap:               maxLabelValues,
+		overflowLabel:           overflowLabelValue,
 	}
 	m.attemptLatencyBounds = attemptLatencyBoundaries
 	m.latencyBoundaries = defaultLatencyBuckets
@@ -97,9 +131,12 @@ func NewMetrics() *Metrics {
 	return m
 }
 
-// counter returns the atomic counter for the given key, creating it on first
-// access. The double-check under write lock prevents duplicate allocation.
-func (m *Metrics) counter(key string) *atomic.Int64 {
+// counterModel returns the atomic counter for a logical model name, creating it
+// on first access. The map is bounded like the rest: the model is client-supplied
+// and reaches this function even on the pre-validation paths that record an
+// empty or rejected model, so it must not be allowed to grow without limit.
+func (m *Metrics) counterModel(key string) *atomic.Int64 {
+	key = m.boundLabelValue(m.requestsByModel, key)
 	m.mu.RLock()
 	c, ok := m.requestsByModel[key]
 	m.mu.RUnlock()
@@ -114,7 +151,7 @@ func (m *Metrics) counter(key string) *atomic.Int64 {
 	return c
 }
 
-// counterStatus returns the atomic counter for the given status key.
+// counterStatus returns the atomic counter for the given status code.
 func (m *Metrics) counterStatus(key string) *atomic.Int64 {
 	m.mu.RLock()
 	c, ok := m.requestsByStatus[key]
@@ -130,7 +167,7 @@ func (m *Metrics) counterStatus(key string) *atomic.Int64 {
 	return c
 }
 
-// counterFailure returns the atomic counter for the given failure status key.
+// counterFailure returns the atomic counter for the given failure status code.
 func (m *Metrics) counterFailure(key string) *atomic.Int64 {
 	m.mu.RLock()
 	c, ok := m.failuresByStatus[key]
@@ -149,12 +186,11 @@ func (m *Metrics) counterFailure(key string) *atomic.Int64 {
 // Request records a successful or failed request.
 func (m *Metrics) Request(model string, status int, latency time.Duration) {
 	m.requestsTotal.Add(1)
-	m.counter("requests_by_model_" + model).Add(1)
-	statusKey := "requests_by_status_" + strconv.Itoa(status)
-	m.counterStatus(statusKey).Add(1)
+	m.counterModel(model).Add(1)
+	m.counterStatus(strconv.Itoa(status)).Add(1)
 	if status >= 400 {
 		m.failuresTotal.Add(1)
-		m.counterFailure("failures_by_status_" + strconv.Itoa(status)).Add(1)
+		m.counterFailure(strconv.Itoa(status)).Add(1)
 	}
 	secs := latency.Seconds()
 	m.latencySumNS.Add(latency.Nanoseconds())
@@ -179,8 +215,10 @@ func (m *Metrics) Fallback(fromEndpoint string) {
 }
 
 // counterFallbackFrom returns the atomic counter for the given endpoint,
-// creating it on first access.
+// creating it on first access. Bounded like the attempt telemetry, since the
+// endpoint is a provider:model key subject to the same config churn.
 func (m *Metrics) counterFallbackFrom(key string) *atomic.Int64 {
+	key = m.boundLabelValue(m.fallbacksByFromEndpoint, key)
 	m.mu.RLock()
 	c, ok := m.fallbacksByFromEndpoint[key]
 	m.mu.RUnlock()
@@ -202,13 +240,20 @@ func (m *Metrics) Cooldown() {
 
 // CircuitTransition records a circuit breaker state change for an endpoint.
 func (m *Metrics) CircuitTransition(from, to CircuitState, endpoint string) {
-	key := fmt.Sprintf("from=\"%s\",to=\"%s\",endpoint=\"%s\"", from, to, endpoint)
+	// from.String()/to.String() rather than string(from): CircuitState is an
+	// int-backed enum, so a direct conversion would emit the rune for the
+	// state number ("\x00", "\x01") instead of "closed"/"open"/"half-open".
+	// The String form is closed over four values, so it needs no escaping —
+	// labelEscape is applied anyway so this stays correct if that changes.
+	key := fmt.Sprintf("from=%q,to=%q,endpoint=%q",
+		labelEscape(from.String()), labelEscape(to.String()), labelEscape(endpoint))
 	m.counterCircuitTransition(key).Add(1)
 }
 
 // counterCircuitTransition returns the atomic counter for a circuit state
 // transition key, creating it on first access.
 func (m *Metrics) counterCircuitTransition(key string) *atomic.Int64 {
+	key = m.boundLabelValue(m.circuitTransitions, key)
 	m.mu.RLock()
 	c, ok := m.circuitTransitions[key]
 	m.mu.RUnlock()
@@ -241,21 +286,25 @@ func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
 	if endpoint == "" {
 		return
 	}
-	m.counterAttempts(endpoint).Add(1)
+	// One decision, four maps. Every attempt-telemetry structure below is
+	// indexed by the returned key, so the cap is enforced once and the key sets
+	// are identical by construction.
+	key := m.boundedAttemptKey(endpoint)
+	m.lazyCounter(m.attemptsByEndpoint, key).Add(1)
 	if !ok {
-		m.counterAttemptFailures(endpoint).Add(1)
+		m.lazyCounter(m.attemptFailuresByEnd, key).Add(1)
 	}
 	ns := d.Nanoseconds()
 	if ns < 0 {
 		ns = 0
 	}
-	m.counterAttemptLatencySum(endpoint).Add(ns)
+	m.lazyCounter(m.attemptLatencyNSByEnd, key).Add(ns)
 
 	m.mu.Lock()
-	h, exists := m.attemptHistByEnd[endpoint]
+	h, exists := m.attemptHistByEnd[key]
 	if !exists {
 		h = make([]atomic.Int64, len(m.attemptLatencyBounds)+1) // +1 for +Inf
-		m.attemptHistByEnd[endpoint] = h
+		m.attemptHistByEnd[key] = h
 	}
 	m.mu.Unlock()
 
@@ -270,39 +319,148 @@ func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
 	h[idx].Add(1)
 }
 
-func (m *Metrics) counterAttempts(endpoint string) *atomic.Int64 {
-	return m.lazyCounter(m.attemptsByEndpoint, endpoint)
+// boundedAttemptKey admits one new attempt label and returns the key it was
+// actually stored under — the raw endpoint below the cap, overflowLabelValue at
+// or above it.
+//
+// It must be called EXACTLY once per Attempt, before any of the attempt maps are
+// touched, and the returned key is what all of them must be indexed by. An
+// earlier version bounded each map independently inside lazyCounter, which was
+// wrong twice over: the bounded value never propagated back to the caller, so
+// the histogram map was still keyed by the raw label and grew without bound;
+// and bounding each map separately let the maps disagree at the boundary, which
+// could produce an endpoint with attempt counts but no latency histogram.
+// Deciding once, up front, makes the key set identical across all four maps by
+// construction and needs no further coordination.
+//
+// The cap includes the overflow bucket, because that bucket occupies a slot in
+// the map exactly like a real endpoint does. The first version of this admitted
+// cap real endpoints and then let the overflow key in on top, so the map
+// reached cap+1. One extra counter is immaterial to memory, but "the map never
+// exceeds the cap" is the property the tests assert, and a limit that is not
+// actually the limit is worse than no limit at all — it reads as a guarantee it
+// does not provide.
+//
+// So one slot is reserved for the bucket: a new real value is only admitted
+// while there is room for the bucket to follow. That makes len(map) <= labelsCap
+// an invariant, and it also guarantees the bucket is present whenever the map is
+// full, which is what makes the collapse below total (there is always somewhere
+// to put the observation). The cost is labelsCap-1 individually-named endpoints,
+// which maxLabelValues leaves ample room for.
+func (m *Metrics) boundedAttemptKey(endpoint string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, tracked := m.attemptsByEndpoint[endpoint]; tracked {
+		return endpoint
+	}
+	// Room for a real value plus the reserved slot for the bucket.
+	if len(m.attemptsByEndpoint) < m.labelsCap-1 {
+		m.attemptsByEndpoint[endpoint] = &atomic.Int64{}
+		return endpoint
+	}
+	// The bucket itself is a legitimate label that any caller may submit, and
+	// it is counted in its own right when it is.
+	if endpoint == m.overflowLabel {
+		m.attemptsByEndpoint[endpoint] = &atomic.Int64{}
+		return endpoint
+	}
+	m.labelsOverflowed.Add(1)
+	key := m.overflowLabel
+	if _, has := m.attemptsByEndpoint[key]; !has {
+		// Unreachable given the reservation above, but the fallback keeps the
+		// invariant true even if the reservation is ever changed: without it a
+		// missing bucket would silently drop the observation.
+		m.attemptsByEndpoint[key] = &atomic.Int64{}
+	}
+	return key
 }
 
-func (m *Metrics) counterAttemptFailures(endpoint string) *atomic.Int64 {
-	return m.lazyCounter(m.attemptFailuresByEnd, endpoint)
-}
-
-func (m *Metrics) counterAttemptLatencySum(endpoint string) *atomic.Int64 {
-	return m.lazyCounter(m.attemptLatencyNSByEnd, endpoint)
-}
-
-// lazyCounter returns the counter for endpoint in store, creating it on first
-// access. The store must be one of the attempt-telemetry maps. Read-locks for
-// the common case and double-checks under a write lock so two goroutines
-// racing on a brand-new endpoint cannot each allocate one.
-func (m *Metrics) lazyCounter(store map[string]*atomic.Int64, endpoint string) *atomic.Int64 {
+// lazyCounter returns the counter for key in store, creating it on first access.
+// The key must already have been through boundedAttemptKey; this function only
+// guarantees the counter allocation is race-free (read-lock fast path, then a
+// double-check under the write lock so two goroutines racing on a brand-new key
+// cannot each allocate one).
+func (m *Metrics) lazyCounter(store map[string]*atomic.Int64, key string) *atomic.Int64 {
 	m.mu.RLock()
-	c, ok := store[endpoint]
+	c, ok := store[key]
 	m.mu.RUnlock()
 	if ok {
 		return c
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if c, ok = store[endpoint]; !ok {
+	if c, ok = store[key]; !ok {
 		c = &atomic.Int64{}
-		store[endpoint] = c
+		store[key] = c
 	}
 	return c
 }
 
+// boundLabelValue maps a raw label value onto the value that will actually be
+// used as a map key, folding unknown values into a single overflow bucket once
+// the map is full. Used by the single-key maps (per-model requests, per-endpoint
+// fallbacks, circuit transitions); the attempt telemetry decides once up front
+// in boundedAttemptKey instead, because it spans four maps that must agree.
+//
+// Why this is needed. Every label value here comes from configuration
+// (provider:model keys), but the configuration is not fixed for the process
+// lifetime: HandleAdminConfig accepts an arbitrary new config and
+// watchConfig hot-reloads the file on a 3 s poll. A config churn loop — or a
+// nightly free-model sync that keeps introducing fresh model ids — therefore
+// feeds genuinely unbounded values into these maps. Nothing ever evicted a
+// series, and each endpoint costs a counter set plus a 12-bucket histogram, so
+// the process grows until it is OOM-killed. A metrics endpoint that can be used
+// to kill the gateway is a self-inflicted DoS.
+//
+// A value that is already a tracked key keeps its own series even at capacity;
+// the cap only affects admitting *new* values. That means the hot endpoints of
+// a churning config stay individually visible, and only the tail collapses.
+func (m *Metrics) boundLabelValue(store map[string]*atomic.Int64, value string) string {
+	m.mu.RLock()
+	_, tracked := store[value]
+	// Same slot reservation as boundedAttemptKey, for the same reason: without
+	// it the map reaches cap+1 by letting the bucket in on top.
+	room := len(store) < m.labelsCap-1
+	m.mu.RUnlock()
+	if tracked || room || value == m.overflowLabel {
+		return value
+	}
+	m.labelsOverflowed.Add(1)
+	return m.overflowLabel
+}
+
 // ServeHTTP writes Prometheus text format to the response.
+// labelEscape escapes a label value for the Prometheus text exposition format.
+//
+// Every label value here is interpolated into a `"..."` quoted string with no
+// escaping at all. That is a real injection path, not a theoretical one: the
+// provider and model names come from config, and config is writable through
+// HandleAdminConfig and rewritten on disk by the model-sync job. A provider
+// named `x" 1\nairouter_requests_total{model="victim` therefore produces two
+// syntactically valid series on the next scrape, and an operator or a downstream
+// scraper reads both as genuine. The exposition format requires escaping
+// backslash, double quote, and newline; everything else is literal.
+func labelEscape(v string) string {
+	if !strings.ContainsAny(v, "\\\"\n") {
+		return v
+	}
+	var b strings.Builder
+	b.Grow(len(v) + 8)
+	for _, r := range v {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintln(w, "# HELP airouter_requests_total Total requests by model and status")
@@ -310,10 +468,10 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	m.mu.RLock()
 	for k, c := range m.requestsByModel {
-		fmt.Fprintf(w, "airouter_requests_total{model=\"%s\"} %d\n", k, c.Load())
+		fmt.Fprintf(w, "airouter_requests_total{model=\"%s\"} %d\n", labelEscape(k), c.Load())
 	}
 	for k, c := range m.requestsByStatus {
-		fmt.Fprintf(w, "airouter_requests_total{status=\"%s\"} %d\n", k, c.Load())
+		fmt.Fprintf(w, "airouter_requests_total{status=\"%s\"} %d\n", labelEscape(k), c.Load())
 	}
 	m.mu.RUnlock()
 
@@ -322,7 +480,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	m.mu.RLock()
 	for k, c := range m.failuresByStatus {
-		fmt.Fprintf(w, "airouter_failures_total{status=\"%s\"} %d\n", k, c.Load())
+		fmt.Fprintf(w, "airouter_failures_total{status=\"%s\"} %d\n", labelEscape(k), c.Load())
 	}
 	m.mu.RUnlock()
 
@@ -336,7 +494,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE airouter_fallbacks_total_by_endpoint counter")
 	m.mu.RLock()
 	for k, c := range m.fallbacksByFromEndpoint {
-		fmt.Fprintf(w, "airouter_fallbacks_total_by_endpoint{endpoint=\"%s\"} %d\n", k, c.Load())
+		fmt.Fprintf(w, "airouter_fallbacks_total_by_endpoint{endpoint=\"%s\"} %d\n", labelEscape(k), c.Load())
 	}
 	m.mu.RUnlock()
 
@@ -372,6 +530,16 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# HELP airouter_sse_comments_routed_out SSE comment lines dropped instead of being parsed as events")
 	fmt.Fprintln(w, "# TYPE airouter_sse_comments_routed_out counter")
 	fmt.Fprintf(w, "airouter_sse_comments_routed_out %d\n", m.sseCommentsRoutedOut.Load())
+
+	// A non-zero value here means label values were being discarded for lack
+	// of registry space and folded into __overflow__ instead. It is the signal
+	// that either the cap is too low for the deployment or something is
+	// feeding the gateway unbounded label values (a config churn loop, or a
+	// model sync inventing new ids). While it is zero, every series in this
+	// response is exact.
+	fmt.Fprintln(w, "# HELP airouter_metrics_label_overflow_total Observations folded into the overflow bucket because the label registry is full")
+	fmt.Fprintln(w, "# TYPE airouter_metrics_label_overflow_total counter")
+	fmt.Fprintf(w, "airouter_metrics_label_overflow_total %d\n", m.labelsOverflowed.Load())
 
 	m.serveAttemptMetrics(w)
 }
@@ -432,8 +600,8 @@ func (m *Metrics) serveAttemptMetrics(w http.ResponseWriter) {
 
 	for _, ep := range endpoints {
 		n := attempts[ep]
-		fmt.Fprintf(w, "airouter_endpoint_attempts_total{endpoint=\"%s\"} %d\n", ep, n)
-		fmt.Fprintf(w, "airouter_endpoint_attempt_failures_total{endpoint=\"%s\"} %d\n", ep, failures[ep])
+		fmt.Fprintf(w, "airouter_endpoint_attempts_total{endpoint=\"%s\"} %d\n", labelEscape(ep), n)
+		fmt.Fprintf(w, "airouter_endpoint_attempt_failures_total{endpoint=\"%s\"} %d\n", labelEscape(ep), failures[ep])
 
 		sum := float64(latSum[ep]) / 1e9
 		h := hists[ep]
@@ -442,10 +610,10 @@ func (m *Metrics) serveAttemptMetrics(w http.ResponseWriter) {
 			if i < len(h) {
 				cumulative += h[i]
 			}
-			fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_bucket{endpoint=\"%s\",le=\"%g\"} %d\n", ep, bound, cumulative)
+			fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_bucket{endpoint=\"%s\",le=\"%g\"} %d\n", labelEscape(ep), bound, cumulative)
 		}
-		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_bucket{endpoint=\"%s\",le=\"+Inf\"} %d\n", ep, n)
-		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_sum{endpoint=\"%s\"} %f\n", ep, sum)
-		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_count{endpoint=\"%s\"} %d\n", ep, n)
+		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_bucket{endpoint=\"%s\",le=\"+Inf\"} %d\n", labelEscape(ep), n)
+		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_sum{endpoint=\"%s\"} %f\n", labelEscape(ep), sum)
+		fmt.Fprintf(w, "airouter_endpoint_attempt_duration_seconds_count{endpoint=\"%s\"} %d\n", labelEscape(ep), n)
 	}
 }
