@@ -148,9 +148,9 @@ func (s CircuitState) String() string {
 // the cooldown system: cooldowns prevent immediate retries; the circuit
 // breaker adds a half-open probe phase to safely restore availability.
 type CircuitBreaker struct {
-	State       CircuitState `json:"state"`
-	OpenedAt    time.Time    `json:"opened_at"`
-	ProbesSent  int          `json:"probes_sent"`
+	State      CircuitState `json:"state"`
+	OpenedAt   time.Time    `json:"opened_at"`
+	ProbesSent int          `json:"probes_sent"`
 }
 
 const (
@@ -1475,15 +1475,15 @@ func (r *Router) GetAllCooldowns() map[string]CooldownEntry {
 // cooldown state, returned by the /v1/airouter/state endpoint so operators
 // can diagnose fail-over behavior from a single call.
 type CircuitStateSnapshot struct {
-	ModelKey      string        `json:"model_key"`
-	CircuitState  string        `json:"circuit_state"`
-	OpenedAt      time.Time     `json:"opened_at"`
-	ProbesSent    int           `json:"probes_sent"`
-	CooldownExpiry time.Time    `json:"cooldown_expiry,omitempty"`
-	CooldownIn    time.Duration `json:"cooldown_remaining_ms"`
-	ErrorCount    int           `json:"error_count"`
-	StatusCode    int           `json:"status_code"`
-	LastError     string        `json:"last_error,omitempty"`
+	ModelKey       string        `json:"model_key"`
+	CircuitState   string        `json:"circuit_state"`
+	OpenedAt       time.Time     `json:"opened_at"`
+	ProbesSent     int           `json:"probes_sent"`
+	CooldownExpiry time.Time     `json:"cooldown_expiry,omitempty"`
+	CooldownIn     time.Duration `json:"cooldown_remaining_ms"`
+	ErrorCount     int           `json:"error_count"`
+	StatusCode     int           `json:"status_code"`
+	LastError      string        `json:"last_error,omitempty"`
 }
 
 // GetAllCircuitsState returns a combined snapshot of every endpoint's circuit
@@ -1516,9 +1516,9 @@ func (r *Router) GetAllCircuitsState() []CircuitStateSnapshot {
 }
 
 type ProviderError struct {
-	StatusCode  int
-	Body        []byte
-	Err         error
+	StatusCode int
+	Body       []byte
+	Err        error
 	// RetryAfter, when set, is the upstream's requested backoff for a 429
 	// (parsed from the Retry-After header). The cooldown logic honors it as a
 	// floor so we never wait less than the provider asked.

@@ -198,10 +198,10 @@ type ModelListResponse struct {
 }
 
 type Model struct {
-	ID           string `json:"id"`
-	Object       string `json:"object"`
-	Created      int64  `json:"created"`
-	OwnedBy      string `json:"owned_by"`
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
 	// MaxContextTokens is the advertised context window (input capacity) of
 	// this logical model, in tokens. It is derived from the smallest
 	// context_length in the fallback chain, so it is safe for every backend
@@ -598,60 +598,60 @@ func estimateTokens(req *ChatCompletionRequest) int {
 // `"type":"image_url"` marker (not a bare "image_url" substring) so a text
 // message that merely mentions the field is not mis-routed.
 func requestHasVision(body []byte) bool {
-return bytes.Contains(body, []byte(`"type":"image_url"`))
+	return bytes.Contains(body, []byte(`"type":"image_url"`))
 }
 
 // defaultMaxTokensForModel returns the output-token ceiling the gateway
 // applies to requests that omit max_tokens. Returns 0 if the client should
 // be left alone (no default configured, or explicit 0 = never default).
 func (g *GatewayContext) defaultMaxTokensForModel(model string) int {
-prefs := g.config.Load().Preferences
-def := prefs.DefaultMaxTokensValue()
-if def < 0 {
-	// auto: half the profile's advertised context window
-	chain, ok := g.config.Load().Models[model]
-	if !ok {
-		return 0
-	}
-	var minCtx int
-	for _, ep := range chain.Chain {
-		w := ep.ContextWindow()
-		if w <= 0 {
-			continue
+	prefs := g.config.Load().Preferences
+	def := prefs.DefaultMaxTokensValue()
+	if def < 0 {
+		// auto: half the profile's advertised context window
+		chain, ok := g.config.Load().Models[model]
+		if !ok {
+			return 0
 		}
-		if minCtx == 0 || w < minCtx {
-			minCtx = w
+		var minCtx int
+		for _, ep := range chain.Chain {
+			w := ep.ContextWindow()
+			if w <= 0 {
+				continue
+			}
+			if minCtx == 0 || w < minCtx {
+				minCtx = w
+			}
 		}
+		if minCtx <= 0 {
+			return 0
+		}
+		return minCtx / 2
 	}
-	if minCtx <= 0 {
-		return 0
-	}
-	return minCtx / 2
-}
-return def
+	return def
 }
 
 // injectMaxTokens sets max_tokens on the raw request body. It preserves all
 // other fields and their ordering, and returns the original body unchanged
 // on any parse failure (fail-open so a request is never dropped).
 func injectMaxTokens(body []byte, maxTokens int) []byte {
-var data map[string]json.RawMessage
-if err := json.Unmarshal(body, &data); err != nil {
-	return body
-}
-if _, ok := data["max_tokens"]; ok {
-	return body
-}
-val, err := json.Marshal(maxTokens)
-if err != nil {
-	return body
-}
-data["max_tokens"] = val
-out, err := json.Marshal(data)
-if err != nil {
-	return body
-}
-return out
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	if _, ok := data["max_tokens"]; ok {
+		return body
+	}
+	val, err := json.Marshal(maxTokens)
+	if err != nil {
+		return body
+	}
+	data["max_tokens"] = val
+	out, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // appendAssistantMessage returns body with an assistant message appended to the
@@ -941,7 +941,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		start := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		resp, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
-		if 		err != nil {
+		if err != nil {
 			cancel()
 			if isClientDisconnect(err) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
@@ -1006,7 +1006,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 }
 
 func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
-start := time.Now()
+	start := time.Now()
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
@@ -1360,10 +1360,10 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 		})
 	}
 	type CircuitInfo struct {
-		ModelKey   string       `json:"model_key"`
-		State      string       `json:"state"`
-		OpenedAt   time.Time    `json:"opened_at"`
-		ProbesSent int          `json:"probes_sent"`
+		ModelKey   string    `json:"model_key"`
+		State      string    `json:"state"`
+		OpenedAt   time.Time `json:"opened_at"`
+		ProbesSent int       `json:"probes_sent"`
 	}
 	circuitsResult := make([]CircuitInfo, 0, len(circuits))
 	for key, cb := range circuits {
@@ -1377,9 +1377,9 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"cooldowns":  result,
-		"circuits":   circuitsResult,
-		"count":      len(result),
+		"cooldowns": result,
+		"circuits":  circuitsResult,
+		"count":     len(result),
 	})
 }
 

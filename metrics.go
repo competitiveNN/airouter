@@ -46,11 +46,11 @@ var defaultLatencyBuckets = []float64{
 // NewMetrics creates a new Metrics instance with pre-allocated maps.
 func NewMetrics() *Metrics {
 	m := &Metrics{
-		requestsByModel:           make(map[string]*atomic.Int64),
-		requestsByStatus:          make(map[string]*atomic.Int64),
-		failuresByStatus:          make(map[string]*atomic.Int64),
-		fallbacksByFromEndpoint:   make(map[string]*atomic.Int64),
-		circuitTransitions:        make(map[string]*atomic.Int64),
+		requestsByModel:         make(map[string]*atomic.Int64),
+		requestsByStatus:        make(map[string]*atomic.Int64),
+		failuresByStatus:        make(map[string]*atomic.Int64),
+		fallbacksByFromEndpoint: make(map[string]*atomic.Int64),
+		circuitTransitions:      make(map[string]*atomic.Int64),
 	}
 	m.latencyBoundaries = defaultLatencyBuckets
 	m.latencyBuckets = make([]atomic.Int64, len(defaultLatencyBuckets)+1) // +1 for +Inf
