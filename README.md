@@ -126,9 +126,34 @@ Two counters make this visible rather than silent:
 `model="__overflow__"`, `endpoint="__overflow__"`) so collapsing never changes
 the label schema of healthy series.
 
+**The overflow bucket is not a histogram.** Eviction can roll a victim's attempt
+count and latency sum into `__overflow__`, but not its per-latency-band counts:
+once the endpoint is gone, "the 0.25s band held 40 observations from a label we
+evicted" is not representable. So `__overflow__` publishes no
+`airouter_endpoint_attempt_duration_seconds_*` series at all, and its totals
+appear instead as two gauges:
+
+```text
+airouter_evicted_attempts_latency_seconds_sum{endpoint="__overflow__"}    0.095540
+airouter_evicted_attempts_latency_seconds_count{endpoint="__overflow__"}  84
+```
+
+Both are emitted for every endpoint label (zero for live ones), so the series
+neither appears and disappears as the cap is crossed nor needs a special case in
+a "total minus live" query. Do not pass them to `histogram_quantile` — the
+distribution genuinely does not exist, only the count and the sum. Mean latency
+of evicted attempts is `sum / count` by hand.
+
+They are gauges rather than counters because an eviction *adds* to them, and a
+`rate()` over a series that can decrease is worse than no series. Read them as
+totals since process start.
+
 `docs/RUNBOOK.md` ("Label cardinality is bounded") covers what to watch, and
-`docs/audit.md` records the bugs found along the way — including three that a
-green test suite did not catch.
+`docs/audit.md` records the bugs found along the way — including four that a
+green test suite did not catch, among them an `__overflow__` bucket that was
+being exported as a histogram whose finite buckets were all `0` while its own
+`_sum` said every observation was nearly instant. It parsed, declared
+`histogram`, and made every dashboard look healthy.
 
 ## Observability
 
