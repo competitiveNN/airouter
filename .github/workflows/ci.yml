@@ -762,3 +762,10 @@ jobs:
       # against a freshly generated bundle rather than grepping for them.
       - name: the handoff document's commands actually work
         run: bash scripts/doc-verify.sh
+
+      # doc-verify.sh's verdict was, for a while, produced by running it once and
+      # seeing green -- which is evidence that proves nothing. This breaks the
+      # document in the ways it has actually broken and requires the check to go
+      # red for a NAMED reason, so the check above cannot pass vacuously.
+      - name: the document check can actually fail
+        run: bash scripts/doc-verify-selftest.sh
