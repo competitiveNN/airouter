@@ -648,6 +648,115 @@ convention.
   cap is a safety valve and must not reshape healthy data. Each map now collapses
   under its own label name — `status="__overflow__"`, `model="__overflow__"`.
 
+### Round 4 (2026-09-29) — the overflow bucket was an invalid histogram
+
+Rounds 1-3 made the bound *hold*. This round asked a question none of them did:
+what does the output actually say, and is it true? It was not.
+
+• `serveAttemptMetrics` (was metrics.go, overflow bucket emitted as a histogram)
+  — round 2 established that per-band histogram data cannot be rolled into the
+  overflow bucket, and recorded the consequence as "`__overflow__`'s `_count` can
+  sit below what its `_sum` implies. That is the design." That was a wrong
+  conclusion reached from a correct observation, and it shipped. The bucket was
+  still exported as a full histogram, with a zeroed band distribution:
+
+  ```text
+  airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="0.25"} 0
+  airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="45"}   0
+  airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="+Inf"} 11
+  airouter_endpoint_attempt_duration_seconds_sum{endpoint="__overflow__"} 0.110000
+  airouter_endpoint_attempt_duration_seconds_count{endpoint="__overflow__"} 11
+  ```
+
+  Every finite bucket is 0 and `+Inf` is 11, so the series claims all 11
+  observations exceeded 45 seconds while its own `_sum` says they averaged 10ms.
+  A Prometheus histogram is cumulative, so finite bounds must be `<= +Inf`; this
+  one is not. It is not a histogram, it is a lie with a legal-looking name.
+
+  The severity is the part that matters. Nothing rejects it: the scrape parses,
+  the family declares `histogram`, every dashboard renders, no alert fires, and
+  `histogram_quantile` returns a plausible number with no relationship to
+  reality. A silent wrong answer is strictly worse than an error, and this only
+  appears once the cap is crossed — the healthy path is fine, which is why
+  every prior test, all of which ran below or just past the cap, passed.
+
+  FIXED: the overflow label gets **no** histogram series at all. Its count and
+  latency sum are published as gauges,
+  `airouter_evicted_attempts_latency_seconds_{sum,count}`, named so that no
+  quantile function will accept them by accident and emitted for every endpoint
+  label (zero for live ones) so the series neither appears and disappears at the
+  cap nor needs a special case in a "total minus live" query. They are gauges
+  and not counters because an eviction *adds* to them, and a `rate()` over a
+  series that can decrease is worse than no series.
+
+  The lesson generalises past this bug: a bound that fires only under stress
+  needs a test that forces the stress. "Parse succeeds" was the wrong oracle
+  here — the corrupt output parsed perfectly. `TestOverflowBucketIsNotExposedAsHistogram`
+  asserts the conservation identity instead
+  (`live_histogram_counts + gauge_count == total_attempts`, likewise for the sum),
+  which is the property that must hold for any cap and any label mix, and which
+  fails both if the bucket is histogrammed again (83 vs 49, double-counted) and
+  if the gauges go missing (unreported rather than honestly reported). It also
+  asserts a live label still has a real histogram, so the fix cannot pass by
+  breaking histograms everywhere.
+
+  The first draft of the fix used `break` where `continue` was meant, which
+  silently stopped the endpoint loop at the bucket and dropped every later
+  sample. The test caught it; the shape of the mistake is worth recording
+  because the dropped samples produce no error either.
+
+• `TestEveryLabelKeyMapIsBoundedAndRenders` (was metrics_cardinality_test.go,
+  hand-listed structural coverage) — round 3's structural test named six maps,
+  and there are eight. A hand-maintained list of the things a test is supposed
+  to cover is a list that drifts, and this one had already drifted before it
+  ran once. Replaced with a reflection walk over every
+  `map[labelKey]*atomic.Int64` field in `Metrics`, so a new map is covered the
+  moment it is declared. Verified to have teeth by adding a ninth, deliberately
+  unbounded map and confirming the test failed.
+
+  Note the reflection goes through `reflect.ValueOf(m).Elem()`, not
+  `reflect.ValueOf(*m)`: `Metrics` embeds a mutex, and copying it trips
+  `go vet`'s copylocks check.
+
+• `referenceEscape` (was metrics_cardinality_test.go, compared against itself) —
+  round 3 introduced an independent escaper as the fuzz oracle, which is only an
+  oracle if it is pinned. Both were free to drift together, or the escaper
+  could be "fixed" to match a regression. `TestReferenceEscapeMatchesPrometheusRules`
+  now pins it against fixed vectors — quote, backslash, backslash-then-quote,
+  newline, CR, tab, NUL, UTF-8, empty, and a realistic injection attempt —
+  compared byte for byte, because a substring heuristic for double-escaping
+  produced false positives on the entirely legitimate input `\"`. Verified to
+  fail when the oracle's backslash handling is removed.
+
+• `export-unpushed.sh` (was scripts/, unfetchable bundle) — the recovery
+  instructions the script printed could not be followed.
+  `git bundle create A..HEAD` records the tip as the ref `HEAD`, and
+  `git fetch <bundle> 'HEAD:refs/heads/fb'` fails with `couldn't find remote
+  ref refs/heads/HEAD`. The bundle verifies, is non-empty, and cannot be
+  fetched. This is the same failure shape as the histogram above: a check that
+  confirms the artifact *exists* rather than confirming the documented
+  recovery actually works. FIXED: the script creates a temporary
+  `refs/heads/airouter-unpushed-export`, bundles that, and deletes it on exit,
+  so the printed `git fetch` has a ref it can resolve. The `unpushed-export` CI
+  job now runs the script's own instructions and counts the recovered commits.
+
+  Two further notes on that job. Its upstream is a dedicated `base` ref rather
+  than `origin/master`, because on a pull_request event HEAD is a merge commit
+  and the job's result would depend on the event type. And its no-op assertion
+  deletes the generated artifacts first: they are build output, so asserting
+  "no bundle exists after the run" fails the moment anyone runs the script
+  locally before pushing. The property under test is "this run created
+  nothing", not "no artifact has ever existed".
+
+Tests added this round:
+TestOverflowBucketIsNotExposedAsHistogram,
+TestEveryLabelKeyMapIsBoundedAndRenders,
+TestReferenceEscapeMatchesPrometheusRules,
+TestLabelEscapeIsNotIdempotentOnEscapedInput, plus the `unpushed-export` CI job.
+Each Go test was verified to fail against the unfixed code first; the CI
+overflow check was verified to reject the pre-fix output, and the export job
+against the pre-fix script.
+
 Tests added this round: TestEveryBoundedMapHasAWellFormedKeyShape,
 TestFullExpositionParsesUnderOverflow, TestStatusMapsAreBounded,
 TestConcurrentDistinctLabelsNeverExceedTheCap, plus `referenceEscape` as the
@@ -697,6 +806,19 @@ Loop Bounds — CLEAN (maxAttempts = chainLen*3+1)
 • TestParseRetryAfterEdgeCases  (new, 2026-09-28)
 
 ## Test summary
+  `go test -race ./...` → 288 passed, 0 failed (2026-09-29, round 4)
+  Negative controls added this round (each verified to FAIL against the
+  unfixed code before being accepted):
+  • TestOverflowBucketIsNotExposedAsHistogram — reverting the fix restores the
+    corrupt histogram AND double-counts (83 vs 49 observations);
+  • TestEveryLabelKeyMapIsBoundedAndRenders — an added ninth, unbounded map
+    fails it;
+  • TestReferenceEscapeMatchesPrometheusRules — dropping backslash handling from
+    the oracle fails it;
+  • CI `unpushed-export` job — the pre-fix script's bundle cannot be fetched.
+  CI `metrics output parses and labels are not forged` — the pre-fix overflow
+  output is rejected by the histogram-shape check.
+
   `go test -race ./...` → 250 passed, 0 failed (2026-09-29)
   `gofmt -l .` → clean; `go vet ./...` → no issues
   `python3 scripts/validate-config.py` → OK: 4 profiles validated
