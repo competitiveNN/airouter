@@ -50,9 +50,19 @@ mkdir -p "$D/scripts" "$D/dist" "$D/docs"
 for s in "$REPO"/scripts/*.sh "$REPO"/scripts/*.py "$REPO"/scripts/*.txt; do
   cp "$s" "$D/scripts/" 2>/dev/null
 done
-cp "$DOC" "$D/dist/README.md"
 printf 'base\n' > "$D/README.md"
 printf "# audit\n" > "$D/docs/audit.md"
+# A MINIMAL handoff document for the fixture, not a copy of the real one.
+#
+# The real dist/README.md cites ~13 real commits, and copying it into a fixture
+# whose history does not contain them makes the attribution check report every
+# one as a dangling citation. That failure is a property of the FIXTURE, not of
+# recovery, and it arrives wearing the costume of a recovery bug.
+#
+# The real document is not what is being trusted here. It is read directly from
+# $DOC below and its refspecs are executed against THIS fixture's bundle. The
+# fixture only needs a document the fixture's own history can satisfy.
+printf '# unpushed handoff\n' > "$D/dist/README.md"
 g() { git -C "$1" -c user.email=t@t -c user.name=t "${@:2}"; }
 g "$D" init -q -b master
 g "$D" config user.email t@t
@@ -62,11 +72,32 @@ g "$D" commit -qm "base commit"
 g "$D" update-ref refs/remotes/origin/master HEAD
 i=0
 while [ "$i" -lt 2 ]; do
-  printf 'change %s\n' "$i" >> "$D/README.md"
+  # Each unpushed commit touches its OWN file. Appending every commit to one
+  # README makes the patch un-replayable by construction: `git am` onto the
+  # base then hits a genuine 3-way conflict on the same lines, and the check
+  # reports a recovery failure that is a property of the FIXTURE, not of the
+  # recovery. It cost two wrong fixes before that was diagnosed. A handoff
+  # carries changes to distinct files; the fixture now does too.
+  printf 'content %s\n' "$i" > "$D/change-$i.txt"
   g "$D" add -A
   g "$D" commit -qm "unpushed $i"
   i=$((i + 1))
 done
+
+# The fixture's dist/README.md must list the fixture's own unpushed commits, or
+# the attribution check inside recovery-check.sh will -- correctly -- report them
+# as missing from the handoff. The check is right and the fixture was wrong: a
+# hand-off document with no commit list is not a realistic handoff, and the
+# resulting failure read as a recovery defect when it was a fixture defect.
+# The commit that lists them touches only dist/, so it is itself exempt.
+printf '\nFixture unpushed commits:\n' >> "$D/dist/README.md"
+g "$D" rev-list --reverse refs/remotes/origin/master..HEAD | while IFS= read -r sha; do
+  gmsg=$(g "$D" log -1 --format=%s "$sha")
+  printf -- '- `%s` %s\n' "$(printf '%s' "$sha" | cut -c1-7)" "$gmsg" >> "$D/dist/README.md"
+done
+g "$D" add -A
+g "$D" commit -qm "list the fixture's unpushed commits"
+
 if ! ( cd "$D" && UPSTREAM=origin/master bash scripts/export-unpushed.sh >/dev/null 2>&1 ); then
   echo "$P could not generate fixture artifacts" >&2
   exit 2
@@ -128,6 +159,95 @@ then
   ok "no sh block instructs a 'HEAD:' fetch (which git rejects)"
 else
   bad "an sh block still instructs a 'HEAD:' fetch, which git rejects"
+fi
+
+# ------------------------------------------------- the other claims too ----
+# Round 15's defect was a documented command that did not work. The fetch
+# refspecs were the obvious instance, but the document makes several other
+# executable claims, and each is one more instruction a reader will follow
+# verbatim:
+#
+#   ./scripts/dist-freshness-check.sh --verbose   are they current?
+#   ./scripts/recovery-check.sh                   do they actually recover?
+#   git am --3way <patch>                         applying the patch
+#   git bundle list-heads <bundle>                reading the recorded tip
+#
+# A claim in prose that nothing executes is the same failure as a stale
+# refspec, just quieter. Each is run here against the fixture. The push and
+# remote-URL blocks are deliberately NOT run: they act on a real remote, and a
+# verification step that can push to GitHub is not a verification step.
+printf ''
+
+echo "$P additional documented claims"
+
+# 1. The document says the freshness checker exits non-zero when artifacts are
+#    stale. Verify the positive half here (they ARE current), because that is
+#    the claim a reader relies on before relying on the artifacts at all.
+if ( cd "$D" && UPSTREAM=origin/master bash scripts/dist-freshness-check.sh --verbose ) \
+     >/dev/null 2>&1; then
+  ok "the documented freshness check passes on current artifacts"
+else
+  bad "the documented freshness check FAILED on freshly generated artifacts"
+fi
+
+# 2. `git bundle list-heads` is documented as the way to read the tip, and as
+#    agreeing with HEAD. Run it and compare, rather than trusting that the doc
+#    describes the right command.
+BUNDLE_TIP=$(git -C "$D" bundle list-heads "$D/dist/airouter-unpushed.bundle" 2>/dev/null \
+  | awk 'NR==1{print $1}')
+HEAD_TIP=$(git -C "$D" rev-parse HEAD)
+if [ -n "$BUNDLE_TIP" ] && [ "$BUNDLE_TIP" = "$HEAD_TIP" ]; then
+  ok "the documented 'git bundle list-heads' really does report HEAD"
+else
+  bad "bundle list-heads reported '$BUNDLE_TIP', HEAD is '$HEAD_TIP'"
+fi
+
+# 3. `git am --3way` on the patch, in a clone at the TRUE BASE. This is the
+#    documented patch path and the one a reader without the bundle will use.
+#
+#    Two things the first version of this got wrong, both of which made the
+#    assertion look like a product failure when it was neither:
+#      - it cloned at `master`, which ALREADY CONTAINS the unpushed commits, so
+#        there was nothing to apply;
+#      - the throwaway clone had no committer identity, so `git am` died with
+#        "Committer identity unknown" before it could even try.
+#    A fixture that fails for its own reasons is worse than no fixture: it
+#    teaches the reader to distrust a check that was working.
+PR="$WORK/patchreader"
+git clone -q "$D" "$PR" 2>/dev/null
+# Put the reader on the base, which is what the handoff document actually tells
+# a person: apply onto the pushed history, not onto a tree that already has the
+# commits. Cloning at master would make this a tautology.
+if git -C "$PR" rev-parse --verify --quiet refs/remotes/origin/master >/dev/null 2>&1; then
+  git -C "$PR" checkout -q -B base refs/remotes/origin/master 2>/dev/null
+else
+  git -C "$PR" checkout -q -B base HEAD~2 2>/dev/null
+fi
+# `git am` re-creates every commit, so it needs a committer to be someone. The
+# reader is a throwaway clone and the identities are already synthetic.
+git -C "$PR" config user.email reader@example.invalid
+git -C "$PR" config user.name reader
+if ( cd "$PR" && git am --3way "$D/dist/airouter-unpushed.patch" ) >/dev/null 2>&1; then
+  if [ "$(git -C "$PR" rev-parse HEAD^{tree})" = "$(git -C "$D" rev-parse HEAD^{tree})" ]; then
+    ok "the documented 'git am --3way' reproduces the tree exactly"
+  else
+    bad "git am applied but the resulting tree differs from the working tree"
+  fi
+else
+  bad "the documented 'git am --3way' failed on the generated patch"
+fi
+
+# 4. The document tells the reader recovery-check.sh answers "do they actually
+#    recover?". Run it the documented way (no UPSTREAM override, from the
+#    fixture) and require the answer to be yes. --quick skips the Go build,
+#    which CI's `go` job already covers for identical content.
+RC_OUT=$( cd "$D" && UPSTREAM=origin/master bash scripts/recovery-check.sh --quick 2>&1 )
+RC_GOT=$?
+if [ "$RC_GOT" -eq 0 ]; then
+  ok "the documented recovery check passes on the generated artifacts"
+else
+  bad "the documented recovery check FAILED on freshly generated artifacts (exit $RC_GOT)"
+  printf '%s\n' "$RC_OUT" | grep -E '^\s+FAIL' | head -4 | sed 's/^/         | /'
 fi
 
 echo ""
