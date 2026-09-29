@@ -3,9 +3,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -769,6 +771,12 @@ type exposedSeries struct {
 	name   string
 	labels map[string]string
 	value  float64
+	// typ is the metric family name from the preceding "# TYPE" line, e.g.
+	// "histogram" or "gauge". Comment lines are skipped by the parser, so the
+	// type is tracked here: a test asserting "this is not a histogram" cannot
+	// work from the sample name alone, since a histogram's buckets and a
+	// gauge's samples are both just name + labels + value.
+	typ string
 }
 
 // parseExposition parses Prometheus text exposition format into one entry per
@@ -786,9 +794,20 @@ type exposedSeries struct {
 // program.
 func parseExposition(body string) ([]exposedSeries, error) {
 	var out []exposedSeries
+	// Type is per metric family, not per line. Tracking only the most recent
+	// # TYPE made every series after a histogram declaration look like a
+	// histogram, which is how the first version of this test accused the
+	// counter families of being histograms. Resolve by name at the end.
+	types := map[string]string{}
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			if name, kind, ok := parseTypeComment(line); ok {
+				types[name] = kind
+			}
 			continue
 		}
 		name, labels, rest, err := splitSampleLine(line)
@@ -799,9 +818,39 @@ func parseExposition(body string) ([]exposedSeries, error) {
 		if err != nil {
 			return nil, fmt.Errorf("line %q: bad sample value %q", line, rest)
 		}
-		out = append(out, exposedSeries{name: name, labels: labels, value: v})
+		out = append(out, exposedSeries{name: name, labels: labels, value: v, typ: types[familyOf(name, types)]})
 	}
 	return out, nil
+}
+
+// familyOf maps a sample name back to the family that declared its type:
+// "foo_seconds_bucket" and "foo_seconds_sum" both belong to "foo_seconds".
+// Declared names win; otherwise the longest matching declared prefix is used,
+// which is what makes the lookup correct for a family declared without any
+// suffix-specific entries.
+func familyOf(name string, types map[string]string) string {
+	if _, ok := types[name]; ok {
+		return name
+	}
+	for _, suffix := range []string{"_bucket", "_sum", "_count", "_total"} {
+		if base := strings.TrimSuffix(name, suffix); base != name {
+			if _, ok := types[base]; ok {
+				return base
+			}
+		}
+	}
+	return name
+}
+
+// parseTypeComment returns the metric family name and the declared type from a
+// `# TYPE foo histogram` line. ok is false for any other comment, so HELP and
+// blank-comment lines leave the caller's current type untouched.
+func parseTypeComment(line string) (name, typ string, ok bool) {
+	fields := strings.Fields(strings.TrimPrefix(line, "#"))
+	if len(fields) != 3 || !strings.EqualFold(fields[0], "TYPE") {
+		return "", "", false
+	}
+	return fields[1], fields[2], true
 }
 
 // splitSampleLine splits `name{a="1",b="2"} 42` into its parts.
@@ -1589,5 +1638,367 @@ func TestConcurrentDistinctLabelsNeverExceedTheCap(t *testing.T) {
 	if want := int64(workers * perWorker); total != want {
 		t.Errorf("attempt total = %d, want %d — %d observations were dropped or double-counted",
 			total, want, want-total)
+	}
+}
+
+// TestEveryLabelKeyMapIsBoundedAndRenders is the exhaustive form of
+// TestEveryBoundedMapHasAWellFormedKeyShape.
+//
+// The shape test lists six maps by hand, which is exactly the weakness that let
+// two unbounded maps survive two rounds of cardinality work: a hand-written list
+// is only correct on the day it is written, and a new map that nobody adds to it
+// is silently unasserted. This test discovers the maps instead, by walking
+// Metrics with reflect and picking up every field of type
+// map[labelKey]*atomic.Int64 — which is the type the registry uses for a
+// bounded label map, and the only way a new one can be added.
+//
+// So the property is now structural rather than enumerated:
+//
+//   - every map[labelKey]*atomic.Int64 field IS bounded (add a check or fail);
+//   - every one of its keys is a well-formed label set;
+//   - a key carrying the overflow value is a legal sample.
+//
+// Add a new bounded map and it is covered the moment it is declared, with no
+// edit here. Declare a map that is not bounded and this fails, which is the
+// check that would have caught counterStatus and counterFailure.
+func TestEveryLabelKeyMapIsBoundedAndRenders(t *testing.T) {
+	const small = minLabelValues
+	const hostile = "x\" 1\ninjected=\"yes"
+
+	m := NewMetrics()
+	m.SetLabelCap(small)
+	if got := m.LabelCap(); got != small {
+		t.Fatalf("SetLabelCap(%d) did not take (cap is %d); this test would exercise nothing", small, got)
+	}
+
+	// Drive every bounded map past the cap. Attempt, Request, Fallback and
+	// CircuitTransition are the only entry points, and each has to be exercised
+	// for the structural walk below to have anything to look at.
+	for i := 0; i <= small; i++ {
+		name := fmt.Sprintf("ep-%d", i)
+		m.Attempt(name, time.Duration(i+1)*time.Millisecond, i%2 == 0)
+		m.Request(name, 400+i, time.Millisecond)
+		m.Fallback(name)
+		m.CircuitTransition(CircuitClosed, CircuitOpen, name)
+	}
+	// Hostile values too: a key that is only well-formed for tidy input is not
+	// well-formed.
+	m.Attempt(hostile, time.Millisecond, true)
+	m.Request(hostile, 503, time.Millisecond)
+	m.Fallback(hostile)
+	m.CircuitTransition(CircuitOpen, CircuitHalfOpen, hostile)
+
+	// The pointer's element, not a copy: Metrics embeds sync.Mutex and copying
+	// it would trip `go vet`'s copylocks check.
+	v := reflect.ValueOf(m).Elem()
+	typ := v.Type()
+
+	found := 0
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Type != reflect.TypeOf(map[labelKey]*atomic.Int64(nil)) {
+			continue
+		}
+		found++
+		t.Run(field.Name, func(t *testing.T) {
+			store := v.Field(i)
+			if store.IsNil() {
+				t.Fatalf("map is nil; NewMetrics did not initialise it")
+			}
+			if n := store.Len(); n == 0 {
+				t.Fatalf("map is empty; the overflow path was not exercised")
+			}
+
+			sawOverflow := false
+			for _, k := range store.MapKeys() {
+				key := labelKey(k.String())
+				// Well-formed means: parses as a label set, and every label
+				// name is a legal Prometheus identifier. The identifier check
+				// is not redundant with the parse — the parser is lenient about
+				// label names, which is how a bare `__overflow__` in the label
+				// set position got through in the first place.
+				series, err := parseExposition("m{" + string(key) + "} 1")
+				if err != nil {
+					t.Errorf("key %q is not a parseable label set: %v", key, err)
+					continue
+				}
+				if len(series[0].labels) == 0 {
+					t.Errorf("key %q parsed to a sample with no labels", key)
+					continue
+				}
+				for name, value := range series[0].labels {
+					if !isPromIdentifier(name) {
+						t.Errorf("key %q: label name %q is not a legal Prometheus identifier", key, name)
+					}
+					if value == overflowLabelValue {
+						sawOverflow = true
+					}
+				}
+			}
+
+			// The bound itself. This is the assertion that has teeth: removing
+			// the bound from a map makes this fail, which is exactly what
+			// happened to requestsByStatus and failuresByStatus.
+			if n := store.Len(); n > small {
+				t.Errorf("map holds %d labels, above the cap of %d — this map is not bounded", n, small)
+			}
+			if !sawOverflow {
+				t.Errorf("no key carries the overflow value after being driven past the cap of %d; "+
+					"this map is either unbounded or its overflow path never ran", small)
+			}
+		})
+	}
+
+	// If this walks zero fields the test is vacuous — e.g. someone changed the
+	// field type and the type assertion above stopped matching. Better to fail
+	// loudly than to pass on a registry it never looked at.
+	if found < 6 {
+		t.Errorf("found only %d map[labelKey]*atomic.Int64 fields, expected at least 6; "+
+			"the structural walk is not seeing the maps it is meant to cover", found)
+	}
+}
+
+// TestReferenceEscapeMatchesPrometheusRules pins the test oracle itself.
+//
+// referenceEscape is the thing labelEscape is compared against in
+// FuzzExpositionRoundTrip, which makes it load-bearing: if it drifts, the fuzzer
+// stops being able to fail and the escaping guard quietly stops guarding. It
+// lives in the test file, so the natural refactor is "tidy the helper" or "make
+// it consistent with the implementation" — and consistency with the
+// implementation is precisely the bug it exists to detect, since a shared
+// mistake would be confirmed rather than caught.
+//
+// So the vectors are fixed here, byte for byte, against the specification
+// (Prometheus text exposition: escape backslash, double quote and newline;
+// everything else is literal) rather than against labelEscape. If someone
+// changes the oracle to match a change in the implementation, this fails.
+//
+// The cases are the ones where a plausible implementation goes wrong: a lone
+// backslash, a lone quote, a backslash that already precedes a quote (the
+// classic double-escape trap), CRLF, a NUL, a multi-byte rune that must pass
+// through untouched, and the empty string. The two backslash cases are the ones
+// worth having: `\` and `\"` escape differently, and getting them confused is
+// exactly how a real value ends up with a stray backslash in the exposition.
+func TestReferenceEscapeMatchesPrometheusRules(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"plain", "work", "work"},
+		{"double quote", `a"b`, `a\"b`},
+		{"lone backslash", `a\b`, `a\\b`},
+		{"backslash then quote", `a\"b`, `a\\\"b`},
+		{"quote then backslash", `a"\b`, `a\"\\b`},
+		{"newline", "a\nb", `a\nb`},
+		{"carriage return is literal", "a\rb", "a\rb"},
+		{"tab is literal", "a\tb", "a\tb"},
+		{"nul is literal", "a\x00b", "a\x00b"},
+		{"only a backslash", `\`, `\\`},
+		{"only a quote", `"`, `\"`},
+		{"trailing backslash", `ab\`, `ab\\`},
+		{"utf8 passes through", "héllo\U0001f600", "héllo\U0001f600"},
+		{"utf8 plus a quote", `é"`, `é\"`},
+		// A real config value: the shape a hostile provider name takes.
+		{"injection attempt", "x\" 1\nairouter_requests_total{model=\"victim",
+			`x\" 1\nairouter_requests_total{model=\"victim`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := referenceEscape(tc.in); got != tc.want {
+				t.Errorf("referenceEscape(%q) = %q, want %q\nThe oracle is wrong, not the "+
+					"implementation — check against the exposition spec before changing this.",
+					tc.in, got, tc.want)
+			}
+			// The oracle and the implementation must also agree, or the fuzzer
+			// comparing them is comparing two different functions and the whole
+			// exercise is noise. Asserted here on the fixed vectors so a
+			// divergence is reported as a concrete case rather than only as a
+			// fuzz failure someone has to go hunting for.
+			if got := labelEscape(tc.in); got != tc.want {
+				t.Errorf("labelEscape(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLabelEscapeIsNotIdempotentOnEscapedInput is the direct statement of the
+// rule that broke: escaping an already-escaped value changes it.
+//
+// This is a property of the format, not an implementation quirk, and it is the
+// reason labelKey exists. A test that merely round-trips a value through the
+// parser cannot see a double escape, because the parser unescapes once and gets
+// the original back either way. Asserting idempotence of the WRONG operation is
+// how the corrupt version got shipped with a green suite.
+func TestLabelEscapeIsNotIdempotentOnEscapedInput(t *testing.T) {
+	for _, in := range []string{`a"b`, `a\b`, "a\nb", `a\"b`} {
+		once := labelEscape(in)
+		twice := labelEscape(once)
+		if once == twice {
+			t.Errorf("labelEscape(%q) is idempotent, so a double escape would be "+
+				"invisible: once=%q twice=%q", in, once, twice)
+		}
+		// And unescaping the output exactly once must return the input.
+		if got, want := prometheusUnescape(once), in; got != want {
+			t.Errorf("unescaping labelEscape(%q) once = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// prometheusUnescape is the inverse of the exposition escaping rules, used only
+// to assert that escaping is reversible. parseExposition does this internally
+// for a whole sample line; this is the bare-value form so the escaping property
+// can be stated without a sample line wrapped around it.
+func prometheusUnescape(v string) string {
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		if v[i] != '\\' || i+1 >= len(v) {
+			b.WriteByte(v[i])
+			continue
+		}
+		i++
+		switch v[i] {
+		case 'n':
+			b.WriteByte('\n')
+		case '"':
+			b.WriteByte('"')
+		case '\\':
+			b.WriteByte('\\')
+		default:
+			b.WriteByte('\\')
+			b.WriteByte(v[i])
+		}
+	}
+	return b.String()
+}
+
+// renderMetrics drives the exposition through a real http.ResponseWriter,
+// which is what /metrics does, rather than writing into a buffer directly. A
+// bytes.Buffer is not a ResponseWriter, and a stub would risk testing the stub.
+func renderMetrics(t *testing.T, m *Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics returned %d: %s", rec.Code, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
+// TestOverflowBucketIsNotExposedAsHistogram pins the mitigation for the
+// corrupt-output bug described in serveAttemptMetrics.
+//
+// The pre-fix output parsed, declared histogram, and was silently wrong, so a
+// "does it parse" assertion is not enough. What is asserted is the specific
+// thing that was wrong: a histogram_quantile-shaped input is no longer offered
+// to histogram_quantile at all, and the observations the bucket carries are
+// still accounted for exactly once, under names that are not a histogram.
+func TestOverflowBucketIsNotExposedAsHistogram(t *testing.T) {
+	m := NewMetrics()
+	m.SetLabelCap(minLabelValues)
+	// Distinct labels well past the cap, at a latency far too small to fall in
+	// any high band. That mismatch is what made the old output so confidently
+	// wrong: 34 observations averaging 10ms were reported as all being above
+	// 45 seconds.
+	const attempts = minLabelValues * 3
+	const each = 10 * time.Millisecond
+	for i := 0; i < attempts; i++ {
+		m.Attempt(fmt.Sprintf("ep-%d", i), each, false)
+	}
+	// One live label admitted last, so the "does the loop still emit anything
+	// after the bucket?" bug — a `break` where a `continue` was meant — is
+	// caught rather than masked by the bucket sorting last.
+	const liveEach = 3 * time.Millisecond
+	m.Attempt("live", liveEach, false)
+
+	series, err := parseExposition(renderMetrics(t, m))
+	if err != nil {
+		t.Fatalf("exposition does not parse: %v", err)
+	}
+
+	// 1. No histogram series for the overflow label, at any bucket bound, and
+	//    under no metric family declared histogram. The pre-fix output had
+	//    _bucket{le="0.25"} 0 ... _bucket{le="+Inf"} 34.
+	const histFamily = "airouter_endpoint_attempt_duration_seconds"
+	for _, x := range series {
+		if x.labels["endpoint"] != overflowLabelValue {
+			continue
+		}
+		if x.typ == "histogram" || x.name == histFamily || x.name == histFamily+"_bucket" {
+			t.Errorf("overflow label is exposed as histogram series %q (le=%q): its "+
+				"distribution is unknowable and histogram_quantile over it returns nonsense",
+				x.name, x.labels["le"])
+		}
+	}
+
+	// 2. The replacement gauges exist, are typed gauge, and are emitted for
+	//    every endpoint — so the series does not appear and disappear as the
+	//    cap is hit, and a "total minus live" query needs no special case.
+	var sumAll, countAll, evSum, evCount, liveSum, liveCount float64
+	gauges := 0
+	for _, x := range series {
+		switch x.name {
+		case "airouter_evicted_attempts_latency_seconds_sum":
+			if x.typ != "gauge" {
+				t.Errorf("%s declared %q, want gauge", x.name, x.typ)
+			}
+			gauges++
+			sumAll += x.value
+			if x.labels["endpoint"] == overflowLabelValue {
+				evSum += x.value
+			}
+		case "airouter_evicted_attempts_latency_seconds_count":
+			if x.typ != "gauge" {
+				t.Errorf("%s declared %q, want gauge", x.name, x.typ)
+			}
+			gauges++
+			countAll += x.value
+			if x.labels["endpoint"] == overflowLabelValue {
+				evCount += x.value
+			}
+		case histFamily + "_sum":
+			liveSum += x.value
+		case histFamily + "_count":
+			liveCount += x.value
+		}
+	}
+	if gauges == 0 {
+		t.Fatal("no replacement gauges in the exposition; the overflow data is unreported, not merely unhistogrammed")
+	}
+	if evSum == 0 || evCount == 0 {
+		t.Fatalf("the overflow gauges carry no data (sum=%v count=%v) after %d labels were "+
+			"driven past a cap of %d; the eviction is not rolling anything into the bucket",
+			evSum, evCount, attempts, minLabelValues)
+	}
+	// Only the overflow label has a non-zero gauge; every live label is zero.
+	if math.Abs(sumAll-evSum) > 1e-12 || math.Abs(countAll-evCount) > 1e-12 {
+		t.Errorf("live endpoints report non-zero evicted latency (sum %v vs %v, count %v vs %v); "+
+			"only the bucket should carry evicted observations", sumAll, evSum, countAll, evCount)
+	}
+
+	// 3. Nothing was lost and nothing was counted twice. Every attempt is
+	//    either still in a live histogram or folded into the gauges, exactly
+	//    once. Asserted as an identity over the output rather than a recomputed
+	//    constant, so it stays true for any cap and any mix of labels.
+	if got, want := liveCount+evCount, float64(attempts+1); got != want {
+		t.Errorf("histogram counts plus gauge count = %v, want %v: observations were lost or double-counted",
+			got, want)
+	}
+	wantSecs := float64(attempts)*each.Seconds() + liveEach.Seconds()
+	if got := liveSum + evSum; math.Abs(got-wantSecs) > 1e-9 {
+		t.Errorf("histogram sums plus gauge sum = %v, want %v: latency was lost or double-counted",
+			got, wantSecs)
+	}
+
+	// 4. The live label still gets a real histogram, and it is a valid one.
+	//    Without this the fix would also pass by breaking histograms everywhere.
+	sawLive := false
+	for _, x := range series {
+		if x.typ == "histogram" && x.labels["endpoint"] == "live" {
+			sawLive = true
+		}
+	}
+	if !sawLive {
+		t.Error("the live endpoint lost its histogram; the overflow branch must skip only the bucket")
 	}
 }

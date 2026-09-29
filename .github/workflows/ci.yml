@@ -406,7 +406,33 @@ jobs:
                 exit 1
               fi
             done
-            echo "overflow buckets use per-series label names"
+            # The overflow label must never appear in a histogram. It cannot:
+            # evicted labels roll their count and sum into the bucket, but their
+            # per-band data is unrepresentable, so the bucket would have to
+            # report a distribution it does not have. The output that did so
+            # parsed, declared histogram, and claimed that a set of 10ms
+            # observations were all above 45s -- silently wrong, and
+            # histogram_quantile returns a plausible-looking nonsense number
+            # rather than an error. Assert the absence so the shape cannot come
+            # back, at any bucket bound.
+            if grep -E '^airouter_endpoint_attempt_duration_seconds(_bucket|_sum|_count)?\{' /tmp/metrics3.txt \
+              | grep -q 'endpoint="__overflow__"'; then
+              echo "::error::overflow label is exposed as a histogram; its per-band distribution"
+              echo "::error::is unknowable and histogram_quantile over it returns nonsense"
+              grep -E '^airouter_endpoint_attempt_duration_seconds' /tmp/metrics3.txt \
+                | grep 'endpoint="__overflow__"' | head -5
+              exit 1
+            fi
+            # ...and the replacement gauges must exist, or the observations are
+            # simply gone: unreported rather than honestly reported.
+            for g in airouter_evicted_attempts_latency_seconds_sum \
+                     airouter_evicted_attempts_latency_seconds_count; do
+              if ! grep -q "^# TYPE $g gauge" /tmp/metrics3.txt; then
+                echo "::error::$g is not exported as a gauge"
+                exit 1
+              fi
+            done
+            echo "overflow buckets use per-series label names and are not histograms"
           else
             echo "no overflow buckets yet (expected below the cap)"
           fi
@@ -425,3 +451,119 @@ jobs:
         run: |
           echo "--- fake upstream ---"; cat /tmp/fake-upstream.log 2>/dev/null || true
           echo "--- gateway ---"; cat /tmp/airouter.log 2>/dev/null || true
+
+  # export-unpushed.sh is how the unpushed set is handed off, and it is the only
+  # thing standing between "16 commits ahead of origin" and those commits being
+  # silently lost. It is also a script with three distinct outcomes -- a real
+  # export, a no-op when there is nothing unpushed, and a hard error when the
+  # upstream ref does not exist -- and only the first is exercised by running it
+  # by hand. The two failure paths are the ones that matter: a no-op that
+  # reports success while writing an empty bundle, or an upstream typo that
+  # produces a patch of the wrong commits, both look fine from the terminal.
+  unpushed-export:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: set up a base ref to diff against
+        run: |
+          # The script diffs $UPSTREAM..HEAD, so the test needs an upstream that
+          # is known to be behind HEAD. A dedicated ref at HEAD does that without
+          # moving the checked-out branch -- which actions/checkout may have
+          # checked out as a worktree branch (and which then cannot be
+          # force-updated) or left detached (and which has no branch to update).
+          # Using origin/master instead would make this job's result depend on
+          # whether the event is a push or a pull_request, since a PR's HEAD is
+          # a merge commit that is two ahead of master.
+          git config user.name ci
+          git config user.email ci@example.invalid
+          git branch -f base HEAD
+          echo "base is $(git rev-parse --short base)"
+
+      - name: no-op path writes nothing
+        run: |
+          set -euo pipefail
+          # Clear any generated artifacts first. They are build output, ignored
+          # by git, and safe to delete. The alternative -- asserting the files
+          # are absent after the run -- is a false failure the moment anyone
+          # runs the script locally before pushing, because a leftover bundle
+          # from that run is indistinguishable from one this run wrote. The
+          # property under test is "this run created nothing", not "no bundle
+          # has ever existed".
+          rm -f dist/airouter-unpushed.bundle dist/airouter-unpushed.patch
+          out=$(UPSTREAM=base ./scripts/export-unpushed.sh 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'nothing unpushed' || {
+            echo "::error::expected a no-op message when nothing is unpushed"; exit 1;
+          }
+          # A no-op that still wrote a bundle is worse than a no-op that failed:
+          # it leaves an empty artifact that looks recoverable.
+          if [ -e dist/airouter-unpushed.bundle ] || [ -e dist/airouter-unpushed.patch ]; then
+            echo "::error::a no-op run wrote artifacts"
+            exit 1
+          fi
+
+      - name: unknown upstream fails loudly
+        run: |
+          set -euo pipefail
+          # Non-zero exit, and a message naming the ref. A script that silently
+          # fell back to a different upstream would export the wrong commits.
+          if out=$(UPSTREAM=base/nope ./scripts/export-unpushed.sh 2>&1); then
+            echo "::error::expected a non-zero exit for a missing upstream"; exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q 'base/nope' || {
+            echo "::error::the error message does not name the bad upstream"; exit 1
+          }
+
+      - name: real export is complete and correct
+        run: |
+          set -euo pipefail
+          git commit -q --allow-empty -m "unpushed one"
+          git commit -q --allow-empty -m "unpushed two"
+          out=$(UPSTREAM=base ./scripts/export-unpushed.sh 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'exported 2 commits' || {
+            echo "::error::expected exactly 2 exported commits"; exit 1
+          }
+          # Both artifacts exist and are non-empty. An empty patch is what a
+          # wrong upstream produces.
+          test -s dist/airouter-unpushed.patch || {
+            echo "::error::patch is missing or empty"; exit 1
+          }
+          test -s dist/airouter-unpushed.bundle || {
+            echo "::error::bundle is missing or empty"; exit 1
+          }
+          # The bundle must be clonable and must actually carry the unpushed
+          # commits. `git bundle verify` only checks the index; running the
+          # script's own printed recovery instructions is the only thing that
+          # proves the hand-off works. It did not: git bundle create A..HEAD
+          # records the tip as the ref "HEAD", and git fetch rejects
+          # "refs/heads/HEAD" outright, so the documented recovery command
+          # failed on a bundle that verified and was non-empty.
+          git bundle verify dist/airouter-unpushed.bundle
+          rm -rf /tmp/check
+          # Clone at the base, not at HEAD, so the recovered commits are
+          # genuinely absent before the fetch and the count means something.
+          git clone -q -b base . /tmp/check
+          git -C /tmp/check fetch -q "$GITHUB_WORKSPACE/dist/airouter-unpushed.bundle" \
+            'refs/heads/airouter-unpushed-export:refs/heads/recovered'
+          git -C /tmp/check log --oneline recovered
+          test "$(git -C /tmp/check rev-list --count base..recovered)" = 2 || {
+            echo "::error::the bundle did not carry both unpushed commits"; exit 1
+          }
+          # The temporary ref exists only to name the bundle tip; it must not
+          # outlive the run.
+          if git rev-parse --verify --quiet refs/heads/airouter-unpushed-export >/dev/null; then
+            echo "::error::the temporary export ref leaked into the repository"
+            exit 1
+          fi
+          # The artifacts are generated, not committed. A regression that
+          # re-adds them to the index reintroduces the self-referential loop
+          # the script exists to avoid.
+          if git ls-files --error-unmatch dist/airouter-unpushed.bundle >/dev/null 2>&1; then
+            echo "::error::the bundle is tracked; it must stay a build artifact"; exit 1
+          fi
