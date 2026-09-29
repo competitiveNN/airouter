@@ -1,8 +1,14 @@
 [Unit]
 Description=Airouter model sync (fetch free models, rebuild config.yaml via maki)
+After=network.target
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/dev/airouter
-ExecStart=%h/dev/airouter/scripts/sync-models.sh
+# The sync script refreshes model metadata from the upstream provider APIs,
+# so it needs the same credentials as the daemon. Load them the same way the
+# daemon does: source the .envrc next to the binary. systemd's EnvironmentFile=
+# cannot be used here (it is not a shell parser, so it ignores `export KEY=value`
+# and resolves no intra-file references).
+ExecStart=/bin/bash -c 'set -a; . %h/dev/airouter/.envrc; set +a; exec %h/dev/airouter/scripts/sync-models.sh'
 TimeoutStartSec=30min
