@@ -154,6 +154,7 @@ The unpushed commits, oldest first:
 - `907e01d` Make the handoff artifact's staleness a gate instead of a note
 - `7289e7e` Require cited commits to be reachable, not merely present
 - `482dee7` Prove the handoff actually recovers, and test that it does
+- `179d165` Run the recovery check in CI, and fix the two bugs it found
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
