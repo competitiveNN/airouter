@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2000,5 +2001,488 @@ func TestOverflowBucketIsNotExposedAsHistogram(t *testing.T) {
 	}
 	if !sawLive {
 		t.Error("the live endpoint lost its histogram; the overflow branch must skip only the bucket")
+	}
+}
+
+// TestEveryExportedHistogramIsWellFormed asserts the Prometheus histogram
+// invariants across the WHOLE exposition, for every family and every label set.
+//
+// This is the generalisation of the overflow-bucket bug, and it is deliberately
+// not written against `airouter_endpoint_attempt_duration_seconds`. That bug was
+// found by hand, in one family, after three rounds of metrics work; the reason it
+// survived is that every test named the specific series it cared about. A guard
+// that walks the parsed output cannot be defeated by adding a new histogram,
+// renaming one, or overflowing a map nobody thought to test.
+//
+// The invariants themselves are in checkHistogramInvariants, which returns
+// violations rather than failing, so each one can be negative-controlled
+// individually — see TestEachHistogramInvariantHasTeeth. A guard whose untested
+// branches never fire is a guard you cannot trust to fire at all.
+func TestEveryExportedHistogramIsWellFormed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(*Metrics)
+	}{
+		{"single endpoint", func(m *Metrics) {
+			m.Attempt("a", 10*time.Millisecond, false)
+		}},
+		// A full map, so the overflow bucket exists and must be absent from
+		// every histogram. This is the case that was broken.
+		{"overflow bucket", func(m *Metrics) {
+			m.SetLabelCap(minLabelValues)
+			for i := 0; i < minLabelValues*3; i++ {
+				m.Attempt(fmt.Sprintf("ep-%d", i), 10*time.Millisecond, false)
+			}
+		}},
+		// Hostile label values, including one that looks like it is forging a
+		// `le` label. A guard that builds its key by string surgery on raw
+		// output would be defeated by this; one that parses first is not.
+		{"hostile labels", func(m *Metrics) {
+			for _, v := range []string{
+				`a"b`, "a\\b", "a\nb", `",le="1"`, "__overflow__",
+			} {
+				m.Attempt(v, 10*time.Millisecond, false)
+				m.Request(v, 200, time.Millisecond)
+			}
+		}},
+		// Observations in several bands, so the monotonicity assertions run
+		// against a non-degenerate distribution rather than trivially passing
+		// on a series of all-zero buckets.
+		{"every latency band", func(m *Metrics) {
+			for _, d := range []time.Duration{
+				time.Millisecond, 100 * time.Millisecond, 400 * time.Millisecond,
+				1500 * time.Millisecond, 4 * time.Second, 25 * time.Second,
+			} {
+				m.Attempt("spread", d, false)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMetrics()
+			tc.build(m)
+
+			series, err := parseExposition(renderMetrics(t, m))
+			if err != nil {
+				t.Fatalf("exposition does not parse: %v", err)
+			}
+			if n := countHistogramBuckets(series); n == 0 {
+				t.Fatal("no histogram buckets parsed; the guard is not looking at anything")
+			}
+			for _, v := range checkHistogramInvariants(series) {
+				t.Error(v)
+			}
+		})
+	}
+}
+
+// histBucket is one _bucket sample: a latency bound and the cumulative
+// observation count at or below it.
+type histBucket struct {
+	le    string
+	value float64
+}
+
+// histogramIndex groups the parsed exposition by metric family and then by
+// label set, which is the level at which every invariant is defined: monotonicity
+// is a property of one histogram's buckets, not of a family as a whole.
+func histogramIndex(series []exposedSeries) (map[string]map[string][]histBucket, map[string]map[string]float64, map[string]map[string]float64) {
+	buckets := map[string]map[string][]histBucket{}
+	counts := map[string]map[string]float64{}
+	sums := map[string]map[string]float64{}
+	for _, x := range series {
+		if x.typ != "histogram" {
+			continue
+		}
+		if !strings.HasSuffix(x.name, "_bucket") {
+			continue
+		}
+		le, ok := x.labels["le"]
+		if !ok {
+			// Reported by the caller as a violation; recorded as an empty
+			// bucket so it is not silently skipped.
+			continue
+		}
+		base := strings.TrimSuffix(x.name, "_bucket")
+		set := renderLabelSet(x.labels, "le")
+		if buckets[base] == nil {
+			buckets[base] = map[string][]histBucket{}
+		}
+		buckets[base][set] = append(buckets[base][set], histBucket{le: le, value: x.value})
+	}
+	for _, x := range series {
+		if !strings.HasSuffix(x.name, "_count") {
+			continue
+		}
+		base := strings.TrimSuffix(x.name, "_count")
+		set := renderLabelSet(x.labels, "")
+		if counts[base] == nil {
+			counts[base] = map[string]float64{}
+		}
+		counts[base][set] = x.value
+	}
+	for _, x := range series {
+		if !strings.HasSuffix(x.name, "_sum") {
+			continue
+		}
+		base := strings.TrimSuffix(x.name, "_sum")
+		set := renderLabelSet(x.labels, "")
+		if sums[base] == nil {
+			sums[base] = map[string]float64{}
+		}
+		sums[base][set] = x.value
+	}
+	return buckets, counts, sums
+}
+
+// countHistogramBuckets is the guard's own liveness check: a well-formedness
+// test that has silently stopped finding histograms is indistinguishable from
+// one that is passing.
+func countHistogramBuckets(series []exposedSeries) int {
+	n := 0
+	for _, x := range series {
+		if x.typ == "histogram" && strings.HasSuffix(x.name, "_bucket") {
+			n++
+		}
+	}
+	return n
+}
+
+// checkHistogramInvariants returns one string per violation found. Returning
+// rather than t.Error is what lets TestEachHistogramInvariantHasTeeth feed it
+// deliberately-broken input.
+//
+// The invariants, per the exposition spec:
+//
+//  1. every _bucket sample carries an `le` label;
+//  2. `le` bounds are strictly increasing;
+//  3. exactly one `+Inf` bucket, and it is last;
+//  4. cumulative counts never decrease, and `+Inf` is the maximum;
+//  5. `+Inf` equals the family's `_count` for that label set.
+//
+// (4) is the one the overflow bucket actually violated: every finite bucket 0
+// with `+Inf` = N claims all N observations exceeded the top bound while its own
+// `_sum` said they were nearly instant.
+func checkHistogramInvariants(series []exposedSeries) []string {
+	var out []string
+	bad := func(f string, a ...any) { out = append(out, fmt.Sprintf(f, a...)) }
+
+	// (1) A bucket without `le` cannot be placed in the ordering at all, so it
+	// is caught before anything tries to sort by it.
+	for _, x := range series {
+		if x.typ == "histogram" && strings.HasSuffix(x.name, "_bucket") {
+			if _, ok := x.labels["le"]; !ok {
+				bad("histogram sample %s has no `le` label: %v", x.name, x.labels)
+			}
+		}
+	}
+
+	buckets, counts, sums := histogramIndex(series)
+	for family, sets := range buckets {
+		for set, bs := range sets {
+			where := family + "{" + set + "}"
+
+			// (3) +Inf terminates the series, exactly once. Without it the
+			// observation count is unrecoverable and quantile functions are
+			// undefined, which is why a histogram missing it is not a histogram.
+			nInf := 0
+			for _, b := range bs {
+				if b.le == "+Inf" {
+					nInf++
+				}
+			}
+			if nInf != 1 {
+				bad("%s has %d +Inf buckets, want exactly 1", where, nInf)
+				continue
+			}
+			if last := bs[len(bs)-1]; last.le != "+Inf" {
+				bad("%s last bucket is le=%q, want +Inf; +Inf must terminate the series",
+					where, last.le)
+				continue
+			}
+
+			// (2) Strictly increasing bounds. A repeat or a decrease means the
+			// buckets are not cumulative, so ordering them by value and by
+			// emission would disagree.
+			for i := 1; i < len(bs); i++ {
+				prev, cur := bs[i-1].le, bs[i].le
+				if cur == "+Inf" {
+					break
+				}
+				lo, err1 := strconv.ParseFloat(prev, 64)
+				hi, err2 := strconv.ParseFloat(cur, 64)
+				if err1 != nil || err2 != nil {
+					bad("%s: unparseable le bound %q or %q", where, prev, cur)
+					break
+				}
+				if hi <= lo {
+					bad("%s: le bounds are not strictly increasing at le=%q after le=%q",
+						where, cur, prev)
+					break
+				}
+			}
+
+			// (4) Cumulative counts never decrease. The invalid-histogram
+			// signature: a series reported as a distribution it does not have.
+			for i := 1; i < len(bs); i++ {
+				if bs[i].value < bs[i-1].value {
+					bad("%s: bucket le=%q (%v) is LOWER than le=%q (%v); a cumulative "+
+						"histogram cannot decrease", where, bs[i].le, bs[i].value,
+						bs[i-1].le, bs[i-1].value)
+					break
+				}
+			}
+			if inf := bs[len(bs)-1].value; inf < bs[0].value {
+				bad("%s: +Inf (%v) is below the first bucket (%v)", where, inf, bs[0].value)
+			}
+
+			// (5) +Inf and _count are two renderings of one number.
+			if c, ok := counts[family][set]; ok {
+				if inf := bs[len(bs)-1].value; inf != c {
+					bad("%s: +Inf bucket is %v but _count is %v; observations are being "+
+						"counted twice or not at all", where, inf, c)
+				}
+			}
+
+			// (6) The buckets must be consistent with the family's own _sum.
+			//
+			// This is the invariant that actually catches the overflow bug, and
+			// it is not redundant with (4). The overflow output was
+			//
+			//     le=0.25 ... le=45  all 0;  le=+Inf  11;  _sum  0.11
+			//
+			// Every consecutive pair is non-decreasing, so (4) passes. But the
+			// buckets claim all 11 observations exceeded 45s, so a real _sum
+			// would be at least 11*45 = 495 — not 0.11. The buckets and the sum
+			// describe different worlds.
+			//
+			// Generally: if `above` observations are attributed to the open band
+			// above the top finite bound, each of them is > that bound, so
+			// _sum >= above * topBound. Only a strictly-less-than result is a
+			// violation, so a missing or zero _sum is not flagged here.
+			if sum, ok := sums[family][set]; ok && sum > 0 && len(bs) >= 2 {
+				topBound, boundErr := strconv.ParseFloat(bs[len(bs)-2].le, 64)
+				if boundErr != nil {
+					// Non-numeric bounds: (2) already reports these.
+					topBound = -1
+				}
+				if topBound > 0 {
+					above := bs[len(bs)-1].value - bs[len(bs)-2].value
+					if above > 0 {
+						if minSum := above * topBound; sum < minSum {
+							bad("%s: %v observations are attributed to the band above "+
+								"le=%g, so _sum must be at least %g, but it is %g. The "+
+								"buckets and the sum describe different distributions: the "+
+								"series is being reported as a latency distribution it does "+
+								"not have", where, above, topBound, minSum, sum)
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// renderLabelSet renders a parsed sample's labels back into a stable key, so
+// buckets and the _count they must agree with can be matched. When skip is
+// non-empty that label is omitted — a bucket's `le` is part of what makes it
+// that bucket, not part of the series it belongs to.
+//
+// Sorted so the key does not depend on Go's map iteration order.
+func renderLabelSet(labels map[string]string, skip string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(labels))
+	for n := range labels {
+		if n != skip {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, n := range names {
+		parts = append(parts, fmt.Sprintf("%s=%q", n, labels[n]))
+	}
+	return strings.Join(parts, ",")
+}
+
+// TestEachHistogramInvariantHasTeeth feeds checkHistogramInvariants a
+// deliberately broken exposition, one violation at a time.
+//
+// The guard above only proves it accepts correct output. That is half the
+// question: a well-formedness check whose branches never fire is one that will
+// not fire when a real regression reaches it, and it looks identical from the
+// outside. This is the part that is easy to skip and expensive to discover
+// later, because the failure mode is a green test suite over corrupt metrics.
+//
+// The synthetic input is the wire format directly, so the violations are
+// exactly the shapes seen in production — the first of these is the real
+// pre-fix overflow bucket output, transcribed.
+func TestEachHistogramInvariantHasTeeth(t *testing.T) {
+	const fam = "airouter_endpoint_attempt_duration_seconds"
+
+	// helper renders a labelled sample. Histograms under test are well-formed
+	// apart from the single intended violation, so anything the guard reports
+	// beyond the expected message is itself a finding.
+	render := func(name, labels, value string) string {
+		if labels == "" {
+			return name + " " + value + "\n"
+		}
+		return name + "{" + labels + "} " + value + "\n"
+	}
+	wellFormed := func() []exposedSeries {
+		body := "# TYPE " + fam + " histogram\n"
+		// Cumulative: 3 at or below 0.5, 7 at or below 1, 9 total. The 2 above
+		// le=1 contribute at least 2.0 to the sum, so _sum=7.1 is consistent.
+		for _, b := range []struct{ le, v string }{{"0.5", "3"}, {"1", "7"}, {"+Inf", "9"}} {
+			body += render(fam+"_bucket", `endpoint="a",le="`+b.le+`"`, b.v)
+		}
+		body += render(fam+"_sum", `endpoint="a"`, "7.1")
+		body += render(fam+"_count", `endpoint="a"`, "9")
+		series, err := parseExposition(body)
+		if err != nil {
+			t.Fatalf("synthetic well-formed input does not parse: %v", err)
+		}
+		return series
+	}
+
+	t.Run("baseline is clean", func(t *testing.T) {
+		if v := checkHistogramInvariants(wellFormed()); len(v) != 0 {
+			t.Fatalf("well-formed input reported violations: %v", v)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func([]exposedSeries) []exposedSeries
+		want   string
+	}{
+		{
+			// The real bug, transcribed: every finite bucket 0, +Inf = 9, and a
+			// _sum of 1.5 for 9 observations that the buckets all place above
+			// le=1. Consecutive buckets are non-decreasing, so this is invisible
+			// to the "cannot decrease" check — it is caught by the buckets-vs-_sum
+			// consistency invariant, which is the one that matters here.
+			name: "zeroed finite buckets with a populated +Inf",
+			mutate: func(s []exposedSeries) []exposedSeries {
+				for i := range s {
+					if s[i].name == fam+"_bucket" && s[i].labels["le"] != "+Inf" {
+						s[i].value = 0
+					}
+				}
+				return s
+			},
+			want: "different distributions",
+		},
+		{
+			name: "missing +Inf",
+			mutate: func(s []exposedSeries) []exposedSeries {
+				out := s[:0]
+				for _, x := range s {
+					if x.name == fam+"_bucket" && x.labels["le"] == "+Inf" {
+						continue
+					}
+					out = append(out, x)
+				}
+				return out
+			},
+			want: "want exactly 1",
+		},
+		{
+			name: "+Inf is not last",
+			mutate: func(s []exposedSeries) []exposedSeries {
+				// Reorder only: move the +Inf bucket to the front, so the series
+				// still has exactly one +Inf but it no longer terminates.
+				//
+				// The first version of this case appended +Inf to the end, where
+				// it already was — a no-op the guard correctly reported nothing
+				// for, which is exactly what a test that only looks like coverage
+				// does. The second tried to rebuild the slice and tripped over
+				// its own index arithmetic. Reordering is the whole point, so do
+				// exactly that.
+				var inf *exposedSeries
+				out := make([]exposedSeries, 0, len(s))
+				for i := range s {
+					if s[i].name == fam+"_bucket" && s[i].labels["le"] == "+Inf" {
+						inf = &s[i]
+						continue
+					}
+					out = append(out, s[i])
+				}
+				if inf != nil {
+					out = append([]exposedSeries{*inf}, out...)
+				}
+				return out
+			},
+			want: "must terminate",
+		},
+		{
+			name: "duplicate +Inf",
+			mutate: func(s []exposedSeries) []exposedSeries {
+				var dup exposedSeries
+				for _, x := range s {
+					if x.name == fam+"_bucket" && x.labels["le"] == "+Inf" {
+						dup = x
+						break
+					}
+				}
+				return append(s, dup)
+			},
+			want: "want exactly 1",
+		},
+		{
+			name: "non-increasing le bounds",
+			mutate: func(s []exposedSeries) []exposedSeries {
+				for i := range s {
+					if s[i].name == fam+"_bucket" && s[i].labels["le"] == "1" {
+						s[i].labels["le"] = "0.1"
+					}
+				}
+				return s
+			},
+			want: "not strictly increasing",
+		},
+		{
+			name: "bucket without an le label",
+			mutate: func(s []exposedSeries) []exposedSeries {
+				for i := range s {
+					if s[i].name == fam+"_bucket" {
+						delete(s[i].labels, "le")
+						break
+					}
+				}
+				return s
+			},
+			want: "no `le` label",
+		},
+		{
+			// The other half of the real bug: a histogram that is internally
+			// consistent but disagrees with its own _count.
+			name: "+Inf disagrees with _count",
+			mutate: func(s []exposedSeries) []exposedSeries {
+				for i := range s {
+					if s[i].name == fam+"_count" {
+						s[i].value = 4
+					}
+				}
+				return s
+			},
+			want: "counted twice or not at all",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Deep copy: wellFormed() hands out fresh maps each call, so
+			// mutating in place is safe and cannot leak between cases.
+			v := checkHistogramInvariants(tc.mutate(wellFormed()))
+			if len(v) == 0 {
+				t.Fatalf("guard reported no violation for %q; this invariant has no teeth", tc.name)
+			}
+			joined := strings.Join(v, "\n")
+			if !strings.Contains(joined, tc.want) {
+				t.Errorf("violation reported, but not the one intended:\n%s", joined)
+			}
+			t.Logf("guard said:\n%s", joined)
+		})
 	}
 }
