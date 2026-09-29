@@ -88,6 +88,21 @@ jobs:
       - name: fuzz gate (all targets, 20s each)
         run: bash scripts/fuzz-gate.sh 20
 
+      # The fuzz gate above cannot be validated by running it: every defect
+      # round 9 found in it is dormant in a single-package repository, which is
+      # what this one is, so "the gate passes" and "the gate covers two
+      # packages" are indistinguishable from inside CI. This builds throwaway
+      # two-package repositories and asserts the gate's behaviour there, so the
+      # condition that hid those defects is reproduced on every run.
+      #
+      # Runs first in this job's ordering in the sense that it is cheap and
+      # needs no Go toolchain of its own — it stubs `go` — but it is placed
+      # immediately after the gate so a reader sees the two together. It exits
+      # non-zero on any case that misbehaves, and its last case runs the
+      # pre-round-9 gate against the same fixtures to prove the suite can fail.
+      - name: fuzz gate self-test
+        run: bash scripts/fuzz-gate-selftest.sh
+
       # Proves the SSE ordering guard has teeth: it reintroduces the historical
       # bug, requires the ordering tests to FAIL, then restores proxy.go and
       # requires them to pass again. A test that passes both ways guards nothing,
