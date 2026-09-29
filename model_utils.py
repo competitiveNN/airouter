@@ -9,7 +9,13 @@ from typing import Any
 
 # Cache for AA enrichment data (intelligence scores + release dates).
 # Avoids redundant API calls when the data is still fresh.
-CACHE_FILE = Path(__file__).resolve().parent / "free-models-cache.json"
+#
+# This MUST NOT be free-models-cache.json: that filename is also the --save
+# target for the full fetched model LIST (a JSON array). Pointing both at one
+# path made load_cache() blow up with `AttributeError: 'list' object has no
+# attribute 'get'` on every sync, and it surfaced as an opaque
+# "airouter-model-sync.service failed" rather than a cache-staleness no-op.
+CACHE_FILE = Path(__file__).resolve().parent / "aa-enrichment-cache.json"
 CACHE_TTL_HOURS = 24
 
 # Models to hide — specialized, outdated, or low-quality models
@@ -60,18 +66,26 @@ MAX_MODEL_AGE_MONTHS = 12
 
 
 def load_cache() -> dict[str, Any] | None:
-    """Load cached AA enrichment data if it exists and is still fresh."""
+    """Load cached AA enrichment data if it exists and is still fresh.
+
+    Returns None on any problem (missing, unreadable, wrong shape, stale) so
+    the caller simply refetches. A cache is an optimisation, never a
+    correctness dependency: a malformed file must degrade to a network call,
+    not crash the sync.
+    """
     if not CACHE_FILE.exists():
         return None
     try:
         data = json.loads(CACHE_FILE.read_text())
-        fetched_at = datetime.fromisoformat(data.get("fetched_at", "").replace("Z", "+00:00"))
+        if not isinstance(data, dict):
+            return None
+        fetched_at = datetime.fromisoformat(str(data.get("fetched_at", "")).replace("Z", "+00:00"))
         age = datetime.now(UTC) - fetched_at
         if age.total_seconds() > CACHE_TTL_HOURS * 3600:
             return None
         enrichment = data.get("enrichment", {})
         return enrichment if isinstance(enrichment, dict) else None
-    except (json.JSONDecodeError, ValueError, OSError):
+    except (json.JSONDecodeError, ValueError, TypeError, OSError):
         return None
 
 

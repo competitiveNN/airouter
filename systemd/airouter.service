@@ -5,10 +5,14 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/dev/airouter
-ExecStart=%h/dev/airouter/airouter -port 9090 -api-key admin
+# run-airouter.sh sources the .envrc next to the binary and execs the daemon.
+# systemd's own EnvironmentFile= is deliberately NOT used: it is not a shell
+# parser, so it silently ignores the `export KEY=value` lines direnv writes
+# and resolves no intra-file references. See scripts/run-airouter.sh.
+ExecStart=%h/dev/airouter/scripts/run-airouter.sh -port 9090 -api-key admin
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=30
 
 [Install]
-WantedBy=default
+WantedBy=default.target
