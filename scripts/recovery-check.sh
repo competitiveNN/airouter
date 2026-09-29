@@ -120,6 +120,47 @@ if [ ! -r "$BUNDLE" ] || [ ! -r "$PATCH" ]; then
 fi
 
 BASE_SHA=$(git -C "$REPO" rev-parse "$UPSTREAM")
+
+# The bundle's tip ref is DISCOVERED, not assumed.
+#
+# export-unpushed.sh honours an EXPORT_REF override (its own default is
+# "airouter-unpushed-export"), and a reader who exported with a custom name gets
+# a perfectly good bundle that this script would otherwise refuse with a
+# misleading "could not be fetched" -- a message that points at corruption, not
+# at a name. Hardcoding the default here is what made an ad-hoc verification of
+# the bundle tip report a false "MISMATCH": the tip is at
+# refs/heads/airouter-unpushed-export, the probe looked for refs/heads/master,
+# and the empty result read as staleness.
+#
+# `git bundle list-heads` reports the ref names the bundle actually contains, so
+# asking the bundle is exact where assuming a name is a guess. The tip is the
+# head whose commit is HEAD-equivalent; --not-$UPSTREAM means the bundle holds
+# the unpushed commits and their base prerequisite, and only the tip is a head we
+# want. Take the first listed head, and fail loudly if the bundle advertises
+# none, rather than silently checking out nothing.
+#
+# The two ways this can come up empty are NOT the same problem and are reported
+# differently. `git bundle list-heads` exits non-zero on a bundle it cannot
+# read at all (truncated, random bytes, wrong format), and exits zero with empty
+# output for a readable bundle that carries no head. Collapsing them into one
+# "no head ref" message would tell a reader their corrupt bundle "advertises no
+# head", which is a different diagnosis pointing at a different fix, and it
+# would do so while the more honest "could not be fetched" never got to run.
+# The exit status is captured for exactly this reason.
+LIST_OUT=$(git -C "$REPO" bundle list-heads "$BUNDLE" 2>&1)
+LIST_RC=$?
+BUNDLE_REF=$(printf '%s\n' "$LIST_OUT" | awk 'NR==1{print $2}')
+if [ "$LIST_RC" -ne 0 ]; then
+  # Unreadable. Let the fetch below produce the canonical diagnosis instead of
+  # pre-empting it with a message about ref names.
+  BUNDLE_REF="refs/heads/airouter-unpushed-export"
+elif [ -z "$BUNDLE_REF" ]; then
+  # Readable, but genuinely carries no head to fetch. That is not a corrupt
+  # bundle and not a stale one; it is an artifact with nothing in it.
+  bad "the bundle is readable but advertises no head ref; there is nothing to fetch"
+  exit 1
+fi
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/recovery-check.XXXXXX") || exit 2
 cleanup() {
   if [ "$KEEP" -eq 1 ]; then
@@ -131,6 +172,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "$P base $BASE_SHA ($(git -C "$REPO" rev-parse --short "$UPSTREAM"))"
+# Name the ref we found, so a run against a custom EXPORT_REF says so instead of
+# leaving the reader to wonder which name was used.
+echo "$P bundle tip ref $BUNDLE_REF"
 
 # ---------------------------------------------------------------- bundle ----
 echo "$P bundle"
@@ -141,11 +185,11 @@ git -C "$B" config user.name t
 # The base must exist before the bundle can be fetched: a bundle records its
 # prerequisites, and fetching into a repository that has none fails with a
 # message that looks like a corrupt bundle rather than a missing base.
-if ! git -C "$B" fetch -q "$BUNDLE" 'refs/heads/airouter-unpushed-export:refs/heads/recovered' 2>/dev/null; then
+if ! git -C "$B" fetch -q "$BUNDLE" "$BUNDLE_REF:refs/heads/recovered" 2>/dev/null; then
   # No base in the clone: bring one in, then retry. This mirrors what the
   # documented recovery instructions actually require of a reader.
   git -C "$B" fetch -q "$REPO" "$BASE_SHA" || { bad "bundle base could not be fetched"; exit 1; }
-  git -C "$B" fetch -q "$BUNDLE" 'refs/heads/airouter-unpushed-export:refs/heads/recovered' \
+  git -C "$B" fetch -q "$BUNDLE" "$BUNDLE_REF:refs/heads/recovered" \
     || { bad "bundle could not be fetched"; exit 1; }
 fi
 git -C "$B" checkout -q recovered 2>/dev/null || { bad "bundle tip did not check out"; exit 1; }
@@ -249,6 +293,30 @@ run_in_recovered() {
   fi
 }
 
+# UPSTREAM is PINNED to the recovered tree's own origin/master for every
+# self-test, rather than merely inherited.
+#
+# This is the same class of bug as the UPSTREAM leak fixed in
+# dist-freshness-selftest.sh, one level up. When a caller sets UPSTREAM=base
+# (as the unpushed-export CI job does) that variable is exported into every
+# child, and the self-tests below run in a RECOVERED tree whose base ref is
+# named origin/master, not base. dist-freshness-selftest.sh happens to pin it
+# internally, so this passed by accident; a self-test that did not would have
+# compared against a ref that does not exist in the tree it just recovered and
+# reported a failure that looked like a broken recovery.
+#
+# Pinning it here makes the contract explicit at the boundary instead of
+# leaving it to each child to defend itself. A child that genuinely needs a
+# different upstream passes it on its own command line, where it is visible.
+RECOVERED_UPSTREAM=origin/master
+if ! git -C "$B" rev-parse --verify --quiet "$RECOVERED_UPSTREAM" >/dev/null 2>&1; then
+  # Not fatal: the self-tests are the thing being exercised, and a tree without
+  # that ref simply reports for itself. Said out loud rather than guessed at.
+  printf '  note: recovered tree has no %s; self-tests use their own defaults\n' \
+    "$RECOVERED_UPSTREAM"
+  RECOVERED_UPSTREAM=
+fi
+
 for selftest in \
   fuzz-gate-selftest \
   audit-drift-selftest \
@@ -260,8 +328,13 @@ do
     SKIPPED_AUDIT=$((SKIPPED_AUDIT + 1))
     continue
   fi
-  run_in_recovered "recovered tree: $selftest passes" \
-    bash "scripts/$selftest.sh"
+  if [ -n "$RECOVERED_UPSTREAM" ]; then
+    run_in_recovered "recovered tree: $selftest passes" \
+      env UPSTREAM="$RECOVERED_UPSTREAM" bash "scripts/$selftest.sh"
+  else
+    run_in_recovered "recovered tree: $selftest passes" \
+      bash "scripts/$selftest.sh"
+  fi
 done
 
 # The checkers themselves must run in the recovered tree. The attribution check
