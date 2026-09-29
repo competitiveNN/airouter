@@ -1487,10 +1487,15 @@ goes down, and the run still looks green. Both totals are now declared
 (`EXPECTED_FULL`, `EXPECTED_CLONE`) and the run fails if `PASSED` matches
 neither. Verified: removing one assertion turns the run red at 13/14.
 
-This immediately caught a stray empty commit (`ced60ba`, left behind by a
-`git commit --allow-empty` used while negative-controlling the freshness check),
+This immediately caught a stray empty commit, left behind by a
+`git commit --allow-empty` used while negative-controlling the freshness check,
 which the attribution check had been reporting and which would otherwise have
-been documented as real history.
+been documented as real history. It was removed rather than described — and the
+citation that described it had to be written without its hash, because that same
+commit is unreachable from `HEAD` and therefore absent from any clone. The check
+passes in this working tree and fails in a fresh one, which is precisely the
+"claim written from memory of work rather than from the history" shape it exists
+to catch, committed here by accident.
 
 **4. CI wiring, and where the freshness check deliberately is not run.** The
 `unpushed-export` job now ends by asserting freshness, because it is the one
