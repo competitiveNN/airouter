@@ -21,6 +21,44 @@ def main() -> int:
     if not providers:
         problems.append("no providers configured")
 
+    # The gateway's LogicalModels is exactly [smart work fast large]. A key
+    # outside that set parses fine but is permanently unroutable —
+    # /v1/chat/completions answers "Unknown model". The nightly maki sync
+    # added a `test:` profile this way before it was caught, so reject any
+    # extra profile at the validation step, where it is cheap to fix.
+    extra = set(models) - {"smart", "work", "fast", "large"}
+    if extra:
+        problems.append(
+            f"unroutable profile(s) {sorted(extra)}: models may only contain "
+            "smart/work/fast/large (see LogicalModels in config.go)"
+        )
+
+    # Models that the opencode key provably cannot call. Verified 2026-09-29:
+    # 11 of 12 return 403 FreeTierError, paid big-pickle included; the
+    # attribution headers do not change it. Listing them in a chain costs a
+    # guaranteed round trip per request that reaches them.
+    OPENCODE_DEAD_MODELS = {
+        "big-pickle",
+        "jev-1.13-free",
+        "deepseek-v4-flash-free",
+        "muse-spark-1.2-contributor-free",
+        "muse-spark-1.3-contributor-free",
+        "mimo-v2.5-free",
+        "mimo-v2.6-flash-free",
+        "longcat-2.5-preview-free",
+        "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+        "ling-3.0-flash-fin-free",
+    }
+    for name, mc in models.items():
+        for i, ep in enumerate((mc or {}).get("chain") or []):
+            if str(ep.get("provider", "")).startswith("opencode"):
+                if ep.get("model") in OPENCODE_DEAD_MODELS:
+                    problems.append(
+                        f"{name}[{i}]: opencode/{ep['model']} returns 403 "
+                        "FreeTierError and can never serve traffic"
+                    )
+
     # Provider groups: models from these sources must appear on every provider
     # in their group (same model id, consecutive entries) so a rate-limited
     # key falls through to the next key on the same model.
