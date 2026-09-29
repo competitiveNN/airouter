@@ -26,17 +26,6 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 
 TESTS='TestStreamSSE_BuffersPreReleaseEventsUntilReleasePoint|TestStreamSSE_WireLevelDeltaOrdering'
 
-# The mutation: drop the flushBuffered() call that the fix added, so
-# `released = true` is set but the buffer is only drained later, after the
-# releasing event has already been written.
-MUTATION_ORIG='			released = true
-			if err := flushBuffered(); err != nil {
-				return err
-			}
-		}'
-MUTATION_BROKEN='			released = true
-		}'
-
 restore() {
   if [ -n "${BACKUP:-}" ] && [ -f "$BACKUP" ]; then
     cp "$BACKUP" proxy.go
@@ -57,38 +46,54 @@ if ! go test -run "$TESTS" ./... >/dev/null 2>&1; then
 fi
 echo "  ok"
 
-if ! grep -qF "$MUTATION_ORIG" proxy.go; then
+# Prose for both outcomes, so the pre-check and the mutation cannot disagree.
+refactored() {
   echo "  SKIP: the mutation site is no longer present in proxy.go." >&2
   echo "  Proxy.streamSSE has been refactored since this script was written." >&2
   echo "  The fix (flush the buffer before forwarding the releasing event) may" >&2
-  echo "  have moved or changed shape — confirm the ordering contract by hand." >&2
-  restore
-  exit 2
-fi
+  echo "  have moved or changed shape — confirm the ordering contract by hand" >&2
+  echo "  and update the mutation in this script to match." >&2
+}
+
+# The mutation is applied by the python block below, which is the single source
+# of truth for the site text. There is deliberately no separate grep pre-check:
+# two copies of the site string can drift apart, and when they do the pre-check
+# reports "refactored" for a site that is still present (or vice versa).
 
 echo "sse-negative-check: mutating proxy.go to reintroduce the ordering bug"
-if ! python3 - <<'PY'
+# Capture python's exit code directly. Using `if ! cmd` would lose it, because
+# $? then reflects the negation, not the command.
+set +e
+python3 - <<'PY'
 import sys
 src = open('proxy.go').read()
 old = "			released = true\n			if err := flushBuffered(); err != nil {\n				return err\n			}\n		}"
 new = "			released = true\n		}"
 if old not in src:
-    sys.exit(1)
+    sys.exit(3)   # 3 = site gone, not a write failure
 open('proxy.go', 'w').write(src.replace(old, new, 1))
 PY
-then
-  echo "  FAIL: could not apply the mutation; proxy.go is unchanged." >&2
-  restore
-  exit 1
-fi
+mutate_code=$?
+set -e
 
-if grep -qF "$MUTATION_BROKEN" proxy.go; then
-  echo "  mutation applied"
-else
-  echo "  FAIL: could not apply the mutation; proxy.go is unchanged." >&2
+# Distinguish "the code moved" (exit 2, a warning) from "the mutation could
+# not be written" (exit 1, a real problem). Getting this backwards would tell
+# a future maintainer their guard is broken when the code merely refactored.
+case "$mutate_code" in
+  0) : ;;
+  3) refactored; restore; exit 2 ;;
+  *) echo "  FAIL: could not apply the mutation (python exit $mutate_code)." >&2; restore; exit 1 ;;
+esac
+
+# Verify the mutation actually changed something. Comparing against the backup
+# is the real test; a substring grep would also match the pre-mutation text,
+# since the "broken" form is a prefix of the "fixed" form.
+if cmp -s proxy.go "$BACKUP"; then
+  echo "  FAIL: the mutation did not change proxy.go." >&2
   restore
   exit 1
 fi
+echo "  mutation applied"
 
 echo "sse-negative-check: mutated code must FAIL the ordering tests"
 if go test -run "$TESTS" ./... >/dev/null 2>&1; then
