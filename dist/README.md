@@ -204,13 +204,23 @@ itself matters.
 
 `push` is still `false`, so these commits exist only here and in `dist/`. If you
 are reading this to pick the work up, check the artifacts against the checkout
-before relying on them — they are regenerated per commit, and a stale bundle is
-worse than none because it looks authoritative:
+before relying on them — a stale bundle looks exactly as authoritative as a
+fresh one:
+
+```sh
+./scripts/dist-freshness-check.sh --verbose   # exits 1 if they are stale
+```
+
+It compares the bundle's tip, the patch's tail, and the patch's commit count
+against `HEAD`, and tells you to run `./scripts/export-unpushed.sh` if they
+disagree. It reports rather than regenerating on purpose: a check that silently
+rewrites the artifacts reports success for work it never verified.
+
+The one-line version, if you want it inline:
 
 ```sh
 git bundle list-heads dist/airouter-unpushed.bundle   # must equal git rev-parse HEAD
-./scripts/export-unpushed.sh                          # if it does not
 ```
 
-The first command is the check. A bundle whose tip is not `HEAD` is missing
-whatever was committed since, and the mismatch is the only symptom.
+A bundle whose tip is not `HEAD` is missing whatever was committed since, and
+the mismatch is the only symptom.

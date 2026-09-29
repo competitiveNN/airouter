@@ -1433,6 +1433,101 @@ Tests added this round: none in Go. `scripts/audit-drift-selftest.sh`,
 `scripts/audit-attribution-selftest.sh` and `scripts/audit-attribution-check.py`,
 all wired into the `go` CI job.
 
+### Round 12 (2026-09-29) — the handoff artifact could go stale unnoticed
+
+Round 11 left one instruction unenforced. `dist/README.md` told the next
+session to check that the bundle's tip matches `HEAD` before trusting it. That
+was correct, and it was also a thing a session had to remember to do — and it
+had been done by hand after every commit, three cycles running.
+
+The failure it guards against is the quietest one available here. A *missing*
+bundle is obvious. A *stale* bundle still exists, still passes `git bundle
+verify`, is non-empty, and carries a plausible set of commits; it simply
+describes an older `HEAD`, so a handoff built from it omits every commit made
+since, silently.
+
+**1. `scripts/dist-freshness-check.sh`.** Compares three things against the
+repository: the bundle's recorded tip, the patch's last commit, and the patch's
+commit count. The count matters because a tip-only comparison would pass for a
+bundle that carried the right commit and dropped others.
+
+It reports rather than regenerating, deliberately. A check that silently
+rewrites the artifacts reports success for work it never verified, and a
+generator that is itself broken stays broken and invisible. The fix is one
+command, printed on failure.
+
+It treats "nothing unpushed" as **clean, not stale** and exits 0. A checkout
+with no unpushed commits needs no artifacts, and reporting that as a failure
+would push the next person towards committing them — the exact self-referential
+loop `export-unpushed.sh` exists to prevent. It exits 2 when it cannot run at
+all (no upstream ref, not a repository) rather than reporting success it did not
+earn.
+
+**2. `scripts/dist-freshness-selftest.sh`.** Sixteen assertions, eight cases, on
+throwaway repositories where HEAD, the artifacts and the unpushed set are set
+deliberately and then broken.
+
+Building it caught a hole in the test itself, which is the part worth writing
+down. Cases 2 and 7 both exercise the bundle tip, and both fail on more than
+the tip — the patch end and the patch count disagree there too. So disabling
+the tip comparison entirely still left all thirteen assertions green: the other
+checks were masking it. Case 8 holds the patch correct and makes **only** the
+tip wrong, and asserts the patch is not reported, so nothing can absorb the
+failure. With case 8 added, disabling the tip check fails two assertions.
+
+Verified to fail: tip comparison disabled (14/16), patch count check removed
+(15/16), "nothing unpushed" treated as stale (15/16).
+
+**3. The skip contract is now pinned.** `audit-attribution-selftest.sh` skips
+two assertions in a bare clone — the generated patch is absent, and there are no
+unpushed commits — and the passing total legitimately varies by environment
+(14 in a full checkout, 9 in a clone). That variability is exactly the shape a
+slow loss of coverage takes: a case starts skipping for a new reason, the number
+goes down, and the run still looks green. Both totals are now declared
+(`EXPECTED_FULL`, `EXPECTED_CLONE`) and the run fails if `PASSED` matches
+neither. Verified: removing one assertion turns the run red at 13/14.
+
+This immediately caught a stray empty commit (`ced60ba`, left behind by a
+`git commit --allow-empty` used while negative-controlling the freshness check),
+which the attribution check had been reporting and which would otherwise have
+been documented as real history.
+
+**4. CI wiring, and where the freshness check deliberately is not run.** The
+`unpushed-export` job now ends by asserting freshness, because it is the one
+place where the artifacts genuinely exist: it just generated them, so "fresh" is
+a real assertion. Every other assertion in that job would be satisfied by a
+generator that silently wrote yesterday's state.
+
+The check is *not* run in the `go` job, and the omission is annotated there. The
+artifacts are generated, gitignored, and local to an unpushed history; a CI
+checkout has none, so the check would correctly report them missing and the job
+would be permanently red. There is nothing for CI to verify about another
+machine's unpushed history. What CI does gate is the logic, via the self-test.
+
+Verification this round:
+
+  `go test -race -count=1 ./...` → 329 passed
+  `gofmt -l .` → clean; `go vet ./...` → no issues; `go build ./...` → success
+  `scripts/dist-freshness-selftest.sh` → 16 passed, 0 failed
+  `scripts/dist-freshness-check.sh --verbose` → artifacts match HEAD, 37 covered
+  `scripts/audit-attribution-selftest.sh` → 14 passed, 0 failed
+    (full run: expected 14)
+  `scripts/audit-attribution-selftest.sh` in a fresh clone → 9 passed
+    (reduced run: expected 9)
+  `scripts/audit-drift-selftest.sh` → 11 passed, 0 failed
+  `scripts/fuzz-gate-selftest.sh` → 31 passed, 0 failed
+  `scripts/audit-drift-check.py` → 53 anchors checked, all resolve
+  `scripts/audit-attribution-check.py` → all citations resolve
+  `scripts/secret-scan.sh` → clean
+  `scripts/sse-check.py --rounds 3` → PASS, 12/12 streams
+  `scripts/sse-negative-check.sh` → PASS
+  `python3 -m pytest scripts/test_regenerate_config.py -q` → 11 passed
+  CI YAML parses; 4 jobs, none `continue-on-error`
+
+Tests added this round: `scripts/dist-freshness-check.sh` and
+`scripts/dist-freshness-selftest.sh`, the latter wired into the `go` job and the
+former into the `unpushed-export` job. No production code changed.
+
 ---
 
 ## Resource leak audit (2026-09-07) — re-verified 2026-09-20
