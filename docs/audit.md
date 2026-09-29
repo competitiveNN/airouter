@@ -748,6 +748,78 @@ what does the output actually say, and is it true? It was not.
   locally before pushing. The property under test is "this run created
   nothing", not "no artifact has ever existed".
 
+### Round 5 (2026-09-29) — generalising the histogram guard, and the invariant it was missing
+
+Round 4 fixed the overflow bucket. The test that pinned it named that one
+family, which is the same shape of gap that let the bug survive rounds 1-3: a
+well-formedness check written against the specific series it was thinking of.
+Nothing would have caught the identical defect in the request-duration
+histogram, or in any histogram added later.
+
+• `checkHistogramInvariants` (was metrics_cardinality_test.go, no general
+  guard) — the exposition is now walked in full and every family, every label
+  set, is checked against the spec rather than against a hand-picked list. Six
+  invariants: `le` present, strictly increasing, exactly one `+Inf` and it
+  last, cumulative counts non-decreasing, `+Inf` equal to `_count`, and — the
+  one added last and the one that matters — **buckets consistent with `_sum`**.
+
+  That sixth invariant exists because of how round 4's negative control came
+  out. The obvious well-formedness checks are all monotonicity checks over
+  *consecutive* buckets, and the real bug was:
+
+  ```text
+  le=0.25 ... le=45   all 0
+  le=+Inf             11
+  _sum                0.110000
+  _count              11
+  ```
+
+  Every consecutive pair is non-decreasing. `+Inf` agrees with `_count`. A
+  guard built from the obvious invariants passes this output cleanly, and the
+  series is still a lie: the buckets say all 11 observations exceeded 45
+  seconds while the sum says they averaged 10ms. The buckets and the sum
+  describe different worlds, and *that* is the defect — not a decrease.
+
+  The invariant that catches it: if `above` observations are attributed to the
+  open band above the top finite bound, each of them exceeded that bound, so
+  `_sum >= above * topBound`. Here that demands 11 × 45 = 495 and is given
+  0.11. This is only implied by monotonicity when the buckets are populated;
+  the overflow bucket is exactly the case where they cannot be, which is why
+  the bug produced zeroed bands in the first place. Written as a strict `<`
+  comparison so a missing or zero `_sum` is not flagged.
+
+  The lesson is that a spec-compliance checklist is not the same as an
+  invariant set, and the difference only shows up when you try to violate
+  each one deliberately. A guard that has only ever been run against correct
+  output has an unknown set of untested branches, and those branches are
+  exactly where a latent detector hides.
+
+• `TestEachHistogramInvariantHasTeeth` (was metrics_cardinality_test.go,
+  guard verified only in the accepting direction) — feeds
+  `checkHistogramInvariants` one deliberately broken exposition per invariant
+  and requires each to be reported. The checker returns strings rather than
+  calling `t.Error` specifically so this is possible.
+
+  Two of the seven cases failed when first written, and both failures were
+  informative rather than annoying:
+    - the "zeroed finite buckets" case reported nothing, which is how the
+      missing `_sum` invariant above was found;
+    - the "`+Inf` is not last" case was a no-op mutation — it moved `+Inf` to
+      the end, where it already was — so it passed vacuously while looking
+      like coverage. A mutation that does not mutate is the most expensive kind
+      of useless test, because it is indistinguishable from a real one in
+      review.
+  The baseline fixture was also wrong before it was right: its first `_sum` was
+  inconsistent with its own bucket layout, so the "clean" input was not clean.
+  Fixtures used as negative controls have to satisfy the invariants they are
+  not testing, or every case passes for the wrong reason.
+
+Tests added this round: `TestEveryExportedHistogramIsWellFormed`,
+`TestEachHistogramInvariantHasTeeth`, plus `checkHistogramInvariants`,
+`histogramIndex`, `countHistogramBuckets` and `renderLabelSet`. Both were
+verified to fail against the pre-fix exporter, and every individual invariant
+was verified to fire against a synthetic violation of itself.
+
 Tests added this round:
 TestOverflowBucketIsNotExposedAsHistogram,
 TestEveryLabelKeyMapIsBoundedAndRenders,
