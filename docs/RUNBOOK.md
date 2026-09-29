@@ -108,6 +108,7 @@ unauthenticated scrape is an information leak, not a health check — use
 | `airouter_endpoint_attempt_failures_total{endpoint}` | counter | Failure ratio per upstream |
 | `airouter_endpoint_attempt_duration_seconds{endpoint}` | histogram | Per-attempt cost per upstream |
 | `airouter_sse_comments_routed_out` | counter | Upstream keepalive chatter filtered out of the event path |
+| `airouter_metrics_label_overflow_total` | counter | Label values folded into `__overflow__` because the registry is full |
 
 The `airouter_endpoint_attempt_*` series are the ones to read when deciding
 whether a fallback chain needs reordering: `fallbacks_total` says an endpoint
@@ -121,6 +122,32 @@ counts `: keepalive` lines stripped before they could be misread as events.
 All four request surfaces (chat completions, responses, responses-stream, and
 responses-websocket) record the per-endpoint attempt telemetry, so the series
 cover fallback traffic regardless of which surface the client used.
+
+### Label cardinality is bounded
+
+Endpoint and model labels are derived from config, and config is **not** fixed
+for the process lifetime: `POST /admin/config` accepts an arbitrary new config
+and the file watcher hot-reloads every 3s. Without a bound, a config churn loop
+(or a model sync that keeps inventing model ids) grows the registry until the
+gateway is OOM-killed — the metrics endpoint becomes a way to kill the process.
+
+So every label map is capped at `maxLabelValues` (512) in `metrics.go`. Once a
+map is full, a label value that is not already tracked collapses into a single
+`__overflow__` bucket rather than creating a new series. Consequences:
+
+- **Nothing is silently dropped.** Collapsed observations are still counted, and
+  `airouter_metrics_label_overflow_total` increments. It should be `0` in a
+  healthy deployment.
+- **Already-tracked labels stay distinct.** A churning config never displaces
+  the endpoints that are actually hot; only the tail collapses.
+- **If that counter is non-zero**, either the cap is too low for the deployment
+  (raise `maxLabelValues`) or something is feeding unbounded label values
+  (check for a config rewrite loop). The per-endpoint series are aggregate
+  beyond the cap, so treat the overflow bucket as "unknown endpoints" rather
+  than as one specific provider.
+
+The cap is a memory bound, not a tuning knob with a correct value: the live
+config has 60 distinct endpoint keys, so 512 leaves ~8x headroom.
 
 ## SSE framing contract
 
@@ -150,6 +177,34 @@ against `scripts/fake-sse-upstream.py` (a deliberately hostile SSE upstream
 that interleaves comment lines and omits the trailing blank line) so the
 contract is asserted on every push without provider credentials. The fixture
 config is `testdata/ci-config.yaml`.
+
+### Required status checks
+
+CI enforces what it can from the workflow file: every job sets
+`continue-on-error: false` (so a red X is a failure, not a "known flake"), jobs
+use `fail-fast: false` (so one broken guard does not cancel the others and hide
+their diagnostics), and a nonzero exit fails the job.
+
+What a workflow **cannot** enforce is whether a red X actually blocks a merge.
+That is a repository setting, and until it is configured the SSE contract job
+is advisory. This is not reachable from the repo — it is an org-level setting —
+so it has to be done once by an admin:
+
+> Settings → Branches → Branch protection rules → `master` →
+> "Require status checks to pass before merging".
+
+Add these three required contexts (names must match the job ids exactly):
+
+| Required status check | Job |
+|----------------------|-----|
+| `go` | build, vet, gofmt, tests, SSE negative check, secret scan, audit anchors |
+| `config` | config validation and generator regression tests |
+| `sse-contract` | end-to-end SSE termination contract, metrics assertions |
+
+Note the check name is the **job id**, not a step name. If `sse-contract` is
+left out of this list, the whole point of the job — asserting a bug that
+returns HTTP 200 and is invisible to every other check — is that a green build
+still ships a broken stream. Mark it required when adding the rule.
 
 ## Health
 

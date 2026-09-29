@@ -405,6 +405,80 @@ Status: FIXED. All 10 circuit breaker tests pass (9 new + 1 legacy
 
 ---
 
+## Metrics registry (2026-09-29)
+
+Round focused on `/metrics`, which had been mounted only a few commits earlier
+and had never been exercised against a hostile or merely churning input. Three
+defects, all in `metrics.go`, all now fixed and pinned.
+
+• `Metrics.Request` (was metrics.go:183-205) — label values were storage keys
+  leaking into the exposition output. The store was keyed by a composite
+  (`"requests_by_model_" + model`, `"requests_by_status_" + status`) and that
+  composite was interpolated straight into the label, so every series read
+  `airouter_requests_total{model="requests_by_model_smart"}`. Same for
+  `status="requests_by_status_502"`. The key and the label are now separate
+  concerns and the label carries only the model name or status code. This was
+  cosmetic in isolation, but it meant every dashboard query, alert rule, and
+  recording rule had to hard-code a storage detail that no operator would
+  otherwise guess, so the series were effectively undiscoverable
+  (TestMetricsModelLabelIsTheBareModelName).
+
+• `boundedAttemptKey` (was metrics.go, unbounded before this round) — the
+  per-endpoint attempt maps had no cardinality bound at all. Label values come
+  from config, and config is not fixed for the process lifetime:
+  `HandleAdminConfig` accepts an arbitrary new config and `watchConfig`
+  hot-reloads the file on a 3s poll. A config churn loop — or a nightly
+  free-model sync that keeps introducing fresh model ids — therefore fed
+  genuinely unbounded values into `attemptsByEndpoint`,
+  `attemptFailuresByEnd`, `attemptLatencyNSByEnd`, and `attemptHistByEnd`.
+  Nothing evicted a series, and each endpoint cost four counters plus a
+  12-bucket histogram, so the process grew until it was OOM-killed: a metrics
+  endpoint that can be used to kill the gateway is a self-inflicted DoS.
+  Measured before the fix: 5000 distinct labels produced 5000 entries and a
+  6.9 MB scrape response. FIXED: every label map is capped at `maxLabelValues`
+  (512, ~8x the 60 endpoint keys in the live config) and unknown values
+  collapse into a single `__overflow__` bucket. Collapsed observations are
+  still counted, and `airouter_metrics_label_overflow_total` makes the
+  condition visible instead of silent (TestMetricsAttemptCardinalityIsBounded,
+  TestMetricsCardinalityBoundedAcrossAllLabelMaps,
+  TestMetricsCardinalityBoundIsRaceFree,
+  TestHandleMetricsServesBoundedOutputEndToEnd).
+
+  Two implementation notes worth keeping, because both were bugs found by the
+  tests rather than by review. Bounding each map independently inside
+  `lazyCounter` was wrong twice over: the bounded value never propagated back to
+  the caller, so the histogram map was still keyed by the *raw* label and grew
+  to 6400 entries while the counter maps stopped at 512; and separate checks
+  let the maps disagree at the boundary, so an endpoint could have attempt
+  counts with no latency histogram. Deciding once in `boundedAttemptKey` and
+  threading that key through all four maps makes the key sets identical by
+  construction. Separately, the first version let the map reach `cap+1` by
+  admitting `__overflow__` on top of `cap` real endpoints — a limit that is not
+  actually the limit is worse than no limit, because it reads as a guarantee it
+  does not provide, so one slot is now reserved for the bucket.
+
+• `labelEscape` (was metrics.go, no escaping before this round) — every label
+  value was interpolated into a `"..."` quoted string with no escaping. The
+  provider and model names are config-derived and config is writable through
+  `HandleAdminConfig` and rewritten by the model-sync job, so a provider named
+  `x" 1\nairouter_requests_total{model="victim` produced two syntactically valid
+  series on the next scrape, both of which an operator or a downstream scraper
+  reads as genuine. The exposition format requires escaping backslash, double
+  quote, and newline. FIXED: `labelEscape` is applied at every interpolation
+  site, and `parseExposition` in `metrics_cardinality_test.go` asserts the
+  output still parses as one series per line with exactly one model-labelled
+  request series (TestMetricsLabelValuesCannotForgeSeries). CI re-checks this
+  against the booted gateway, and the check was verified to reject both an
+  unescaped forgery and a raw-newline injection, so it is not decorative.
+
+  While fixing this, `go vet` caught a latent conversion bug: `CircuitState` is
+  an int-backed enum, so `string(from)` emits the rune for the state number
+  (`"\x00"`) instead of `closed`/`open`/`half-open`. Fixed to use
+  `CircuitState.String`, and pinned by
+  TestMetricsCircuitTransitionLabelsAreReadable.
+
+---
+
 ## Resource leak audit (2026-09-07) — re-verified 2026-09-20
 
 HTTP Response Bodies — CLEAN

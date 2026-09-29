@@ -4,9 +4,30 @@ on:
   push:
   pull_request:
 
+# A job that never runs is indistinguishable from a job that passes. These
+# make the failure modes loud instead of silent:
+#
+#   continue-on-error: false (set per job) — a red X here is a real failure,
+#     never a "known flake". Without it, a maintainer can neuter a guard by
+#     adding one line, and the guard still looks present in the file. GitHub's
+#     `defaults` block only accepts `run` (shell/working-directory), so this has
+#     to be set on each job rather than once at the top.
+#
+# The step-level `continue-on-error` on the SSE negative check is the one
+# deliberate exception, and it is annotated at the step: exit 2 there means
+# "this guard needs re-targeting after a refactor", not "the contract broke".
+defaults:
+  run:
+    shell: bash
+
 jobs:
   go:
     runs-on: ubuntu-latest
+    continue-on-error: false
+    strategy:
+      # One broken job must not cancel the others: the SSE contract job and the
+      # go job fail for unrelated reasons, and cancelling one hides the other.
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
@@ -77,6 +98,7 @@ jobs:
 
   config:
     runs-on: ubuntu-latest
+    continue-on-error: false
     steps:
       - uses: actions/checkout@v4
 
@@ -113,8 +135,15 @@ jobs:
   # not by which model answered. The fake is deliberately nastier than a real
   # provider (comment lines interleaved mid-chunk, no trailing blank line on the
   # final event) so the test actually exercises the failure modes.
+  # NOTE: this job must be listed as a required status check in the repository's
+  # branch protection rules, or a red X here is advisory only. That setting is
+  # an org-level config and cannot be set from this file — see docs/RUNBOOK.md
+  # ("Required status checks") for the exact values to enter. Everything that CAN
+  # be enforced from here is: a nonzero exit fails the job, and the job is not
+  # allowed to be marked continue-on-error.
   sse-contract:
     runs-on: ubuntu-latest
+    continue-on-error: false
     steps:
       - uses: actions/checkout@v4
 
@@ -267,6 +296,52 @@ jobs:
             exit 1
           fi
           echo "sse comments routed out: $comments"
+
+      - name: metrics output parses and labels are not forged
+        run: |
+          # The registry is bounded and label values are escaped, but both
+          # properties are only worth anything if the served output is still
+          # valid exposition format. A scrape that fails to parse takes the
+          # dashboard down silently, and an unescaped label can forge a series
+          # that an operator reads as real. Python's own parser is the check:
+          # no dependency, and it is the same shape a real scraper sees.
+          AIROUTER_API_KEY=ci-test-key python3 - <<'PY'
+          import os, re, sys, urllib.request
+
+          req = urllib.request.Request(
+              "http://127.0.0.1:9090/metrics",
+              headers={"Authorization": "Bearer " + os.environ["AIROUTER_API_KEY"]})
+          body = urllib.request.urlopen(req, timeout=10).read().decode()
+
+          series = 0
+          for lineno, line in enumerate(body.splitlines(), 1):
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              series += 1
+              # name{labels} value  — the value must be a bare number, which
+              # is exactly what an unescaped newline in a label would break.
+              m = re.fullmatch(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})? ([^ ]+)", line)
+              if not m:
+                  print(f"::error::line {lineno} does not parse as a series: {line!r}")
+                  sys.exit(1)
+              float(m.group(3))  # raises if the value is not numeric
+              # No raw control characters may reach the wire.
+              if any(ord(c) < 0x20 for c in line):
+                  print(f"::error::line {lineno} contains a raw control character: {line!r}")
+                  sys.exit(1)
+              if m.group(2):
+                  # Every label value must be quoted; an unquoted one means the
+                  # escaping was bypassed somewhere.
+                  for pair in re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)=((?:"(?:[^"\\]|\\.)*")|[^,]*)', m.group(2)):
+                      if not pair[1].startswith('"'):
+                          print(f"::error::line {lineno} has an unquoted label value: {line!r}")
+                          sys.exit(1)
+          if series == 0:
+              print("::error::/metrics returned no series at all")
+              sys.exit(1)
+          print(f"metrics exposition parsed cleanly: {series} series")
+          PY
 
       - name: stop servers
         if: always()
