@@ -785,6 +785,24 @@ func requestTimeout(tokens int) time.Duration {
 	return base + time.Duration(extra)*time.Second
 }
 
+// maxFallbackWallClock bounds the total time a single request may spend
+// walking its chain, independent of how many endpoints the chain contains.
+//
+// The per-attempt loop is bounded by maxAttempts = chainLen*3+1, which for the
+// shipped config is 82 (smart), 145 (work), 115 (large). Combined with a 5s
+// per-attempt timeout for a small request, that is a theoretical 7 minutes of
+// retrying before a client sees anything. Measured on 2026-09-29: a 4-token
+// `smart` request whose providers were all timing out took 62.6s, walking 20+
+// endpoints at 5s apiece. The client just sees a hung request.
+//
+// Cooldowns normally mask this — a timing-out endpoint is skipped on the next
+// request — but the very first request after a restart or a bulk cooldown
+// clear pays the full walk, which is exactly when a user is watching.
+//
+// Attempts are also skipped entirely once this budget is spent, so the
+// fallback still degrades gracefully; it just stops grinding.
+const maxFallbackWallClock = 45 * time.Second
+
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
 	start := time.Now()
 	ctx := r.Context()
@@ -805,6 +823,15 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	for {
 		if ctx.Err() != nil {
 			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+			g.recordRequest(req.Model, 503, time.Since(start))
+			return
+		}
+		// Wall-clock guard: stop grinding through the chain once this request
+		// has spent its whole fallback budget, so a client never waits
+		// minutes on a chain of failing providers.
+		if attempts > 0 && time.Since(start) > maxFallbackWallClock {
+			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted after %d attempts in %v", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond))
+			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
@@ -993,12 +1020,23 @@ start := time.Now()
 	defer sendDone()
 
 	for {
+		// Wall-clock guard, mirroring the non-streaming path: a streaming
+		// request walking a long failing chain must not hold the client open
+		// for minutes. accumulatedContent is non-empty once we have replayed
+		// anything to the client, in which case writing a fresh error into the
+		// stream body would corrupt an already-started response — so just
+		// finish the stream cleanly instead.
+		if attempts > 0 && time.Since(start) > maxFallbackWallClock {
+			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted after %d attempts in %v", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond))
+			if accumulatedContent == "" {
+				writeSSEError(w, flusher, "All models are currently unavailable")
+			}
+			g.recordRequest(req.Model, 503, time.Since(start))
+			return
+		}
 		if ctx.Err() != nil {
 			// Context cancelled (client disconnect or timeout). Log the cause
 			// for debugging; the deferred sendDone() will terminate the stream.
-			if cause := context.Cause(ctx); cause != nil {
-				log.Printf("[debug] session=%s model=%s -> context cancelled: %v", sessionID, req.Model, cause)
-			}
 			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
@@ -1229,6 +1267,28 @@ func (g *GatewayContext) HandleAdminSessions(w http.ResponseWriter, r *http.Requ
 func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Request) {
 	if !g.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
+		return
+	}
+	// DELETE clears backoff state. Without it the only way to clear a
+	// cooldown is to stop the daemon, edit cooldowns.json by hand, and start
+	// it again — and that hand-edit is silently reverted by the running
+	// router, which rewrites the file from its in-memory copy.
+	//
+	// Targets come from the query string so a mistaken bulk clear is at least
+	// explicit:   DELETE /admin/cooldowns?model=<provider:model>
+	//              DELETE /admin/cooldowns            (clears everything)
+	if r.Method == http.MethodDelete {
+		modelKey := r.URL.Query().Get("model")
+		removed := g.router.ClearCooldowns(modelKey)
+		if modelKey != "" && removed == 0 {
+			writeAPIError(w, 404, "No cooldown for model "+modelKey, "not_found", "cooldown_not_found")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"cleared": removed,
+			"model":   modelKey,
+		})
 		return
 	}
 	if r.Method != http.MethodGet {

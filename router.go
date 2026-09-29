@@ -480,10 +480,25 @@ func (r *Router) loadCooldowns() {
 		log.Printf("[debug] loaded %d active cooldowns (legacy format)", len(r.cooldowns))
 		return
 	}
+	// Decode the two sections independently. A single json.Unmarshal into the
+	// merged envelope is all-or-nothing: one malformed value anywhere — most
+	// easily a hand-edited circuits entry whose "state" is the string "open"
+	// rather than the numeric CircuitState — aborts the whole parse and every
+	// cooldown is dropped, so one bad byte silently discards all backoff state
+	// and the daemon re-hammers every failing endpoint from scratch. Parsing
+	// each section on its own means a bad circuit costs only that circuit.
 	var state cooldownsState
 	if err := json.Unmarshal(data, &state); err != nil {
-		log.Printf("[warn] failed to parse cooldowns (state reset): %v", err)
-		return
+		log.Printf("[warn] failed to parse cooldowns envelope (recovering sections): %v", err)
+		// Recover the cooldowns even though the envelope failed to decode.
+		var cooldownsOnly struct {
+			Cooldowns map[string]CooldownEntry `json:"cooldowns"`
+		}
+		if err := json.Unmarshal(data, &cooldownsOnly); err != nil {
+			log.Printf("[warn] failed to parse cooldowns (state reset): %v", err)
+			return
+		}
+		state.Cooldowns = cooldownsOnly.Cooldowns
 	}
 	now := time.Now()
 	for k, v := range state.Cooldowns {
@@ -498,7 +513,20 @@ func (r *Router) loadCooldowns() {
 	// would re-open it on the next request anyway). HalfOpen is restored as
 	// written — a half-open circuit with an expired cooldown will immediately
 	// admit a probe, which is the desired behaviour.
-	for k, v := range state.Circuits {
+	// Same independent-decode treatment for circuits: a malformed circuit
+	// must not cost us the cooldowns recovered above.
+	circuits := state.Circuits
+	if circuits == nil {
+		var circuitsOnly struct {
+			Circuits map[string]CircuitBreaker `json:"circuits"`
+		}
+		if err := json.Unmarshal(data, &circuitsOnly); err != nil {
+			log.Printf("[warn] failed to parse circuits (cooldowns kept): %v", err)
+		} else {
+			circuits = circuitsOnly.Circuits
+		}
+	}
+	for k, v := range circuits {
 		cb := v
 		switch cb.State {
 		case CircuitOpen:
@@ -1224,6 +1252,43 @@ func (r *Router) ResetCircuit(ep *ModelEndpoint) {
 		cb.ProbesSent = 0
 		cb.OpenedAt = time.Time{}
 	}
+}
+
+// ClearCooldowns drops cooldown and circuit state so endpoints can be probed
+// again immediately. When modelKey is empty every entry is cleared; otherwise
+// only the named endpoint is reset. It returns the number of entries removed.
+//
+// This exists because the only other way to clear backoff state was to stop
+// the daemon, hand-edit cooldowns.json, and start it again. That is a
+// footgun: the router holds the authoritative copy in memory and rewrites the
+// whole file from it on the next failure, so an edit made while the daemon is
+// running is silently reverted (and, if the file is left malformed, the
+// restart can drop every cooldown instead of just the intended ones).
+func (r *Router) ClearCooldowns(modelKey string) int {
+	r.mu.Lock()
+	removed := 0
+	if modelKey == "" {
+		removed = len(r.cooldowns) + len(r.circuits)
+		r.cooldowns = make(map[string]CooldownEntry)
+		r.circuits = make(map[string]*CircuitBreaker)
+	} else {
+		if _, ok := r.cooldowns[modelKey]; ok {
+			delete(r.cooldowns, modelKey)
+			removed++
+		}
+		if _, ok := r.circuits[modelKey]; ok {
+			delete(r.circuits, modelKey)
+			removed++
+		}
+	}
+	r.mu.Unlock()
+	if removed > 0 {
+		// Persist immediately rather than waiting for the debounced save timer:
+		// an operator clearing state needs it durable now, and a pending
+		// failure would otherwise re-arm the timer and rewrite the file.
+		r.saveCooldowns()
+	}
+	return removed
 }
 
 // cleanupCircuits removes circuit breaker entries for endpoints that are no
