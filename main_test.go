@@ -564,7 +564,16 @@ func TestRouterModelFallback(t *testing.T) {
 	}
 }
 
-func TestRouterSelectNext(t *testing.T) {
+// TestRouterSelectEndpointSkipsCooldown asserts that SelectEndpoint walks past
+// endpoints in cooldown and pins the choice to the session.
+//
+// Named after SelectEndpoint, which is what it actually calls. It used to be
+// called TestRouterSelectNext, after a Router.SelectNext helper that no longer
+// exists; the old name sent readers looking for a symbol that is gone, and
+// implied a "reselect from the top" behaviour that SelectEndpoint does not
+// have. It walks the chain and honours the per-request tried set, so a model
+// that already failed this request is never returned again.
+func TestRouterSelectEndpointSkipsCooldown(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	sessionID := "test-session-3"
@@ -583,7 +592,7 @@ func TestRouterSelectNext(t *testing.T) {
 		t.Errorf("expected %v, got %v", chain[1], *ep)
 	}
 
-	// Now fail this model and select next
+	// Now fail this model; the session moves on to the next available endpoint
 	router.ApplyCooldown(ep, 500, "server error")
 	ep2, _ := router.SelectEndpoint("smart", sessionID, false, nil)
 	if ep2 == nil {
@@ -594,7 +603,11 @@ func TestRouterSelectNext(t *testing.T) {
 	}
 }
 
-func TestRouterSelectNextAllInCooldown(t *testing.T) {
+// TestRouterSelectEndpointAllInCooldown asserts the exhausted-chain result:
+// no endpoint plus a positive wait, which the handler turns into a 503 after
+// sleeping up to that wait. Renamed from TestRouterSelectNextAllInCooldown;
+// see TestRouterSelectEndpointSkipsCooldown.
+func TestRouterSelectEndpointAllInCooldown(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	sessionID := "test-session-4"
