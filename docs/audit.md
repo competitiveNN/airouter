@@ -2165,3 +2165,45 @@ correct when written and wrong seconds later with no edit to either the commits
 or the document. Not "fixed", because there is nothing to fix without a lock on
 the remote: the round records it so the next reader does not spend an hour
 diagnosing 37 failures that mean "someone pushed while you were working".
+
+**7. Someone pushed, and three green checks turned red for premises nobody wrote
+down.** Halfway through this round `origin/master..HEAD` went from 37 commits to
+0 — another account with access pushed, no edit to the commits or to any file.
+Nothing in the product changed, and three checks disagreed with that: the
+attribution check reported all 37 entries of the handoff list as "not an unpushed
+commit", and `audit-attribution-selftest.sh` case 5 failed twice.
+
+Both self-test failures were the same defect, and it is worth naming separately
+from the ones above: **a case whose premise is satisfied by the environment
+instead of by the fixture has an undocumented dependency, and it fails as though
+the subject had regressed.**
+
+  - The "wrong base" control replayed the unpushed patch onto `HEAD` and required
+    `git am` to refuse it. With 37 commits it refused; with 2, git recognised an
+    already-applied patch, skipped, and exited 0. The case then reported that the
+    *fixture's base was wrong* while the base was fine. Replaced by a structural
+    control — the replay base must not already contain the patch tip — which
+    states the property the case needed and depends on neither the size of the
+    patch nor the chattiness of the installed git.
+  - The sanity step grepped `docs/audit.md` for the first backticked hash and
+    required it *not* to resolve in the replayed tree. Every hash the document
+    cites is now upstream, so it resolved, in the replay's own base, correctly.
+    The citations are now derived from `origin/master..HEAD` and written into the
+    throwaway recovered tree, so the case has something to match no matter what
+    the real document happens to cite. 18/18 again, same contract, no case
+    removed.
+
+The lesson generalises past this file: when a check depends on a fact about the
+repository — there are unpushed commits, the document cites one, the artifact
+exists — assert that fact or construct it. Case 5 already asserted the artifact
+was absent-and-skipped-loudly; it had simply never asserted the other two.
+
+**8. The credential came back, and the gate caught it rather than the human.**
+`secret-scan.sh` is the one gate step that is failing right now, and it is right:
+`.git/config` again contains a token embedded in the remote URL, which had already
+been remediated once earlier this month. It came back through the push path — the
+handoff document's own instructions said to add a token to a remote URL, so
+following them reproduced the finding. The document now says username, never
+token, and explains why at the top. Rotating the token itself is an owner action,
+not an agent action, so the finding is reported rather than "fixed" by deleting
+someone else's working credential.
