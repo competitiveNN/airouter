@@ -1,0 +1,18 @@
+# HELP airouter_endpoint_attempt_duration_seconds Duration of a single upstream attempt
+# TYPE airouter_endpoint_attempt_duration_seconds histogram
+airouter_endpoint_attempts_total{endpoint="__overflow__"} 11
+airouter_endpoint_attempt_failures_total{endpoint="__overflow__"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="0.25"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="0.5"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="1"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="2"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="3"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="5"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="8"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="12"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="20"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="30"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="45"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="+Inf"} 11
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="__overflow__"} 0.110000
+airouter_endpoint_attempt_duration_seconds_count{endpoint="__overflow__"} 11

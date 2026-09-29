@@ -1,0 +1,291 @@
+# Golden fixture: output the histogram guard MUST accept.
+# Captured from a running gateway under load with 17 label evictions,
+# so it includes real histograms plus the __overflow__ gauges. Generated
+# rather than hand-written so it cannot be 'fixed' into looking valid.
+# HELP airouter_requests_total Total requests by model and status
+# TYPE airouter_requests_total counter
+# HELP airouter_failures_total Total failures by status code
+# TYPE airouter_failures_total counter
+# HELP airouter_fallbacks_total Number of model fallbacks
+# TYPE airouter_fallbacks_total counter
+# HELP airouter_fallbacks_total_by_endpoint Number of fallbacks triggered by each endpoint
+# TYPE airouter_fallbacks_total_by_endpoint counter
+# HELP airouter_cooldowns_applied_total Number of cooldown applications
+# TYPE airouter_cooldowns_applied_total counter
+# HELP airouter_circuit_state_transitions Number of circuit breaker state transitions
+# TYPE airouter_circuit_state_transitions counter
+# HELP airouter_request_duration_seconds Request latency in seconds
+# TYPE airouter_request_duration_seconds histogram
+# HELP airouter_sse_comments_routed_out SSE comment lines dropped instead of being parsed as events
+# TYPE airouter_sse_comments_routed_out counter
+# HELP airouter_metrics_label_overflow_total Observations folded into the overflow bucket because the label registry is full
+# TYPE airouter_metrics_label_overflow_total counter
+# HELP airouter_metrics_label_evictions_total Labels displaced from the registry to admit a newer one
+# TYPE airouter_metrics_label_evictions_total counter
+# HELP airouter_endpoint_attempts_total Upstream attempts made against each endpoint
+# TYPE airouter_endpoint_attempts_total counter
+# HELP airouter_endpoint_attempt_failures_total Upstream attempts against each endpoint that failed
+# TYPE airouter_endpoint_attempt_failures_total counter
+# HELP airouter_endpoint_attempt_duration_seconds Duration of a single upstream attempt
+# TYPE airouter_endpoint_attempt_duration_seconds histogram
+# HELP airouter_evicted_attempts_latency_seconds_sum Latency of attempts whose endpoint was evicted from the metrics window. NOT a histogram: the per-latency-band distribution is unknown and is not reported, so do not use histogram_quantile on this.
+# TYPE airouter_evicted_attempts_latency_seconds_sum gauge
+# HELP airouter_evicted_attempts_latency_seconds_count Number of attempts whose endpoint was evicted from the metrics window. NOT a histogram: see the _sum metric.
+# TYPE airouter_evicted_attempts_latency_seconds_count gauge
+
+airouter_request_duration_seconds_bucket{le="0.005"} 180
+airouter_request_duration_seconds_bucket{le="0.01"} 180
+airouter_request_duration_seconds_bucket{le="0.025"} 180
+airouter_request_duration_seconds_bucket{le="0.05"} 180
+airouter_request_duration_seconds_bucket{le="0.1"} 180
+airouter_request_duration_seconds_bucket{le="0.25"} 180
+airouter_request_duration_seconds_bucket{le="0.5"} 180
+airouter_request_duration_seconds_bucket{le="1"} 180
+airouter_request_duration_seconds_bucket{le="2.5"} 180
+airouter_request_duration_seconds_bucket{le="5"} 180
+airouter_request_duration_seconds_bucket{le="10"} 180
+airouter_request_duration_seconds_bucket{le="+Inf"} 180
+airouter_request_duration_seconds_sum 0.161918
+airouter_request_duration_seconds_count 180
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="0.25"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="0.5"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="1"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="2"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="3"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="5"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="8"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="12"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="20"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="30"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="45"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-0",le="+Inf"} 3
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-fast-0"} 0.002882
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-fast-0"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="0.25"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="0.5"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="1"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="2"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="3"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="5"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="8"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="12"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="20"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="30"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="45"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-2",le="+Inf"} 3
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-fast-2"} 0.002642
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-fast-2"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="0.25"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="0.5"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="1"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="2"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="3"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="5"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="8"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="12"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="20"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="30"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="45"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-3",le="+Inf"} 4
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-fast-3"} 0.003856
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-fast-3"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="0.25"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="0.5"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="1"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="2"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="3"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="5"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="8"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="12"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="20"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="30"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="45"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-4",le="+Inf"} 5
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-fast-4"} 0.003578
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-fast-4"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="0.25"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="0.5"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="1"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="2"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="3"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="5"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="8"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="12"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="20"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="30"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="45"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-5",le="+Inf"} 11
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-fast-5"} 0.008492
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-fast-5"} 11
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="0.25"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="0.5"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="1"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="2"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="3"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="5"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="8"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="12"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="20"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="30"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="45"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-6",le="+Inf"} 3
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-fast-6"} 0.002419
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-fast-6"} 3
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="0.25"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="0.5"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="1"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="2"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="3"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="5"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="8"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="12"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="20"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="30"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="45"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-fast-7",le="+Inf"} 8
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-fast-7"} 0.006731
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-fast-7"} 8
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="0.25"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="0.5"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="1"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="2"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="3"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="5"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="8"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="12"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="20"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="30"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="45"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-0",le="+Inf"} 6
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-0"} 0.006507
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-0"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="0.25"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="0.5"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="1"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="2"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="3"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="5"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="8"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="12"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="20"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="30"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="45"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-1",le="+Inf"} 6
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-1"} 0.005443
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-1"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="0.25"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="0.5"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="1"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="2"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="3"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="5"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="8"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="12"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="20"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="30"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="45"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-2",le="+Inf"} 7
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-2"} 0.005626
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-2"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="0.25"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="0.5"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="1"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="2"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="3"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="5"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="8"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="12"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="20"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="30"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="45"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-3",le="+Inf"} 4
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-3"} 0.003368
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-3"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="0.25"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="0.5"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="1"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="2"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="3"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="5"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="8"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="12"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="20"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="30"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="45"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-4",le="+Inf"} 5
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-4"} 0.004264
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-4"} 5
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="0.25"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="0.5"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="1"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="2"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="3"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="5"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="8"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="12"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="20"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="30"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="45"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-5",le="+Inf"} 4
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-5"} 0.003225
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-5"} 4
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="0.25"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="0.5"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="1"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="2"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="3"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="5"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="8"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="12"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="20"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="30"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="45"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-6",le="+Inf"} 6
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-6"} 0.005110
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-6"} 6
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="0.25"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="0.5"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="1"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="2"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="3"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="5"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="8"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="12"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="20"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="30"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="45"} 7
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="fake:fake-large-7",le="+Inf"} 7
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="fake:fake-large-7"} 0.006693
+airouter_endpoint_attempt_duration_seconds_count{endpoint="fake:fake-large-7"} 7
+airouter_evicted_attempts_latency_seconds_sum{endpoint="__overflow__"} 0.087776
+airouter_evicted_attempts_latency_seconds_count{endpoint="__overflow__"} 98
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-fast-0"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-fast-0"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-fast-2"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-fast-2"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-fast-3"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-fast-3"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-fast-4"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-fast-4"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-fast-5"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-fast-5"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-fast-6"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-fast-6"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-fast-7"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-fast-7"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-0"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-0"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-1"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-1"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-2"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-2"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-3"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-3"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-4"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-4"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-5"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-5"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-6"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-6"} 0
+airouter_evicted_attempts_latency_seconds_sum{endpoint="fake:fake-large-7"} 0.000000
+airouter_evicted_attempts_latency_seconds_count{endpoint="fake:fake-large-7"} 0

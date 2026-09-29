@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
@@ -2749,4 +2750,74 @@ h_count{endpoint="a"} 9
 			}
 		}
 	})
+}
+
+// TestGoldenExpositions pins the guard against committed fixtures in
+// testdata/metrics, so the historical defect stays reproducible without
+// re-running a fuzzer.
+//
+// The fuzz target is the better long-run signal, but it is a poor memory: its
+// corpus is gitignored, it explores randomly, and a 385M-execution run on one
+// machine says nothing about the next one. The single most valuable input here
+// is a specific historical output that no fuzzer is likely to rediscover — the
+// `__overflow__` bucket as it was actually served, which is why it survived
+// three audit rounds. That belongs on disk, parsed by a deterministic test.
+//
+// Both directions are asserted, because a guard is only useful if it is also
+// quiet on correct data. A test that only checks the bad fixture passes just
+// as happily when the guard fires on everything.
+func TestGoldenExpositions(t *testing.T) {
+	for _, tc := range []struct {
+		file       string
+		wantClean  bool
+		wantSubstr string
+	}{
+		{
+			// The defect, transcribed from a real pre-fix scrape: every finite
+			// band 0 with a populated +Inf, and a _sum that says the
+			// observations were nearly instant. Consecutive buckets are
+			// non-decreasing and +Inf agrees with _count, so only the
+			// buckets-vs-_sum invariant rejects it.
+			file:       "overflow-as-histogram.prom",
+			wantClean:  false,
+			wantSubstr: "different distributions",
+		},
+		{
+			// Real output from a running gateway under load, with 17 evictions
+			// and the __overflow__ gauges present. Must produce nothing.
+			file:      "valid-histograms.prom",
+			wantClean: true,
+		},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			body, err := os.ReadFile(filepath.Join("testdata/metrics", tc.file))
+			if err != nil {
+				t.Fatalf("reading fixture: %v", err)
+			}
+			series, err := parseExposition(string(body))
+			if err != nil {
+				t.Fatalf("fixture does not parse, so it tests nothing: %v", err)
+			}
+			if n := countHistogramBuckets(series); n == 0 {
+				t.Fatal("fixture contains no histogram buckets; it cannot exercise the guard")
+			}
+
+			violations := checkHistogramInvariants(series)
+			if tc.wantClean {
+				if len(violations) != 0 {
+					t.Fatalf("guard fired on known-good output (%d violations), so it is "+
+						"too strict to ship:\n%s", len(violations), strings.Join(violations, "\n"))
+				}
+				return
+			}
+			if len(violations) == 0 {
+				t.Fatal("guard accepted a fixture that is the historical defect; it has " +
+					"lost the property it was written for")
+			}
+			if joined := strings.Join(violations, "\n"); !strings.Contains(joined, tc.wantSubstr) {
+				t.Errorf("fixture rejected, but not for the intended reason.\nwant substring: %q\ngot:\n%s",
+					tc.wantSubstr, joined)
+			}
+		})
+	}
 }
