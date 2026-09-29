@@ -14,7 +14,7 @@ authenticates but has `push: false` on the repository, and neither
 `gh api repos/competitiveNN/airouter --jq .permissions.push`.
 
 So the work is committed locally and **not** on the remote. These two files in
-`dist/` carry the 23 commits that `origin/master` is missing, so nothing is lost
+`dist/` carry the commits that `origin/master` is missing, so nothing is lost
 if this checkout goes away.
 
 ## Files
@@ -75,7 +75,7 @@ git push origin master
 
 ## Contents
 
-The 23 unpushed commits, oldest first:
+The unpushed commits, oldest first:
 
 - `0100387` fix: start airouter with provider API keys in its environment
 - `a515364` feat: resilient cooldown state, DELETE /admin/cooldowns, bounded fallback
@@ -100,6 +100,8 @@ The 23 unpushed commits, oldest first:
 - `b7cccda` Make the histogram guard's coverage durable: golden fixtures + CI fuzzing
 - `cb4e826` Audit the gate: FROZEN=1 was the broken invocation, not the working one
 - `c40f0eb` docs: refresh dist/README for the unpushed commits
+- `ba4a6c4` docs: note that the unpushed count in dist/README is self-referential
+- `119e998` Fuzz the target's own package: the recursive gate could never have worked
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
@@ -107,11 +109,11 @@ contain itself, and `c746484` replaced the approach. They are kept because
 rewriting published history is worse than three honest commits, but nothing
 needs doing with them.
 
-The commit count has the same self-reference problem in miniature: stating 23
-creates the commit that makes it 24. Read the number off
-`git rev-list --count origin/master..HEAD` rather than trusting this line. The
-bundle and patch in this directory are always regenerated, so they are never
-stale.
+The commit count has the same self-reference problem in miniature: writing a
+number here creates the commit that makes it one larger. Read the number off
+`git rev-list --count origin/master..HEAD` rather than trusting any number
+written in this file. The bundle and patch in this directory are always
+regenerated, so they are never stale.
 
 `cb4e826` audits `b7cccda`: it found the fuzz gate's documented `FROZEN=1`
 invocation was the one that failed (fabricating a counterexample from a usage
@@ -119,8 +121,19 @@ error), that a committed corpus made the gate permanently red, that discovery
 was root-only, and that the threshold study was measuring a code path that never
 executes. No production code changed.
 
+`119e998` audits `cb4e826` the same way, and the result is that the recursive
+discovery it added could never have worked: the fuzz phase still passed
+`./...`, which Go refuses outright once a module has two packages, and the
+refusal was reported as a counterexample pointing at a file that did not exist.
+Three further defects sat behind it (a `dirname` result read as a stdlib import,
+a crasher check scoped to the root instead of the package that owns it, and a
+count comparison where a set diff was needed). It is the third commit in a row
+whose findings are all in the gate rather than in the code, and each one was
+only found by running the gate in the configuration it was written for.
+
 ## Verification
 
 Both artifacts were checked, not just written: the bundle was fetched into a
-fresh clone and the patch was applied with `git am --3way` onto `origin/master`.
-Both produce a tree that builds and passes the full test suite.
+fresh clone and the patch was applied with `git am --3way` onto the commit
+`origin/master` points at. Both produce a tree that builds and passes the full
+test suite (`go build ./...`, `go test -count=1 ./...`).
