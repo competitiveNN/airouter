@@ -1266,6 +1266,98 @@ TestMetricsCardinalityBoundaryIsExact, TestMetricsOverflowNeverEmitsMalformedSam
 TestConfigValidationRejectsOutOfRangeLabelCap, TestValidateConfigRangeMatchesGo,
 FuzzExpositionRoundTrip.
 
+### Round 11 (2026-09-29) — the two gaps the last round named
+
+Round 10 ended by naming what it had not fixed: `scripts/audit-drift-check.py`
+had no self-test, and the anchor check could not tell a finding that shipped from
+a finding that was merely described in the past tense. Both are closed here. No
+production code changed; for the fourth round running, every finding is in the
+test and gate layer.
+
+**1. `scripts/audit-drift-selftest.sh`** — the extension round 10 specified,
+built the same way as the fuzz-gate self-test: throwaway two-package
+repositories, no Go toolchain, no network. Eleven assertions across seven cases —
+recursive discovery in a two-package fixture, a negative control against a copy
+of the checker reverted to the root-only glob, a bogus anchor, a deleted
+subpackage function, a missing audit document, an empty audit document, and a
+liveness case against the real repository.
+
+Two properties are load-bearing:
+
+- **Negative controls run against copies, never the real script.** The suite
+  needs a broken checker to assert against. A harness that edited
+  `scripts/audit-drift-check.py` in place could destroy the thing it is
+  testing — which is the exact class of accident that cost round 10 its fix
+  (`git reset --hard` while probing a different script). The fixture copies
+  the script into a temp tree and breaks the copy.
+- **A liveness case.** Every other case asserts that the checker *complains*,
+  which a checker that does nothing would also satisfy. The real-repository
+  case requires it to resolve all 53 anchors and exit 0, so "it passes" cannot
+  be reached by doing nothing.
+
+Verified to fail when the fix is undone: reverting `rglob` to the root-only glob
+produces 3 failures including the behavioural one; making the checker vacuous
+(nothing ever reported) produces 4.
+
+**2. `scripts/audit-attribution-check.py`** — the second gap. It checks the
+commit-level claim the anchor check cannot:
+
+- every commit hash cited in `docs/audit.md` or `dist/README.md` resolves to a
+  real commit. A hash that does not exist is a citation written from memory
+  rather than from the history, which is precisely the shape a lost fix takes;
+- `dist/README.md`'s unpushed-commit list matches `origin/master..HEAD` as a
+  **set**, not a count — the same substitution that fixed the fuzz gate, for
+  the same reason: a count is satisfied by any equally-wrong list.
+
+It found real drift immediately. `979dcf6` and `ee4bf69` were unpushed and
+missing from the handoff list, so a handoff built from that document would not
+have carried them. Both were added.
+
+**The self-reference, and why the check still converges.** Writing the list
+creates a commit, which makes the list wrong, which requires rewriting it. This
+is the loop `dist/README.md` already documents for the bundle and for the count
+in miniature, and left unchecked because it looked unsatisfiable. The
+resolution is to exempt commits whose diff touches `dist/README.md` — a commit
+cannot contain its own hash, so requiring it to is not a constraint but a
+paradox. The exemption is derived from each commit's own diff rather than from
+anything the document says, so it cannot be widened from the prose, and every
+code, test, script and audit commit is still required to appear in the list. A
+real change cannot hide behind it.
+
+Wiring this into CI required `fetch-depth: 0` on the `go` job.
+`actions/checkout@v4` defaults to a shallow single-ref checkout, which has no
+`origin/master`, so the unpushed-list half would have skipped and still exited 0
+— a guard passing because it could not see what it guards. That failure is
+worse than having no guard, and it is the reason the skip path prints a notice
+under `--verbose` rather than failing silently.
+
+Verification this round:
+
+`go test -race -count=1 ./...` → ok, 0 failed
+`gofmt -l .` → clean; `go vet ./...` → no issues
+`scripts/audit-drift-selftest.sh` → 11 passed, 0 failed
+`scripts/audit-attribution-check.py` → all citations resolve, 31 unpushed
+  commit(s) listed accurately
+`scripts/audit-drift-check.py` → 53 anchors checked, all resolve
+`scripts/fuzz-gate-selftest.sh` → 31 passed, 0 failed
+`scripts/fuzz-gate.sh 20` → PASS, 2 targets
+`scripts/secret-scan.sh` → clean
+CI YAML parses; 4 jobs, none `continue-on-error`
+`scripts/sse-check.py --rounds 3` → PASS, 12/12 streams
+`scripts/sse-negative-check.sh` → PASS
+`python3 -m pytest scripts/test_regenerate_config.py -q` → 11 passed
+
+Negative controls for the new checker, each verified to fail first: dropping a
+real unpushed commit from the list (exit 1, 23 missing reported), a fabricated
+hash cited in `docs/audit.md` (reported), and a phantom commit listed in
+`dist/README.md` (reported twice — once as a citation, once as a listed-but-
+nonexistent commit). The fabricated hashes are written here without backticks
+deliberately: the checker treats a backticked hex token as a citation, so
+documenting its own negative control in the document it guards would trip it.
+
+Tests added this round: none in Go. `scripts/audit-drift-selftest.sh` and
+`scripts/audit-attribution-check.py`, both wired into the `go` CI job.
+
 ---
 
 ## Resource leak audit (2026-09-07) — re-verified 2026-09-20

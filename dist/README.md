@@ -104,8 +104,10 @@ The unpushed commits, oldest first:
 - `119e998` Fuzz the target's own package: the recursive gate could never have worked
 - `c941f23` docs: refresh dist/README for the fuzz-gate package fix
 - `5437846` Test the gate in the layout that hid its bugs
+- `979dcf6` docs: refresh dist/README for the fuzz-gate self-test
 - `56dfbdf` Walk every .go file, not just the ones in the root
 - `aaad4dd` Correct the round-10 record: the drift fix shipped in 56dfbdf, not here
+- `ee4bf69` docs: refresh dist/README for the audit-drift-check glob fix
 
 The middle two are the self-reference loop described at the top of this file:
 `fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
@@ -149,10 +151,22 @@ the separate commit: that fix was written during `5437846`, then destroyed by a
 and the audit document both went on describing it as shipped. It was caught in
 review, re-applied, and the record corrected in `aaad4dd`.
 
-`audit-drift-check.py` is still the one script here with no self-test guarding it,
-and it is the one that had the bug. The header of `fuzz-gate-selftest.sh` names the
-gap and spells out the extension, so it is found by reading the code rather than by
-being surprised a fourth time.
+`audit-drift-check.py` was the one script here with no self-test guarding it, and
+it is the one that had the bug. `fuzz-gate-selftest.sh` named that gap and spelled
+out the extension; `audit-drift-selftest.sh` is the extension, and
+`audit-attribution-check.py` closes the second gap it left — the one where a
+finding is accurate about the code and wrong about the commit, because the anchor
+check validates symbols and never checked that a fix actually shipped.
+
+That second check needs full history. The `go` CI job now checks out with
+`fetch-depth: 0`, because a shallow single-ref checkout has no `origin/master`
+and the unpushed-list half would skip while still exiting 0 — a guard passing
+because it could not see the thing it guards.
+
+The list above omits the commits that deliver it, on purpose: a commit cannot
+contain its own hash, so requiring it to would be unsatisfiable. `audit-attribution-check.py`
+exempts exactly the commits whose diff touches this file, derived from their diffs
+rather than from this prose, so nothing real can hide behind the exemption.
 
 ## Verification
 
@@ -163,4 +177,4 @@ compared against `HEAD`'s. (`git am` re-creates each commit, so the resulting
 commits have different hashes — the trees are what must match, and they do.)
 The recovered tree builds, and the full test suite passes there:
 
-    go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh
+    go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh && bash scripts/audit-drift-selftest.sh

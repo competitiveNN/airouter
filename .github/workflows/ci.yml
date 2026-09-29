@@ -29,7 +29,14 @@ jobs:
       # go job fail for unrelated reasons, and cancelling one hides the other.
       fail-fast: false
     steps:
+      # fetch-depth: 0 is required, not an optimisation. The attribution check
+      # below compares dist/README.md's unpushed-commit list against
+      # origin/master..HEAD; a shallow single-ref checkout has no origin/master,
+      # so the check would skip that half and still exit 0 — a guard that passes
+      # because it could not see the thing it guards is worse than no guard.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -142,6 +149,39 @@ jobs:
       - name: audit anchors resolve
         run: python3 scripts/audit-drift-check.py
 
+      # audit-drift-check.py was the one script in the repository with no
+      # self-test, and it was the one that carried a real bug: it read sources
+      # with a root-only glob, so a symbol that had merely moved into a
+      # subdirectory was reported as deleted, with a remediation (add it to the
+      # ALLOWLIST) that is both wrong and permanent. That bug is invisible in a
+      # single-package repository — which this one is — so running the checker
+      # proves nothing about whether it can see a second package.
+      #
+      # This builds throwaway two-package repositories and asserts the checker
+      # walks into them, that a stale anchor is caught, and that a checker
+      # reverted to the root-only glob fails the same suite. Negative controls
+      # run against COPIES, never the real script, so the suite cannot damage
+      # the thing it is testing.
+      - name: audit drift self-test
+        run: bash scripts/audit-drift-selftest.sh
+
+      # The anchor check above validates that the SYMBOL a finding names still
+      # exists. It says nothing about whether the FIX a finding describes was
+      # applied, and those are different questions. That gap had a concrete
+      # cost: a round documented a change to this very script, verified it, then
+      # a `git reset --hard` during unrelated probing destroyed it — and every
+      # check kept passing, because the anchors were all still valid. The
+      # finding was right about the code and wrong about the commit.
+      #
+      # This checks the other direction: every commit hash the documentation
+      # cites resolves to a real commit, and dist/README.md's unpushed-commit
+      # list matches git as a set (not a count — a count is satisfied by any
+      # equally wrong list, which is how the fuzz gate's own bug survived three
+      # rounds). Needs the full history fetched above; without it this step
+      # degrades to the citation check and says so.
+      - name: audit attributions resolve
+        run: python3 scripts/audit-attribution-check.py
+
   config:
     runs-on: ubuntu-latest
     continue-on-error: false
@@ -167,7 +207,7 @@ jobs:
         run: python3 -m pytest scripts/test_regenerate_config.py -q
 
       - name: compile python scripts
-        run:           python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py scripts/fake-sse-upstream.py scripts/audit-drift-check.py
+        run:           python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py scripts/fake-sse-upstream.py scripts/audit-drift-check.py scripts/audit-attribution-check.py
 
   # End-to-end assertion of the SSE termination contract. The bug this guards
   # (a `data: [DONE]` released ahead of the real chunks, so the client silently
