@@ -178,3 +178,12 @@ commits have different hashes — the trees are what must match, and they do.)
 The recovered tree builds, and the full test suite passes there:
 
     go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh && bash scripts/audit-drift-selftest.sh
+
+One check is deliberately excluded from the `git am` half, and the reason is
+worth stating so it is not mistaken for drift later.
+`audit-attribution-check.py` resolves every commit hash the documentation
+cites, and `git am` re-hashes every commit it replays — so in a patch-recovered
+tree all of those citations are absent by construction and the check reports
+every one of them. That is the check working, not a broken recovery. The bundle
+preserves the original hashes, which is why it is the preferred artifact and
+the one to use when the history matters.
