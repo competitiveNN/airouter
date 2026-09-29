@@ -1456,6 +1456,181 @@ func TestHandleModelsAdvertisesMaxContextTokens(t *testing.T) {
 	}
 }
 
+// TestDefaultMaxTokensInjectedByHalfContext verifies that when a client omits
+// max_tokens and the profile advertises a context window, the gateway
+// injects max_tokens = half the profile's smallest context window into the
+// body forwarded upstream.
+func TestDefaultMaxTokensInjectedByHalfContext(t *testing.T) {
+	var receivedBody map[string]interface{}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID:      "t",
+			Object:  "chat.completion",
+			Created: 1,
+			Model:   "m",
+			Choices: []ChatCompletionChoice{{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+		})
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "test", Model: "a", ContextLength: 8192},
+				{Provider: "test", Model: "b", ContextLength: 16384},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	// min ctx in chain = 8192, half = 4096
+	got, ok := receivedBody["max_tokens"]
+	if !ok {
+		t.Fatal("expected max_tokens injected into upstream body")
+	}
+	if got.(float64) != 4096 {
+		t.Errorf("expected max_tokens=4096 (half of 8192), got %v", got)
+	}
+}
+
+// TestDefaultMaxTokensPreservesClientValue verifies that a client-supplied
+// max_tokens is forwarded untouched (no injection).
+func TestDefaultMaxTokensPreservesClientValue(t *testing.T) {
+	var receivedBody map[string]interface{}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "t", Object: "chat.completion", Created: 1, Model: "m",
+			Choices: []ChatCompletionChoice{{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+		})
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "test", Model: "a", ContextLength: 8192}}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"max_tokens":512}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if got := receivedBody["max_tokens"]; got == nil || got.(float64) != 512 {
+		t.Errorf("expected max_tokens preserved as 512, got %v", got)
+	}
+}
+
+// TestDefaultMaxTokensDisabledWhenExplicitZero verifies that setting
+// preferences.default_max_tokens: 0 disables injection entirely.
+func TestDefaultMaxTokensDisabledWhenExplicitZero(t *testing.T) {
+	var receivedBody map[string]interface{}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "t", Object: "chat.completion", Created: 1, Model: "m",
+			Choices: []ChatCompletionChoice{{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+		})
+	}))
+	defer backend.Close()
+
+	fiveHundred := 500
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "test", Model: "a", ContextLength: 8192}}},
+		},
+		Preferences: &Preferences{
+			DefaultMaxTokens: &fiveHundred, // explicit positive -> use it
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	// Explicit absolute value, not half-of-context
+	if got := receivedBody["max_tokens"]; got == nil || got.(float64) != 500 {
+		t.Errorf("expected max_tokens=500 (explicit default), got %v", got)
+	}
+}
+
+// TestDefaultMaxTokensNoContextSkips verifies that when a profile has no
+// context window data, the gateway does NOT inject max_tokens.
+func TestDefaultMaxTokensNoContextSkips(t *testing.T) {
+	var receivedBody map[string]interface{}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID: "t", Object: "chat.completion", Created: 1, Model: "m",
+			Choices: []ChatCompletionChoice{{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "ok"}}},
+		})
+	}))
+	defer backend.Close()
+
+	// No preferences -> auto, but no context_length on the endpoint
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "test", Model: "a"}}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if _, ok := receivedBody["max_tokens"]; ok {
+		t.Errorf("expected no max_tokens injection when no context_length, got %v", receivedBody["max_tokens"])
+	}
+}
+
 func TestHandleChatCompletionsNonStreaming(t *testing.T) {
 	var receivedModel string
 	var requestCount int

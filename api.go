@@ -558,6 +558,17 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 
 	sessionID := bodySessionID(body)
 
+	// Inject default max_tokens if the client omitted it. The default is
+	// the smaller of: (profile's min context window / 2), or a positive
+	// value from config.DEFAULT_MAX_TOKENS. A value of 0 means "never
+	// default" — let the provider pick. We check req.MaxTokens (parsed)
+	// since that also handles the Responses API's max_output_tokens.
+	if req.MaxTokens == nil {
+		if def := g.defaultMaxTokensForModel(req.Model); def > 0 {
+			body = injectMaxTokens(body, def)
+		}
+	}
+
 	if req.Stream {
 		g.handleStream(w, r, body, &req, sessionID)
 	} else {
@@ -587,7 +598,60 @@ func estimateTokens(req *ChatCompletionRequest) int {
 // `"type":"image_url"` marker (not a bare "image_url" substring) so a text
 // message that merely mentions the field is not mis-routed.
 func requestHasVision(body []byte) bool {
-	return bytes.Contains(body, []byte(`"type":"image_url"`))
+return bytes.Contains(body, []byte(`"type":"image_url"`))
+}
+
+// defaultMaxTokensForModel returns the output-token ceiling the gateway
+// applies to requests that omit max_tokens. Returns 0 if the client should
+// be left alone (no default configured, or explicit 0 = never default).
+func (g *GatewayContext) defaultMaxTokensForModel(model string) int {
+prefs := g.config.Load().Preferences
+def := prefs.DefaultMaxTokensValue()
+if def < 0 {
+	// auto: half the profile's advertised context window
+	chain, ok := g.config.Load().Models[model]
+	if !ok {
+		return 0
+	}
+	var minCtx int
+	for _, ep := range chain.Chain {
+		w := ep.ContextWindow()
+		if w <= 0 {
+			continue
+		}
+		if minCtx == 0 || w < minCtx {
+			minCtx = w
+		}
+	}
+	if minCtx <= 0 {
+		return 0
+	}
+	return minCtx / 2
+}
+return def
+}
+
+// injectMaxTokens sets max_tokens on the raw request body. It preserves all
+// other fields and their ordering, and returns the original body unchanged
+// on any parse failure (fail-open so a request is never dropped).
+func injectMaxTokens(body []byte, maxTokens int) []byte {
+var data map[string]json.RawMessage
+if err := json.Unmarshal(body, &data); err != nil {
+	return body
+}
+if _, ok := data["max_tokens"]; ok {
+	return body
+}
+val, err := json.Marshal(maxTokens)
+if err != nil {
+	return body
+}
+data["max_tokens"] = val
+out, err := json.Marshal(data)
+if err != nil {
+	return body
+}
+return out
 }
 
 // appendAssistantMessage returns body with an assistant message appended to the

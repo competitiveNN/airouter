@@ -67,8 +67,17 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 	body, err := buildChatBody(chatReq)
 	if err != nil {
 		writeAPIError(w, 500, "Failed to encode upstream request", "server_error", "encode_failed")
-		g.recordRequest("", 500, time.Since(start))
+		g.recordRequest(req.Model, 500, time.Since(start))
 		return
+	}
+
+	// Default max_tokens if the client omitted it (same rule as chat
+	// completions). chatReq.MaxTokens mirrors req.MaxOutputTokens, so the
+	// parsed check is correct for the Responses surface too.
+	if chatReq.MaxTokens == nil {
+		if def := g.defaultMaxTokensForModel(req.Model); def > 0 {
+			body = injectMaxTokens(body, def)
+		}
 	}
 
 	// Vision is detected on the translated chat body, since that is what the
