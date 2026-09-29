@@ -1,0 +1,32 @@
+# Fixture config for the `sse-contract` CI job. It points every logical model
+# at scripts/fake-sse-upstream.py so the SSE termination contract can be
+# asserted on captured bytes without provider credentials.
+#
+# This is deliberately NOT a valid production config: every chain has a single
+# endpoint and none ends in kilo-auto/free, both of which
+# scripts/validate-config.py requires. It is a test fixture, not a deployment
+# target, and the `config` CI job validates the real config.yaml.
+#
+# The port must match the --port passed to fake-sse-upstream.py in ci.yml.
+providers:
+  fake:
+    url: http://127.0.0.1:9099
+    api_key_env: FAKE_KEY
+
+models:
+  smart:
+    chain:
+      - provider: fake
+        model: fake-smart
+  work:
+    chain:
+      - provider: fake
+        model: fake-work
+  fast:
+    chain:
+      - provider: fake
+        model: fake-fast
+  large:
+    chain:
+      - provider: fake
+        model: fake-large

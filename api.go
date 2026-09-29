@@ -288,8 +288,34 @@ func (g *GatewayContext) recordCooldown() {
 	}
 }
 
+// recordAttempt records one upstream attempt against an endpoint: how long it
+// took and whether it succeeded.
+//
+// Every fallback loop calls this around its per-endpoint call. Together these
+// series answer what the request-level metrics cannot: which endpoints the
+// router actually reaches, how often those reaches fail, and how much
+// wall-clock each one costs. That is the data needed to decide whether an
+// endpoint should be demoted in the chain, or whether the fallback budget is
+// set too high for the chain as it stands.
+func (g *GatewayContext) recordAttempt(ep *ModelEndpoint, d time.Duration, ok bool) {
+	if g.metrics != nil && ep != nil {
+		g.metrics.Attempt(ep.Key(), d, ok)
+	}
+}
+
 // HandleMetrics serves the Prometheus text-format metrics endpoint.
+//
+// Authenticated like the admin surface, not like the health check. The metric
+// series are labelled by provider and model and describe routing behaviour
+// (attempt counts, failure rates, which endpoint the chain is demoting to),
+// which is operator telemetry rather than public health data. Serving it
+// unauthenticated would let anyone on the network enumerate the configured
+// upstream providers and watch them fail.
 func (g *GatewayContext) HandleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !g.checkAuth(r) {
+		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
+		return
+	}
 	if g.metrics == nil {
 		w.WriteHeader(http.StatusNotImplemented)
 		return
@@ -841,20 +867,61 @@ func fallbackBudget(timeout time.Duration) time.Duration {
 	return budget
 }
 
+// budgetState tracks a request's fallback walk against its wall-clock budget.
+//
+// Every fallback loop in the gateway uses this rather than repeating
+// `attempts > 0 && time.Since(start) > budget`. The duplication is not
+// cosmetic: when the budget was first added to the chat path, the two
+// Responses loops in responses_api.go were simply missed, and they happily
+// held a client open for 2m30s (measured 2026-09-29) while the chat path was
+// capped at 12s for a small request. Copy-paste across a fourth and fifth
+// loop is exactly how that happened, so the check lives here once and each
+// loop constructs a state and asks it a question.
+//
+// It also owns the attempt counter, so `attempts` and the budget check can
+// never disagree about how many attempts have been made.
+type budgetState struct {
+	start     time.Time
+	budget    time.Duration
+	attempts  int
+	exhausted bool
+}
+
+// newBudgetState starts a budget for one request's fallback walk. timeout is
+// the per-attempt timeout; the budget is scaled from it by fallbackBudget.
+func newBudgetState(start time.Time, timeout time.Duration) *budgetState {
+	return &budgetState{start: start, budget: fallbackBudget(timeout)}
+}
+
+// next records that another attempt is about to be made.
+func (b *budgetState) next() { b.attempts++ }
+
+// exhausted reports whether the walk should stop. The first attempt is always
+// allowed, so a request is never failed before it has been tried once.
+func (b *budgetState) exhaustedNow() bool {
+	if b.attempts > 0 && time.Since(b.start) > b.budget {
+		b.exhausted = true
+		return true
+	}
+	return false
+}
+
+// elapsed is the wall-clock time spent so far, for logging.
+func (b *budgetState) elapsed() time.Duration { return time.Since(b.start) }
+
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
 	start := time.Now()
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
-	// Wall-clock budget for this request's fallback walk, scaled to the
-	// per-attempt timeout (small requests get a short budget).
-	budget := fallbackBudget(timeout)
+	// Wall-clock budget for this request's fallback walk. Shared by all four
+	// fallback loops so none can ship without the bound.
+	walk := newBudgetState(start, timeout)
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
 		maxAttempts = 1
 	}
-	attempts := 0
 
 	// tried tracks endpoints that have failed in THIS request's fallback loop.
 	// It is local to this goroutine so concurrent requests with the same
@@ -870,13 +937,13 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// Wall-clock guard: stop grinding through the chain once this request
 		// has spent its whole fallback budget, so a client never waits
 		// minutes on a chain of failing providers.
-		if attempts > 0 && time.Since(start) > budget {
-			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
+		if walk.exhaustedNow() {
+			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		if attempts >= maxAttempts {
+		if walk.attempts >= maxAttempts {
 			if requestHasVision(body) {
 				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
 				switch state {
@@ -898,7 +965,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		attempts++
+		walk.next()
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
@@ -940,9 +1007,15 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
+		// attemptStart times this single upstream call, distinct from the
+		// request-level `start` above. Shadowing it would silently turn every
+		// time.Since(start) below into a per-attempt measurement, which is how
+		// the request-level latency metric would stop meaning request latency.
+		attemptStart := time.Now()
 		resp, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
 		if err != nil {
 			cancel()
+			g.recordAttempt(ep, time.Since(attemptStart), false)
 			if isClientDisconnect(err) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				g.recordRequest(req.Model, 499, time.Since(start))
@@ -961,6 +1034,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			cancel()
+			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
 			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, ParseRetryAfter(resp.Header.Get("Retry-After")))
@@ -980,9 +1054,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		resp.Body.Close()
 		cancel()
 		g.router.RecordSuccess(ep)
-		if dur := time.Since(start); dur > 0 {
+		attemptDur := time.Since(attemptStart)
+		g.recordAttempt(ep, attemptDur, true)
+		if attemptDur > 0 {
 			if copts := extractCompletionTokens(respBody); copts > 0 {
-				g.router.RecordTPS(*ep, float64(copts)/dur.Seconds())
+				g.router.RecordTPS(*ep, float64(copts)/attemptDur.Seconds())
 			}
 		}
 
@@ -1010,9 +1086,6 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	ctx := r.Context()
 	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
-	// Wall-clock budget for this request's fallback walk, scaled to the
-	// per-attempt timeout (small requests get a short budget).
-	budget := fallbackBudget(timeout)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1025,12 +1098,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		return
 	}
 
+	// Wall-clock budget for this request's fallback walk, shared policy.
+	walk := newBudgetState(start, timeout)
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
 		maxAttempts = 1
 	}
-	attempts := 0
 
 	// tried tracks endpoints that have failed in THIS request's fallback loop.
 	// It is local to this goroutine so concurrent requests with the same
@@ -1070,8 +1144,8 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// anything to the client, in which case writing a fresh error into the
 		// stream body would corrupt an already-started response — so just
 		// finish the stream cleanly instead.
-		if attempts > 0 && time.Since(start) > budget {
-			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, attempts, time.Since(start).Round(time.Millisecond), budget)
+		if walk.exhaustedNow() {
+			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			if accumulatedContent == "" {
 				writeSSEError(w, flusher, "All models are currently unavailable")
 			}
@@ -1084,7 +1158,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
-		if attempts >= maxAttempts {
+		if walk.attempts >= maxAttempts {
 			if requestHasVision(body) {
 				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
 				switch state {
@@ -1105,7 +1179,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
-		attempts++
+		walk.next()
 
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
@@ -1150,13 +1224,19 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// client. The size-based timeout guards only time-to-first-token; the
 		// parent context keeps the connection alive for the rest of a long
 		// generation.
-		start := time.Now()
+		// attemptStart times this single upstream call. It must not shadow the
+		// request-level `start`: every recordRequest below measures the whole
+		// request, and a shadowed timer would make the request-latency metric
+		// report only the final attempt.
+		attemptStart := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
 		partial, toolCalls, completionTokens, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout, sessionID)
 		if err == nil {
 			g.router.RecordSuccess(ep)
-			if dur := time.Since(start); dur > 0 && completionTokens > 0 {
-				g.router.RecordTPS(*ep, float64(completionTokens)/dur.Seconds())
+			attemptDur := time.Since(attemptStart)
+			g.recordAttempt(ep, attemptDur, true)
+			if attemptDur > 0 && completionTokens > 0 {
+				g.router.RecordTPS(*ep, float64(completionTokens)/attemptDur.Seconds())
 			}
 			// StreamToClient emits [DONE] on success; mark as sent so the
 			// deferred sendDone() doesn't emit a duplicate.
@@ -1165,6 +1245,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			return
 		}
 
+		g.recordAttempt(ep, time.Since(attemptStart), false)
 		if isClientDisconnect(err) {
 			// Client went away; nothing to resume and no point cooling a model.
 			g.recordRequest(req.Model, 499, time.Since(start))

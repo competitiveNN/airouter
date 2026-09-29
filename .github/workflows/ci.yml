@@ -60,4 +60,185 @@ jobs:
         run: python3 -m pytest scripts/test_regenerate_config.py -q
 
       - name: compile python scripts
-        run: python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py
+        run: python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py scripts/fake-sse-upstream.py
+
+  # End-to-end assertion of the SSE termination contract. The bug this guards
+  # (a `data: [DONE]` released ahead of the real chunks, so the client silently
+  # drops the answer) returned HTTP 200 and was invisible to every check in the
+  # go job — it only shows up when you assert on the captured bytes. That is
+  # what scripts/sse-check.py does, so it needs a real gateway in front of a
+  # real SSE stream.
+  #
+  # The upstream is scripts/fake-sse-upstream.py, not a live provider: CI has no
+  # provider credentials, and the contract is decided by the gateway's framing,
+  # not by which model answered. The fake is deliberately nastier than a real
+  # provider (comment lines interleaved mid-chunk, no trailing blank line on the
+  # final event) so the test actually exercises the failure modes.
+  sse-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Everything below runs as long-lived background servers. They are
+      # started with setsid + a PID file and torn down in `stop servers`, which
+      # is `if: always()` so a failed assertion still releases the ports for
+      # the job's own cleanup and the log step can still read the log file.
+      #
+      # The config is a committed fixture (testdata/ci-config.yaml), not a
+      # heredoc: a config that only exists inside a `run:` block is invisible to
+      # review, to the `config` job, and to anyone debugging a failure.
+      - name: start fake upstream
+        run: |
+          setsid python3 scripts/fake-sse-upstream.py --port 9099 \
+            > /tmp/fake-upstream.log 2>&1 < /dev/null &
+          echo $! > /tmp/fake-upstream.pid
+          # Bounded readiness wait. The fake answers 200 to any POST, so a
+          # successful probe means the socket is accepting, not just bound.
+          for i in $(seq 1 50); do
+            if curl -sf -o /dev/null -X POST http://127.0.0.1:9099/v1/chat/completions; then
+              echo "fake upstream ready after ${i} probe(s)"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::fake upstream did not become ready"
+          cat /tmp/fake-upstream.log
+          exit 1
+
+      - name: start gateway
+        run: |
+          go build -o /tmp/airouter .
+          # FAKE_KEY is what the fixture's api_key_env names. It is set so the
+          # upstream request carries an Authorization header, matching a real
+          # deployment — Config.validate does not require it and the fake
+          # upstream ignores it, so this is realism, not a dependency.
+          setsid env FAKE_KEY=ci-fake-key /tmp/airouter \
+            -config testdata/ci-config.yaml -port 9090 \
+            -api-key ci-test-key > /tmp/airouter.log 2>&1 < /dev/null &
+          echo $! > /tmp/airouter.pid
+          for i in $(seq 1 100); do
+            if curl -sf -o /dev/null http://127.0.0.1:9090/health; then
+              echo "gateway ready after ${i} probe(s)"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::gateway did not become ready"
+          cat /tmp/airouter.log
+          exit 1
+
+      - name: assert termination contract
+        run: |
+          AIROUTER_API_KEY=ci-test-key python3 scripts/sse-check.py \
+            --url http://127.0.0.1:9090/v1/chat/completions \
+            --expect "PING OK" --rounds 3
+
+      - name: assert SSE comments never reach the client
+        run: |
+          # The gateway must strip upstream comment lines. Checking it here as
+          # well as in sse-check.py keeps the failure legible in CI logs even if
+          # the contract script itself changes.
+          body=$(AIROUTER_API_KEY=ci-test-key curl -sf -N \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer ci-test-key' \
+            -d '{"model":"work","stream":true,"messages":[{"role":"user","content":"ping"}]}' \
+            http://127.0.0.1:9090/v1/chat/completions)
+          if printf '%s' "$body" | grep -q '^:'; then
+            echo "::error::an SSE comment line leaked to the client"
+            printf '%s\n' "$body" | head -20
+            exit 1
+          fi
+          sentinels=$(printf '%s' "$body" | grep -c '^data: \[DONE\]$' || true)
+          if [ "$sentinels" -ne 1 ]; then
+            echo "::error::expected exactly 1 [DONE] sentinel, got $sentinels"
+            printf '%s\n' "$body" | head -20
+            exit 1
+          fi
+
+      - name: metrics expose attempt telemetry
+        run: |
+          # /metrics is authenticated: the series are labelled by provider and
+          # model, so an unauthenticated scrape is an information leak. Assert
+          # the rejection too, so a future refactor can't quietly unprotect it.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9090/metrics)
+          if [ "$code" = "200" ]; then
+            echo "::error::/metrics served without credentials"
+            exit 1
+          fi
+          # Drive one request first: the attempt series only exist once the
+          # router has actually made an attempt, so scraping a freshly booted
+          # gateway would otherwise assert against an empty registry.
+          curl -sf -o /dev/null -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer ci-test-key' \
+            -d '{"model":"work","stream":false,"messages":[{"role":"user","content":"ping"}]}' \
+            http://127.0.0.1:9090/v1/chat/completions || true
+          curl -sf -H 'Authorization: Bearer ci-test-key' \
+            -o /tmp/metrics.txt http://127.0.0.1:9090/metrics || {
+            echo "::error::/metrics rejected valid credentials"; exit 1;
+          }
+          for series in \
+            airouter_endpoint_attempts_total \
+            airouter_endpoint_attempt_failures_total \
+            airouter_endpoint_attempt_duration_seconds; do
+            if ! grep -q "^$series" /tmp/metrics.txt; then
+              echo "::error::missing metric series: $series"
+              exit 1
+            fi
+          done
+
+          # The attempt series must be present AND non-zero. A series that
+          # exists but never increments is the exact failure mode that let
+          # /metrics stay unmounted for so long: the code looked right, the
+          # dashboard looked fine, and nothing was actually being recorded.
+          attempts=$(grep '^airouter_endpoint_attempts_total{' /tmp/metrics.txt \
+            | awk '{s += $NF} END {print s + 0}')
+          if [ "$attempts" -lt 1 ]; then
+            echo "::error::no upstream attempts recorded; attempt telemetry is dead"
+            exit 1
+          fi
+
+      - name: assert SSE comment counter is wired and non-zero
+        run: |
+          # The fake upstream interleaves ": keepalive" lines on every request,
+          # and the contract step above already made 12 of them. If the counter
+          # is missing OR zero, the comment-stripping path is no longer
+          # instrumented — a silent regression, since stripping still works and
+          # every other assertion would pass.
+          curl -sf -H 'Authorization: Bearer ci-test-key' \
+            -o /tmp/metrics2.txt http://127.0.0.1:9090/metrics || {
+            echo "::error::/metrics unreachable"; exit 1;
+          }
+          if ! grep -q '^airouter_sse_comments_routed_out' /tmp/metrics2.txt; then
+            echo "::error::airouter_sse_comments_routed_out is not exported"
+            exit 1
+          fi
+          comments=$(awk '/^airouter_sse_comments_routed_out /{print $2; exit}' /tmp/metrics2.txt)
+          if [ "${comments:-0}" -lt 1 ]; then
+            echo "::error::sse comment counter is ${comments:-<missing>}, expected > 0"
+            echo "the upstream emitted keepalives on every request, so a zero here means the counter is not wired"
+            exit 1
+          fi
+          echo "sse comments routed out: $comments"
+
+      - name: stop servers
+        if: always()
+        run: |
+          for f in /tmp/airouter.pid /tmp/fake-upstream.pid; do
+            [ -f "$f" ] || continue
+            kill "$(cat "$f")" 2>/dev/null || true
+          done
+
+      - name: gateway log
+        if: always()
+        run: |
+          echo "--- fake upstream ---"; cat /tmp/fake-upstream.log 2>/dev/null || true
+          echo "--- gateway ---"; cat /tmp/airouter.log 2>/dev/null || true

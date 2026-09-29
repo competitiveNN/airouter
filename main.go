@@ -39,6 +39,7 @@ func main() {
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
 	router.SetMetrics(gateway.metrics)
+	proxy.SetMetrics(gateway.metrics)
 	proxy.SetToolCalls(*toolCalls)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,6 +54,7 @@ func main() {
 	mux.HandleFunc("/v1/responses", gateway.HandleResponses)
 	mux.HandleFunc("/v1/responses/ws", gateway.HandleResponsesWebSocket)
 	mux.HandleFunc("/health", gateway.HandleHealth)
+	mux.HandleFunc("/metrics", gateway.HandleMetrics)
 	mux.HandleFunc("/v1/airouter/state", gateway.HandleAirouterState)
 	mux.HandleFunc("/admin/providers", gateway.HandleAdminProviders)
 	mux.HandleFunc("/admin/sessions", gateway.HandleAdminSessions)
