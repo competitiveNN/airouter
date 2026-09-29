@@ -1966,3 +1966,92 @@ against a bundle exported as `totally-different-name` (passes). The CI job's
 hardcoded ref is legitimate — that job generates with the default ref and
 deliberately exercises the documented reader path. The remaining occurrences are
 prose explaining the ref, or the `export-unpushed.sh` default itself.
+
+### Round 17 (2026-09-29) — the gate that could lie, and the doc nobody executed twice
+
+Round 16 ended with a full green gate. This round looked at how that gate was
+produced rather than what it reported, and found that the process — not the
+code — was the weak part.
+
+**1. Verification runs could interleave, and did.** Every gate in this
+repository's history so far was a hand-typed `nohup` one-liner appended to a
+log file. Nothing stopped two of them running at once, and nothing stopped a
+mutation probe from editing the tree while one was in flight. In Round 16 that
+produced three false failures — the attribution self-test, the recovery
+self-test, and the attribution check all reported red while the code was fine.
+The cause was not flakiness: a probe was deliberately reverting a fix to prove
+an assertion could fail, the gate read the tree mid-revert, and reported the
+deliberate damage as a regression. Nothing was wrong with the code and
+everything was wrong with the signal.
+
+FIXED. `scripts/gate.sh` runs every check, holds an exclusive `flock` so a
+second run waits instead of interleaving, and fingerprints the worktree at the
+start and at the end. A tree that changed during a run is reported as
+**INVALID** (exit 3), never as a pass or a failure — the results describe a
+repository state that no longer exists, and treating them as either would be
+equally wrong. Verified: two runs started against a held lock both blocked, and
+both completed 21/21 after release.
+
+**2. `doc-verify.sh` was itself an unexecuted claim.** Round 16 added it, and
+its verdict was produced by running it once and observing green. That is the
+same evidence that proves nothing, applied to the very check written to demand
+better evidence.
+
+FIXED. `scripts/doc-verify-selftest.sh` (17 assertions) breaks the document in
+the ways it has actually broken and requires the check to go red for a *named*
+reason. Case 3 is the interesting one: it substitutes a refspec that is
+perfectly well-formed and simply does not exist in the bundle. Only *executing*
+the document catches it — the text check cannot see it at all — so the case
+proves the "execute, don't grep" design earns its cost. Case 5 corrupts a real
+fixture's bundle and requires both the documented recovery check and the
+documented freshness check to go red, which is what makes doc-verify's green
+claims mean something. Every case asserts `dist/README.md` is restored
+byte-for-byte: a test harness that can leave the handoff instructions broken is
+worse than no harness.
+
+**3. The document made more executable claims than the fetch refspec.** Round 16
+fixed the one that was obviously wrong. The document also instructs the reader
+to run `git am --3way`, `git bundle list-heads`, `dist-freshness-check.sh`, and
+`recovery-check.sh` — a claim in prose that nothing executes is the same
+failure as a stale refspec, only quieter. All four now run against a freshly
+generated bundle. The push and remote-URL blocks are deliberately *not* run: a
+verification step that can push to GitHub is not a verification step.
+
+**4. Extending it produced four wrong fixes before the cause was diagnosed, and
+the reason is worth keeping.** The new assertions failed, and each failure
+looked like a product defect. Every one was a property of the *fixture*:
+  - the reader clone had no committer identity, so `git am` died with
+    "Committer identity unknown";
+  - the clone was at `master`, which already contains the unpushed commits, so
+    there was nothing to apply;
+  - every unpushed commit appended to the *same* `README.md`, so replaying onto
+    the base produced a genuine 3-way conflict — the fixture was un-replayable
+    by construction;
+  - the fixture copied the real `dist/README.md`, dragging in 13 citations to
+    real commits its history does not contain, which the attribution check
+    correctly reported as dangling.
+The fourth is the instructive one: the check was right and the fixture was
+wrong, and loosening the check would have been the natural and wrong response.
+A fixture that fails for its own reasons is worse than no fixture, because it
+teaches the reader to distrust a check that was working.
+
+**5. The doc→commit-list self-reference is exempt by design, not deferred.**
+`dist/README.md` must list every unpushed commit, which means a commit that
+updates that list is itself missing from it. Rather than solve this with a
+machine-generated section, the checker exempts commits whose *entire* diff is
+confined to `dist/` — a commit cannot name its own hash, so requiring it to
+would be unsatisfiable. The exemption is deliberately narrow: one code file in
+the diff disqualifies it, so a doc tweak cannot launder a real change out of
+the handoff. This was verified by measurement rather than assumption, and it is
+correct as it stands.
+
+**6. Mid-stream error injection was already covered.** Before adding a chaos
+case, the existing suite was checked first: ten tests already drive errors
+*during* an active stream — `TestMidStreamErrorRecovery`,
+`TestConcurrentMidStreamErrorRecovery`, `TestChaosBackendKilledMidStream`
+(connection closed with no `[DONE]`, the abrupt-death path),
+`TestProviderProxyStreamingMidStreamResume`,
+`TestHandleStream_MidStreamFallbackEmitsDoneOnce`, and the responses-API
+equivalent, plus idle-timeout and context-cancellation cases. That is the
+project's central requirement, and it is not a gap. Adding an eleventh test
+because it was on a list would have been motion, not coverage.
