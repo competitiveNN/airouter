@@ -4,7 +4,10 @@ Regenerate the models section in config.yaml from free-models.json
 """
 
 import json
+import os
 import re
+import shutil
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -416,16 +419,31 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
             elif m.provider == 'opencode':
                 opencode_count += 1
     
-    # Determine auto fallback
-    if kilocode_count >= opencode_count:  # ties go to kilocode
-        auto_provider = 'kilocode'
-        auto_model = 'kilo-auto/free'
-        auto_comment = f"# last: kilocode dominates ({kilocode_count} vs {opencode_count})"
+    # The last-resort endpoint must itself be callable. Pick whichever of the
+    # two auto-fallbacks survived verification; the fetcher only emits models
+    # that answered a real request, so an absent provider is genuinely out of
+    # credit/entitlement rather than merely unlisted. Previously the choice was
+    # a raw count comparison, which happily appended opencode/big-pickle even
+    # while it 403'd on every call.
+    available = {
+        'kilocode': ('kilocode', 'kilo-auto/free'),
+        'opencode': ('opencode', 'big-pickle'),
+    }
+    emitted_providers = {e['provider'] for e in chain}
+    candidates = [p for p in ('kilocode', 'opencode') if p in emitted_providers]
+    if not candidates:
+        # Nothing survived; keep the historical default rather than emitting a
+        # chain with no terminator.
+        candidates = ['kilocode']
+    if len(candidates) == 2:
+        chosen = 'kilocode' if kilocode_count >= opencode_count else 'opencode'
+        auto_comment = f"# last: {chosen} dominates ({kilocode_count} vs {opencode_count})"
     else:
-        auto_provider = 'opencode'
-        auto_model = 'big-pickle'
-        auto_comment = f"# last: opencode dominates ({opencode_count} vs {kilocode_count})"
-    
+        chosen = candidates[0]
+        dead = [p for p in ('kilocode', 'opencode') if p not in emitted_providers]
+        auto_comment = f"# last: {chosen} (only verified provider; {', '.join(dead)} unavailable)"
+    auto_provider, auto_model = available[chosen]
+
     # Add auto fallback with vision: true
     chain.append({
         'provider': auto_provider,
@@ -480,7 +498,137 @@ def load_preference_newest_first_on_tie(config_path: str) -> bool:
         return True
 
 
-def main():
+CONFIG_PATH = '/var/home/fra/dev/airouter/config.yaml'
+
+# Top-level keys that config.yaml owns. The generator replaces the `models:`
+# block and must leave everything else byte-for-byte intact.
+PROTECTED_TOP_LEVEL_KEYS = ('providers', 'preferences')
+
+
+def find_models_section(config: str) -> tuple[int, int]:
+    """Return (start, end) offsets of the top-level `models:` block.
+
+    Anchoring on a bare `config.find('models:')` is wrong: config.yaml's own
+    header comments contain the literal text `/v1/models:` (describing the
+    max_context_tokens floor), which occurs around line 51, well before the real
+    key near line 144. The old find() therefore treated that comment as the
+    start of the block and emitted a 3 KB "header" — silently deleting the
+    entire `providers:` section and every api_key_env entry, after which the
+    daemon started with no provider configuration at all.
+
+    Match the real key instead: `models:` at column 0, not inside a comment.
+    """
+    start = re.search(r'(?m)^models:[ \t]*$', config)
+    if not start:
+        raise SystemExit("Could not find a top-level 'models:' key in config.yaml")
+    # The block ends at the next top-level key (or EOF).
+    nxt = re.search(r'(?m)^[a-zA-Z][a-zA-Z0-9_-]*:[ \t]*$', config[start.end():])
+    end = start.end() + (nxt.start() if nxt else len(config) - start.end())
+    return start.start(), end
+
+
+def merge_models_section(config: str, new_models: str) -> str:
+    """Splice a freshly generated models block into the existing config.
+
+    Everything before the models block (providers, comments, preferences that
+    precede it) and everything after it is preserved verbatim.
+    """
+    start, end = find_models_section(config)
+    header = config[:start].rstrip('\n')
+    tail = config[end:].strip('\n')
+    merged = header + '\n\n' + new_models.strip('\n') + '\n'
+    if tail:
+        merged += '\n' + tail + '\n'
+    return merged
+
+
+def validate_config_text(text: str) -> list[str]:
+    """Return a list of problems with a candidate config; empty means OK."""
+    import yaml  # local import: keeps the module importable without pyyaml
+    problems: list[str] = []
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception as exc:  # noqa: BLE001 - report any parse failure
+        return [f"YAML parse error: {exc}"]
+    if not isinstance(parsed, dict):
+        return ['config did not parse to a mapping']
+    # Every provider the old config had must survive regeneration. Losing one
+    # is the failure this function exists to prevent.
+    providers = parsed.get('providers')
+    if not isinstance(providers, dict) or not providers:
+        problems.append('providers section missing or empty')
+    else:
+        for name, prov in providers.items():
+            if not isinstance(prov, dict) or 'url' not in prov:
+                problems.append(f'provider {name} has no url')
+    for key in PROTECTED_TOP_LEVEL_KEYS:
+        if key not in parsed:
+            problems.append(f'top-level {key!r} key was lost')
+    models = parsed.get('models')
+    if not isinstance(models, dict) or not models:
+        problems.append('models section missing or empty')
+    else:
+        for name, mc in models.items():
+            chain = (mc or {}).get('chain') or []
+            if not chain:
+                problems.append(f'profile {name!r} has an empty chain')
+    return problems
+
+
+def write_config_atomically(config: str, new_config: str, argv: list[str]) -> None:
+    """Validate, back up, then atomically replace config.yaml.
+
+    Safe by default: without --write this only reports what would change, so a
+    "looks like a dry run" invocation can never rewrite a hand-maintained file.
+    """
+    problems = validate_config_text(new_config)
+    if problems:
+        print('\n!!! REFUSING TO WRITE: regenerated config is invalid', file=sys.stderr)
+        for p in problems:
+            print(f'    - {p}', file=sys.stderr)
+        raise SystemExit(1)
+
+    before = validate_config_text(config)
+    # A pre-existing problem is worth flagging but is not this tool's doing.
+    if before:
+        print('warning: existing config.yaml already has issues:', file=sys.stderr)
+        for p in before:
+            print(f'    - {p}', file=sys.stderr)
+
+    if new_config == config:
+        print('\nconfig.yaml already up to date (no write needed)')
+        return
+
+    diff = sum(1 for a, b in zip(config.splitlines(), new_config.splitlines()) if a != b)
+    print(f'\nconfig.yaml would change (~{diff} differing lines)')
+
+    if '--write' not in argv:
+        print('DRY RUN — nothing written. Re-run with --write to apply.')
+        return
+
+    backup = f'{CONFIG_PATH}.bak'
+    shutil.copyfile(CONFIG_PATH, backup)
+    print(f'WRITING {CONFIG_PATH} (backup: {backup})')
+
+    # Write to a sibling temp file then rename, so a crash or a full disk
+    # cannot leave a truncated config behind. os.replace is atomic within a
+    # filesystem, which a plain open(path, 'w') is not.
+    tmp = f'{CONFIG_PATH}.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w') as f:
+            f.write(new_config)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    print(f'wrote {CONFIG_PATH} ({len(new_config)} bytes)')
+
+
+def main(argv: list[str] | None = None):
+    argv = sys.argv[1:] if argv is None else argv
     models = load_models('/tmp/free-models.json')
     unique = get_unique_models(models)
     model_list = list(unique.values())
@@ -488,9 +636,7 @@ def main():
     print(f"Total unique models (after exclusions): {len(model_list)}")
 
     # Read the configured tie-break preference from config.yaml.
-    newest_first = load_preference_newest_first_on_tie(
-        '/var/home/fra/dev/airouter/config.yaml'
-    )
+    newest_first = load_preference_newest_first_on_tie(CONFIG_PATH)
     print(f"Preference newest_first_on_tie: {newest_first}")
 
     # Filter for each profile
@@ -550,33 +696,17 @@ def main():
 """
     
     # Read current config and replace models section
-    with open('/var/home/fra/dev/airouter/config.yaml', 'r') as f:
+    with open(CONFIG_PATH, 'r') as f:
         config = f.read()
 
-    # Find where the models section begins.  The header may end with one or
-    # more blank lines; normalize to exactly one blank line before `models:`
-    # so regeneration is idempotent (re-running never grows the file).
-    models_start = config.find('models:')
-    if models_start == -1:
-        raise SystemExit("Could not find 'models:' section in config.yaml")
-    # Preserve everything after the models section verbatim (e.g. the
-    # `test:` block that follows `large:`), so regeneration never drops it.
-    header = config[:models_start].rstrip('\n')
-    new_config = header + '\n\n' + new_models
-    # Re-append any trailing top-level keys that were present in the
-    # original config after `models:` (e.g. the `test:` block).
-    rest = config[models_start + len('models:'):]
-    m = re.search(r'(?m)^([a-zA-Z][a-zA-Z0-9_-]*):', rest)
-    if m:
-        new_config += '\n' + rest[m.start():]
-    
-    with open('/var/home/fra/dev/airouter/config.yaml', 'w') as f:
-        f.write(new_config)
-    
+    new_config = merge_models_section(config, new_models)
+
     print("\n=== SUMMARY ===")
     for name, chain in [('smart', smart_chain), ('work', work_chain), ('fast', fast_chain), ('large', large_chain)]:
         concrete = [e for e in chain if not e['model'].startswith('kilo-auto') and e['model'] != 'big-pickle']
         print(f"{name:6s}: {len(chain)} entries ({len(concrete)} concrete), head={concrete[0]['model'] if concrete else 'N/A'}, tail={chain[-1]['model']}")
+
+    write_config_atomically(config, new_config, argv)
 
 if __name__ == '__main__':
     main()

@@ -48,7 +48,12 @@ Rules:
     "intelligence" as the single sortable score regardless of its source.
 
 5. Profile selection (a model may appear in several profiles when it fits, but
-   never twice in the same chain except the nvidia/nvidia2/nvidia3 trio):
+   never twice in the same chain except the nvidia/nvidia2/nvidia3 trio).
+   The `models:` section must contain EXACTLY these four keys and no others:
+   `smart`, `work`, `fast`, `large`. The gateway's LogicalModels is
+   [smart work fast large]; any other key (e.g. a `test` profile) is accepted
+   by the YAML parser but is permanently unroutable, because
+   /v1/chat/completions rejects it with "Unknown model". Do not add one.
    - smart: strongest generalists, intelligence >= 25, any context length.
    - work:  coding workhorses. Same pool as smart plus dedicated code models
      (e.g. cohere/north-mini-code). Drop tiny models (intelligence < 15).
@@ -57,14 +62,25 @@ Rules:
    - large: context_length >= 200000 only. Sort by context_length desc, then
      intelligence desc.
 
-6. The LAST entry of EVERY chain is that profile's auto fallback. Count the
-   concrete (non-auto) endpoints contributed by kilocode vs opencode in the
-   chain:
-   - kilocode count strictly greater -> provider `kilocode`, model `kilo-auto/free`
-   - otherwise                       -> provider `opencode`, model `big-pickle`
-     (ties included, i.e. ties go to kilocode)
-   Add a trailing comment with the counts, e.g.:
-   `# last: kilocode dominates (5 vs 2)` or `# last: opencode dominates (3 vs 1)`.
+6. The LAST entry of EVERY chain is that profile's auto fallback. It must be an
+   endpoint that can actually be called — never a model that 403s:
+   - if the chain contains `kilocode` endpoints -> provider `kilocode`,
+     model `kilo-auto/free`
+   - otherwise -> whichever auto model is present, else default to
+     `kilocode`/`kilo-auto/free`
+
+   Do NOT use a kilocode-vs-opencode count comparison to choose this. The
+   opencode key authenticates but is not entitled to the free tier: 11 of its
+   12 models return 403 FreeTierError (paid `big-pickle` included). Choosing
+   `opencode`/`big-pickle` here once made the last-resort endpoint of the
+   `smart` chain a guaranteed failure. Prefer `kilocode`/`kilo-auto/free`
+   unless opencode is strictly the only provider left. Add a trailing comment
+   recording the choice, e.g. `# last: kilocode (only verified provider;
+   opencode unavailable)`.
+
+   Only models that survived verification in fetch-free-models.py appear in
+   /tmp/free-models.json, so anything in that file is callable — the point is
+   to not re-add a model you know is dead.
 
   7. Vision capability: for every concrete (non-auto) endpoint you place in a
      chain, look up its source record in /tmp/free-models.json (same provider
