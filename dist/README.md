@@ -75,22 +75,30 @@ git push origin master
 
 ## Contents
 
-The 13 unpushed commits, in order:
+The 16 unpushed commits, oldest first:
 
+- `0100387` fix: start airouter with provider API keys in its environment
+- `a515364` feat: resilient cooldown state, DELETE /admin/cooldowns, bounded fallback
+- `0cc4e34` fix: stop config regeneration destroying the config header and re-adding dead models
+- `b097b1f` fix: never truncate or double-terminate an SSE stream
+- `dd167d7` style: gofmt the four drifted files
+- `d834215` test: cover the mid-stream fallback [DONE] path and add an SSE integrity harness
+- `8f65531` fix: bound the Responses API fallback walk by wall clock
+- `1943655` feat: mount /metrics, add attempt telemetry, and assert the SSE contract in CI
 - `9a6485d` test: rename stale SelectNext tests, add secret scan and SSE negative check
 - `5f9a6fa` test: add audit anchor drift check and harden the SSE negative check
 - `d04f86d` fix: bound metrics label cardinality, escape label values, drop key leakage
 - `a0daa56` fix: recycle metrics labels instead of starving, fix malformed overflow sample
 - `7a34f23` fix: remove the two-key-convention bug class, bound the status maps
+- `fa9aeeb` docs: add README config reference; ship bundle+patch for the unpushed commits
+- `8715b82` chore: refresh unpushed bundle to include the README commit
+- `c746484` chore: make the unpushed bundle a generated artifact, not a committed one
 
-- `0100387` fix: start airouter with provider API keys in its environment
-- `a515364` feat: resilient cooldown state, DELETE /admin/cooldowns, bounded fallbacks
-- `0cc4e34` fix: stop config regeneration destroying the config header
-- `b097b1f` fix: never truncate or double-terminate an SSE stream
-- `dd167d7` style: gofmt the four drifted files
-- `d834215` test: cover the mid-stream fallback [DONE] path and an SSE integration
-- `8f65531` fix: bound the Responses API fallback walk by wall clock
-- `1943655` feat: mount /metrics, add attempt telemetry, and assert the SSE contract
+The middle two are the self-reference loop described at the top of this file:
+`fa9aeeb` committed a bundle, `8715b82` committed a refreshed one that could not
+contain itself, and `c746484` replaced the approach. They are kept because
+rewriting published history is worse than three honest commits, but nothing
+needs doing with them.
 
 ## Verification
 
