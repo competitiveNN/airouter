@@ -127,7 +127,7 @@ Two counters make this visible rather than silent:
 the label schema of healthy series.
 
 `docs/RUNBOOK.md` ("Label cardinality is bounded") covers what to watch, and
-`docs/audit.md` records the bugs found along the way — including two that a
+`docs/audit.md` records the bugs found along the way — including three that a
 green test suite did not catch.
 
 ## Observability
@@ -150,6 +150,14 @@ which providers are configured and how they are behaving.
 | `scripts/` | Config validation, SSE contract checks, secret scan, audit drift check |
 | `docs/RUNBOOK.md` | Operational runbook: metrics, cooldowns, failure modes |
 | `docs/audit.md` | Audit findings, with the regression tests that pin each one |
+
+## Unpushed commits
+
+The local `master` is **13 commits ahead of `origin/master`**. The token in use
+authenticates but has `push: false`, so those commits are not on the remote.
+`dist/` carries them as both a git bundle and a patch, with instructions in
+`dist/README.md`. Both were verified by applying them to `origin/master` in a
+fresh clone and running the suite.
 
 ## Development
 
