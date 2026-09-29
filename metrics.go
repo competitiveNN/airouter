@@ -1049,6 +1049,55 @@ func (m *Metrics) serveAttemptMetrics(w http.ResponseWriter) {
 		writeSample(w, "airouter_endpoint_attempts_total", ep, n)
 		writeSample(w, "airouter_endpoint_attempt_failures_total", ep, failures[ep])
 
+		sum := float64(latSum[ep]) / 1e9
+
+		// The overflow bucket gets NO histogram, and the reason is not
+		// caution about accuracy — it is that the alternative is actively
+		// corrupt output.
+		//
+		// Evicting a label rolls its attempt count, failure count and latency
+		// sum into the bucket, but its per-band data cannot be rolled in: once
+		// the endpoint is gone, "the 0.25s band held 40 observations, all from
+		// a label we evicted" is not representable. So the bucket has a count
+		// and a sum and no distribution.
+		//
+		// Emitting the histogram anyway produced this, which is what a scrape
+		// actually served:
+		//
+		//	..._bucket{endpoint="__overflow__",le="0.25"} 0
+		//	..._bucket{endpoint="__overflow__",le="45"}   0
+		//	..._bucket{endpoint="__overflow__",le="+Inf"} 11
+		//	..._sum{endpoint="__overflow__"} 0.110000
+		//	..._count{endpoint="__overflow__"} 11
+		//
+		// That is not a histogram. A Prometheus histogram is cumulative and its
+		// buckets are monotonic, so every finite bound must be <= +Inf; here
+		// the largest finite bucket (0) is below it, and the 11 observations
+		// are claimed to be entirely above 45s when the real sum says they
+		// averaged 10ms. Nothing rejects it: the scrape parses, the series
+		// type is declared histogram, and every dashboard is green.
+		//
+		// histogram_quantile over that returns a number with no relationship
+		// to reality, and rate(_sum)/rate(_count) returns an average
+		// computed against a distribution that does not exist. The failure is
+		// silent and the number looks plausible, which is the worst kind.
+		//
+		// So the bucket reports as a counter and a gauge instead, under names
+		// that say what they are and that no quantile function will accept:
+		//
+		//	airouter_endpoint_attempts_total          (already emitted)
+		//	airouter_evicted_attempt_latency_seconds_sum  (gauge)
+		//	airouter_evicted_attempt_latency_seconds_count (gauge)
+		//
+		// The count is a gauge, not a counter, for the same reason: it can
+		// change without the process doing anything, because an eviction
+		// ADDS to it, and a rate() over a series that decreases is worse than
+		// no series. An operator who wants the mean latency of evicted
+		// attempts divides the two by hand, which is correct precisely because
+		// both are honest totals.
+		if ep == m.overflowKey {
+			continue
+		}
 		h := hists[ep]
 		var cumulative int64
 		for i, bound := range m.attemptLatencyBounds {
@@ -1057,12 +1106,52 @@ func (m *Metrics) serveAttemptMetrics(w http.ResponseWriter) {
 			}
 			writeBucket(w, "airouter_endpoint_attempt_duration_seconds_bucket", ep, fmt.Sprintf("%g", bound), cumulative)
 		}
-		// The +Inf bucket is the endpoint's attempt count, not the sum of the
-		// histogram: observations rolled into the bucket from an evicted
-		// endpoint contribute a count and a latency sum but no per-band data,
-		// so summing h[] here would under-report every label's +Inf bucket.
-		writeBucket(w, "airouter_endpoint_attempt_duration_seconds_bucket", ep, "+Inf", n)
-		writeSampleFloat(w, "airouter_endpoint_attempt_duration_seconds_sum", ep, float64(latSum[ep])/1e9)
+		// +Inf is the sum of the finite buckets for a real label, which equals
+		// the attempt count because every observation lands in exactly one
+		// band. Read from the histogram rather than from `n` so the
+		// monotonicity of the series is structural rather than a coincidence.
+		writeBucket(w, "airouter_endpoint_attempt_duration_seconds_bucket", ep, "+Inf", cumulative)
+		writeSampleFloat(w, "airouter_endpoint_attempt_duration_seconds_sum", ep, sum)
 		writeSample(w, "airouter_endpoint_attempt_duration_seconds_count", ep, n)
+	}
+	m.serveEvictedLatency(w, endpoints, latSum)
+}
+
+// serveEvictedLatency exports the overflow bucket's latency totals under names
+// that cannot be mistaken for a histogram.
+//
+// This is the mitigation for the problem described in serveAttemptMetrics: the
+// bucket's distribution is unknowable, so it is not exported as one. The names
+// are deliberately unlike the histogram's — no _bucket, no _sum/_count suffix
+// attached to a _seconds histogram name — because the whole failure mode was a
+// quantile function accepting the data. A gauge that does not look like a
+// histogram cannot be fed to histogram_quantile by accident.
+//
+// Both series are emitted for every endpoint, not just the bucket, so a query
+// written as "attempts minus evicted" or a ratio against the total works
+// without a special case, and so the metric does not appear and disappear as
+// the cap is hit.
+func (m *Metrics) serveEvictedLatency(w http.ResponseWriter, endpoints []labelKey, latSum map[labelKey]int64) {
+	fmt.Fprintln(w, "# HELP airouter_evicted_attempts_latency_seconds_sum Latency of attempts whose endpoint was evicted from the metrics window. NOT a histogram: the per-latency-band distribution is unknown and is not reported, so do not use histogram_quantile on this.")
+	fmt.Fprintln(w, "# TYPE airouter_evicted_attempts_latency_seconds_sum gauge")
+	fmt.Fprintln(w, "# HELP airouter_evicted_attempts_latency_seconds_count Number of attempts whose endpoint was evicted from the metrics window. NOT a histogram: see the _sum metric.")
+	fmt.Fprintln(w, "# TYPE airouter_evicted_attempts_latency_seconds_count gauge")
+
+	m.mu.RLock()
+	bucketAttempts := int64(0)
+	if c, ok := m.attemptsByEndpoint[m.overflowKey]; ok {
+		bucketAttempts = c.Load()
+	}
+	m.mu.RUnlock()
+
+	for _, ep := range endpoints {
+		var sum float64
+		var count int64
+		if ep == m.overflowKey {
+			sum = float64(latSum[ep]) / 1e9
+			count = bucketAttempts
+		}
+		writeSampleFloat(w, "airouter_evicted_attempts_latency_seconds_sum", ep, sum)
+		writeSample(w, "airouter_evicted_attempts_latency_seconds_count", ep, count)
 	}
 }

@@ -110,6 +110,8 @@ unauthenticated scrape is an information leak, not a health check — use
 | `airouter_sse_comments_routed_out` | counter | Upstream keepalive chatter filtered out of the event path |
 | `airouter_metrics_label_overflow_total` | counter | Label observations folded into `__overflow__` because a map was full with nothing recyclable |
 | `airouter_metrics_label_evictions_total` | counter | Endpoint series recycled out of the window into `__overflow__` to make room for a new label |
+| `airouter_evicted_attempts_latency_seconds_sum` | gauge | Latency of attempts whose endpoint was evicted. **Not** a histogram — see below |
+| `airouter_evicted_attempts_latency_seconds_count` | gauge | Count of attempts whose endpoint was evicted. **Not** a histogram — see below |
 
 The `airouter_endpoint_attempt_*` series are the ones to read when deciding
 whether a fallback chain needs reordering: `fallbacks_total` says an endpoint
@@ -153,12 +155,47 @@ global write lock on every single observation.
 Two consequences specific to the endpoint map:
 
 - **Attempt counts, failure counts and latency sums are never lost.** They roll
-  into the bucket.
-- **Per-bucket histogram data is *not* merged**, and cannot honestly be. Once
-  the endpoint is gone, "the 0.25s band held 40 observations, all from a label
-  we evicted" is not representable. So `__overflow__`'s `_count` can
-  legitimately be lower than its `_sum` implies. Do not alert on that
-  discrepancy; it is the design, not corruption.
+  into the bucket, and the totals are exported as the
+  `airouter_evicted_attempts_latency_seconds_{sum,count}` gauges.
+- **Per-band histogram data is *not* merged**, and cannot honestly be. Once the
+  endpoint is gone, "the 0.25s band held 40 observations, all from a label we
+  evicted" is not representable.
+
+That second point is why **`__overflow__` is not exported as a histogram at
+all** — no `_bucket`, `_sum` or `_count` series exist for it under
+`airouter_endpoint_attempt_duration_seconds`. An earlier version did export
+one, and it was actively corrupt rather than merely imprecise:
+
+```text
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="0.25"} 0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="45"}   0
+airouter_endpoint_attempt_duration_seconds_bucket{endpoint="__overflow__",le="+Inf"} 11
+airouter_endpoint_attempt_duration_seconds_sum{endpoint="__overflow__"} 0.110000
+airouter_endpoint_attempt_duration_seconds_count{endpoint="__overflow__"} 11
+```
+
+The 11 observations are reported as *entirely above 45 seconds* while their own
+sum says they averaged 10ms. A Prometheus histogram is cumulative, so every
+finite bound must be `<= +Inf`; here the largest is 0. Nothing rejects it — the
+scrape parses, the family declares `histogram`, every dashboard is green, and
+`histogram_quantile` returns a plausible number with no relationship to
+reality. A silent wrong answer is worse than no answer.
+
+So the overflow totals are published as **gauges** under names that no quantile
+function will accept by accident. Two consequences when writing queries:
+
+- **Do not** pass `airouter_evicted_attempts_latency_seconds_*` to
+  `histogram_quantile`. The distribution genuinely does not exist; only the
+  count and sum do.
+- Mean latency of evicted attempts, if you want it, is
+  `airouter_evicted_attempts_latency_seconds_sum / airouter_evicted_attempts_latency_seconds_count`.
+  Both series are emitted for **every** endpoint label (zero for live ones), so
+  a ratio over the whole set needs no special case and the metric does not
+  appear and disappear as the cap is crossed.
+
+The gauges are counters in spirit but are declared `gauge` deliberately: an
+eviction *adds* to them, and a `rate()` over a series that can decrease is worse
+than no series. Read them as totals since process start, not as a rate.
 
 **Collapsing** (the other maps): a label that is not already tracked and finds
 the map full is counted directly against `__overflow__`. This costs no series,
