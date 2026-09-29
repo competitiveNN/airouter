@@ -174,10 +174,17 @@ healthy deployment.
 - **If `airouter_metrics_label_evictions_total` is climbing steadily**, real
   endpoints are losing their series to newer ones. Raise the cap.
 
-`__overflow__` appears in the circuit-transition series as
-`{endpoint="__overflow__"}`. The other maps key on a pre-rendered label set
-(`from="..",to="..",endpoint=".."`) that the exporter splices in unquoted, so
-the bucket is rendered as a single explicit label to keep the sample legal.
+`__overflow__` always appears under the **same label name the series already
+uses**: `requestsByModel` collapses to `model="__overflow__"`,
+`requestsByStatus` and `failuresByStatus` to `status="__overflow__"`, and the
+endpoint-keyed maps to `endpoint="__overflow__"`. That is deliberate. A bucket
+that arrived under a different label name would change the metric's label
+schema, which Prometheus reads as a new series — so a query grouping by status
+would silently lose the bucket, and an alert watching a status series would
+stop covering it. The cap is a safety valve; it must not reshape healthy data.
+
+Grep for `__overflow__` across the whole exposition to find every bucket
+regardless of which dimension collapsed.
 
 The cap is a memory bound, not a tuning knob with a correct value: the live
 config has 60 distinct endpoint keys, so the 512 default leaves ~8x headroom.
