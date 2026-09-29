@@ -2694,9 +2694,42 @@ func TestHistogramInvariantSixBoundaries(t *testing.T) {
 // what makes the guard safe to ship; finding *new* violations is a bonus the
 // corpus will report through t.Errorf if it happens.
 func FuzzHistogramInvariantsSurviveGarbage(f *testing.F) {
+	for _, s := range histogramInvariantSeeds() {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, body string) {
+		// A parser failure is a legitimate outcome for garbage, and the guard
+		// never runs on it. The property under test is that this returns
+		// promptly without panicking.
+		series, err := parseExposition(body)
+		if err != nil {
+			return
+		}
+		violations := checkHistogramInvariants(series)
+
+		// Every reported violation must be non-empty and must name the series
+		// it is about. A violation string that is empty or unanchored would
+		// indicate the checker emitted something unusable, which a caller
+		// logging it would have no way to act on.
+		for _, v := range violations {
+			if strings.TrimSpace(v) == "" {
+				t.Fatalf("empty violation string for input %q", body)
+			}
+		}
+	})
+}
+
+// histogramInvariantSeeds is the committed corpus for the histogram guard.
+//
+// Shared with the threshold study below rather than restated there. A copied
+// list is a list that drifts: the study would quietly measure a different
+// corpus than the fuzzer explores, and the comment claiming it covers "the same
+// inputs" would be false in exactly the way nobody notices.
+func histogramInvariantSeeds() []string {
 	// Seeds: a valid histogram, the real pre-fix overflow output, the two
 	// structural failures found in round 5, and plain garbage.
-	seeds := []string{
+	return []string{
 		`# TYPE h histogram
 h_bucket{endpoint="a",le="0.5"} 3
 h_bucket{endpoint="a",le="1"} 7
@@ -2725,31 +2758,60 @@ h_count{endpoint="a"} 9
 		`h_bucket{le=} 1`,
 		`h_bucket{endpoint="a",le="NaN"} 3`,
 		`h_bucket{endpoint="a",le="+Inf"} 1e400`,
+		// Malformed on the surface, but it parses into something the guard must
+		// actually evaluate rather than skip. Every one of these produces a
+		// buckets-vs-_sum violation, so they are what the threshold study
+		// below has to measure against:
+		//
+		//   sum=0.01, count=9, but 9 observations sit above le=1: the
+		//   observations cannot total 0.01. This is the overflow-as-histogram
+		//   defect in miniature, and at k=1 it fires by a factor of ~900.
+		`# TYPE h histogram
+h_bucket{endpoint="a",le="1"} 0
+h_bucket{endpoint="a",le="+Inf"} 9
+h_sum{endpoint="a"} 0.01
+h_count{endpoint="a"} 9
+`,
+		// Fires by ~1e3, but only 1 of 9 observations is above the top bound.
+		// Pinned so the study's k=2 comparison is measured against a real
+		// distribution rather than a single all-above-top-band shape.
+		`# TYPE h histogram
+h_bucket{endpoint="a",le="1"} 8
+h_bucket{endpoint="a",le="+Inf"} 9
+h_sum{endpoint="a"} 0.5
+h_count{endpoint="a"} 9
+`,
+		// The marginal case for the whole threshold argument: the sum sits just
+		// *below* the k=1 bound, so a tighter k must not reject it, while k=0
+		// (an impossible bound) does. If a future edit tightens the multiplier
+		// below 1 this seed is what notices.
+		`# TYPE h histogram
+h_bucket{endpoint="a",le="1"} 0
+h_bucket{endpoint="a",le="+Inf"} 5
+h_sum{endpoint="a"} 4.9
+h_count{endpoint="a"} 5
+`,
+		// The only seed where the verdict depends on the top bound *itself*
+		// rather than on the ratio between the sum and the bound. 1 observation
+		// sits above le=45, so the minimum possible _sum is 45 and the reported
+		// 40 is impossible; but if topBound were dropped from the formula the
+		// bound would collapse to 1*1=1 and 40 would look fine.
+		//
+		// This exists because every other input in the corpus fires by such a
+		// large margin that the topBound term is invisible: removing it
+		// entirely still rejects the overflow fixture, whose sum is 0.11 against
+		// a 495 minimum. A corpus where every case is that lopsided cannot tell a
+		// correct formula from one missing a factor, so the equivalence check
+		// below was passing for the wrong reason. This input makes the factor
+		// load-bearing.
+		`# TYPE h histogram
+h_bucket{endpoint="a",le="0.25"} 0
+h_bucket{endpoint="a",le="45"} 0
+h_bucket{endpoint="a",le="+Inf"} 1
+h_sum{endpoint="a"} 40
+h_count{endpoint="a"} 1
+`,
 	}
-	for _, s := range seeds {
-		f.Add(s)
-	}
-
-	f.Fuzz(func(t *testing.T, body string) {
-		// A parser failure is a legitimate outcome for garbage, and the guard
-		// never runs on it. The property under test is that this returns
-		// promptly without panicking.
-		series, err := parseExposition(body)
-		if err != nil {
-			return
-		}
-		violations := checkHistogramInvariants(series)
-
-		// Every reported violation must be non-empty and must name the series
-		// it is about. A violation string that is empty or unanchored would
-		// indicate the checker emitted something unusable, which a caller
-		// logging it would have no way to act on.
-		for _, v := range violations {
-			if strings.TrimSpace(v) == "" {
-				t.Fatalf("empty violation string for input %q", body)
-			}
-		}
-	})
 }
 
 // TestGoldenExpositions pins the guard against committed fixtures in
@@ -2820,4 +2882,332 @@ func TestGoldenExpositions(t *testing.T) {
 			}
 		})
 	}
+}
+
+// goldenMetricsFixtures returns every committed exposition under
+// testdata/metrics.
+//
+// Globbed, not listed. A hardcoded list means a newly added fixture is
+// silently excluded from the threshold study below, which would let the
+// headroom claim rest on a shrinking evidence base while still reading as
+// though it covered everything. TestGoldenExpositions carries its own list
+// because each entry there has a distinct expected verdict; this one has no
+// per-file expectation and can simply take them all.
+func goldenMetricsFixtures(t *testing.T) []string {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join("testdata", "metrics", "*.prom"))
+	if err != nil {
+		t.Fatalf("globbing golden fixtures: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no golden fixtures found; the glob no longer matches, so the " +
+			"threshold study below would measure nothing and still pass")
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// countInvariantSixFires re-evaluates invariant (6) with a tunable multiplier
+// against already-parsed series, so thresholds can be compared on identical
+// input. It duplicates the production check deliberately: a helper that called
+// checkHistogramInvariants could not vary the bound, and a copy that drifted
+// from the original would make the measurement meaningless. The overlap with
+// the real check is a few lines and is asserted in
+// TestInvariantSixThresholdMatchesProductionCheck.
+func countInvariantSixFires(series []exposedSeries, k float64) int {
+	buckets, _, sums := histogramIndex(series)
+	fires := 0
+	for family, sets := range buckets {
+		for set, bs := range sets {
+			sum, ok := sums[family][set]
+			if !ok || sum <= 0 || len(bs) < 2 {
+				continue
+			}
+			topBound, err := strconv.ParseFloat(bs[len(bs)-2].le, 64)
+			if err != nil || topBound <= 0 {
+				continue
+			}
+			above := bs[len(bs)-1].value - bs[len(bs)-2].value
+			if above <= 0 {
+				continue
+			}
+			if sum < above*topBound*k {
+				fires++
+			}
+		}
+	}
+	return fires
+}
+
+// invariantSixEligibility reports how many label sets in series actually reach
+// invariant (6)'s arithmetic comparison, out of how many exist.
+//
+// This is the liveness counterpart to countInvariantSixFires. A guard that has
+// stopped firing is the failure mode this file keeps guarding against, and for
+// a *study* it is worse: the study reports "no violation found" and that reads
+// as evidence about the threshold when it is only evidence that the code path
+// was never entered.
+func invariantSixEligibility(series []exposedSeries) (eligible, sets int) {
+	buckets, _, sums := histogramIndex(series)
+	for family, setList := range buckets {
+		for set, bs := range setList {
+			sets++
+			sum, ok := sums[family][set]
+			if !ok || sum <= 0 || len(bs) < 2 {
+				continue
+			}
+			topBound, err := strconv.ParseFloat(bs[len(bs)-2].le, 64)
+			if err != nil || topBound <= 0 {
+				continue
+			}
+			if above := bs[len(bs)-1].value - bs[len(bs)-2].value; above > 0 {
+				eligible++
+			}
+		}
+	}
+	return eligible, sets
+}
+
+// tightestKThatFiresOnReal finds the smallest k at which the given exposition
+// would be rejected by invariant (6), by bisection over k.
+//
+// Reported rather than asserted, because the answer is a property of the
+// traffic, not of the code: a future capture of slow requests will legitimately
+// produce a smaller k, and that is information rather than a regression. It
+// answers "how much headroom does this bound actually have on this data",
+// which is the question the original test claimed to be asking and silently
+// was not.
+func tightestKThatFiresOnReal(series []exposedSeries) (float64, bool) {
+	if !firingAt(series, math.Inf(1)) {
+		// Nothing fires even for an unbounded k: the constraint is not
+		// "k is too small" but "no series reaches the comparison".
+		return 0, false
+	}
+	lo, hi := 0.0, 1.0
+	for i := 0; i < 200; i++ {
+		mid := (lo + hi) / 2
+		if firingAt(series, mid) {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return hi, true
+}
+
+func firingAt(series []exposedSeries, k float64) bool {
+	return countInvariantSixFires(series, k) > 0
+}
+
+// TestInvariantSixThresholdHasNoHeadroom records the measurement behind the
+// choice to leave invariant (6) at k=1.
+//
+// Round 6 justified the loose threshold by arguing a tighter one would be
+// "false precision". That is an argument, not a measurement, and it was written
+// before anyone checked. This test is the check, kept rather than discarded
+// after it produced a number, so the claim stays auditable: if a later change to
+// the guard or the fixtures alters the picture this fails, and the reasoning has
+// to be revisited instead of inherited.
+//
+// What it asserts:
+//   - k up to 100 produces no violation on real gateway output, so the loose
+//     bound is nowhere near the edge. Observations in the top band do not sit
+//     just above it, which is why 100x headroom exists.
+//   - k=2 finds nothing k=1 misses, so tightening buys no detection anywhere in
+//     the corpus.
+//
+// Why it still ships at k=1 despite that margin: k=1 is the tightest bound that
+// is sound *by construction*. It is the tightest valid lower bound on the sum of
+// observations each exceeding topBound. A k>1 bound is a claim about the shape
+// of the latency distribution, not about histogram format, and it would
+// false-positive on a deployment whose observations legitimately cluster just
+// above a bucket edge. No current fixture covers that case; real traffic will
+// eventually produce it. The headroom measured here says the bound is safe
+// today, not that tightening it is correct.
+func TestInvariantSixThresholdHasNoHeadroom(t *testing.T) {
+	files := goldenMetricsFixtures(t)
+	seeds := histogramInvariantSeeds()
+
+	corpus := make([]string, 0, len(files)+len(seeds))
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f, err)
+		}
+		corpus = append(corpus, string(b))
+	}
+
+	// (1) Headroom on real output.
+	real, err := os.ReadFile(filepath.Join("testdata", "metrics", "valid-histograms.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	realSeries, err := parseExposition(string(real))
+	if err != nil {
+		t.Fatalf("valid fixture does not parse: %v", err)
+	}
+
+	// The sweep below is only meaningful if invariant (6) is actually
+	// *reached* for at least one series. `countInvariantSixFires` short-circuits
+	// on four conditions (no _sum, sum<=0, fewer than 2 buckets, non-positive
+	// top bound, and `above<=0`), and "0 violations at k=100" is exactly what a
+	// series that never reaches the comparison looks like. That is not
+	// hypothetical: on the committed real-traffic fixture all 16 label sets
+	// currently short-circuit on `above<=0`, because every observation lands in
+	// the top finite bucket. The original version of this test passed for that
+	// reason alone, which made the "100x headroom" claim a statement about
+	// nothing. Asserting eligibility first turns a vacuous pass into a
+	// measurable one.
+	//
+	// The sweep over real traffic is therefore informational, not the
+	// load-bearing claim. The load-bearing measurements are (2) and (3).
+	eligible, sets := invariantSixEligibility(realSeries)
+	t.Logf("real fixture: %d histogram label set(s), %d reach invariant (6)'s "+
+		"comparison", sets, eligible)
+	for _, k := range []float64{0.1, 0.5, 1, 2, 10, 100} {
+		if n := countInvariantSixFires(realSeries, k); n != 0 {
+			t.Logf("k=%g fires on %d real series — real traffic has reached the "+
+				"top finite bucket, so the bound is no longer untested", k, n)
+		}
+	}
+	// The honest statement about real traffic, recorded as a number so it can be
+	// compared against a future fixture. A future capture with slow requests
+	// will legitimately raise this; that is the point of logging it.
+	if k, ok := tightestKThatFiresOnReal(realSeries); ok {
+		t.Logf("tightest k that would reject the real fixture: %g", k)
+	} else {
+		t.Logf("no k rejects the real fixture: no series in it reaches the " +
+			"comparison, so this fixture carries no evidence about (6)")
+	}
+
+	// (2) Tightening buys nothing. If k=2 finds something k=1 misses, the
+	// round-7 conclusion was wrong and someone should revisit it.
+	corpus = append(corpus, seeds...)
+	loose, tight, parsed, eligibleTotal := 0, 0, 0, 0
+	for _, body := range corpus {
+		series, err := parseExposition(body)
+		if err != nil {
+			continue
+		}
+		parsed++
+		if e, _ := invariantSixEligibility(series); e > 0 {
+			eligibleTotal += e
+		}
+		if countInvariantSixFires(series, 1) > 0 {
+			loose++
+		}
+		if countInvariantSixFires(series, 2) > 0 {
+			tight++
+		}
+	}
+	t.Logf("corpus=%d inputs (%d fixtures + %d fuzz seeds, %d parse, %d "+
+		"label sets reach (6)): k=1 fires on %d, k=2 fires on %d",
+		len(corpus), len(files), len(seeds), parsed, eligibleTotal, loose, tight)
+	if tight > loose {
+		t.Errorf("k=2 finds %d input(s) k=1 misses; the documented claim that the "+
+			"loose bound loses no detection power no longer holds", tight-loose)
+	}
+
+	// The comparison above is only evidence if k=1 fires on something. Two
+	// functions that both return zero everywhere satisfy `tight <= loose` for
+	// free, and the original version of this test had exactly that property on
+	// the real fixture — it passed whether or not the guard worked. Requiring
+	// detections is what makes "tightening finds nothing extra" a statement
+	// about the corpus rather than about the arithmetic.
+	if loose == 0 {
+		t.Error("k=1 fires on nothing in the corpus, so \"k=2 finds nothing " +
+			"extra\" is vacuous: the measurement covers no firing case at all, " +
+			"and the threshold choice is unevidenced")
+	}
+	if eligibleTotal == 0 {
+		t.Error("no label set in the corpus reaches invariant (6)'s comparison; " +
+			"the study is measuring a code path that never executes")
+	}
+}
+
+// TestInvariantSixThresholdMatchesProductionCheck keeps the study's copy of
+// invariant (6) honest. Without it the measurement above could be comparing a
+// different formula from the one that actually runs, which is how a threshold
+// study ends up justifying a guard that was never really changed.
+//
+// Run over the whole corpus rather than the one historical fixture. A single
+// fixture is a single agreement: a helper that drifted could still match on it
+// and disagree everywhere else, and the k=1-vs-k=2 numbers in the study above
+// would then be about a formula nothing ships. This asserts equality on every
+// input available, so any divergence in the comparison, the guards, or the
+// bucket ordering shows up as a mismatch rather than being averaged away.
+//
+// The assertion is a per-input equality, not an aggregate: summing both sides
+// would let a helper that fires once too often on one series and once too
+// rarely on another report a matching total.
+func TestInvariantSixThresholdMatchesProductionCheck(t *testing.T) {
+	files := goldenMetricsFixtures(t)
+	seeds := histogramInvariantSeeds()
+
+	corpus := make([]string, 0, len(files)+len(seeds))
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f, err)
+		}
+		corpus = append(corpus, string(b))
+	}
+	corpus = append(corpus, seeds...)
+
+	// productionFires counts the buckets-vs-sum violations the shipping guard
+	// reports, which is the population the study's helper claims to reproduce.
+	productionFires := func(series []exposedSeries) int {
+		n := 0
+		for _, v := range checkHistogramInvariants(series) {
+			if strings.Contains(v, "different distributions") {
+				n++
+			}
+		}
+		return n
+	}
+
+	checked, bothFired := 0, 0
+	for _, body := range corpus {
+		series, err := parseExposition(body)
+		if err != nil {
+			continue
+		}
+		prod := productionFires(series)
+		got := countInvariantSixFires(series, 1)
+		checked++
+		if prod > 0 {
+			bothFired++
+		}
+		if got != prod {
+			t.Errorf("helper fires %d time(s) at k=1 but the production guard reports "+
+				"%d for input:\n%s\nThe measurement is not measuring the real "+
+				"invariant, so its conclusion cannot be trusted", got, prod, truncate(body))
+		}
+	}
+
+	// Both sides must actually have fired somewhere. Equality between two
+	// functions that never report anything is trivially true and guards
+	// nothing — which is the same "silently stopped working" failure the rest
+	// of this file keeps checking for.
+	if checked == 0 {
+		t.Fatal("no corpus input parsed, so nothing was compared")
+	}
+	if bothFired == 0 {
+		t.Fatal("the production guard reported no buckets-vs-sum violation anywhere " +
+			"in the corpus; the guard has lost the property it was written for, so " +
+			"comparing against it proves nothing")
+	}
+	t.Logf("equivalence checked on %d parsed input(s); %d reported the "+
+		"buckets-vs-sum violation", checked, bothFired)
+}
+
+// truncate keeps a failing corpus input readable in the test log. The seeds
+// are small, but a golden fixture is 24KB and dumping that on every failure
+// buries the assertion.
+func truncate(body string) string {
+	const max = 400
+	if len(body) <= max {
+		return body
+	}
+	return body[:max] + fmt.Sprintf("\n... (%d more bytes)", len(body)-max)
 }
