@@ -196,3 +196,100 @@ func TestProviderErrorStatusStillWins(t *testing.T) {
 		t.Fatal("unreachable")
 	}
 }
+
+// ── A client error must not penalise the endpoint ─────────────────────────────
+//
+// 2026-10-01, opencode/space-bunny-free:
+//
+//	{"error":{"type":"invalid_request_error",
+//	          "message":"Upstream request failed: [invalid_request_error] invalid request"}}
+//	-> cooldown opencode/space-bunny-free status=400 errors=3 for 24h0m0s
+//
+// Three client-side rejections escalated the endpoint into a day-long ban, so even
+// a corrected request kept failing and the model stayed dark for every other
+// caller. A retry of an unacceptable request is byte-identical and is rejected
+// identically, so a cooldown cannot help; it can only remove a working model
+// from everyone else's rotation.
+
+func TestAClientErrorGetsNoCooldown(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	ep := &ModelEndpoint{Provider: "opencode", Model: "space-bunny-free"}
+
+	for i := 0; i < 5; i++ {
+		got := r.ApplyCooldownForSession(ep, 400,
+			`{"error":{"type":"invalid_request_error","message":"Upstream request failed: [invalid_request_error] invalid request"}}`,
+			"", 0)
+		if got != 0 {
+			t.Fatalf("400 returned a %v cooldown on attempt %d; a request error must not "+
+				"cool the endpoint at all", got, i+1)
+		}
+	}
+
+	// The endpoint must still be selectable.
+	if wait := r.minCooldownWait([]ModelEndpoint{*ep}, false); wait > 0 {
+		t.Errorf("endpoint is held out of rotation for %v after only client errors", wait)
+	}
+}
+
+func TestAClientErrorNeverReachesTheSoftBan(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	for _, code := range []int{400, 413, 422} {
+		for n := 1; n <= 20; n++ {
+			if d := r.cooldownForError(code, n); d != 0 {
+				t.Fatalf("status %d with %d errors gave %v, want 0", code, n, d)
+			}
+		}
+	}
+}
+
+func TestAClientErrorIgnoresRetryAfter(t *testing.T) {
+	// A provider sending Retry-After on a 400 must not buy itself a cooldown.
+	r := NewRouter(&Config{}, "")
+	ep := &ModelEndpoint{Provider: "opencode", Model: "space-bunny-free"}
+	got := r.ApplyCooldownForSession(ep, 400, "invalid request", "", 5*time.Minute)
+	if got != 0 {
+		t.Errorf("Retry-After on a client error produced a %v cooldown; it must be ignored", got)
+	}
+}
+
+func TestEndpointErrorsStillCoolDown(t *testing.T) {
+	// The fix must not over-reach: 404 and 401/403 describe the ENDPOINT.
+	if isClientRequestError(404) {
+		t.Error("404 is a misconfigured endpoint, not a bad request")
+	}
+	if isClientRequestError(401) || isClientRequestError(403) {
+		t.Error("401/403 are credential/plan problems, not bad requests")
+	}
+	r := NewRouter(&Config{}, "")
+	if d := r.cooldownForError(404, 3); d == 0 {
+		t.Error("404 stopped cooling the endpoint; a misconfigured model must still be held out")
+	}
+	if d := r.cooldownForError(429, 3); d == 0 {
+		t.Error("429 stopped cooling the endpoint")
+	}
+	if d := r.cooldownForError(503, 3); d == 0 {
+		t.Error("503 stopped cooling the endpoint")
+	}
+}
+
+// The recorded error must stay visible even when it earns no cooldown.
+func TestAClientErrorIsStillRecorded(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	ep := &ModelEndpoint{Provider: "opencode", Model: "space-bunny-free"}
+	msg := `{"error":{"type":"invalid_request_error","message":"invalid request"}}`
+	r.ApplyCooldownForSession(ep, 400, msg, "", 0)
+
+	status, count := cooldownStatusForTest(t, r, ep)
+	if status != 400 {
+		t.Errorf("status_code = %d, want 400 recorded for diagnosis", status)
+	}
+	if count < 1 {
+		t.Errorf("error_count = %d, want it recorded", count)
+	}
+	r.mu.Lock()
+	last := r.cooldowns[ep.Key()].LastError
+	r.mu.Unlock()
+	if last == "" {
+		t.Error("last_error is empty; the diagnostic value of the entry is lost")
+	}
+}
