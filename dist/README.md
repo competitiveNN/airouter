@@ -183,6 +183,8 @@ Two properties make any such list awkward, and neither is a bug to be fixed:
     presence: a code change that also edits this file is still required to be
     listed, so nothing real can be laundered out of the handoff.
 - `7271803` Cooldown: a client error must not take the endpoint out of rotation
+- `43496cf` .gitignore + dist/README.md: prune the pushed list, ignore regenerator .bak2
+- `9c208c9` dist/README.md: list the client-error cooldown fix
     reports every entry as "not an unpushed commit (it may have been pushed or
     rewritten)". That is the check being right, and it means something far more
     mundane than a corrupted handoff: someone else pushed.
