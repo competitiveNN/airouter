@@ -303,6 +303,49 @@ def _in_profile(text, profile, old, new):
     return text[:m.start(2)] + block.replace(old, new, 1) + text[m.end(2):]
 
 
+def _drop_provider_entry(text, profile, provider):
+    """Remove the first `provider` entry from `profile`'s chain.
+
+    Derived from the live config rather than hardcoded. Three of these cases
+    used to spell out the model id, score and context of the entry they removed,
+    which made them silently no-ops the moment a regeneration changed chain
+    composition -- a case that plants nothing and then "passes" the suite it was
+    supposed to be breaking is worse than no case at all.
+    """
+    pattern = re.compile(rf"(?ms)(^  {re.escape(profile)}:\n    chain:\n)(.*?)(?=^  \w+:|\Z)")
+    m = pattern.search(text)
+    assert m, f"no block for {profile}"
+    block = m.group(2)
+    entry = re.compile(
+        r"(?m)^      - provider: " + re.escape(provider) + r"\n"
+        r"(?:^(?!      - provider: ).*\n)*"
+    )
+    new_block, n = entry.subn("", block, count=1)
+    assert n == 1, f"{provider} has no entry in the {profile} chain to drop"
+    return text[:m.start(2)] + new_block + text[m.end(2):]
+
+
+def _score_below_floor(text, profile, floor):
+    """Rewrite the first scored entry of `profile` to an intelligence below `floor`.
+
+    Picks a real entry out of the live chain instead of naming one, so the case
+    keeps planting a violation as the generator's composition changes.
+    """
+    pattern = re.compile(rf"(?ms)(^  {re.escape(profile)}:\n    chain:\n)(.*?)(?=^  \w+:|\Z)")
+    m = pattern.search(text)
+    assert m, f"no block for {profile}"
+    block = m.group(2)
+    entry = re.compile(
+        r"(?ms)^(      - provider: \w+\n        model: [^\n]*\n"
+        r"        vision: (?:true|false)\n        intelligence: )([0-9.]+)"
+    )
+    m2 = entry.search(block)
+    assert m2, f"no scored entry in the {profile} chain to push below {floor}"
+    lowered = float(m2.group(2)) - floor - 0.1
+    new_block = block[:m2.start(2)] + repr(round(lowered, 1)) + block[m2.end(2):]
+    return text[:m.start(2)] + new_block + text[m.end(2):]
+
+
 # (label, mutation applied to config.yaml, expected substring in the output)
 CHECK_RULE_CASES = [
     (
@@ -325,18 +368,12 @@ CHECK_RULE_CASES = [
     ),
     (
         "dropped nvidia key",
-        lambda t: re.sub(
-            r"(?m)^      - provider: nvidia3\n        model: z-ai/glm-5\.3.*\n"
-            r"        vision: false\n        intelligence: 44\.8\n"
-            r"        context_length: 131072\n", "", t),
+        lambda t: _drop_provider_entry(t, "smart", "nvidia3"),
         "rule3: smart nvidia3 is missing",
     ),
     (
         "dropped commandcode key",
-        lambda t: re.sub(
-            r"(?m)^      - provider: commandcode2\n        model: poolside/laguna-s-2\.1-free.*\n"
-            r"        vision: false\n        intelligence: 25\.0\n"
-            r"        context_length: 256000\n", "", t),
+        lambda t: _drop_provider_entry(t, "smart", "commandcode2"),
         "rule3: smart commandcode2 is missing",
     ),
     (
@@ -418,12 +455,7 @@ CHECK_RULE_CASES = [
     ),
     (
         "smart entry below the intelligence floor",
-        lambda t: _in_profile(
-            t, "smart",
-            "        model: qwen/qwen3.8-27b:free  # 33.7  elo=1671\n"
-            "        vision: true\n        intelligence: 33.7",
-            "        model: qwen/qwen3.8-27b:free  # 12.9\n"
-            "        vision: true\n        intelligence: 12.9"),
+        lambda t: _score_below_floor(t, "smart", 25.0),
         "below intelligence 25.0",
     ),
 ]

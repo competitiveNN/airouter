@@ -1073,8 +1073,14 @@ func TestOpencodeHeadersInjected(t *testing.T) {
 	if gotClient != "cli" {
 		t.Errorf("expected x-opencode-client=cli, got %q", gotClient)
 	}
-	if gotSession != "test-session" {
-		t.Errorf("expected x-opencode-session pinned to session, got %q", gotSession)
+	// The gateway id "test-session" is mapped onto the canonical
+	// `ses_<12hex><14base62>` shape rather than forwarded raw: measured live on
+	// 2026-10-01, any other session shape is answered 403 FreeTierError even
+	// when every other free-tier condition holds. The mapping is deterministic
+	// so prompt-cache affinity survives.
+	if want := opencodeSessionFor("test-session"); gotSession != want {
+		t.Errorf("x-opencode-session = %q, want %q (the canonical mapping of test-session)",
+			gotSession, want)
 	}
 	if gotRequest == "" {
 		t.Error("expected x-opencode-request header")

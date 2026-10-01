@@ -12,6 +12,7 @@ free-models-cache.json
 arena-code-cache.json
 aa-enrichment-cache.json
 first-seen-cache.json
+opencode-probe-cache.json
 
 # Runtime state (regenerated on startup)
 cooldowns.json

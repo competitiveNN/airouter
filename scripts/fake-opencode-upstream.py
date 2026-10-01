@@ -43,8 +43,45 @@ REQUIRED_HEADERS = {
 REQUIRED_PATTERNS = {
     "x-opencode-request": re.compile(r"^msg_[0-9a-f]{32}$"),
 }
-# Either a generated ses_<hex> or the gateway's own pinned ctx:<hex>.
-SESSION_PATTERN = re.compile(r"^(ses_[0-9a-f]{32}|ctx:[0-9a-f]{16,})$")
+# The canonical OpenCode session shape, `ses_<12 hex><14 base62>`.
+#
+# Measured live against opencode.ai/zen/v1 on 2026-10-01: a session id in ANY
+# other shape -- absent, `ctx:<hex>`, or the `ses_`+32hex airouter used to send
+# -- is answered with `403 FreeTierError` even when every other free-tier
+# condition is satisfied. So the format is load-bearing, not cosmetic.
+SESSION_PATTERN = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+
+# The gate also inspects the body: `stream` must be true and `tools` must carry
+# BOTH of these names. Measured: `bash`+`read` -> 200, while a single `bash`,
+# `read`+`edit`+`glob`, two arbitrary names, an empty array, or stream=false all
+# returned 403.
+#
+# Off by default: the routing check drives bare chat completions through
+# airouter, which is a legitimate shape for a non-free request. Turn it on with
+# --require-gate-body to prove a client satisfies the full contract.
+GATE_TOOLS = ("bash", "read")
+
+
+def _gate_body_problem(req: dict) -> str | None:
+    """Return why this body would be rejected by the free-tier gate."""
+    if not req.get("stream"):
+        return "stream is not true"
+    tools = req.get("tools")
+    if not isinstance(tools, list):
+        return "body has no tools array"
+    names = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        # chat-completions nests the name under `function`; responses puts it flat
+        fn = tool.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else tool.get("name")
+        if isinstance(name, str):
+            names.add(name)
+    missing = [n for n in GATE_TOOLS if n not in names]
+    if missing:
+        return f"tools is missing {','.join(missing)} (has {sorted(names)})"
+    return None
 
 CHUNKS = ("PING", " OK")
 DEFAULT_MODEL = "space-bunny-free"
@@ -92,6 +129,7 @@ def chunk(model: str, delta: dict, finish: str | None = None) -> bytes:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     require_headers = True
+    require_gate_body = False
     empty_first = 0
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003 - keep output readable
@@ -112,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
                 return f"{name}={got!r} does not match {pattern.pattern}"
         session = self.headers.get("x-opencode-session", "")
         if not SESSION_PATTERN.match(session):
-            return f"x-opencode-session={session!r} is neither ses_<hex> nor a pinned ctx:<hex>"
+            return f"x-opencode-session={session!r} is not ses_<12hex><14base62>"
         return None
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -129,6 +167,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         model = DEFAULT_MODEL
         stream = False
+        req: dict = {}
         try:
             length = int(self.headers.get("Content-Length") or 0)
             req = json.loads(self.rfile.read(length) or b"{}")
@@ -136,6 +175,19 @@ class Handler(BaseHTTPRequestHandler):
             stream = bool(req.get("stream"))
         except Exception:
             pass
+
+        if self.require_gate_body:
+            problem = _gate_body_problem(req)
+            if problem:
+                body = free_tier_error(
+                    "OpenCode's free tier can only be used from within OpenCode"
+                )
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
 
         if self.require_headers:
             problem = self._attribution_problem()
@@ -236,6 +288,12 @@ def main() -> int:
              "for the attribution assertion",
     )
     ap.add_argument(
+        "--require-gate-body",
+        action="store_true",
+        help="also enforce the body half of the free-tier gate (stream=true and "
+             "both bash+read in tools), as opencode.ai does since 2026-10",
+    )
+    ap.add_argument(
         "--empty-first",
         type=int,
         default=0,
@@ -249,10 +307,16 @@ def main() -> int:
         time.sleep(args.delay)
 
     Handler.require_headers = not args.no_require_headers
+    Handler.require_gate_body = args.require_gate_body
     Handler.empty_first = args.empty_first
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.daemon_threads = True
-    mode = "requiring attribution headers" if Handler.require_headers else "accepting anything"
+    if not Handler.require_headers:
+        mode = "accepting anything"
+    elif Handler.require_gate_body:
+        mode = "requiring attribution headers AND gate body"
+    else:
+        mode = "requiring attribution headers"
     print(f"fake-opencode-upstream on http://127.0.0.1:{args.port} ({mode})", flush=True)
     try:
         srv.serve_forever()
