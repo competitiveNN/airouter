@@ -3,6 +3,7 @@
 Regenerate the models section in config.yaml from free-models.json
 """
 
+import argparse
 import json
 import os
 import re
@@ -38,6 +39,16 @@ def _parse_release_date(value: str | int | None) -> datetime | None:
                 return datetime.strptime(s, fmt).replace(tzinfo=UTC)
             except ValueError:
                 continue
+        # ISO-8601 with fractional seconds and/or a numeric offset, which is
+        # what `datetime.now(UTC).isoformat()` produces. It matters: the
+        # auto-router probe writes exactly that form, and a parser that returns
+        # None for it silently downgrades every probe verdict to "unprobed",
+        # which disables the terminator guard without any error anywhere.
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     return None
 
 
@@ -143,6 +154,22 @@ def _size_tier(model_id: str) -> int:
     return 0
 
 
+# How long an auto-router probe verdict stays actionable. A `live` verdict
+# pins the terminator, so a router that dies between syncs would otherwise be
+# trusted indefinitely: the fetcher stops running, the last verdict stays in the
+# list, and the config keeps pointing at a dead endpoint with no signal. Past
+# this age a verdict decays to `unknown` — which is not the same as `dead`, so
+# it does NOT move the terminator off a working provider or block a sync; it
+# only stops being evidence for a rescue. A week is generous for a probe that
+# the nightly sync runs daily, and it is deliberately not a short number: a
+# weekend or a holiday must not invalidate the config.
+AUTO_PROBE_MAX_AGE_DAYS = 7
+
+# Endpoints already reported as having an untimestamped verdict, so four chains
+# asking the same question do not print the same warning four times.
+_WARNED_NO_TIMESTAMP: set[tuple[str, str]] = set()
+
+
 @dataclass
 class Model:
     id: str
@@ -156,6 +183,18 @@ class Model:
     vision: bool
     raw: dict
     released: str | int | None = None
+    # fetch-free-models.py sets verified=True on a candidate that answered a
+    # real 1-token completion and verified=False on one it probed and REJECTED.
+    # None means no verdict: not probed, or the probe could not reach one (429,
+    # 5xx, timeout) — see classify_probe_status in fetch-free-models.py.
+    verified: bool | None = None
+    # True for the minimal record --probe-auto appends when an auto router has
+    # no free-tier listing to stamp (opencode/big-pickle). It exists so the
+    # terminator guard can see a verdict for it; it is never a chain candidate.
+    probe_only: bool = False
+    # When the auto-router probe ran, from auto_probe.checked_at. A verdict
+    # without a timestamp cannot be shown to be fresh, so it is not trusted.
+    probe_checked_at: datetime | None = None
 
     @property
     def score(self) -> float | None:
@@ -207,6 +246,18 @@ class Model:
         """Check if this is an auto-fallback model"""
         return self.id in ('kilo-auto/free', 'big-pickle')
 
+    @property
+    def is_chain_candidate(self) -> bool:
+        """May this model be placed in a chain as a concrete endpoint?
+
+        False for the --probe-auto placeholder records: they carry a liveness
+        verdict and nothing else, and the terminator is the only place a meta
+        router belongs. Every profile filter also requires a non-null score, so
+        this is belt and braces — but the exclusion is a property worth having
+        in one place rather than a coincidence of four filters.
+        """
+        return not self.probe_only and not self.is_auto_fallback
+
     def get_comment(self) -> str:
         """Generate trailing comment with score and elo (no ctx — it is a
         real field now, surfaced as max_tokens by /v1/models)."""
@@ -239,6 +290,11 @@ def load_models(json_path: str) -> list[Model]:
             vision=caps.get('vision', False),
             raw=item.get('raw', {}),
             released=item.get('released'),
+            verified=item.get('verified'),
+            probe_only=bool(item.get('probe_only', False)),
+            probe_checked_at=_parse_release_date(
+                (item.get('auto_probe') or {}).get('checked_at')
+            ),
         )
         models.append(m)
     return models
@@ -324,7 +380,8 @@ def sort_models(
 
 def filter_smart(models: list[Model]) -> list[Model]:
     """smart: strongest generalists, intelligence >= 25, any context length"""
-    return [m for m in models if m.score is not None and m.score >= 25]
+    return [m for m in models
+            if m.score is not None and m.score >= 25 and m.is_chain_candidate]
 
 
 def filter_work(models: list[Model]) -> list[Model]:
@@ -337,7 +394,7 @@ def filter_work(models: list[Model]) -> list[Model]:
     """
     return [m for m in models
             if m.score is not None and m.score >= 15
-            and not m.is_excluded and not m.is_auto_fallback]
+            and not m.is_excluded and m.is_chain_candidate]
 
 
 def filter_fast(models: list[Model]) -> list[Model]:
@@ -345,7 +402,7 @@ def filter_fast(models: list[Model]) -> list[Model]:
     fast_keywords = ['flash-lite', 'lightning', 'nano', 'gemma', 'lfm', 'laguna-xs']
     candidates = []
     for m in models:
-        if m.score is None:
+        if m.score is None or not m.is_chain_candidate:
             continue
         id_lower = m.id.lower()
         is_fast = m.score < 25 or any(kw in id_lower for kw in fast_keywords)
@@ -362,17 +419,207 @@ def filter_large(models: list[Model]) -> list[Model]:
     candidates = [m for m in models
                   if m.context_length >= 200000
                   and m.score is not None
-                  and not m.is_auto_fallback]
+                  and m.is_chain_candidate]
     candidates.sort(key=lambda x: (x.context_length, x.score or 0), reverse=True)
     return candidates
 
 
-def build_chain(models: list[Model], profile: str) -> list[dict]:
-    """Build fallback chain for a profile"""
+def auto_fallback_terminator(
+    providers_present: set[str],
+    catalog: dict[tuple[str, str], Model] | None = None,
+    previous: tuple[str, str, str] | None = None,
+) -> tuple[str, str, str]:
+    """Pick the chain terminator and return (provider, model, comment).
+
+    Liveness, never popularity. The opencode key authenticates but is not
+    entitled to the free tier: 11 of its 12 models 403 FreeTierError (paid
+    big-pickle included), so a kilocode-vs-opencode COUNT comparison is not
+    evidence of anything — it once appended opencode/big-pickle as the
+    terminator of `smart` while that endpoint failed on every call.
+
+    `catalog` is the full (mapped_provider, id) -> Model catalog, built from
+    fetch-free-models.py --probe-auto output. Verdict per candidate, from that
+    record's `verified` field:
+
+        live     verified is True  — a 1-token completion came back
+        dead     verified is False — the provider REFUSED the call (4xx)
+        unknown  verified is None  — not probed, or the probe could not reach
+                 a verdict (429, 5xx, timeout). Says nothing about the endpoint.
+
+    The ladder, in full:
+
+        1. Preferred = opencode only when the chain contains opencode endpoints
+           and no kilocode ones; otherwise kilocode. The rescue is always the
+           other router, whether or not the chain already uses that provider:
+           a chain with no kilocode endpoint at all still needs a terminator,
+           and a live opencode router beats a refused kilocode one even where
+           it introduces a provider the chain did not have.
+        2. live or unknown -> use the preferred router. `unknown` deliberately
+           does not change today's behaviour: a flaky network must never be
+           able to move the terminator off a working provider, and a stale
+           verdict (older than AUTO_PROBE_MAX_AGE_DAYS) counts as unknown for
+           the same reason.
+        3. dead -> use the other router ONLY if it probed live. Promoting an
+           unverified endpoint over a confirmed-dead one would be trading a
+           known failure for a possible one.
+        4. dead with no live alternative -> abort, leaving the existing config
+           in place. Emitting a terminator the provider has refused turns every
+           exhausted chain into a failed request, and regenerating anyway would
+           overwrite a working config with a worse one. This is a state a human
+           has to resolve (fix the key, or drop the auto entry deliberately);
+           the previous behaviour was to write the dead endpoint and hope.
+
+    The decision is per chain but the abort is global, because the generator
+    writes all four chains at once. That is why the rescue is unconditional:
+    a single degenerate chain (say a `fast` profile with no qualifying model)
+    must not be able to strand the other three.
+
+    With no catalog at all (a caller that cannot probe) step 2 always applies,
+    so the choice degrades to the pre-probe rule rather than to a hard failure.
+
+    `previous` is the (provider, model, comment) this chain already carries, if
+    any. When the verdict is unknown AND the endpoint is unchanged, the existing
+    comment is kept verbatim: a run that could not check the claim must not
+    rewrite it into a different claim. A regeneration from a verdict-less list
+    (SKIP_AUTO_PROBE=1, a fixture, a fetcher that never probed) would otherwise
+    overwrite a recorded "probed live" with "not probed" — destroying the only
+    provenance the file has — and the next run would do it again, so the diff
+    would be permanent noise. scripts/check-rules.py reports an unverifiable
+    claim as its own problem instead, which is where an operator will look.
+    Any real change of endpoint, or a fresh verdict, still writes a fresh
+    comment.
+    """
+    available = {
+        'kilocode': ('kilocode', 'kilo-auto/free'),
+        'opencode': ('opencode', 'big-pickle'),
+    }
+
+    def verdict(provider: str) -> str:
+        rec = (catalog or {}).get(available[provider])
+        if rec is None:
+            return 'unknown'
+        if rec.verified is None:
+            return 'unknown'
+        # Freshness. A verdict is a fact about one moment; a `live` from three
+        # weeks ago is evidence that the endpoint existed, not that it works
+        # now, and a `dead` from three weeks ago may since have been fixed. Both
+        # decay to `unknown`, which keeps the preferred router and cannot
+        # trigger the rescue. A verdict with no timestamp at all is treated the
+        # same way: unverifiable freshness is not freshness.
+        checked = rec.probe_checked_at
+        if checked is None:
+            key = available[provider]
+            if key not in _WARNED_NO_TIMESTAMP:
+                _WARNED_NO_TIMESTAMP.add(key)
+                print(
+                    f'warning: {key[0]}/{key[1]} carries a verdict with no probe '
+                    f'timestamp; treating it as unprobed',
+                    file=sys.stderr,
+                )
+            return 'unknown'
+        age_days = (datetime.now(UTC) - checked).total_seconds() / 86400.0
+        if age_days > AUTO_PROBE_MAX_AGE_DAYS:
+            return 'unknown'
+        return 'live' if rec.verified is True else 'dead'
+
+    if 'opencode' in providers_present and 'kilocode' not in providers_present:
+        preferred, rescue = 'opencode', 'kilocode'
+        why = 'kilocode absent from chain'
+    elif 'kilocode' in providers_present:
+        preferred, rescue = 'kilocode', 'opencode'
+        why = 'opencode auto not entitled to free tier'
+    else:
+        preferred, rescue = 'kilocode', 'opencode'
+        why = 'no auto provider in chain'
+
+    if verdict(preferred) != 'dead':
+        provider, model = available[preferred]
+        state = verdict(preferred)
+        if state == 'unknown' and previous is not None \
+                and previous[:2] == (provider, model) and previous[2]:
+            return provider, model, previous[2]
+        # The probe verdict is stable text, not the probe timestamp: a date here
+        # would rewrite every chain on every nightly run for no added signal,
+        # and "probed live" is the part worth having in the file.
+        if state == 'live':
+            note = f'auto router probed live; {why}'
+        else:
+            note = why + ('; auto router not probed (unknown verdict)'
+                          if catalog is not None else '')
+        return provider, model, f'# last: {preferred} ({note})'
+
+    if verdict(rescue) == 'live':
+        provider, model = available[rescue]
+        print(
+            f'warning: {preferred} auto router is dead in the model list; '
+            f'falling back to {rescue}/{model}, which probed live',
+            file=sys.stderr,
+        )
+        return provider, model, f'# last: {rescue} ({preferred} auto router probed dead)'
+
+    provider, model = available[preferred]
+    alternative = (
+        f'{rescue}/{available[rescue][1]} is not live either ({verdict(rescue)})'
+    )
+    raise SystemExit(
+        f'refusing to write {provider}/{model} as the chain terminator: the probe '
+        f'record in the model list says the provider refuses it, and {alternative}. '
+        f'A dead last-resort endpoint turns every exhausted chain into a failed '
+        f'request. config.yaml has been left unchanged — fix the key, re-fetch '
+        f'with --probe-auto, or drop the auto entry deliberately.'
+    )
+
+
+def parse_terminators(config_text: str) -> dict[str, tuple[str, str, str]]:
+    """Extract each profile's current terminator as (provider, model, comment).
+
+    The comment is needed verbatim: when a run cannot verify the probe verdict,
+    the terminator decision keeps whatever the file already says rather than
+    replacing a recorded claim with a different one (see
+    auto_fallback_terminator).
+    """
+    out: dict[str, tuple[str, str, str]] = {}
+    for profile in ('smart', 'work', 'fast', 'large'):
+        m = re.search(
+            rf'(?ms)^  {profile}:\n    chain:\n(.*?)(?=^  \w+:|\Z)', config_text
+        )
+        if not m:
+            continue
+        entry = None
+        for line in m.group(1).splitlines():
+            prov = re.match(r'^      - provider: (\S+)\s*$', line)
+            if prov:
+                entry = [prov.group(1), '', '']
+            # Capture the comment INCLUDING its hash, exactly as written, so
+            # format_chain_yaml can write it back byte-for-byte. Rebuilding a
+            # '#' around stripped text is how the bare-comment case turned into
+            # a YAML syntax error, and requiring '# ' (hash AND space) meant a
+            # bare '#' was not recognised as a comment at all.
+            mod = re.match(r'^        model: (\S+)(?:\s+(#.*))?$', line)
+            if mod and entry is not None:
+                entry[1] = mod.group(1)
+                entry[2] = mod.group(2) or ''
+        if entry and entry[1]:
+            out[profile] = (entry[0], entry[1], entry[2])
+    return out
+
+
+def build_chain(
+    models: list[Model],
+    profile: str,
+    records: dict[tuple[str, str], Model] | None = None,
+    previous: tuple[str, str, str] | None = None,
+) -> list[dict]:
+    """Build fallback chain for a profile.
+
+    `records` is the full (mapped_provider, id) -> Model catalog used for the
+    terminator liveness check; see auto_fallback_terminator. `previous` is this
+    profile's current terminator, so an unverifiable run preserves its comment.
+    """
+    if records is None:
+        records = {}
     chain = []
-    kilocode_count = 0
-    opencode_count = 0
-    
+
     for m in models:
         if m.mapped_provider == 'nvidia':
             # Emit trio: nvidia, nvidia2, nvidia3
@@ -385,10 +632,6 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                     'context_length': m.context_length,
                     'comment': m.get_comment()
                 })
-            if m.provider == 'kilocode':
-                kilocode_count += 3
-            elif m.provider == 'opencode':
-                opencode_count += 3
         elif m.mapped_provider == 'commandcode':
             # Emit pair: commandcode, commandcode2 (two API keys on the same
             # upstream proxy) so a rate-limited key falls through to the next.
@@ -401,10 +644,6 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                     'context_length': m.context_length,
                     'comment': m.get_comment()
                 })
-            if m.provider == 'kilocode':
-                kilocode_count += 2
-            elif m.provider == 'opencode':
-                opencode_count += 2
         else:
             chain.append({
                 'provider': m.mapped_provider,
@@ -414,35 +653,12 @@ def build_chain(models: list[Model], profile: str) -> list[dict]:
                 'context_length': m.context_length,
                 'comment': m.get_comment()
             })
-            if m.provider == 'kilocode':
-                kilocode_count += 1
-            elif m.provider == 'opencode':
-                opencode_count += 1
-    
-    # The last-resort endpoint must itself be callable. Pick whichever of the
-    # two auto-fallbacks survived verification; the fetcher only emits models
-    # that answered a real request, so an absent provider is genuinely out of
-    # credit/entitlement rather than merely unlisted. Previously the choice was
-    # a raw count comparison, which happily appended opencode/big-pickle even
-    # while it 403'd on every call.
-    available = {
-        'kilocode': ('kilocode', 'kilo-auto/free'),
-        'opencode': ('opencode', 'big-pickle'),
-    }
-    emitted_providers = {e['provider'] for e in chain}
-    candidates = [p for p in ('kilocode', 'opencode') if p in emitted_providers]
-    if not candidates:
-        # Nothing survived; keep the historical default rather than emitting a
-        # chain with no terminator.
-        candidates = ['kilocode']
-    if len(candidates) == 2:
-        chosen = 'kilocode' if kilocode_count >= opencode_count else 'opencode'
-        auto_comment = f"# last: {chosen} dominates ({kilocode_count} vs {opencode_count})"
-    else:
-        chosen = candidates[0]
-        dead = [p for p in ('kilocode', 'opencode') if p not in emitted_providers]
-        auto_comment = f"# last: {chosen} (only verified provider; {', '.join(dead)} unavailable)"
-    auto_provider, auto_model = available[chosen]
+
+    # The last-resort endpoint must itself be callable, so the choice is a
+    # liveness question, never a popularity one.
+    auto_provider, auto_model, auto_comment = auto_fallback_terminator(
+        {e['provider'] for e in chain}, records, previous
+    )
 
     # Add auto fallback with vision: true
     chain.append({
@@ -499,6 +715,7 @@ def load_preference_newest_first_on_tie(config_path: str) -> bool:
 
 
 CONFIG_PATH = '/var/home/fra/dev/airouter/config.yaml'
+DEFAULT_MODELS_PATH = '/tmp/free-models.json'
 
 # Top-level keys that config.yaml owns. The generator replaces the `models:`
 # block and must leave everything else byte-for-byte intact.
@@ -584,12 +801,20 @@ def validate_config_text(text: str) -> list[str]:
     return problems
 
 
-def write_config_atomically(config: str, new_config: str, argv: list[str]) -> None:
+def write_config_atomically(
+    config: str,
+    new_config: str,
+    write: bool,
+    config_path: str | None = None,
+) -> None:
     """Validate, back up, then atomically replace config.yaml.
 
-    Safe by default: without --write this only reports what would change, so a
+    Safe by default: with write=False this only reports what would change, so a
     "looks like a dry run" invocation can never rewrite a hand-maintained file.
+    `config_path` defaults to the module-level CONFIG_PATH, which tests
+    monkeypatch.
     """
+    target = config_path or CONFIG_PATH
     problems = validate_config_text(new_config)
     if problems:
         print('\n!!! REFUSING TO WRITE: regenerated config is invalid', file=sys.stderr)
@@ -611,41 +836,85 @@ def write_config_atomically(config: str, new_config: str, argv: list[str]) -> No
     diff = sum(1 for a, b in zip(config.splitlines(), new_config.splitlines()) if a != b)
     print(f'\nconfig.yaml would change (~{diff} differing lines)')
 
-    if '--write' not in argv:
+    if not write:
         print('DRY RUN — nothing written. Re-run with --write to apply.')
         return
 
-    backup = f'{CONFIG_PATH}.bak'
-    shutil.copyfile(CONFIG_PATH, backup)
-    print(f'WRITING {CONFIG_PATH} (backup: {backup})')
+    backup = f'{target}.bak'
+    shutil.copyfile(target, backup)
+    print(f'WRITING {target} (backup: {backup})')
 
     # Write to a sibling temp file then rename, so a crash or a full disk
     # cannot leave a truncated config behind. os.replace is atomic within a
     # filesystem, which a plain open(path, 'w') is not.
-    tmp = f'{CONFIG_PATH}.tmp.{os.getpid()}'
+    tmp = f'{target}.tmp.{os.getpid()}'
     try:
         with open(tmp, 'w') as f:
             f.write(new_config)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, CONFIG_PATH)
+        os.replace(tmp, target)
     except Exception:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    print(f'wrote {CONFIG_PATH} ({len(new_config)} bytes)')
+    print(f'wrote {target} ({len(new_config)} bytes)')
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """CLI surface.
+
+    Paths are flags so the whole regeneration can be driven from a fixture (a
+    saved model list, a scratch config) instead of only from /tmp and the live
+    file. Hardcoding them made the terminator ladder untestable through the CLI,
+    which is where it actually runs. argparse rather than a hand-rolled scan
+    because the scan silently accepted a typo'd flag and exited 0 having changed
+    nothing, which is indistinguishable from "already up to date".
+    """
+    ap = argparse.ArgumentParser(
+        prog='regenerate_config.py',
+        description='Regenerate the models: section of config.yaml from a '
+                    'fetched free-model list.',
+        # No abbreviations. `--model` is an unambiguous prefix of `--models`, so
+        # argparse would silently accept the typo and read a path the caller
+        # never meant to name. A typo has to be loud here: the alternative is a
+        # sync that quietly regenerates from the wrong input, or does nothing and
+        # exits 0 looking like "already up to date".
+        allow_abbrev=False,
+    )
+    ap.add_argument(
+        '--models', default=DEFAULT_MODELS_PATH, metavar='FILE',
+        help=f'fetched model list (default: {DEFAULT_MODELS_PATH})',
+    )
+    ap.add_argument(
+        '--config', default=CONFIG_PATH, metavar='FILE',
+        help=f'config.yaml to rewrite (default: {CONFIG_PATH})',
+    )
+    ap.add_argument(
+        '--write', action='store_true',
+        help='apply the change; without it this is a dry run',
+    )
+    return ap
 
 
 def main(argv: list[str] | None = None):
     argv = sys.argv[1:] if argv is None else argv
-    models = load_models('/tmp/free-models.json')
+    args = build_parser().parse_args(argv)
+    models_path, config_path = args.models, args.config
+
+    models = load_models(models_path)
     unique = get_unique_models(models)
     model_list = list(unique.values())
+
+    # Read the existing config up front: the tie-break preference comes from
+    # it, and so do the current terminator comments (see below).
+    with open(config_path) as f:
+        config = f.read()
 
     print(f"Total unique models (after exclusions): {len(model_list)}")
 
     # Read the configured tie-break preference from config.yaml.
-    newest_first = load_preference_newest_first_on_tie(CONFIG_PATH)
+    newest_first = load_preference_newest_first_on_tie(config_path)
     print(f"Preference newest_first_on_tie: {newest_first}")
 
     # Filter for each profile
@@ -682,11 +951,17 @@ def main(argv: list[str] | None = None):
     for m in large_models:
         print(f"  {m.mapped_provider:12s} {m.id:50s} score={m.score} ctx={m.context_length} vision={m.vision}")
     
-    # Build chains
-    smart_chain = build_chain(smart_models, 'smart')
-    work_chain = build_chain(work_models, 'work')
-    fast_chain = build_chain(fast_models, 'fast')
-    large_chain = build_chain(large_models, 'large')
+    # Build chains. The full catalog is passed so the terminator can be checked
+    # against the fetcher's probe verdict, not just counted.
+    records = {(m.mapped_provider, m.id): m for m in model_list}
+    # The current terminators, so a run that cannot verify a verdict keeps the
+    # comment the file already carries instead of replacing a recorded claim
+    # with a different one. See auto_fallback_terminator.
+    previous = parse_terminators(config)
+    smart_chain = build_chain(smart_models, 'smart', records, previous.get('smart'))
+    work_chain = build_chain(work_models, 'work', records, previous.get('work'))
+    fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'))
+    large_chain = build_chain(large_models, 'large', records, previous.get('large'))
     
     # Generate new models section
     new_models = f"""models:
@@ -704,10 +979,7 @@ def main(argv: list[str] | None = None):
 {format_chain_yaml(large_chain)}
 """
     
-    # Read current config and replace models section
-    with open(CONFIG_PATH, 'r') as f:
-        config = f.read()
-
+    # Replace the models section, preserving everything else byte-for-byte.
     new_config = merge_models_section(config, new_models)
 
     print("\n=== SUMMARY ===")
@@ -715,7 +987,7 @@ def main(argv: list[str] | None = None):
         concrete = [e for e in chain if not e['model'].startswith('kilo-auto') and e['model'] != 'big-pickle']
         print(f"{name:6s}: {len(chain)} entries ({len(concrete)} concrete), head={concrete[0]['model'] if concrete else 'N/A'}, tail={chain[-1]['model']}")
 
-    write_config_atomically(config, new_config, argv)
+    write_config_atomically(config, new_config, args.write, config_path)
 
 if __name__ == '__main__':
     main()
