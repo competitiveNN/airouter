@@ -155,6 +155,23 @@ What `origin/master` is missing, oldest first:
   give the Go suite a size contract
 - `4ceef1a` attribution self-test: case 5 was passing on an unwritten premise, and
   a push exposed it
+- `af10ff9` gitignore: editor scratch files (*.swp, *.swo) — an untracked swap file
+  in the checkout participates in the gate's tree fingerprint, so an editor opening
+  a file mid-run turns the run INVALID
+- `2810e8a` AGENTS.md: record the git-checkout rule that cost 8 lines of
+  uncommitted work — `git checkout -- <path>` on a dirty file discards the whole
+  file, and the result is indistinguishable from a clean tree
+- `2fff96a` gate.sh: stage accounting, an unverified-by-design fingerprint limit,
+  and the two routing stages documented as non-interchangeable
+- `ea2a303` shell-lint: lint untracked scripts as a NOTICE, not a rule — the
+  tracked-only rule left just-written scripts unlinted
+- `2f09927` test-suite-baseline: record the three opencode attribution tests
+- `7a775a8` Add the OpenCode routing harness, its hermetic selftest, and the
+  gate-invariant suite — live proof that the gateway routes to OpenCode, plus the
+  hermetic proof that the check itself can fail
+- `d331467` gate.sh: fix two bugs in the INVALID RUN mtime diagnostic, and prove it
+  fires — it printed timestamps instead of paths, and never fired at all unless
+  the gate was run from the repo root
 
 That is the whole required list as of this writing — commits that touch only
 `dist/` are exempt by design, so the commits maintaining this file are not
