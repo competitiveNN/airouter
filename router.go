@@ -975,7 +975,10 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 	duration := r.cooldownForError(statusCode, cd.ErrorCount)
 	// Honor the upstream's Retry-After as a floor: never cool down for less
 	// than the provider asked, since it knows its own rate-limit windows.
-	if retryAfter > duration {
+	// Honour Retry-After for genuine provider-side throttling only. On a client
+	// error the provider is not asking us to back off -- and letting its header
+	// override the zero above would reintroduce the ban this prevents.
+	if !isClientRequestError(statusCode) && retryAfter > duration {
 		duration = retryAfter
 	}
 	// Add up to 25% random jitter on transient errors (429/5xx) so concurrent
@@ -1346,6 +1349,33 @@ func (r *Router) ApplyCooldownFromErrorForSession(ep *ModelEndpoint, err error, 
 	r.ApplyCooldownForSession(ep, statusCode, errMsg, sessionID, retryAfter)
 }
 
+// isClientRequestError reports whether a status blames the REQUEST rather than
+// the endpoint.
+//
+// A 400/413/422 means the request itself is unacceptable. Sending the identical
+// request again produces the identical rejection, so cooling the endpoint down
+// cannot help anyone -- it only removes a working model from every other
+// caller's rotation. The gateway's job there is to return the error, not to
+// penalise the model.
+//
+// This was not hypothetical. On 2026-10-01, opencode/space-bunny-free answered a
+// request with
+//
+//	{"error":{"type":"invalid_request_error",
+//	          "message":"Upstream request failed: [invalid_request_error] invalid request"}}
+//
+// and the router recorded `status=400 errors=3 for 24h0m0s`: three client-side
+// rejections escalated the endpoint into a 24-hour ban, so even a corrected
+// request kept failing and the endpoint stayed dark for every other caller.
+// 404 and 401/403 are deliberately NOT here -- those do describe the endpoint.
+func isClientRequestError(statusCode int) bool {
+	switch statusCode {
+	case 400, 413, 422:
+		return true
+	}
+	return false
+}
+
 func baseCooldownForError(statusCode int) time.Duration {
 	switch statusCode {
 	case 429:
@@ -1377,6 +1407,12 @@ func baseCooldownForError(statusCode int) time.Duration {
 // (see Router.RecordSuccess), so escalation only reflects recent consecutive
 // failures.
 func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration {
+	// The request was unacceptable, not the model. No cooldown, and no escalation:
+	// a retry is byte-identical and will be rejected identically. Checked first,
+	// so errorCount cannot walk a 400 into the soft-ban branch below.
+	if isClientRequestError(statusCode) {
+		return 0
+	}
 	base := baseCooldownForError(statusCode)
 	if errorCount <= 1 {
 		return base
