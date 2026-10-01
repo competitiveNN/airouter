@@ -172,6 +172,10 @@ What `origin/master` is missing, oldest first:
 - `d331467` gate.sh: fix two bugs in the INVALID RUN mtime diagnostic, and prove it
   fires — it printed timestamps instead of paths, and never fired at all unless
   the gate was run from the repo root
+- `3ffc79e` Cooldown: a failure with no HTTP status is transient, not a permanent
+  ban — three consecutive network timeouts were serving a 24h ban (ten, a week),
+  because "no status" fell through to the permanent-soft-ban branch instead of
+  the bounded 5xx branch
 
 That is the whole required list as of this writing — commits that touch only
 `dist/` are exempt by design, so the commits maintaining this file are not
