@@ -47,14 +47,22 @@ AUTO_MODELS = {"kilo-auto/free", "big-pickle"}
 ROUTABLE_PROFILES = ["smart", "work", "fast", "large"]
 BANNED_ID = re.compile(r"content-safety|x-preview-f-free")
 
-# The four CommandCode free-tier deals. All four are emitted on both
-# commandcode providers, so a rate-limited key falls through to the next.
-COMMANDCODE_DEALS = {
-    "stealth/space-bunny-alpha",
-    "poolside/laguna-s-2.1-free",
-    "inclusionai/ling-3.0-flash-sante:free",
-    "meituan/longcat-2.0-free",
-}
+# CommandCode free-ness is NOT enumerated here.
+#
+# This used to be a list of "the four curated free-tier deals", and it carried
+# the same defect as the one in fetch-free-models.py: meituan/longcat-2.0-free
+# stayed in it long after the deal ended (probed live 2026-10-01: HTTP 400 "You
+# have insufficient credits to make this request. Please purchase more
+# credit[s]"), so the checker accepted a billed model in work, fast and large on
+# both commandcode keys. In the other direction it rejected genuinely free new
+# deals -- inclusionai/ling-3.1-flash:free was fetched, probe-verified and then
+# FAILED this rule purely for not being one of the four.
+#
+# Free-ness is now a probe verdict, carried on the record the fetcher emits as
+# `verified`. Rule 3 grades against that evidence, so a deal that ends leaves on
+# the next fetch and a deal that starts is admitted without editing this file.
+# With no model list there is no evidence to grade against and the rule says so
+# instead of falling back to a stale enumeration.
 
 # Key groups that must be used as a unit: same model id on every provider of
 # the group, in consecutive entries, or a 429 on one key has nowhere to go.
@@ -386,17 +394,44 @@ def check(
                         f"rule3: {profile} {mid} keys are not consecutive (positions {positions})"
                     )
 
-        # rule 3: the CommandCode free set is the curated deal list, so any id
-        # served through a commandcode provider must be one of the four. (Ids
-        # are not a private namespace: kilocode lists its own
+        # rule 3: every id served through a commandcode provider must be one the
+        # fetcher PROVED free, not one a list once declared free. (Ids are not a
+        # private namespace: kilocode lists its own
         # inclusionai/ling-3.0-flash-sante:free, which is a separate free tier
-        # and legitimately appears on kilocode only.)
-        for ep in chain:
-            if str(ep.get("provider")).startswith("commandcode") and ep.get("model") not in COMMANDCODE_DEALS:
+        # and legitimately appears on kilocode only -- so this is about the
+        # commandcode provider specifically.)
+        # With no model list there is no probe evidence to grade against, and
+        # main() already prints that as a NOTICE and exits 0. Enumerating a
+        # fallback list here would reinstate the defect this rule just lost.
+        for ep in chain if index is not None else []:
+            provider = str(ep.get("provider"))
+            mid = ep.get("model")
+            if not provider.startswith("commandcode"):
+                continue
+            src = index.get((provider, mid)) if index is not None else None
+            verified = getattr(src, "verified", None)
+            if src is None:
+                # Absent from the fetched list: the fetcher neither offered it nor
+                # probed it. That is how a deal which ENDED disappears, so serving
+                # it is the defect this rule exists to catch.
                 problems.append(
-                    f"rule3: {profile} serves {ep.get('model')} on a commandcode provider but it is "
-                    "not one of the four curated free-tier deals"
+                    f"rule3: {profile} serves {mid} on {provider} but it is not "
+                    "in the fetched model list; the deal may have ended — run "
+                    "fetch-free-models.py --json --probe-auto --save and regenerate"
                 )
+            elif verified is False:
+                # Present AND probe-rejected: a definitive "this is billed" verdict.
+                problems.append(
+                    f"rule3: {profile} serves {mid} on {provider} but its probe "
+                    "rejected it as not free (verified=False)"
+                )
+            elif verified is None:
+                # Never probed. "Not probed" is NOT "not free", so this is not a
+                # violation — a model list derived from config.yaml itself (the
+                # self-contained check the meta-tests run) has no probe verdicts at
+                # all, and failing here would make that path unrunnable. Say it
+                # once, in the summary, rather than per entry.
+                pass
 
     return problems
 
@@ -416,8 +451,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"NOTICE: no model list at {models_path}; data-dependent rules "
-            "(4 score sync, 7 vision, 8 ids, 11 value sync) are NOT checked. "
-            "Run fetch-free-models.py --json --save to enable them."
+            "(3 commandcode free-deal provenance, 4 score sync, 7 vision, "
+              "8 ids, 11 value sync) are NOT checked. Run "
+              "fetch-free-models.py --json --probe-auto --save to enable them."
         )
 
     problems = check(rc, cfg, Path(args.config).read_text(), index)
