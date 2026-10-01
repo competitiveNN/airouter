@@ -482,6 +482,17 @@ func (e *SSEError) Error() string {
 	return "SSE error event: " + e.Data
 }
 
+// Status reports the HTTP-ish status this failure should be classified as when
+// the router decides how long to keep the endpoint out of rotation.
+//
+// An upstream that speaks SSE and then emits an error event is a bad-gateway
+// condition, and 502 is exactly what statusForStreamError already returns for
+// this shape on the /v1/responses path. Without this method the SAME upstream
+// fault was a 502 there and a statusless 0 on the chat path, and the two
+// disagreed on the penalty -- which is how an injected test error ended up
+// banning commandcode:stealth/space-bunny-alpha for 24 hours.
+func (e *SSEError) Status() int { return 502 }
+
 func ExtractSSEError(data []byte) error {
 	// SSE events can carry errors in three shapes:
 	//   1. A "data:" line whose JSON payload contains an "error" object
