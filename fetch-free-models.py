@@ -1044,26 +1044,35 @@ def fetch_opencode() -> list[dict[str, Any]]:
     return free_models
 
 
-# CommandCode free-tier models.  The provider models list at
-# https://api.commandcode.ai/provider/v1/models is the full catalog and does
-# NOT itself mark free/paid — every model there is billed at its per-token
-# rate unless an active "deal" makes it free.  The authoritative free set is
-# the one published on the CommandCode pricing page
-# (https://commandcode.ai/docs/resources/pricing-limits), which lists exactly
-# four free models, each with a "Free while capacity lasts" / "Free while the
-# stealth preview lasts" deal:
-#   - stealth/space-bunny-alpha        (stealth preview, 1M ctx, free)
-#   - poolside/laguna-s-2.1-free       (free while capacity lasts, 256K ctx)
-#   - inclusionai/ling-3.0-flash-sante:free  (free while it lasts, 262K ctx)
-#   - meituan/longcat-2.0-free         (free while it lasts, 1M ctx)
-# Anything else returned by the provider endpoint is metered (per-token),
-# so we never route to it as a free model.  Update this set when CommandCode
-# adds or removes a free deal.
-COMMANDCODE_FREE_MODELS: set[str] = {
-    "stealth/space-bunny-alpha",
+# CommandCode CANDIDATE free deals — seeds, not the answer.
+#
+# The provider models list at https://api.commandcode.ai/provider/v1/models is
+# the full catalog and does NOT mark free/paid: every model there is billed at
+# its per-token rate unless an active deal makes it free. So the id alone cannot
+# answer "is this free?", and a hand-maintained list of free models goes stale
+# the moment a deal ends -- which is exactly what happened:
+#
+#   meituan/longcat-2.0-free  stayed in this list long after the deal ended.
+#   Probed live on 2026-10-01 it answers HTTP 400 "You have insufficient
+#   credits to make this request. Please purchase more credit[s]" -- the
+#   provider's unambiguous statement that the call is BILLED.
+#
+# So this set is now only the SEED list of ids worth probing: deals that do not
+# carry the provider's own free suffix. Free-ness itself is decided by
+# commandcode_probe() below, exactly as it already is for OpenCode, and a seed
+# that stops being free drops out on the next sync without anyone editing this
+# file. The suffix heuristic still catches the deals that advertise themselves
+# (see commandcode_is_free_candidate).
+COMMANDCODE_FREE_SEEDS: set[str] = {
+    "stealth/space-bunny-alpha",   # stealth preview, 1M ctx
+    "meituan/longcat-2.0-free",    # deal ended; probe now rejects it
+}
+
+# Ids that were free seeds historically and must stay probe-able (not silently
+# dropped from the candidate set) so a resurrected deal is picked up again.
+COMMANDCODE_FREE_MODELS = COMMANDCODE_FREE_SEEDS | {
     "poolside/laguna-s-2.1-free",
     "inclusionai/ling-3.0-flash-sante:free",
-    "meituan/longcat-2.0-free",
 }
 
 # CommandCode context windows, taken from the live provider list.  The
@@ -1138,37 +1147,219 @@ def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def fetch_commandcode() -> list[dict[str, Any]]:
-    """Fetch CommandCode free models from the provider models endpoint.
+# ── CommandCode endpoint resolution ─────────────────────────────────────────────
+# The probe has to hit the endpoint the GATEWAY will use, not the one this script
+# happened to be written with. config.yaml routes commandcode at
+# http://127.0.0.1:3050/v1, while COMMANDCODE_ENDPOINT points at
+# https://api.commandcode.ai/provider/v1. Probing the public host measures a
+# different server and answers 403 "Your Go plan doesn't include API access" for
+# EVERY model — which looks exactly like "none of these are free" and would
+# empty the chain. Measured 2026-10-01:
+#
+#   via api.commandcode.ai : space-bunny-alpha 403, laguna 403, longcat 400
+#   via the routed endpoint: space-bunny-alpha 200, laguna 502, longcat 400
+#
+# Only the routed endpoint can tell a live deal from a dead one.
 
-    The provider endpoint lists the full catalog (paid and free alike) with
-    no free flag, so the free set is intersected against the curated
-    COMMANDCODE_FREE_MODELS deal list.  The endpoint is unauthenticated in
-    practice, but the Provider API key (COMMANDCODE_API_KEY) is sent when
-    available so rate limits / availability follow the authenticated plan.
+
+def commandcode_base_url() -> str:
+    """The base URL config.yaml routes commandcode through, else the default."""
+    config = Path(__file__).resolve().parent / "config.yaml"
+    try:
+        import yaml
+
+        cfg = yaml.safe_load(config.read_text()) or {}
+        url = ((cfg.get("providers") or {}).get("commandcode") or {}).get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip().rstrip("/")
+    except Exception as exc:  # missing config, no yaml, unparseable
+        print(
+            f"CommandCode: could not read commandcode url from config.yaml ({exc}); "
+            "falling back to the built-in endpoint, whose probe result may not "
+            "reflect the routed server",
+            file=sys.stderr,
+        )
+    # COMMANDCODE_ENDPOINT is a models URL; the base is everything before it.
+    return COMMANDCODE_ENDPOINT[: -len("/models")] if COMMANDCODE_ENDPOINT.endswith("/models") else COMMANDCODE_ENDPOINT
+
+
+def commandcode_models_url() -> str:
+    return commandcode_base_url() + "/models"
+
+
+def commandcode_chat_url() -> str:
+    return commandcode_base_url() + "/chat/completions"
+
+
+def commandcode_is_free_candidate(model_id: str) -> bool:
+    """Whether a catalog id is worth probing, by the provider's own convention.
+
+    Two ways an id advertises a free deal:
+
+      * the free suffix — `-free` (poolside/laguna-s-2.1-free) or `:free`
+        (inclusionai/ling-3.0-flash-sante:free). That is the provider's naming
+        convention for a live free deal, so honour it as a heuristic rather than
+        enumerating ids.
+      * no suffix at all — the stealth preview `stealth/space-bunny-alpha` is
+        free and never carried one. Those are the seeds.
+
+    This is a CANDIDATE filter. Being a candidate is not being free; only
+    commandcode_probe() decides that.
+    """
+    if not model_id:
+        return False
+    name = model_id.rsplit("/", 1)[-1].lower()
+    return name.endswith("-free") or name.endswith(":free") or model_id in COMMANDCODE_FREE_SEEDS
+
+
+# Verbs in a provider error body that mean "this call is billed", i.e. the model
+# is NOT on a free deal. Matched case-insensitively against the message.
+_COMMANDCODE_PAID_MARKERS = (
+    "insufficient credit",
+    "insufficient balance",
+    "purchase more credit",
+    "add credit",
+    "payment required",
+    "upgrade to",
+    "billing",
+)
+
+
+def commandcode_probe(model_id: str, api_key: str) -> str:
+    """Send one minimal chat completion and classify the result.
+
+    Returns one of:
+
+      "ok"      — the call succeeded, so the deal is live and free.
+      "paid"    — the provider said the call is billed. This is a DEFINITIVE
+                  verdict and the model is excluded.
+      "unknown" — a transient or inconclusive condition (capacity, rate limit,
+                  5xx, timeout, or a plan restriction). NOT evidence that the
+                  deal ended, so it must not be treated as "paid".
+
+    The distinction between "paid" and "unknown" is the whole point. Probed live
+    on 2026-10-01 through the endpoint the gateway actually uses:
+
+      meituan/longcat-2.0             400 insufficient credits   -> "paid"
+      stealth/space-bunny-alpha       200                        -> "ok"
+      poolside/laguna-s-2.1-free      502 providers at capacity  -> "unknown"
+
+    Treating all three as one "unusable" bucket is what the old hardcoded list
+    got wrong in the other direction: a capacity blip would look like a deal
+    ending.
+    """
+    body = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }).encode()
+    headers = {**HEADERS, "Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(
+        commandcode_chat_url(), data=body, headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return "ok" if resp.status == 200 else "unknown"
+    except urllib.error.HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read()
+        except Exception:
+            pass
+        text = raw.decode("utf-8", "replace").lower()
+        # Billing language wins over the status code: this provider returns 400
+        # (not 402) for "insufficient credits", so keying on 402 alone misses it.
+        if any(marker in text for marker in _COMMANDCODE_PAID_MARKERS):
+            return "paid"
+        if e.code in (401, 403):
+            # "Your Go plan doesn't include API access" — this endpoint is not
+            # reachable on this plan, which says nothing about the deal.
+            return "unknown"
+        if e.code == 404:
+            return "paid"      # the id is gone from the catalog entirely
+        return "unknown"       # 429, 5xx, and everything else transient
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return "unknown"
+
+
+def fetch_commandcode() -> list[dict[str, Any]]:
+    """Fetch CommandCode free models, verified by a real completion.
+
+    Candidates come from the provider's own free-suffix convention plus the
+    seed list; free-ness is decided by commandcode_probe(). A deal that ends
+    drops out on the next sync with no edit to this file, which is the property
+    the hardcoded COMMANDCODE_FREE_MODELS list did not have.
+
+    Set SKIP_COMMANDCODE_PROBE=1 to fall back to candidates-only (the old
+    behaviour); it prints loudly and marks the output unverified.
     """
     print("Fetching from CommandCode provider API...", file=sys.stderr)
     headers = dict(HEADERS)
     cc_key = os.getenv("COMMANDCODE_API_KEY")
     if cc_key:
         headers["Authorization"] = f"Bearer {cc_key}"
-    data = fetch_json(COMMANDCODE_ENDPOINT, headers=headers)
+    data = fetch_json(commandcode_models_url(), headers=headers)
     if not data or not isinstance(data, dict) or "data" not in data:
         print("CommandCode: no data or unexpected format", file=sys.stderr)
         return []
 
-    free_models = []
+    candidates = []
     for model in data.get("data", []):
         model_id = canonicalize_commandcode_id(model.get("id", ""))
-        if model_id not in COMMANDCODE_FREE_MODELS:
+        if not commandcode_is_free_candidate(model_id):
             continue
         normalized = normalize_commandcode(model)
         if normalized:
-            free_models.append(normalized)
+            candidates.append(normalized)
 
+    if not cc_key:
+        print(
+            "CommandCode: COMMANDCODE_API_KEY not set — cannot verify, "
+            f"emitting {len(candidates)} UNVERIFIED candidates",
+            file=sys.stderr,
+        )
+        return _mark_unverified(candidates, "COMMANDCODE_API_KEY unset")
+
+    if os.environ.get("SKIP_COMMANDCODE_PROBE") == "1":
+        print(
+            "CommandCode: !!! SKIP_COMMANDCODE_PROBE=1 — emitting UNVERIFIED "
+            "candidates. Deals that have ended will keep costing a failed round "
+            "trip per request. Do not leave this set in a scheduled sync.",
+            file=sys.stderr,
+        )
+        return _mark_unverified(candidates, "SKIP_COMMANDCODE_PROBE=1")
+
+    free_models = []
+    dropped = []
+    unknown = []
+    for model in candidates:
+        verdict = commandcode_probe(model["id"], cc_key)
+        if verdict == "ok":
+            model["verified"] = True
+            free_models.append(model)
+        elif verdict == "paid":
+            dropped.append(f"{model['id']}(paid)")
+        else:
+            # Inconclusive. Excluded from the emit (we cannot route to a model
+            # we have not seen succeed) but reported, so a capacity blip is
+            # visible instead of silently shrinking the chain.
+            unknown.append(f"{model['id']}({verdict})")
+
+    if dropped:
+        print(
+            "CommandCode: dropped no-longer-free deals — " + ", ".join(dropped),
+            file=sys.stderr,
+        )
+    if unknown:
+        print(
+            "CommandCode: inconclusive, excluded this run (transient, NOT a "
+            "verdict that the deal ended) — " + ", ".join(unknown),
+            file=sys.stderr,
+        )
     print(
-        f"CommandCode: found {len(free_models)} free models "
-        f"(of {len(data.get('data', []))} listed; free set is the curated deal list)",
+        f"CommandCode: {len(free_models)}/{len(candidates)} candidates verified free",
         file=sys.stderr,
     )
     return free_models

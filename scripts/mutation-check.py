@@ -350,7 +350,7 @@ MUTATIONS: list[Mutation] = [
 # count and the floor cannot be maintained in two places — and
 # test_every_test_suite_has_a_floor() fails if a new suite is added without one.
 SUITE_TEST_FLOORS = {
-    "scripts/test_fetch_free_models.py": 18,
+    "scripts/test_fetch_free_models.py": 26,
     "scripts/test_mutation_check.py": 19,
     "scripts/test_regenerate_config.py": 48,
     # EXACT, matching every other floor in this table (48/48, 18/18, 17/17).

@@ -18,8 +18,10 @@ directly, with no socket.
 """
 
 import importlib.util
+import io
 import json
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -372,6 +374,165 @@ def test_producer_and_consumer_agree_end_to_end_through_json(monkeypatch, tmp_pa
     assert rec.probe_checked_at is not None
     assert (gen.datetime.now(gen.UTC) - rec.probe_checked_at).total_seconds() < 60
 
+
+
+# ── CommandCode free-ness is probed, not declared ──────────────────────────────
+#
+# Regression tests for the hardcoded-free-list defect. COMMANDCODE_FREE_MODELS
+# was the authoritative free set, so a deal that ended stayed in the chains:
+# meituan/longcat-2.0-free was probed live on 2026-10-01 and answered HTTP 400
+# "You have insufficient credits to make this request. Please purchase more
+# credit[s]", while it still appeared in work, fast and large on both commandcode
+# providers. Free-ness is now decided by commandcode_probe(), and these tests pin
+# the distinction that makes that work.
+
+
+class _Resp:
+    def __init__(self, status=200):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_commandcode_candidate_heuristic_covers_suffixes_and_seeds():
+    """Candidates come from the provider's own suffix convention plus seeds."""
+    # Advertised free deals, by suffix.
+    assert ff.commandcode_is_free_candidate("poolside/laguna-s-2.1-free")
+    assert ff.commandcode_is_free_candidate("inclusionai/ling-3.0-flash-sante:free")
+    assert ff.commandcode_is_free_candidate("inclusionai/ling-3.1-flash:free")
+    # A seed with no suffix at all: the stealth preview.
+    assert ff.commandcode_is_free_candidate("stealth/space-bunny-alpha")
+    # Paid catalog entries must not be candidates.
+    assert not ff.commandcode_is_free_candidate("z-ai/glm-5.3")
+    assert not ff.commandcode_is_free_candidate("meituan/LongCat-2.0-foo")
+    assert not ff.commandcode_is_free_candidate("")
+
+
+def _probe_with(body_bytes, code):
+    def opener(*a, **k):
+        if code >= 400:
+            raise urllib.error.HTTPError("u", code, "e", {}, io.BytesIO(body_bytes))
+        return _Resp(code)
+    return opener
+
+
+@pytest.mark.parametrize("message", [
+    "You have insufficient credits to make this request. Please purchase more credits.",
+    "Insufficient balance on the account",
+    "Payment required for this model",
+])
+def test_billing_language_is_a_paid_verdict_even_on_http_400(message, monkeypatch):
+    """The provider says 400, not 402, for insufficient credits.
+
+    Keying on the status code alone misses the exact case that shipped, so the
+    message is inspected instead. A paid verdict must be DEFINITIVE: it is the
+    only thing that removes a model from the chains.
+    """
+    monkeypatch.setattr(ff.urllib.request, "urlopen",
+                        _probe_with(message.encode(), 400))
+    assert ff.commandcode_probe("meituan/longcat-2.0-free", "k") == "paid"
+
+
+def test_longcat_is_not_free():
+    """The specific regression, stated as its own case.
+
+    If this starts passing without a real re-probe, the fetcher has gone back to
+    trusting a list instead of the provider.
+    """
+    orig = ff.urllib.request.urlopen
+    ff.urllib.request.urlopen = _probe_with(
+        b'{"error":{"message":"You have insufficient credits to make this request."}}', 400)
+    try:
+        assert ff.commandcode_probe("meituan/longcat-2.0-free", "k") == "paid"
+    finally:
+        ff.urllib.request.urlopen = orig
+
+
+@pytest.mark.parametrize("code,body", [
+    (403, b'{"error":{"message":"Your Go plan doesn\'t include API access."}}'),
+    (429, b'{"error":{"message":"slow down"}}'),
+    (502, b'{"error":{"message":"providers at capacity"}}'),
+])
+def test_inconclusive_responses_are_unknown_not_paid(code, body):
+    """A capacity blip or a plan wall must NOT look like a dead deal.
+
+    Collapsing "unknown" into "unusable" is what made the old hardcoded list
+    wrong in the other direction: a transient outage would prune a live deal.
+    """
+    orig = ff.urllib.request.urlopen
+    ff.urllib.request.urlopen = _probe_with(body, code)
+    try:
+        assert ff.commandcode_probe("poolside/laguna-s-2.1-free", "k") == "unknown"
+    finally:
+        ff.urllib.request.urlopen = orig
+
+
+def test_a_200_is_the_only_ok_verdict():
+    orig = ff.urllib.request.urlopen
+    ff.urllib.request.urlopen = lambda *a, **k: _Resp(200)
+    try:
+        assert ff.commandcode_probe("stealth/space-bunny-alpha", "k") == "ok"
+    finally:
+        ff.urllib.request.urlopen = orig
+
+
+def test_a_removed_id_is_paid():
+    """404 means the id is gone from the catalog; that is not a transient."""
+    orig = ff.urllib.request.urlopen
+    ff.urllib.request.urlopen = _probe_with(b'{"error":{"message":"not found"}}', 404)
+    try:
+        assert ff.commandcode_probe("meituan/gone-free", "k") == "paid"
+    finally:
+        ff.urllib.request.urlopen = orig
+
+
+def test_probe_uses_the_endpoint_config_yaml_routes():
+    """The probe must hit the server the gateway will use.
+
+    config.yaml routes commandcode at 127.0.0.1:3050 while the built-in endpoint
+    is api.commandcode.ai. Probing the public host answers 403 for every model,
+    which reads as "none are free" and empties the chain.
+    """
+    url = ff.commandcode_base_url()
+    assert url.endswith("/v1"), url
+    assert "api.commandcode.ai" not in url, (
+        "the probe fell back to the public endpoint, which answers 403 "
+        "plan-restricted for every model and cannot judge any deal"
+    )
+    assert ff.commandcode_chat_url().endswith("/chat/completions")
+    assert ff.commandcode_models_url().endswith("/models")
+
+
+def test_fetch_commandcode_drops_paid_and_reports_inconclusive(monkeypatch):
+    """End to end: a paid deal is absent from the output, and said so."""
+    catalog = {"data": [
+        {"id": "stealth/space-bunny-alpha"},
+        {"id": "meituan/LongCat-2.0"},
+        {"id": "poolside/laguna-s-2.1-free"},
+        {"id": "z-ai/glm-5.3"},
+    ]}
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
+    monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+
+    def fake_probe(model_id, key):
+        if "longcat" in model_id.lower():
+            return "paid"
+        if "laguna" in model_id.lower():
+            return "unknown"
+        return "ok"
+
+    monkeypatch.setattr(ff, "commandcode_probe", fake_probe)
+    out = ff.fetch_commandcode()
+    ids = [m["id"] for m in out]
+    assert not any("longcat" in i for i in ids), ids
+    assert "stealth/space-bunny-alpha" in ids, ids
+    # glm-5.3 is paid catalog noise and was never a candidate.
+    assert not any("glm" in i for i in ids), ids
+    assert all(m.get("verified") is True for m in out), out
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
