@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -41,6 +42,59 @@ func isOpencodeProvider(provider string) bool {
 	return false
 }
 
+// opencodeBase62 is the alphabet OpenCode mints session ids from.
+const opencodeBase62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// opencodeSessionID mints a session id in the canonical OpenCode shape
+// `ses_<12 hex><14 base62>`.
+//
+// The shape is enforced by the gateway. Bisected live against
+// opencode.ai/zen/v1 on 2026-10-01: a session id that is absent, or is any
+// other shape — including the `ses_`+32hex this function used to emit — gets
+// `403 FreeTierError`, even when every other free-tier condition is met. So the
+// old id was not cosmetic; it was a 403 on every proxied free-model request.
+func opencodeSessionID() string {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		// Never block a request on RNG failure. Fill deterministically: the id
+		// stays well-formed, which is what the gateway checks.
+		for i := range b {
+			b[i] = byte(i)
+		}
+	}
+	var sb strings.Builder
+	sb.Grow(4 + 12 + 14)
+	sb.WriteString("ses_")
+	sb.WriteString(hex.EncodeToString(b[:6]))
+	for _, c := range b[6:20] {
+		sb.WriteByte(opencodeBase62[int(c)%len(opencodeBase62)])
+	}
+	return sb.String()
+}
+
+// opencodeSessionFor maps an airouter session id onto the canonical OpenCode
+// shape, deterministically.
+//
+// airouter identifies a session as "ctx:<32 hex>" (api.go, bodySessionID). The
+// gateway rejects that shape with 403 FreeTierError even when every other
+// free-tier condition holds, so the id cannot be forwarded as-is.
+//
+// The mapping is a hash rather than a per-call random id on purpose: pinning the
+// session upstream is what buys prompt-cache affinity, and that only works if the
+// same airouter session presents the same ses_ id on every request of the
+// conversation.
+func opencodeSessionFor(sessionID string) string {
+	sum := sha256.Sum256([]byte("airouter\x00opencode\x00" + sessionID))
+	var sb strings.Builder
+	sb.Grow(4 + 12 + 14)
+	sb.WriteString("ses_")
+	sb.WriteString(hex.EncodeToString(sum[:6]))
+	for _, c := range sum[6:20] {
+		sb.WriteByte(opencodeBase62[int(c)%len(opencodeBase62)])
+	}
+	return sb.String()
+}
+
 // opencodeRequestHeaders returns the OpenCode client-attribution headers that
 // must accompany every request to an OpenCode gateway. The session/request IDs
 // are generated fresh per call so the upstream sees a distinct identity each
@@ -49,7 +103,7 @@ func opencodeRequestHeaders() map[string]string {
 	return map[string]string{
 		"User-Agent":         "opencode/1.18.31/cli",
 		"x-opencode-client":  "cli",
-		"x-opencode-session": "ses_" + randomHex(16),
+		"x-opencode-session": opencodeSessionID(),
 		"x-opencode-request": "msg_" + randomHex(16),
 		"x-opencode-project": "default",
 	}

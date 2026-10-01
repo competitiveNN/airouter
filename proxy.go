@@ -222,12 +222,22 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	// per request so the upstream cannot fingerprint one client across
 	// sessions, matching the official opencode CLI. Explicit provider headers
 	// in the config always win (set after the synthesized ones below).
+	//
+	// The session id must be the canonical `ses_<12hex><14base62>`; the gateway
+	// measures a 403 for any other shape. Headers alone are not sufficient,
+	// though: the gateway also requires stream=true and a `tools` array holding
+	// both `bash` and `read`. Those live in the request body, which is forwarded
+	// from the client verbatim, so an agent client that sends them passes and a
+	// bare chat completion 403s — see scripts/fake-opencode-upstream.py, which
+	// enforces the same contract.
 	if isOpencodeProvider(endpoint.Provider) {
 		for k, v := range opencodeRequestHeaders() {
 			req.Header.Set(k, v)
 		}
 		if sessionID != "" {
-			req.Header.Set("x-opencode-session", sessionID)
+			// The gateway id is "ctx:<hex>", a shape it rejects with 403, so
+			// map it onto the canonical ses_ form instead of forwarding it.
+			req.Header.Set("x-opencode-session", opencodeSessionFor(sessionID))
 		}
 	}
 	// Provider-level header overrides from config take precedence over the
