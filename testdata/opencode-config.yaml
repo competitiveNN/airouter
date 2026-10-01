@@ -1,0 +1,56 @@
+# Fixture config that routes EVERY logical model to OpenCode and nothing else.
+# Used by scripts/opencode-routing-check.sh to assert that the gateway really
+# routes to OpenCode end to end (chain selection, attribution headers, sticky
+# sessions, streaming) instead of silently serving some other provider.
+#
+# Why this is a separate file and not a fifth profile in config.yaml:
+# `LogicalModels` in config.go is the hardcoded list ["smart","work","fast",
+# "large"] and `IsValidModel` gates every /v1/chat/completions request against
+# it, so a "test" key under models: parses fine and is permanently unroutable
+# (400 "Unknown model"). scripts/check-rules.py rule 5, scripts/validate-config.py
+# and TestRealConfigChainInvariants all reject the extra key as well, and
+# regenerate_config.py rewrites the models section from scratch on every sync,
+# which would delete it. Same reasoning as testdata/ci-config.yaml.
+#
+# Deliberately NOT a valid production config: single-endpoint chains that never
+# reach kilo-auto/free, so scripts/validate-config.py rejects it. It is a test
+# fixture, not a deployment target.
+#
+# Only space-bunny-free is listed because it is the single OpenCode model this
+# key is entitled to. Every other OpenCode free model (mimo-v2.5-free,
+# nemotron-3.5-lightning-free, jev-1.13-free, muse-spark-1.3-contributor-free,
+# longcat-2.5-preview-free, ...) answers 403 FreeTierError "OpenCode's free tier
+# can only be used from within OpenCode" even WITH the client-attribution headers
+# the gateway synthesizes, so listing them would make this fixture fail for a
+# reason that has nothing to do with routing. Regenerate this list only from a
+# probe that actually got a 200.
+providers:
+  opencode:
+    url: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY
+
+models:
+  smart:
+    chain:
+      - provider: opencode
+        model: space-bunny-free
+        vision: false
+        intelligence: 25.0
+  work:
+    chain:
+      - provider: opencode
+        model: space-bunny-free
+        vision: false
+        intelligence: 25.0
+  fast:
+    chain:
+      - provider: opencode
+        model: space-bunny-free
+        vision: false
+        intelligence: 25.0
+  large:
+    chain:
+      - provider: opencode
+        model: space-bunny-free
+        vision: false
+        intelligence: 25.0
