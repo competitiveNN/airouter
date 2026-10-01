@@ -193,6 +193,13 @@ Two properties make any such list awkward, and neither is a bug to be fixed:
     presence: a code change that also edits this file is still required to be
     listed, so nothing real can be laundered out of the handoff.
   - `origin/master` can advance underneath the list. When it does, the checker
+- `4da7b54` config sync: forbid extra models: keys in the regeneration instruction
+- `11feedc` scripts: add the rules checker, the mutation harness, and a pytest runner
+- `93eac1d` scripts: add the config-sync Python suites (85 test functions)
+- `e7bb23b` commandcode: decide free-ness by probe, not by a hand-maintained list
+- `cd94156` config.yaml: regenerate — longcat gone, ling-3.1-flash:free admitted
+- `8977724` router_realconfig_test.go: assert the shipped config's chain invariants
+- `b9964b5` ci: run the config suites and the mutation harness in CI
     reports every entry as "not an unpushed commit (it may have been pushed or
     rewritten)". That is the check being right, and it means something far more
     mundane than a corrupted handoff: someone else pushed.
