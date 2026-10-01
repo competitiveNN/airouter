@@ -34,6 +34,7 @@ markers, and `run_guard` sources the extracted text rather than a paraphrase.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
@@ -190,6 +191,79 @@ def test_a_modified_tracked_file_changes_the_fingerprint(scratch_repo):
     assert _fingerprint_of(scratch_repo) != before
 
 
+def test_invalid_run_names_the_paths_that_were_rewritten(scratch_repo):
+    """The MTIME_SNAP diagnostic must actually NAME the rewritten paths.
+
+    Unproven code in the one function that declares results void is the worst
+    place for it: if the naming silently stopped working, whoever has to work out
+    what moved the tree gets a bare "INVALID RUN" and starts guessing.
+
+    The first version of this test asserted only that the exit status was 3 and
+    that "INVALID RUN" was printed -- and it PASSED with the diagnostic neutered,
+    because the name it checked was computed by the test itself rather than read
+    out of gate.sh. So the assertion here is on gate.sh's OWN OUTPUT, and the
+    real `tracked_mtimes` helper and the real summary block are driven against a
+    real git repo, with the snapshot taken the way gate.sh takes it.
+    """
+    before = _fingerprint_of(scratch_repo)
+
+    # Snapshot exactly as gate.sh does: the extracted helper, into a file.
+    snap_file = scratch_repo / "mtime.snapshot"
+    # Define AND invoke: leaving the call off silently produces an EMPTY snapshot
+    # file, and `[ -s "$MTIME_SNAP" ]` then skips the whole diagnostic -- which is
+    # exactly what happened the first time this test was written.
+    snap_script = (
+        f'REPO={shlex.quote(str(scratch_repo))}\n'
+        + _tracked_mtimes_helper()
+        + "tracked_mtimes\n"
+    )
+    proc = subprocess.run(["bash", "-c", snap_script], capture_output=True, text=True)
+    assert proc.returncode == 0, f"the snapshot helper failed: {proc.stderr}"
+    assert proc.stdout.strip(), "the snapshot came back empty, so the scenario is vacuous"
+    snap_file.write_text(proc.stdout)
+
+    target = scratch_repo / "tracked.txt"
+    original = target.read_text()
+    # Rewrite AND restore, then bump the mtime deterministically with os.utime.
+    # Relying on wall-clock here was a race: two writes a few ms apart land in
+    # the same clock tick often enough to make the test flaky in the direction
+    # that HIDES a real regression. An explicit timestamp removes the race and
+    # still models the write-then-restore the diagnostic is meant to name.
+    target.write_text("rewritten during the run\n")
+    _bump_mtime(target)
+    after = _fingerprint_of(scratch_repo)
+    assert after != before, "precondition: the write is visible to the fingerprint"
+
+    prefix, summary = extract_stage_machine_parts()
+    script = (
+        "#!/usr/bin/env bash\n"
+        f'P="gate:"\nSTART_FP={shlex.quote(before)}\nEND_FP={shlex.quote(after)}\n'
+        f'REPO={shlex.quote(str(scratch_repo))}\n'
+        f'MTIME_SNAP={shlex.quote(str(snap_file))}\n'
+        + _tracked_mtimes_helper()
+        + prefix.replace("REGISTERED=__N__", "REGISTERED=1")
+        + 'run "a stage" true\n'
+        + summary
+    )
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 3, f"a moved tree did not exit 3: {proc.returncode}\n{out}"
+    assert "INVALID RUN" in out, out
+    # The assertion that matters, and the one the first version got wrong: the
+    # rewritten path must be named by GATE.SH's diagnostic, not by this test.
+    assert "paths rewritten during the run" in out, (
+        "the INVALID RUN path did not print the mtime diagnostic at all:\n" + out
+    )
+    assert "tracked.txt" in out, (
+        "the diagnostic ran but did not name the rewritten path (so it is "
+        "useless to whoever has to investigate):\n" + out
+    )
+    target.write_text(original)
+    _bump_mtime(target)
+
+
+
 def test_gate_reports_invalid_run_when_the_tree_moved(scratch_repo):
     """A start/end fingerprint mismatch must exit 3, not 1 and not 0.
 
@@ -274,6 +348,24 @@ def extract_guard() -> str:
         "ACCOUNTED=$(( assignment followed by two `fi` closers. The guard was "
         "deleted or restructured."
     )
+
+
+def _bump_mtime(path, seconds=1):
+    """Advance a file's mtime deterministically, so a test never races the clock."""
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 10**9))
+
+
+def _tracked_mtimes_helper() -> str:
+    """gate.sh's tracked_mtimes(), verbatim, including its REPO-dependent body."""
+    text = GATE.read_text()
+    start = text.find("tracked_mtimes() {")
+    if start == -1:
+        raise AssertionError("gate.sh has no tracked_mtimes(); the layout changed")
+    end = text.find("\n}", start)
+    if end == -1:
+        raise AssertionError("tracked_mtimes() is never closed")
+    return text[start:end + 2] + "\n"
 
 
 def extract_stage_machine_parts() -> tuple[str, str]:
