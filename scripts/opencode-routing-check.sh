@@ -334,6 +334,17 @@ for model in "${MODELS[@]}"; do
   prompt="Reply with exactly one word: pong-$i"
   echo "== $model"
 
+  # Non-stream. Deliberately sent WITHOUT the gate's stream+tools pair, because
+  # this fixture's model is entitled regardless of body shape and this case is
+  # about the gateway's response contract, not the free tier.
+  #
+  # Known limitation, verified live 2026-10-01: a gate-DEPENDENT model (say
+  # mimo-v2.5-free) rejects this body with 403, because the gateway requires
+  # stream=true. airouter forwards the client's body verbatim and does not
+  # re-stream an upstream SSE into a single JSON completion, so a non-streaming
+  # caller falls through to the next endpoint in the chain instead. That is the
+  # fallback chain doing its job, not a routing fault, but it does mean
+  # gate-dependent models currently serve streaming agent clients only.
   body=$(python3 - "$model" "$prompt" <<'PY'
 import json, sys
 print(json.dumps({
@@ -412,13 +423,32 @@ PY
   # Streaming: the OpenCode path has to hold mid-stream too, not just on the
   # first byte. One [DONE] and non-empty content is the contract.
   sse_file="$WORK/sse-$model.txt"
+  # The tool pair is sent even though this fixture's model does not need it.
+  # OpenCode's free-tier gate requires stream=true AND a tools array holding
+  # both `bash` and `read`; a body without them is answered 403 regardless of
+  # the headers. Sending them keeps this check valid if the fixture is ever
+  # repointed at a gate-dependent model.
   scode=$(post_with_retry "stream" "$sse_file" "$(python3 - "$model" "$prompt stream" <<'PY'
 import json, sys
+
+
+def tool(name, props, required):
+    return {"type": "function",
+            "function": {"name": name, "description": f"probe {name} tool",
+                         "parameters": {"type": "object", "properties": props,
+                                        "required": required,
+                                        "additionalProperties": False}}}
+
+
 print(json.dumps({
     "model": sys.argv[1],
     "messages": [{"role": "user", "content": sys.argv[2]}],
     "max_tokens": 256,
     "stream": True,
+    "tools": [
+        tool("bash", {"command": {"type": "string"}}, ["command"]),
+        tool("read", {"filePath": {"type": "string"}}, ["filePath"]),
+    ],
 }))
 PY
 )")

@@ -695,9 +695,23 @@ def fetch_kilo() -> list[dict[str, Any]]:
 
 
 def _mark_unverified(models: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
-    """Tag models that never got a real probe, so the defect is visible downstream."""
+    """Tag models that never got a real probe, so the defect is visible downstream.
+
+    `verified` is left UNSET rather than set to False. The generator's own
+    contract (regenerate_config.py) is three-valued:
+
+        verified is True   -> live    (a real call came back)
+        verified is False  -> dead    (the provider REFUSED the call)
+        verified is None   -> unknown (not probed, or the probe could not reach)
+
+    and it maps False to 'dead' while treating None as 'unknown'. So writing
+    False here declared models dead that were never asked, which made a run
+    without a key -- or one that got rate-limited -- silently drop exactly the
+    endpoints the probe exists to protect. `unverified_reason` still carries the
+    explanation for whoever reads the list.
+    """
     for m in models:
-        m["verified"] = False
+        m.pop("verified", None)
         m["unverified_reason"] = f"opencode probe skipped: {reason}"
     return models
 
@@ -735,14 +749,11 @@ AUTO_PROBE_TARGETS = (
         OPENCODE_ENDPOINT,
         "big-pickle",
         "OPENCODE_API_KEY",
-        {
-            # Mirrors opencodeRequestHeaders() in config.go.
-            "User-Agent": "opencode/1.18.31/cli",
-            "x-opencode-client": "cli",
-            "x-opencode-session": "ses_probe",
-            "x-opencode-request": "msg_probe",
-            "x-opencode-project": "default",
-        },
+        # Left empty on purpose: opencode_headers() is applied at the call site
+        # so the session id is minted canonically (ses_<12hex><14base62>).
+        # The hardcoded `ses_probe` that used to live here failed the gate, so
+        # this probe recorded a perfectly working model as permanently dead.
+        {},
     ),
 )
 
@@ -774,6 +785,12 @@ def classify_probe_status(status: int, body: bytes = b"") -> str:
     if 200 <= status < 300:
         if not body:
             return "live"
+        # The OpenCode gate requires stream=true, so that probe answers with SSE
+        # rather than a single JSON object. Without this branch the SSE body
+        # fails json.loads and a working model is recorded `unknown`, which the
+        # generator then treats as "unprobed" rather than live.
+        if body.lstrip()[:5] in (b"data:", b"event:"):
+            return "live" if _sse_has_content(body) else "unknown"
         try:
             parsed = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -782,21 +799,68 @@ def classify_probe_status(status: int, body: bytes = b"") -> str:
     return "unknown"
 
 
+def _sse_has_content(body: bytes) -> bool:
+    """True unless an SSE stream carries nothing but [DONE] / lifecycle events.
+
+    An SSE stream of pure bookkeeping means the model emitted no text, which is
+    the empty-completion artifact the gateway retries rather than a verdict
+    about the model.
+    """
+    try:
+        text = body.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - undecodable bytes are not content
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for delta in parsed.get("choices") or []:
+            d = delta.get("delta") or {}
+            # reasoning_content counts: a reasoning model spends its whole
+            # budget there, and `big-pickle` answers with that alone under a
+            # small max_tokens. Reading only `content` would call a working model
+            # silent.
+            if d.get("content") or d.get("reasoning_content"):
+                return True
+        # Responses-API chunks carry text under output_text / delta.
+        if parsed.get("type") in {"response.output_text.delta"} and parsed.get("delta"):
+            return True
+    return False
+
+
 def probe_endpoint(endpoint: str, model_id: str, api_key: str,
                    extra_headers: dict[str, str] | None = None,
-                   opener: Any = None) -> dict[str, Any]:
+                   opener: Any = None,
+                   opencode_gate: bool = False) -> dict[str, Any]:
     """Send one 1-token chat completion and return a verdict record.
 
     Never raises: a probe that cannot reach the provider is `unknown`, not an
     exception, because this runs inside the nightly sync and a hard failure
     would lose the whole model list. `opener` is injectable so the timeout and
     the error classification can be exercised without a socket or a real wait.
+
+    `opencode_gate` swaps the body for one that satisfies OpenCode's free-tier
+    gate (stream + the bash/read tool pair). Without it the call 403s on its own
+    request shape and `big-pickle` is recorded as permanently dead, which is a
+    statement about the probe, not about the model.
     """
-    body = json.dumps({
-        "model": model_id,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-    }).encode()
+    if opencode_gate:
+        body = opencode_gate_bodies(model_id)[0][1]
+    else:
+        body = json.dumps({
+            "model": model_id,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+        }).encode()
     headers = {
         **HEADERS,
         "Content-Type": "application/json",
@@ -890,7 +954,12 @@ def probe_auto_fallbacks(
                 file=sys.stderr,
             )
             continue
-        result = probe_endpoint(endpoint, model_id, api_key, extra)
+        is_opencode = provider == "opencode"
+        result = probe_endpoint(
+            endpoint, model_id, api_key,
+            opencode_headers(api_key) if is_opencode else extra,
+            opencode_gate=is_opencode,
+        )
         record = by_id.get((provider, model_id))
         if record is None:
             record = {
@@ -927,62 +996,318 @@ def probe_auto_fallbacks(
     return models
 
 
-def opencode_probe(model_id: str, api_key: str) -> str:
-    """Send one minimal chat completion to OpenCode and classify the result.
+# ---------------------------------------------------------------------------
+# OpenCode free-tier gate
+#
+# Bisected live against https://opencode.ai/zen/v1 on 2026-10-01. The gateway
+# answers `403 FreeTierError: OpenCode's free tier can only be used from within
+# OpenCode` unless ALL FOUR of these hold:
+#
+#   1. User-Agent starts with `opencode/`
+#   2. x-opencode-session matches ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$
+#   3. `tools` contains BOTH `bash` and `read`
+#   4. `stream` is true
+#
+# `x-opencode-client`, `x-opencode-request` and `x-opencode-project` are NOT
+# checked (verified by removing each one: still HTTP 200).
+#
+# This matters because the previous probe sent NONE of 3 or 4 — it posted a bare
+# `{"model", "messages", "max_tokens"}` body — so it failed the gate on its own
+# request shape and then reported the model as unusable. That deleted 8 working
+# models from the chains in one sync. "Listed" != "usable", but neither does
+# "rejected by my own malformed probe" != "dead".
+#
+# Items 1, 3 and 4 are also why the gateway needs them at request time; item 2 is
+# the same constraint airouterRequestHeaders() in config.go has to satisfy.
+OPENCODE_UA = "opencode/1.18.31/cli"
+# The gate counts tool NAMES and ignores the schemas. `bash`+`read` is the
+# minimal passing set: `read`+`edit`+`glob`, a single `bash`, and two arbitrary
+# names (`foo`,`bar`) were each measured as 403.
+OPENCODE_CORE_TOOLS = ("bash", "read")
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+# 429 is a rate limit on a working key, never a verdict about the model.
+#
+# It is also a property of the CREDENTIAL, not of the model being probed: once
+# the key is limited, every remaining candidate is limited too. An earlier
+# version retried independently per candidate -- 3 attempts x 2 protocols x 12
+# candidates, with a backoff sleep on each, plus a 30s request timeout -- which
+# turned a single rate-limited run into a ~40 minute hang inside the nightly
+# sync. So the first exhausted 429 aborts the sweep, and the untried candidates
+# are emitted UNVERIFIED rather than rejected: a rate limit must never be able
+# to look like "these models are dead".
+OPENCODE_429_RETRIES = 2
+OPENCODE_429_BACKOFF = 5.0
+# Wall clock for the whole opencode sweep, so a slow or throttled gateway cannot
+# stall the sync indefinitely. Exceeding it leaves the rest unverified.
+OPENCODE_PROBE_BUDGET = 240.0
+# Small pause between candidates. Twelve back-to-back calls are themselves enough
+# to trip the very limit the code then has to wait out.
+OPENCODE_CANDIDATE_PAUSE = 1.0
+# Per-request socket timeout for the gate probe. This bounds "time to first
+# byte" only — the stream is abandoned as soon as one byte arrives — which is why
+# it is a genuine wall-clock bound here in a way the listing TIMEOUT was not.
+OPENCODE_PROBE_TIMEOUT = 20
 
-    Returns "ok", "freetier" (403 FreeTierError — key is authenticated but not
-    entitled), or "error".
+# ── OpenCode probe cache ──────────────────────────────────────────────────────
+#
+# The gate probe answers "does this key still reach this model", which changes
+# on the provider's schedule, not ours. Re-asking on every sync is pure cost:
+# 12 candidates x up to 2 protocols is the slowest phase of the fetcher, and it
+# is also the phase that makes the sync fragile, since a slow upstream turns
+# into an over-budget run that leaves models unverified.
+#
+# Verdicts are cached PER MODEL and expire independently, because the two
+# directions have very different costs of being wrong:
+#   - `ok` cached long: a model that answered keeps answering. Stale-true costs
+#     a chain entry that might 403 for a few days, and the gateway's cooldown
+#     handles that at request time.
+#   - a negative verdict cached SHORT: entitlements change, and models do come
+#     back. Caching "freetier" for a week would keep a working model out of the
+#     chains for a week -- the exact regression this probe was rebuilt to undo.
+OPENCODE_PROBE_CACHE_FILE = Path(__file__).resolve().parent / "opencode-probe-cache.json"
+OPENCODE_PROBE_OK_TTL_HOURS = int(os.environ.get("OPENCODE_PROBE_OK_TTL_HOURS", "168"))
+OPENCODE_PROBE_NEG_TTL_HOURS = int(os.environ.get("OPENCODE_PROBE_NEG_TTL_HOURS", "24"))
 
-    The /zen/v1/models listing is NOT a reliable free-tier oracle. It happily
-    lists models the current key cannot actually call: as of 2026-09-29 the key
-    resolved 5 models (big-pickle, ling-3.0-flash-fin-free, mimo-v2.5-free,
-    mimo-v2.6-flash-free, muse-spark-1.2-contributor-free) and ALL of them
-    returned 403 FreeTierError, paid ones included. The attribution headers
-    airouter sends (x-opencode-client, x-opencode-session, ...) do not change
-    the outcome. So "listed" != "usable" and only a real call can tell.
+
+def opencode_probe_cache_ttl_hours(verdict: str) -> int:
+    """How long a cached verdict of this kind stays trustworthy."""
+    return OPENCODE_PROBE_OK_TTL_HOURS if verdict == "ok" else OPENCODE_PROBE_NEG_TTL_HOURS
+
+
+def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
+    """Read the probe cache, dropping expired and malformed entries.
+
+    Never raises: a corrupt cache must cost one live probe round, not the model
+    list. Anything unusable is discarded rather than repaired, because the whole
+    point is that a cache miss is always safe.
     """
-    body = json.dumps({
+    if not OPENCODE_PROBE_CACHE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(OPENCODE_PROBE_CACHE_FILE.read_text())
+        probes = raw.get("probes") if isinstance(raw, dict) else None
+        if not isinstance(probes, dict):
+            return {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+    live: dict[str, dict[str, Any]] = {}
+    now = datetime.now(UTC)
+    for model_id, entry in probes.items():
+        if not isinstance(entry, dict):
+            continue
+        verdict = entry.get("verdict")
+        if verdict not in ("ok", "freetier", "error"):
+            continue
+        try:
+            checked = datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if (now - checked).total_seconds() > opencode_probe_cache_ttl_hours(verdict) * 3600:
+            continue
+        live[model_id] = entry
+    return live
+
+
+def save_opencode_probe_cache(cache: dict[str, dict[str, Any]]) -> None:
+    """Persist the probe cache. Best-effort: a write failure is not a sync failure."""
+    payload = {
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "probes": cache,
+    }
+    try:
+        OPENCODE_PROBE_CACHE_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    except OSError as e:
+        print(f"OpenCode: could not write the probe cache: {e}", file=sys.stderr)
+
+
+class OpenCodeRateLimited(Exception):
+    """The key is rate-limited, so every remaining candidate is UNKNOWN.
+
+    Carries the per-attempt detail purely for the stderr line; nothing consumes
+    it programmatically.
+    """
+
+
+def opencode_session_id() -> str:
+    """Mint a canonical `ses_<12 hex><14 base62>` id.
+
+    The gateway rejects a session id in any other shape — including the
+    `ses_` + 32 hex that config.go used to send, which was a 403 on every
+    proxied request. 6 random bytes give the hex part; the other 14 bytes are
+    folded through base62 one char each.
+    """
+    raw = os.urandom(20)
+    return "ses_" + raw[:6].hex() + "".join(_BASE62[b % 62] for b in raw[6:20])
+
+
+def opencode_gate_tools(protocol: str) -> list[dict[str, Any]]:
+    """The two core tool definitions, shaped for the envelope they go into.
+
+    The two protocols disagree on where the name lives and getting it wrong is
+    NOT cosmetic: sent flat to /chat/completions, the upstream answers
+    `tools[0].function must be an object`, which looks like a model fault.
+    """
+    def tool(name: str) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "type": "object", "properties": {}, "additionalProperties": False,
+        }
+        if protocol == "responses":
+            return {"type": "function", "name": name,
+                    "description": f"The {name} tool", "parameters": params}
+        return {"type": "function",
+                "function": {"name": name, "description": f"The {name} tool",
+                             "parameters": params}}
+
+    return [tool(n) for n in OPENCODE_CORE_TOOLS]
+
+
+def opencode_gate_bodies(model_id: str) -> list[tuple[str, bytes]]:
+    """Gate-passing request bodies, one per protocol the listing can map to.
+
+    Both are tried: several models answer `400 Model does not support this
+    protocol` on the wrong one. That 400 means the free-tier gate was PASSED and
+    the request reached the model layer, which is exactly the distinction the
+    old probe could not see.
+    """
+    chat = {
         "model": model_id,
         "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-    }).encode()
-    headers = {
+        # 16 is plenty: the verdict is the HTTP status, and _opencode_post reads
+        # ONE byte to prove the stream opened, then closes. An earlier version
+        # drained the whole stream to completion (max_tokens=64) and a reasoning
+        # model trickling tokens kept resetting the per-read socket timeout, so
+        # nemotron-3.5-lightning-free alone took 67s of a 12-candidate sweep.
+        "max_tokens": 16,
+        "stream": True,
+        "tools": opencode_gate_tools("chat"),
+    }
+    responses = {
+        "model": model_id,
+        "input": [{"role": "user", "content": "ping"}],
+        "max_output_tokens": 16,
+        "stream": True,
+        "tools": opencode_gate_tools("responses"),
+    }
+    return [
+        ("/chat/completions", json.dumps(chat).encode()),
+        ("/responses", json.dumps(responses).encode()),
+    ]
+
+
+def opencode_headers(api_key: str, session: str | None = None) -> dict[str, str]:
+    """Headers satisfying gate items 1 and 2. Mirrors opencodeRequestHeaders()."""
+    return {
         **HEADERS,
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
-        # Mirrors opencodeRequestHeaders() in config.go: OpenCode grants
-        # free-tier access to clients that identify as the OpenCode CLI.
-        "User-Agent": "opencode/1.18.31/cli",
+        "User-Agent": OPENCODE_UA,
+        "x-opencode-session": session or opencode_session_id(),
         "x-opencode-client": "cli",
-        "x-opencode-session": "ses_probe",
-        "x-opencode-request": "msg_probe",
+        "x-opencode-request": "msg_" + os.urandom(16).hex(),
         "x-opencode-project": "default",
     }
+
+
+def _opencode_post(path: str, body: bytes, headers: dict[str, str],
+                   opener: Any = None) -> tuple[int, str]:
+    """One POST. Returns (status, error message) and never raises.
+
+    `opener` is injectable so the verdict classification can be exercised
+    without a socket, a credential, or the 429 backoff wait.
+    """
     req = urllib.request.Request(
-        OPENCODE_ENDPOINT + "/chat/completions", data=body, headers=headers,
+        OPENCODE_ENDPOINT + path, data=body, headers=headers,
     )
+    open_url = opener or urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            return "ok" if resp.status == 200 else "error"
+        with open_url(req, timeout=OPENCODE_PROBE_TIMEOUT) as resp:
+            # ONE byte, then close. The verdict is the HTTP status: 200 means
+            # the gate passed and the model opened a stream, which is exactly
+            # "usable". Draining the stream instead is what made this probe
+            # appear to hang — `timeout` is applied per socket read, so a model
+            # emitting tokens slowly resets it indefinitely and read() blocks
+            # until the completion finishes. Measured: 67s for a single
+            # reasoning model, versus well under a second to first byte.
+            resp.read(1)
+            return resp.status, ""
     except urllib.error.HTTPError as e:
-        if e.code == 403:
-            return "freetier"
-        return "error"
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return "error"
+        try:
+            payload = e.read(65536)
+        except Exception:  # noqa: BLE001 - the body is context only
+            payload = b""
+        try:
+            err = json.loads(payload).get("error", {})
+            msg = err.get("message") if isinstance(err, dict) else err
+        except Exception:  # noqa: BLE001 - not our parse problem
+            msg = ""
+        return e.code, str(msg or "").replace("\n", " ")[:120]
+    except Exception as e:  # noqa: BLE001 - URLError, timeout, TLS, decode...
+        return 0, f"{type(e).__name__}: {e}"[:120]
+
+
+def opencode_probe(model_id: str, api_key: str, opener: Any = None) -> tuple[str, str]:
+    """Send one gate-satisfying call and classify the result.
+
+    Returns ("ok"|"freetier"|"error", detail).
+
+    "freetier" is reserved for a genuine 403 FreeTierError on a request that
+    satisfied the whole gate — that is a statement about the key's entitlement.
+    A 400, a protocol mismatch or a transport failure is "error" and is reported
+    with its detail, so a caller can tell "this model is gone" from "I asked it
+    the wrong question".
+
+    Raises OpenCodeRateLimited if the key is rate-limited, which is a fact about
+    the credential rather than about this model. The caller must then treat every
+    remaining candidate as unknown instead of dead.
+    """
+    session = opencode_session_id()
+    headers = opencode_headers(api_key, session)
+    seen: list[str] = []
+    saw_403 = False
+    for path, body in opencode_gate_bodies(model_id):
+        for attempt in range(OPENCODE_429_RETRIES):
+            code, detail = _opencode_post(path, body, headers, opener)
+            if code == 200:
+                return "ok", f"{path} 200"
+            if code == 429:
+                seen.append(f"{path} 429")
+                # No sleep after the final attempt: there is nothing left to wait
+                # for, and that sleep is pure dead time before the sweep aborts.
+                if attempt + 1 < OPENCODE_429_RETRIES:
+                    time.sleep(OPENCODE_429_BACKOFF * (attempt + 1))
+                continue
+            seen.append(f"{path} {code} {detail}".strip())
+            if code == 403:
+                saw_403 = True
+            break
+        else:
+            # Every attempt on this protocol was a 429. The limit is on the key,
+            # not on this model or this protocol, so stop the whole sweep rather
+            # than grinding through the remaining candidates and the second
+            # protocol to reach the same 429.
+            raise OpenCodeRateLimited("; ".join(seen))
+    detail = "; ".join(seen)[:300]
+    return ("freetier", detail) if saw_403 else ("error", detail)
 
 
 def fetch_opencode() -> list[dict[str, Any]]:
     """Fetch OpenCode models; free ones end in -free or are in OPENCODE_FREE_MODELS.
 
-    Every candidate is then verified with a real 1-token chat completion, so we
-    only emit endpoints the gateway can actually serve. Without this the
+    Every candidate is then verified with a real call that satisfies the
+    gateway's free-tier gate (see the OPENCODE gate notes above), so we only
+    emit endpoints the gateway can actually serve. Without verification the
     nightly sync kept re-adding 19 opencode endpoints across the four profile
     chains (7 in smart, 8 in work, 2 in fast, 1 in large) that 403 on every
     call, costing a guaranteed round trip per request that reached them.
 
+    Verdicts are cached per model in OPENCODE_PROBE_CACHE_FILE and expire
+    independently by direction, so a steady-state sync spends one listing call
+    and no probe calls at all. Set REFRESH_OPENCODE_PROBE=1 to force a live
+    re-probe of every candidate and rewrite the cache.
+
     Set SKIP_OPENCODE_PROBE=1 to skip verification and keep the old
-    listing-only behaviour.
+    listing-only behaviour. That reintroduces the dead-endpoint problem, so
+    the output is marked unverified and the reason is printed.
     """
     print("Fetching from OpenCode API...", file=sys.stderr)
     data = fetch_json(OPENCODE_MODELS_URL)
@@ -1025,19 +1350,78 @@ def fetch_opencode() -> list[dict[str, Any]]:
 
     free_models = []
     rejected = []
-    for model in candidates:
-        verdict = opencode_probe(model.get("id", ""), api_key)
+    untried: list[dict[str, Any]] = []
+    refresh = os.environ.get("REFRESH_OPENCODE_PROBE") == "1"
+    cache: dict[str, dict[str, Any]] = {} if refresh else load_opencode_probe_cache()
+    cached_used = 0
+    deadline = time.monotonic() + OPENCODE_PROBE_BUDGET
+    for index, model in enumerate(candidates):
+        if time.monotonic() > deadline:
+            untried.extend(candidates[index:])
+            print(
+                f"OpenCode: probe budget of {OPENCODE_PROBE_BUDGET:.0f}s exhausted "
+                f"after {index} candidates; {len(untried)} left UNVERIFIED",
+                file=sys.stderr,
+            )
+            break
+        model_id = model.get("id", "")
+        entry = cache.get(model_id)
+        if entry is not None:
+            verdict, detail = entry["verdict"], entry.get("detail", "cached")
+            cached_used += 1
+        else:
+            try:
+                verdict, detail = opencode_probe(model_id, api_key)
+            except OpenCodeRateLimited:
+                # Includes the current candidate: it was never actually answered.
+                untried.extend(candidates[index:])
+                print(
+                    f"OpenCode: key is rate limited (429) after {index} candidates; "
+                    f"{len(untried)} left UNVERIFIED. A 429 says nothing about whether "
+                    "those models work, so they are NOT treated as dead.",
+                    file=sys.stderr,
+                )
+                break
+            cache[model_id] = {
+                "verdict": verdict,
+                "detail": detail,
+                "checked_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            }
         if verdict == "ok":
             normalized = normalize_opencode(model)
             if normalized:
                 normalized["verified"] = True
                 free_models.append(normalized)
         else:
-            rejected.append(f"{model.get('id', '?')}({verdict})")
+            rejected.append(f"{model_id}({verdict}: {detail})")
+        if entry is None and index + 1 < len(candidates):
+            time.sleep(OPENCODE_CANDIDATE_PAUSE)
+
+    # Only persist what this sweep actually produced a verdict for, so a run that
+    # stopped early cannot promote a half-finished pass into a week of cache.
+    probed = {m.get("id", "") for m in candidates} - {m.get("id", "") for m in untried}
+    save_opencode_probe_cache(
+        {k: v for k, v in cache.items() if k in probed and k}
+    )
+
+    if untried:
+        free_models.extend(_mark_unverified(
+            [n for n in (normalize_opencode(m) for m in untried) if n],
+            "opencode probe never reached this model (rate limited, or over the "
+            "probe budget)",
+        ))
 
     if rejected:
         print(
             "OpenCode: rejected unusable models — " + ", ".join(rejected),
+            file=sys.stderr,
+        )
+    if cached_used:
+        print(
+            f"OpenCode: {cached_used}/{len(candidates)} verdicts served from "
+            f"{OPENCODE_PROBE_CACHE_FILE.name} (negative verdicts expire after "
+            f"{OPENCODE_PROBE_NEG_TTL_HOURS}h, positive after "
+            f"{OPENCODE_PROBE_OK_TTL_HOURS}h)",
             file=sys.stderr,
         )
     print(f"OpenCode: {len(free_models)}/{len(candidates)} candidates verified usable", file=sys.stderr)

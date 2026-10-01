@@ -20,8 +20,10 @@ directly, with no socket.
 import importlib.util
 import io
 import json
+import re
 import sys
 import urllib.error
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -363,9 +365,11 @@ def test_producer_and_consumer_agree_end_to_end_through_json(monkeypatch, tmp_pa
             return False
 
     monkeypatch.setattr(ff, "probe_endpoint",
-                        lambda endpoint, model_id, key, extra=None, opener=None:
+                        lambda endpoint, model_id, key, extra=None, opener=None,
+                        opencode_gate=False:
                         real_probe(endpoint, model_id, key, extra,
-                                   opener=lambda *a, **k: FakeResponse()))
+                                   opener=lambda *a, **k: FakeResponse(),
+                                   opencode_gate=opencode_gate))
     models = ff.probe_auto_fallbacks([_record()], environ={"KILOCODE_API_KEY": "k"})
     path = tmp_path / "models.json"
     ff.output_json(models, str(path))
@@ -534,5 +538,335 @@ def test_fetch_commandcode_drops_paid_and_reports_inconclusive(monkeypatch):
     assert not any("glm" in i for i in ids), ids
     assert all(m.get("verified") is True for m in out), out
 
+def _opener(routes):
+    """Build a urlopen stand-in. `routes` maps a URL suffix to a callable
+    (req) -> (status, body) or an exception instance to raise."""
+    class _Resp:
+        def __init__(self, status, payload):
+            self.status = status
+            self._payload = payload
+
+        def read(self, *_a):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _open(req, timeout=None):
+        for suffix, action in routes.items():
+            if req.full_url.endswith(suffix):
+                if isinstance(action, BaseException):
+                    raise action
+                status, payload = action(req)
+                return _Resp(status, payload)
+        raise AssertionError(f"unexpected URL {req.full_url}")
+
+    return _open
+
+
+def _err(status, message):
+    import urllib.error
+    import json as _json
+    return urllib.error.HTTPError(
+        "https://opencode.ai/zen/v1", status, "e", {},
+        __import__("io").BytesIO(_json.dumps({"error": {"message": message}}).encode()),
+    )
+
+
+def test_opencode_session_id_is_canonical():
+    """The gateway rejects any session shape but this one.
+
+    Measured live 2026-10-01: `ses_`+32hex -- what config.go used to emit -- is
+    answered 403 FreeTierError, so a regression here is a production 403, not a
+    cosmetic drift.
+    """
+    pattern = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+    for _ in range(50):
+        sid = ff.opencode_session_id()
+        assert pattern.match(sid), sid
+    assert not pattern.match("ses_" + "a" * 32), "old shape must not validate"
+    assert not pattern.match("ctx:abcdef0123456789"), "gateway id must not validate"
+
+
+def test_opencode_gate_bodies_satisfy_every_documented_condition():
+    """stream=true plus both `bash` and `read` in tools, per envelope.
+
+    Measured: `read`+`edit`+`glob`, one `bash`, and two arbitrary names were all
+    403. So this asserts the exact pair, not merely that tools is non-empty.
+    """
+    paths = dict(ff.opencode_gate_bodies("m"))
+    assert set(paths) == {"/chat/completions", "/responses"}
+    for path, raw in paths.items():
+        body = json.loads(raw)
+        assert body["stream"] is True, path
+        assert body["model"] == "m", path
+        names = set()
+        for tool in body["tools"]:
+            if path == "/responses":
+                names.add(tool["name"])
+            else:
+                names.add(tool["function"]["name"])
+        assert names == {"bash", "read"}, (path, names)
+
+
+def test_opencode_probe_accepts_either_protocol():
+    """A model may answer 400 on one protocol and 200 on the other.
+
+    `muse-spark-1.3-contributor-free` -- the model in oh-my-pi#12306 -- answers
+    `400 Model does not support this protocol` on /chat/completions and 200 on
+    /responses. Probing only the first reports a working model as dead.
+    """
+    def routes(req):
+        if req.full_url.endswith("/chat/completions"):
+            return 400, b'{"error":{"message":"Model does not support this protocol."}}'
+        return 200, b'{"type":"response.created"}'
+
+    verdict, detail = ff.opencode_probe("muse-spark-1.3-contributor-free", "k",
+                                        opener=_opener({"": routes}))
+    assert verdict == "ok", detail
+    assert "/responses" in detail, detail
+
+
+def test_opencode_probe_403_is_freetier_but_400_is_only_an_error():
+    """403 means "key is not entitled"; 400 means "I asked it the wrong question".
+
+    Collapsing the second into the first is what deleted 8 working models from
+    the chains.
+    """
+    verdict, _ = ff.opencode_probe("m", "k", opener=_opener({
+        "": lambda req: (_ for _ in ()).throw(_err(403, "free tier"))}))
+    assert verdict == "freetier"
+
+    verdict, detail = ff.opencode_probe("m", "k", opener=_opener({
+        "": lambda req: (_ for _ in ()).throw(_err(400, "Model is unavailable."))}))
+    assert verdict == "error", detail
+    assert "Model is unavailable" in detail, detail
+
+
+def test_opencode_probe_aborts_the_sweep_on_429(monkeypatch):
+    """A 429 is a property of the KEY, so it must abort rather than grind on.
+
+    Retrying per candidate is what turned a rate-limited run into a ~40 minute
+    hang: 12 candidates x 2 protocols x 3 attempts, each with a backoff sleep and
+    a 30s request timeout. One exhausted 429 on the FIRST protocol has to be
+    enough, and it must not surface as any verdict at all.
+    """
+    slept = []
+    monkeypatch.setattr(ff.time, "sleep", slept.append)
+    calls = []
+
+    def routes(req):
+        calls.append(req.full_url)
+        return 429, b'{"error":{"message":"Rate limit exceeded."}}'
+
+    with pytest.raises(ff.OpenCodeRateLimited):
+        ff.opencode_probe("m", "k", opener=_opener({"": routes}))
+    # One protocol only, and it gives up after OPENCODE_429_RETRIES attempts.
+    assert len(calls) == ff.OPENCODE_429_RETRIES, len(calls)
+    # A sleep BETWEEN retries, but not a pointless one after the last attempt.
+    assert len(slept) == ff.OPENCODE_429_RETRIES - 1, slept
+
+
+def test_rate_limited_sweep_keeps_models_unverified_not_dead(monkeypatch, capsys):
+    """The dangerous failure is a throttled run silently deleting models.
+
+    That is exactly the regression this probe was rebuilt to undo, so a 429 has
+    to leave the untried candidates in the list marked unverified.
+    """
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {
+        "data": [{"id": f"m{i}-free"} for i in range(6)],
+    })
+    monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
+
+    def _always_429(model_id, key, opener=None):
+        raise ff.OpenCodeRateLimited("429")
+
+    monkeypatch.setattr(ff, "opencode_probe", _always_429)
+    out = ff.fetch_opencode()
+    assert len(out) == 6, [m["id"] for m in out]
+    assert all(m.get("unverified_reason") for m in out), out
+    assert not any(m.get("verified") is False for m in out), \
+        "a rate limit must never be recorded as a dead model"
+    err = capsys.readouterr().err
+    assert "rate limited" in err, err
+    assert "rejected unusable" not in err, err
+
+
+def test_sweep_stops_at_the_probe_budget(monkeypatch, capsys):
+    """A slow gateway must not stall the nightly sync forever, and overrunning
+    the budget must again leave the remainder unverified rather than rejected."""
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {
+        "data": [{"id": f"m{i}-free"} for i in range(5)],
+    })
+    monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_BUDGET", -1.0)
+    monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(ff, "opencode_probe",
+                        lambda *a, **k: pytest.fail("must not probe past the budget"))
+
+    out = ff.fetch_opencode()
+    assert len(out) == 5, [m["id"] for m in out]
+    assert all(m.get("unverified_reason") for m in out), out
+    err = capsys.readouterr().err
+    assert "budget" in err, err
+    assert "rejected unusable" not in err, err
+
+
+def test_opencode_headers_carry_the_gate_preconditions():
+    h = ff.opencode_headers("k")
+    assert h["User-Agent"].startswith("opencode/")
+    assert re.match(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$", h["x-opencode-session"])
+    assert h["Authorization"] == "Bearer k"
+
+
+def test_probe_endpoint_uses_the_gate_body_for_opencode():
+    """`big-pickle` was recorded permanently dead because its probe 403'd on its
+    own request shape."""
+    sent = {}
+
+    def opener(req, timeout=None):
+        sent["body"] = json.loads(req.data)
+        sent["url"] = req.full_url
+        class _R:
+            status = 200
+            def read(self, *_a): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return _R()
+
+    res = ff.probe_endpoint("https://opencode.ai/zen/v1", "big-pickle", "k",
+                            ff.opencode_headers("k"), opener=opener,
+                            opencode_gate=True)
+    assert res["verdict"] == "live", res
+    assert sent["body"]["stream"] is True, sent["body"]
+    names = {t["function"]["name"] for t in sent["body"]["tools"]}
+    assert names == {"bash", "read"}, names
+
+
+def test_mark_unverified_leaves_verified_unset():
+    """Never-probed must mean `unknown`, not `dead`.
+
+    regenerate_config.py reads the field three ways: True -> live, False -> dead
+    (the provider refused), absent/None -> unknown (never asked). Writing False
+    for a model that was never probed declared it dead, so a run without a key
+    dropped the very endpoints the probe exists to protect.
+    """
+    out = ff._mark_unverified([{"id": "m"}], "test")
+    assert out[0].get("verified") is None, out
+    assert "verified" not in out[0], f"the key must be absent, not False: {out}"
+    assert "test" in out[0]["unverified_reason"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_probe_cache_round_trips(tmp_path, monkeypatch):
+    """A steady-state sync must spend no probe calls at all."""
+    cache_file = tmp_path / "opencode-probe-cache.json"
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", cache_file)
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {
+        "data": [{"id": "m1-free"}, {"id": "m2-free"}],
+    })
+    monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
+
+    probed = []
+    monkeypatch.setattr(ff, "opencode_probe",
+                        lambda m, k, opener=None: (probed.append(m), ("ok", "/chat/completions 200"))[1])
+
+    first = ff.fetch_opencode()
+    assert len(first) == 2 and probed == ["m1-free", "m2-free"]
+    assert cache_file.exists(), "the first sweep must persist its verdicts"
+
+    probed.clear()
+    second = ff.fetch_opencode()
+    assert len(second) == 2
+    assert probed == [], f"a cached sweep must not call the network: {probed}"
+    assert all(m.get("verified") is True for m in second), second
+
+
+def test_probe_cache_expires_negatives_far_faster_than_positives(tmp_path, monkeypatch):
+    """Asymmetric TTL is the safety property, not an optimisation.
+
+    A cached `ok` going stale costs a chain entry that may 403 briefly. A cached
+    `freetier` going stale for a week would keep a working model OUT of the
+    chains for a week -- exactly the regression this probe was rebuilt to undo.
+    """
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_OK_TTL_HOURS", 168)
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_NEG_TTL_HOURS", 24)
+    assert ff.opencode_probe_cache_ttl_hours("ok") == 168
+    assert ff.opencode_probe_cache_ttl_hours("freetier") == 24
+    assert ff.opencode_probe_cache_ttl_hours("error") == 24
+
+    old = datetime.now(UTC) - timedelta(hours=30)
+    stamp = old.isoformat().replace("+00:00", "Z")
+    cache_file = tmp_path / "c.json"
+    cache_file.write_text(json.dumps({"probes": {
+        "good-free": {"verdict": "ok", "checked_at": stamp},
+        "gone-free": {"verdict": "freetier", "checked_at": stamp},
+    }}))
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", cache_file)
+
+    live = ff.load_opencode_probe_cache()
+    assert "good-free" in live, "a 30h-old positive verdict must survive"
+    assert "gone-free" not in live, "a 30h-old negative verdict must be re-probed"
+
+
+def test_probe_cache_ignores_garbage_and_never_raises(tmp_path, monkeypatch):
+    """A cache miss is always safe; a cache read must never cost the model list."""
+    bad = tmp_path / "c.json"
+    for payload in ("not json at all", "[]", '{"probes": "nope"}',
+                    '{"probes": {"m": {"verdict": "bogus"}}}',
+                    '{"probes": {"m": {"verdict": "ok", "checked_at": "nonsense"}}}'):
+        bad.write_text(payload)
+        monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", bad)
+        assert ff.load_opencode_probe_cache() == {}, payload
+
+    missing = tmp_path / "absent.json"
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", missing)
+    assert ff.load_opencode_probe_cache() == {}
+
+
+def test_refresh_env_forces_a_live_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", tmp_path / "c.json")
+    (tmp_path / "c.json").write_text(json.dumps({"probes": {
+        "m1-free": {"verdict": "ok", "checked_at":
+                    ff.datetime.now(ff.UTC).isoformat().replace("+00:00", "Z")},
+    }}))
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {"data": [{"id": "m1-free"}]})
+    monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("REFRESH_OPENCODE_PROBE", "1")
+    monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
+
+    probed = []
+    monkeypatch.setattr(ff, "opencode_probe",
+                        lambda m, k, opener=None: (probed.append(m), ("ok", "200"))[1])
+    ff.fetch_opencode()
+    assert probed == ["m1-free"], "REFRESH_OPENCODE_PROBE=1 must ignore the cache"
+
+
+def test_rate_limited_run_does_not_persist_a_half_finished_pass(tmp_path, monkeypatch):
+    """A sweep that stopped early must not become a week of cached verdicts."""
+    cache_file = tmp_path / "c.json"
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", cache_file)
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {
+        "data": [{"id": "m1-free"}, {"id": "m2-free"}, {"id": "m3-free"}],
+    })
+    monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
+
+    def _first_only(model_id, key, opener=None):
+        if model_id == "m1-free":
+            return "ok", "/chat/completions 200"
+        raise ff.OpenCodeRateLimited("429")
+
+    monkeypatch.setattr(ff, "opencode_probe", _first_only)
+    out = ff.fetch_opencode()
+    assert len(out) == 3, [m["id"] for m in out]
+    saved = json.loads(cache_file.read_text())["probes"]
+    assert set(saved) == {"m1-free"}, saved

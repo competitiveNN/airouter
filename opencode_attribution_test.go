@@ -69,7 +69,15 @@ var nonAttributionProviders = []string{
 }
 
 var (
-	sesIDPattern = regexp.MustCompile(`^ses_[0-9a-f]{32}$`)
+	// sesIDPattern is the canonical OpenCode session shape, `ses_<12 hex><14 base62>`.
+	//
+	// This is load-bearing, not cosmetic: measured live against
+	// opencode.ai/zen/v1 on 2026-10-01, a session id in any other shape --
+	// including the `ses_`+32hex this file used to accept, and the `ctx:<hex>`
+	// airouter uses internally -- is answered with `403 FreeTierError` even when
+	// every other free-tier condition holds. A green test against the old
+	// pattern meant the request would have been rejected in production.
+	sesIDPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 	msgIDPattern = regexp.MustCompile(`^msg_[0-9a-f]{32}$`)
 )
 
@@ -147,12 +155,13 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 	// The two generated ids must be well-formed AND distinct from each other.
 	// Sharing a value would collapse every request into one upstream identity,
 	// which is the fingerprinting the per-call generation exists to prevent.
-	// The session id is exempt when a caller pinned it: buildRequest overrides
-	// it with the gateway's own session id for upstream cache affinity, and
-	// that is asserted separately.
-	if got := h["x-opencode-session"]; got != "" && !strings.HasPrefix(got, "ctx:") {
+	// The session id is always the canonical form, whether generated or derived
+	// from the gateway session, so there is no exemption to carve out here any
+	// more: buildRequest maps the `ctx:<hex>` gateway id through
+	// opencodeSessionFor because the gateway rejects that shape outright.
+	if got := h["x-opencode-session"]; got != "" {
 		if !sesIDPattern.MatchString(got) {
-			t.Errorf("%s: x-opencode-session = %q, want ses_ + 32 hex chars", where, got)
+			t.Errorf("%s: x-opencode-session = %q, want ses_<12hex><14base62>", where, got)
 		}
 		if h["x-opencode-session"] == h["x-opencode-request"] {
 			t.Errorf("%s: session and request ids are identical (%q); they must be independent",
@@ -259,18 +268,40 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 
 	t.Run("session id is pinned to the gateway session", func(t *testing.T) {
 		// Sticky routing is only cache-effective upstream if the same session
-		// presents the same id on every request, so the passed-in session id
-		// must win over the generated one.
+		// presents the same id on every request. The gateway id itself is
+		// `ctx:<hex>`, which the gateway answers with 403, so it is mapped onto
+		// the canonical form rather than forwarded.
 		const sid = "ctx:abcdef0123456789"
 		h := build(t, "opencode", nil, sid)
-		if got := h["x-opencode-session"]; got != sid {
-			t.Errorf("x-opencode-session = %q, want the gateway session id %q", got, sid)
+		want := opencodeSessionFor(sid)
+		if got := h["x-opencode-session"]; got != want {
+			t.Errorf("x-opencode-session = %q, want %q", got, want)
+		}
+		if h["x-opencode-session"] == sid {
+			t.Errorf("x-opencode-session = %q, want the ctx: id mapped, not forwarded raw",
+				h["x-opencode-session"])
 		}
 		// Still well-formed for the request id, which is always generated.
 		if got := h["x-opencode-request"]; !msgIDPattern.MatchString(got) {
 			t.Errorf("x-opencode-request = %q, want msg_ + 32 hex chars", got)
 		}
 		assertAttributionPresent(t, "pinned session", h)
+	})
+
+	t.Run("same gateway session always maps to the same opencode session", func(t *testing.T) {
+		// The whole point of pinning is prompt-cache affinity, which breaks if
+		// the id is re-minted per request.
+		const sid = "ctx:deadbeefcafebabe"
+		first := build(t, "opencode", nil, sid)["x-opencode-session"]
+		for i := 0; i < 5; i++ {
+			if got := build(t, "opencode", nil, sid)["x-opencode-session"]; got != first {
+				t.Fatalf("call %d: x-opencode-session = %q, want the stable %q", i, got, first)
+			}
+		}
+		other := build(t, "opencode", nil, "ctx:0000000000000000")["x-opencode-session"]
+		if other == first {
+			t.Errorf("two different gateway sessions both mapped to %q", first)
+		}
 	})
 
 	t.Run("config headers override the synthesized ones", func(t *testing.T) {
@@ -285,6 +316,57 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 		}
 		if got := h["x-custom"]; got != "yes" {
 			t.Errorf("X-Custom = %q, want %q from the config headers", got, "yes")
+		}
+	})
+}
+
+// TestOpencodeSessionIDShape pins the generated and derived session ids to the
+// one shape the gateway accepts.
+//
+// This is the single highest-impact assertion in the file. Measured live
+// against opencode.ai/zen/v1 on 2026-10-01: a session id in any other shape is
+// answered `403 FreeTierError` even when every other free-tier condition is met.
+// The two shapes this code previously emitted -- `ses_`+32hex from
+// opencodeRequestHeaders, and the raw `ctx:<hex>` that buildRequest forwarded --
+// were both measured 403, so both were production outages that the old
+// `^ses_[0-9a-f]{32}$` pattern happily passed.
+func TestOpencodeSessionIDShape(t *testing.T) {
+	t.Run("generated ids are canonical and unique", func(t *testing.T) {
+		seen := make(map[string]bool, 64)
+		for i := 0; i < 64; i++ {
+			id := opencodeSessionID()
+			if !sesIDPattern.MatchString(id) {
+				t.Fatalf("opencodeSessionID() = %q, want ses_<12hex><14base62>", id)
+			}
+			if seen[id] {
+				t.Fatalf("opencodeSessionID() repeated %q", id)
+			}
+			seen[id] = true
+		}
+	})
+
+	t.Run("derived ids are canonical, deterministic and collision-free", func(t *testing.T) {
+		for _, sid := range []string{
+			"ctx:abcdef0123456789",
+			"ctx:",
+			"",
+			"not-a-session",
+		} {
+			got := opencodeSessionFor(sid)
+			if !sesIDPattern.MatchString(got) {
+				t.Errorf("opencodeSessionFor(%q) = %q, want ses_<12hex><14base62>", sid, got)
+			}
+			if again := opencodeSessionFor(sid); again != got {
+				t.Errorf("opencodeSessionFor(%q) is not deterministic: %q then %q", sid, got, again)
+			}
+			// The whole point of deriving rather than forwarding: the gateway id
+			// must not reach the gateway, because it is a rejected shape.
+			if got == sid {
+				t.Errorf("opencodeSessionFor(%q) returned the input unchanged", sid)
+			}
+		}
+		if a, b := opencodeSessionFor("ctx:a"), opencodeSessionFor("ctx:b"); a == b {
+			t.Errorf("distinct gateway sessions collided on %q", a)
 		}
 	})
 }

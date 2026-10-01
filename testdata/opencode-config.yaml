@@ -16,14 +16,27 @@
 # reach kilo-auto/free, so scripts/validate-config.py rejects it. It is a test
 # fixture, not a deployment target.
 #
-# Only space-bunny-free is listed because it is the single OpenCode model this
-# key is entitled to. Every other OpenCode free model (mimo-v2.5-free,
-# nemotron-3.5-lightning-free, jev-1.13-free, muse-spark-1.3-contributor-free,
-# longcat-2.5-preview-free, ...) answers 403 FreeTierError "OpenCode's free tier
-# can only be used from within OpenCode" even WITH the client-attribution headers
-# the gateway synthesizes, so listing them would make this fixture fail for a
-# reason that has nothing to do with routing. Regenerate this list only from a
-# probe that actually got a 200.
+# Only space-bunny-free is listed, and that is a deliberate choice, not the
+# limit of what this key can serve.
+#
+# It answers HTTP 200 regardless of request shape, so it isolates what this
+# fixture is FOR: chain selection, the synthesized attribution headers, sticky
+# session pinning and streaming. Adding a gate-dependent model here would make a
+# 403 mean "the check forgot the free-tier gate" instead of "routing broke".
+#
+# The earlier comment here claimed space-bunny-free was "the single OpenCode
+# model this key is entitled to" and that everything else 403'd "even WITH the
+# client-attribution headers". That was wrong, and it was wrong because of a
+# probe defect rather than an entitlement: the gateway's free-tier gate also
+# requires stream=true and a `tools` array containing both `bash` and `read`,
+# which the probe did not send. Re-probed with the full gate satisfied on
+# 2026-10-01, this key reaches 9 of 12 listed models; only jev-1.13-free,
+# deepseek-v4-flash-free and ling-3.0-flash-fin-free are genuinely unusable.
+# See the OPENCODE gate notes in fetch-free-models.py.
+#
+# To exercise a gate-dependent model instead, use mimo-v2.5-free or
+# big-pickle (both chat/completions) or muse-spark-1.3-contributor-free
+# (/responses only) and send a stream=true body carrying the bash+read pair.
 providers:
   opencode:
     url: https://opencode.ai/zen/v1
