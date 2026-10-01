@@ -1328,6 +1328,15 @@ func (r *Router) ApplyCooldownFromErrorForSession(ep *ModelEndpoint, err error, 
 	var providerErr *ProviderError
 	if errors.As(err, &providerErr) {
 		statusCode = providerErr.StatusCode
+	} else {
+		// Not every failure is a ProviderError. A transport error, a parse
+		// failure, or an SSE error event carries no HTTP status, and leaving
+		// it at 0 made the cooldown classifier treat "unknown" as
+		// "probably permanent". Honour a Status() method when one is offered.
+		var statuser interface{ Status() int }
+		if errors.As(err, &statuser) {
+			statusCode = statuser.Status()
+		}
 	}
 	errMsg := err.Error()
 	retryAfter := time.Duration(0)
@@ -1375,7 +1384,17 @@ func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration 
 	// Transient: escalate but bound the total. Use a gentler exponential-ish
 	// curve so a persistently rate-limited model backs off to minutes (not
 	// seconds) instead of hammering it every 60s forever.
-	if statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
+	//
+	// statusCode == 0 is TRANSIENT and belongs here, not below. Zero means "no
+	// HTTP status at all": a transport error (timeout, connection reset), a parse
+	// failure, or an upstream SSE error event. Those are the most transient
+	// failures there are, and treating "unknown" as "probably permanent" was
+	// actively harmful: it skipped the bounded-escalation branch entirely and
+	// fell through to the soft-ban branch, so THREE consecutive network timeouts
+	// took an endpoint out for 24 hours (and TEN for a week). Live on
+	// 2026-10-01: 15 of 23 cooldown entries carried status_code 0, mostly
+	// `net/http: timeout awaiting response headers`.
+	if statusCode == 0 || statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
 		factor := time.Duration(errorCount)
 		if factor > 10 {
 			factor = 10
