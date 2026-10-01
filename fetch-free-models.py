@@ -702,6 +702,231 @@ def _mark_unverified(models: list[dict[str, Any]], reason: str) -> list[dict[str
     return models
 
 
+# ── Auto-fallback liveness probe (--probe-auto) ─────────────────────────────────
+#
+# Every chain ends on a meta-router (kilocode `kilo-auto/free`, opencode
+# `big-pickle`). regenerate_config.py refuses to write a terminator it knows to
+# be dead, but it can only honour that if the fetcher says something about the
+# two auto routers — and the ordinary opencode pass only covers models the
+# listing advertises as free, which excludes opencode/big-pickle entirely. Left
+# unprobed, the generator had no evidence for the provider it actually picks and
+# its guard could never fire.
+#
+# The probe answers one question per auto router: can this key make ONE 1-token
+# call to it right now? The verdict vocabulary is deliberately three-valued:
+#
+#   live     a real completion came back. The endpoint can serve.
+#   dead     the provider REFUSED it: 400/401/402/403/404, or a 200 whose body
+#            is an error envelope. This is a statement about entitlement or
+#            existence, not about today, so it is safe to act on.
+#   unknown  we could not find out: 429 (the key is fine, the bucket is empty),
+#            any 5xx, a timeout, a DNS/TLS/connection error, or an unreadable
+#            body. A transport blip says nothing about the endpoint.
+#
+# Collapsing `unknown` into `dead` is the bug this split exists to prevent: it
+# would make one flaky network turn into "this endpoint is permanently gone",
+# and regenerate_config.py aborts the whole regeneration on a confirmed-dead
+# terminator. A dropped connection must never be able to block a sync.
+AUTO_PROBE_TARGETS = (
+    # (provider, models endpoint, model id, api key env, extra headers)
+    ("kilocode", "https://api.kilo.ai/api/gateway/v1", "kilo-auto/free", "KILOCODE_API_KEY", {}),
+    (
+        "opencode",
+        OPENCODE_ENDPOINT,
+        "big-pickle",
+        "OPENCODE_API_KEY",
+        {
+            # Mirrors opencodeRequestHeaders() in config.go.
+            "User-Agent": "opencode/1.18.31/cli",
+            "x-opencode-client": "cli",
+            "x-opencode-session": "ses_probe",
+            "x-opencode-request": "msg_probe",
+            "x-opencode-project": "default",
+        },
+    ),
+)
+
+# HTTP statuses that mean "this provider will not serve this model", as opposed
+# to "ask again later". 429 is deliberately absent: it is a rate limit on a
+# working key, which is transient by definition.
+PROBE_DEAD_STATUSES = frozenset({400, 401, 402, 403, 404})
+
+# Probe timeout, deliberately shorter than the listing TIMEOUT (30s). A probe is
+# a liveness check for ONE 1-token call on the critical path of the nightly
+# sync: if the provider is that slow, the honest answer is `unknown`, and
+# waiting longer only delays the model list to learn nothing. Pinned as its own
+# constant so the third bucket is a decision, not an accident of the listing
+# fetcher's timeout.
+PROBE_TIMEOUT = 20
+
+
+def classify_probe_status(status: int, body: bytes = b"") -> str:
+    """Map an HTTP response to "live" / "dead" / "unknown".
+
+    Split out from the network call so the verdict table is unit-testable
+    without a socket — the distinction that matters (403 is a verdict, 429 is
+    not) is exactly the one a live probe cannot demonstrate reliably.
+    """
+    if status == 429 or status >= 500:
+        return "unknown"
+    if status in PROBE_DEAD_STATUSES:
+        return "dead"
+    if 200 <= status < 300:
+        if not body:
+            return "live"
+        try:
+            parsed = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return "unknown"
+        return "dead" if isinstance(parsed, dict) and parsed.get("error") else "live"
+    return "unknown"
+
+
+def probe_endpoint(endpoint: str, model_id: str, api_key: str,
+                   extra_headers: dict[str, str] | None = None,
+                   opener: Any = None) -> dict[str, Any]:
+    """Send one 1-token chat completion and return a verdict record.
+
+    Never raises: a probe that cannot reach the provider is `unknown`, not an
+    exception, because this runs inside the nightly sync and a hard failure
+    would lose the whole model list. `opener` is injectable so the timeout and
+    the error classification can be exercised without a socket or a real wait.
+    """
+    body = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }).encode()
+    headers = {
+        **HEADERS,
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        **(extra_headers or {}),
+    }
+    checked_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    req = urllib.request.Request(endpoint + "/chat/completions", data=body, headers=headers)
+    open_url = opener or urllib.request.urlopen
+    try:
+        with open_url(req, timeout=PROBE_TIMEOUT) as resp:
+            payload = resp.read()
+            verdict = classify_probe_status(resp.status, payload)
+            status: int | None = resp.status
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read()
+        except Exception:  # noqa: BLE001 - body is best-effort context only
+            payload = b""
+        verdict = classify_probe_status(e.code, payload)
+        status = e.code
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return {
+            "verdict": "unknown",
+            "status": None,
+            "detail": f"transport: {e}",
+            "checked_at": checked_at,
+        }
+    except Exception as e:  # noqa: BLE001 - a probe must not lose the model list
+        # ssl.SSLError, http.client.RemoteDisconnected and friends are not
+        # OSError subclasses on every Python build, and this runs inside the
+        # nightly sync. Any failure to reach a verdict is `unknown`; the stderr
+        # line below is what makes a systematically broken probe visible.
+        print(f"Auto probe: unexpected {type(e).__name__}: {e}", file=sys.stderr)
+        return {
+            "verdict": "unknown",
+            "status": None,
+            "detail": f"unexpected {type(e).__name__}: {e}",
+            "checked_at": checked_at,
+        }
+    detail = {
+        "live": "1-token completion returned",
+        "dead": f"provider refused the model (HTTP {status})",
+        "unknown": f"no verdict (HTTP {status})",
+    }[verdict]
+    return {"verdict": verdict, "status": status, "detail": detail, "checked_at": checked_at}
+
+
+def probe_auto_fallbacks(
+    models: list[dict[str, Any]],
+    environ: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Probe every auto router and stamp the verdict onto the model list.
+
+    A router that is already in the list (kilocode's `kilo-auto/free` is: it is
+    a free-tier model) gets its `verified` field set in place. A router the
+    provider does not offer for free (opencode's `big-pickle`, which the
+    listing hides behind a paywall) has no record to stamp, so a minimal
+    `probe_only` record is appended: the JSON is a list because every consumer
+    expects one, and this is the only way the generator can see a verdict for
+    the endpoint it is about to write. Probe-only records carry no score, so
+    they can never be selected as a chain candidate, and regenerate_config.py
+    re-checks that explicitly.
+
+    Re-running is idempotent: records are looked up by (provider, id) before any
+    append, so a second run over a list that already carries them stamps in
+    place. Appending unconditionally would grow the file by one record per
+    router per run, for as long as the list is kept.
+
+    Set SKIP_AUTO_PROBE=1 for offline or fixture-driven runs (CI, a local
+    regeneration with no egress). Nothing is probed and no verdict is touched,
+    so an existing list keeps the verdicts it already had and a fresh list has
+    none — which the generator reads as "unprobed", never as "dead".
+    """
+    env = os.environ if environ is None else environ
+    if env.get("SKIP_AUTO_PROBE") == "1":
+        print(
+            "Auto probe: !!! SKIP_AUTO_PROBE=1 — no terminator verdicts recorded. "
+            "The generator will treat both routers as unprobed, which keeps "
+            "kilocode (never opencode) but cannot detect an outage. Do not leave "
+            "this set in a scheduled sync.",
+            file=sys.stderr,
+        )
+        return models
+    by_id = {(m.get("provider"), m.get("id")): m for m in models}
+    for provider, endpoint, model_id, key_env, extra in AUTO_PROBE_TARGETS:
+        api_key = env.get(key_env, "")
+        if not api_key:
+            print(
+                f"Auto probe: {key_env} unset, skipping {provider}/{model_id}",
+                file=sys.stderr,
+            )
+            continue
+        result = probe_endpoint(endpoint, model_id, api_key, extra)
+        record = by_id.get((provider, model_id))
+        if record is None:
+            record = {
+                "id": model_id,
+                "name": model_id,
+                "provider": provider,
+                "context_length": 0,
+                "intelligence": None,
+                "elo": None,
+                "released": None,
+                "pricing": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0},
+                "capabilities": {"reasoning": False, "vision": False, "open_weights": False},
+                "source": provider,
+                "fetched_at": result["checked_at"],
+                "raw": {},
+                "probe_only": True,
+            }
+            models.append(record)
+            by_id[(provider, model_id)] = record
+        record["auto_probe"] = result
+        # `verified` is the field the generator acts on, and False must mean
+        # "confirmed dead" only — an unknown verdict leaves it unset (None).
+        if result["verdict"] == "live":
+            record["verified"] = True
+        elif result["verdict"] == "dead":
+            record["verified"] = False
+        else:
+            record.pop("verified", None)
+            record["unverified_reason"] = f"auto probe: {result['detail']}"
+        print(
+            f"Auto probe: {provider}/{model_id} -> {result['verdict']} ({result['detail']})",
+            file=sys.stderr,
+        )
+    return models
+
+
 def opencode_probe(model_id: str, api_key: str) -> str:
     """Send one minimal chat completion to OpenCode and classify the result.
 
@@ -1324,6 +1549,15 @@ def main() -> None:
     parser.add_argument("--google-ai-studio-only", action="store_true", help="Only fetch from Google AI Studio API")
     parser.add_argument("--nvidia-nim-only", action="store_true", help="Only fetch from NVIDIA NIM API")
     parser.add_argument("--commandcode-only", action="store_true", help="Only fetch from CommandCode API")
+    parser.add_argument(
+        "--probe-auto",
+        action="store_true",
+        help="Probe the two chain terminators (kilocode kilo-auto/free, opencode big-pickle) "
+             "with a real 1-token completion and record a live/dead/unknown verdict for each. "
+             "regenerate_config.py acts on the verdict: it never writes a terminator known to "
+             "be dead, and only treats a verdict as evidence when the provider REFUSED the "
+             "call (a 429, 5xx or timeout is recorded as unknown, never as dead).",
+    )
     args = parser.parse_args()
 
     # Default to table if no format specified
@@ -1499,6 +1733,11 @@ def main() -> None:
         by_source[m["source"]] += 1
     summary = ", ".join(f"{k}={v}" for k, v in sorted(by_source.items()))
     print(f"Total models: {len(all_models)} ({summary})", file=sys.stderr)
+
+    # Auto-fallback liveness: runs last so a probe-only record never passes
+    # through the enrichment, smart-floor, hide-list or first-seen passes.
+    if args.probe_auto:
+        all_models = probe_auto_fallbacks(all_models)
 
     # Output
     if args.json:

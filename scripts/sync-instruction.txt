@@ -2,6 +2,17 @@ Task: regenerate the fallback chains in ./config.yaml from the freshly fetched
 free-model list in /tmp/free-models.json (output of fetch-free-models.py).
 Read /tmp/free-models.json and ./config.yaml before editing anything.
 
+When you are done, run `python3 scripts/check-rules.py`. It enforces rules 3-11
+below against the fetched model list (key-group completeness, terminator,
+vision/score sync, no dead or invented ids); the nightly sync restores the
+previous config if it reports anything. Do not hand-verify instead of running it.
+
+Offline or fixture-driven regeneration: set SKIP_AUTO_PROBE=1 so the fetcher
+touches no network and leaves existing verdicts alone. The generator then reads
+both routers as unprobed, which keeps kilocode and cannot detect an outage —
+and check-rules.py will flag any chain whose comment still claims a live probe,
+so an offline run cannot leave a claim the data does not support.
+
 Rules:
 
 1. The `providers:` section stays unchanged. Only rewrite the `models:` section.
@@ -55,32 +66,63 @@ Rules:
    by the YAML parser but is permanently unroutable, because
    /v1/chat/completions rejects it with "Unknown model". Do not add one.
    - smart: strongest generalists, intelligence >= 25, any context length.
-   - work:  coding workhorses. Same pool as smart plus dedicated code models
-     (e.g. cohere/north-mini-code). Drop tiny models (intelligence < 15).
+   - work:  coding workhorses: the same pool as smart, extended down to
+     intelligence >= 15. The tiny-model drop (intelligence < 15) is NOT waived
+     for dedicated code models, so cohere/north-mini-code (9.9) stays out of
+     `work`; it qualifies only through `large` (256,000 ctx).
    - fast:  small/cheap models only: intelligence < 25, or ids containing
-     flash-lite / lightning / nano / gemma / lfm / laguna-xs. Cap at 10 entries.
+     flash-lite / lightning / nano / gemma / lfm / laguna-xs. Cap at 10
+     DISTINCT MODELS, counted before the nvidia trio / commandcode pair
+     expansion, so the rendered chain can be longer than 10 entries.
    - large: context_length >= 200000 only. Sort by context_length desc, then
      intelligence desc.
 
 6. The LAST entry of EVERY chain is that profile's auto fallback. It must be an
-   endpoint that can actually be called — never a model that 403s:
-   - if the chain contains `kilocode` endpoints -> provider `kilocode`,
-     model `kilo-auto/free`
-   - otherwise -> whichever auto model is present, else default to
-     `kilocode`/`kilo-auto/free`
+   endpoint that can actually be called — never a model that 403s. The choice
+   is made on a PROBE VERDICT, never on a count:
+   - preferred = `opencode`/`big-pickle` only when the chain contains opencode
+     endpoints and no kilocode ones; otherwise `kilocode`/`kilo-auto/free`.
+   - `fetch-free-models.py --probe-auto` records a verdict per router in the
+     model list (`verified`): true = a real 1-token completion came back,
+     false = the provider REFUSED the call (4xx), absent = no verdict (not
+     probed, or the probe hit a 429/5xx/timeout).
+   - a verdict older than 7 days (AUTO_PROBE_MAX_AGE_DAYS) counts as no
+     verdict, and so does a `verified` with no `auto_probe.checked_at` — a
+     `live` that old is evidence the router existed, not that it works now,
+     and a fetcher that stops running must not pin the terminator forever.
+   - live OR no verdict -> use the preferred router. A missing verdict is
+     absence of evidence, not evidence of absence, so an unprobed, stale or
+     unreachable router must never move the terminator or block a sync.
+   - refused -> use the OTHER router, which is always available as a rescue
+     (so one degenerate chain cannot strand the other three), and ONLY if it
+     probed live. If nothing probed live, do not write the file at all: leave
+     config.yaml as it is and say why. A refused terminator fails every
+     exhausted request, so regenerating anyway would replace a working config
+     with a worse one.
+   - trailing comment records the choice, e.g.
+     `# last: kilocode (auto router probed live; opencode auto not entitled to
+     free tier)` or `# last: opencode (kilocode auto router probed dead)`.
+     scripts/check-rules.py compares that comment against the probe record, so
+     do not reword it by hand.
+   - a run that CANNOT obtain a verdict (no keys, SKIP_AUTO_PROBE=1, a stale
+     record, an offline fixture) must leave that comment exactly as it found
+     it. Do not "correct" a `probed live` you cannot verify into `not probed`:
+     the claim becomes unverifiable, not false, and check-rules.py reports
+     unverifiable separately from contradictory. A changed endpoint or a fresh
+     verdict is the only reason to write a new comment.
+
 
    Do NOT use a kilocode-vs-opencode count comparison to choose this. The
    opencode key authenticates but is not entitled to the free tier: 11 of its
-   12 models return 403 FreeTierError (paid `big-pickle` included). Choosing
-   `opencode`/`big-pickle` here once made the last-resort endpoint of the
-   `smart` chain a guaranteed failure. Prefer `kilocode`/`kilo-auto/free`
-   unless opencode is strictly the only provider left. Add a trailing comment
-   recording the choice, e.g. `# last: kilocode (only verified provider;
-   opencode unavailable)`.
+   12 models return 403 FreeTierError (paid `big-pickle` included, re-probed
+   2026-09-30). Choosing `opencode`/`big-pickle` here once made the last-resort
+   endpoint of the `smart` chain a guaranteed failure.
 
    Only models that survived verification in fetch-free-models.py appear in
    /tmp/free-models.json, so anything in that file is callable — the point is
-   to not re-add a model you know is dead.
+   to not re-add a model you know is dead. A `probe_only` record (a router the
+   provider does not advertise as free) carries a verdict and nothing else: it
+   is never a chain candidate.
 
   7. Vision capability: for every concrete (non-auto) endpoint you place in a
      chain, look up its source record in /tmp/free-models.json (same provider
@@ -102,11 +144,19 @@ Rules:
    x-preview-f-free.
 
   9. Preserve the existing YAML style: `provider:` / `model:` lines with aligned
-    trailing comments carrying the score and notable context size
-    (e.g. `# 51.8  131,072 ctx`). When a model also carries an "elo" field in the
-    JSON (arena.ai code leaderboard), append it to the comment
-    (e.g. `# 51.8 elo=1587  131,072 ctx`). Update the header comment block if the
-    distribution rules above changed relative to what it describes.
+    trailing comments carrying the score, and `floor` for a model whose score is
+    the synthetic smart-floor default rather than a benchmark. The context
+    window is a real `context_length:` field, NOT part of the comment (it is
+    what /v1/models advertises), so:
+        - provider: nvidia
+          model: z-ai/glm-5.3  # 44.8  elo=1623
+          vision: false
+          intelligence: 44.8
+          context_length: 131072
+    When a model also carries an "elo" field in the JSON (arena.ai code
+    leaderboard), append it to the comment (`# 44.8  elo=1623`). Update the
+    header comment block if the distribution rules above changed relative to
+    what it describes.
 
   10. Self-check after editing: every profile has a non-empty chain, every
       referenced provider exists in `providers:`, the last entry of each chain is

@@ -20,7 +20,12 @@ if [ -f "$PROJECT_DIR/.envrc" ]; then
 fi
 
 echo "[sync] fetching free model list..."
-python3 "$PROJECT_DIR/fetch-free-models.py" --json --save "$MODELS_JSON"
+# --probe-auto calls both chain terminators (kilocode kilo-auto/free, opencode
+# big-pickle) with one real 1-token completion each and records a
+# live/dead/unknown verdict in the model list. regenerate_config.py acts on it:
+# it will not write a refused terminator, and it treats "no verdict" (a 429, a
+# 5xx, a timeout) as no evidence at all. Two extra calls per run.
+python3 "$PROJECT_DIR/fetch-free-models.py" --json --probe-auto --save "$MODELS_JSON"
 
 cp "$PROJECT_DIR/config.yaml" "$BACKUP"
 
@@ -35,6 +40,20 @@ fi
 echo "[sync] validating config..."
 if ! python3 "$PROJECT_DIR/scripts/validate-config.py"; then
     echo "[sync] ERROR: invalid config, restoring previous one" >&2
+    cp "$BACKUP" "$PROJECT_DIR/config.yaml"
+    exit 1
+fi
+
+# Structural validity is not the same as obeying the distribution rules, and
+# only the second one needs the model list — which step 1 just wrote, so this is
+# the one place the rules are enforced against real data instead of asserted
+# from a transcript. Key-group completeness (the nvidia trio / commandcode
+# pair), the auto-fallback terminator, vision+intelligence sync against the
+# fetched records, and dead/invented ids all fail the sync here.
+echo "[sync] checking distribution rules against $MODELS_JSON..."
+if ! python3 "$PROJECT_DIR/scripts/check-rules.py" \
+        --config "$PROJECT_DIR/config.yaml" --models "$MODELS_JSON"; then
+    echo "[sync] ERROR: config violates the distribution rules, restoring previous one" >&2
     cp "$BACKUP" "$PROJECT_DIR/config.yaml"
     exit 1
 fi
