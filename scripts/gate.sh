@@ -103,8 +103,23 @@ START_FP=$(tree_fingerprint)
 # the repository, for the reason the routing log is out of tree.
 MTIME_SNAP="${TMPDIR:-/tmp}/airouter-gate-mtimes.$$"
 tracked_mtimes() {
-  git -C "$REPO" ls-files -z 2>/dev/null \
-    | xargs -0 -r stat -c '%Y %n' -- 2>/dev/null | sort
+  # The `cd` is load-bearing, not decoration. `git -C "$REPO" ls-files` emits
+  # paths RELATIVE to $REPO, but `xargs stat` resolves them against the current
+  # working directory -- so run the pipeline inside $REPO. Without it, stat
+  # cannot statx the files, the snapshot comes back EMPTY, `[ -s "$MTIME_SNAP" ]`
+  # is false, and the diagnostic on the INVALID RUN path silently never fires.
+  # It "worked" only because the gate is normally invoked from the repo root,
+  # which is the worst possible property for a diagnostic that exists to be
+  # trusted. Caught by test_invalid_run_names_the_paths_that_were_rewritten, which
+  # drives this function from a temp repo whose CWD is not the repo.
+  #
+  # %.9Y (nanoseconds), not %Y (seconds). With second resolution a file that is
+  # rewritten and restored inside the same second is indistinguishable from one
+  # that was never touched -- and that is PRECISELY the write-then-restore case
+  # this diagnostic exists to name. Measured: with %Y the snapshot of a file
+  # rewritten 1.2s later was byte-identical, and the diagnostic stayed silent.
+  ( cd "$REPO" && git ls-files -z 2>/dev/null \
+      | xargs -0 -r stat -c '%.9Y %n' -- 2>/dev/null | sort )
 }
 tracked_mtimes >"$MTIME_SNAP" 2>/dev/null || :
 
@@ -375,7 +390,14 @@ if [ "$END_FP" != "$START_FP" ]; then
   # tracked sources with identical content, so this cannot be an invalidation
   # rule. Here it just shortens the search.
   if [ -s "$MTIME_SNAP" ]; then
-    MOVED=$(tracked_mtimes 2>/dev/null | diff "$MTIME_SNAP" - 2>/dev/null | grep '^>' | awk '{print $2}')
+    # `grep '^>'` LEAVES the diff marker in the line, so the content fields are
+    # shifted by one: on a line `> 1790827943.28 config.yaml`, $2 is the
+    # TIMESTAMP and $3 is the path. `awk '{print $2}'` therefore printed
+    # timestamps and the diagnostic fired while naming nothing -- the worst
+    # possible failure for a thing whose entire purpose is naming a path.
+    # Strip the marker first, then drop the first (mtime) field, keeping the
+    # remainder whole so a path containing a space survives.
+    MOVED=$(tracked_mtimes 2>/dev/null | diff "$MTIME_SNAP" - 2>/dev/null | grep '^>' | sed 's/^> //' | cut -d' ' -f2-)
     if [ -n "$MOVED" ]; then
       echo "$P paths rewritten during the run (mtime advanced; content may or may"
       echo "$P not have changed):"
