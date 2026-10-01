@@ -39,3 +39,10 @@ cooldowns.priority.json
 # leaves the fingerprint alone.
 *.swp
 *.swo
+
+# Regenerator backups. `.gitignore` already covers *.bak, but
+# regenerate_config.py also writes config.yaml.bak2 on a second run in the same
+# session, and that one was NOT ignored: it showed up in `git status`, so it
+# participated in the gate's tree fingerprint and could turn a run INVALID for a
+# file nobody made by hand.
+*.bak2

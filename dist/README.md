@@ -151,28 +151,18 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `aa61d01` gate: stop on stale artifacts, execute the last two doc claims, and
   give the Go suite a size contract
-- `4ceef1a` attribution self-test: case 5 was passing on an unwritten premise, and
   a push exposed it
-- `af10ff9` gitignore: editor scratch files (*.swp, *.swo) — an untracked swap file
   in the checkout participates in the gate's tree fingerprint, so an editor opening
   a file mid-run turns the run INVALID
-- `2810e8a` AGENTS.md: record the git-checkout rule that cost 8 lines of
   uncommitted work — `git checkout -- <path>` on a dirty file discards the whole
   file, and the result is indistinguishable from a clean tree
-- `2fff96a` gate.sh: stage accounting, an unverified-by-design fingerprint limit,
   and the two routing stages documented as non-interchangeable
-- `ea2a303` shell-lint: lint untracked scripts as a NOTICE, not a rule — the
   tracked-only rule left just-written scripts unlinted
-- `2f09927` test-suite-baseline: record the three opencode attribution tests
-- `7a775a8` Add the OpenCode routing harness, its hermetic selftest, and the
   gate-invariant suite — live proof that the gateway routes to OpenCode, plus the
   hermetic proof that the check itself can fail
-- `d331467` gate.sh: fix two bugs in the INVALID RUN mtime diagnostic, and prove it
   fires — it printed timestamps instead of paths, and never fired at all unless
   the gate was run from the repo root
-- `3ffc79e` Cooldown: a failure with no HTTP status is transient, not a permanent
   ban — three consecutive network timeouts were serving a 24h ban (ten, a week),
   because "no status" fell through to the permanent-soft-ban branch instead of
   the bounded 5xx branch
@@ -192,14 +182,6 @@ Two properties make any such list awkward, and neither is a bug to be fixed:
     maintain this file are self-exempt. The exemption is by *confinement*, not by
     presence: a code change that also edits this file is still required to be
     listed, so nothing real can be laundered out of the handoff.
-  - `origin/master` can advance underneath the list. When it does, the checker
-- `4da7b54` config sync: forbid extra models: keys in the regeneration instruction
-- `11feedc` scripts: add the rules checker, the mutation harness, and a pytest runner
-- `93eac1d` scripts: add the config-sync Python suites (85 test functions)
-- `e7bb23b` commandcode: decide free-ness by probe, not by a hand-maintained list
-- `cd94156` config.yaml: regenerate — longcat gone, ling-3.1-flash:free admitted
-- `8977724` router_realconfig_test.go: assert the shipped config's chain invariants
-- `b9964b5` ci: run the config suites and the mutation harness in CI
 - `7271803` Cooldown: a client error must not take the endpoint out of rotation
     reports every entry as "not an unpushed commit (it may have been pushed or
     rewritten)". That is the check being right, and it means something far more
