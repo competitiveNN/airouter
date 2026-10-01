@@ -29,3 +29,13 @@ cooldowns.priority.json
 # Go fuzzing corpus cache. Only the minimized crashers under testdata/fuzz are
 # worth committing; the working corpus is gigabytes of generated input.
 /fuzzcache/
+
+# Editor scratch files. Not cosmetic: scripts/gate.sh fingerprints the worktree
+# with `git status --porcelain -uall` at the start of a run and compares it at
+# the end, and -uall is exactly what makes untracked paths count. A vim swap file
+# sitting in the repo root therefore participates in the fingerprint, so an
+# editor opening a tracked file DURING a gate run flips that run to INVALID RUN
+# (exit 3) -- void results, for a file nobody wrote on purpose. Ignored, it
+# leaves the fingerprint alone.
+*.swp
+*.swo
