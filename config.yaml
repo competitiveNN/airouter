@@ -10,32 +10,86 @@
 #   provider: Provider name (key in providers)
 #   model: Actual model name on that provider
 #
-# Distribution rules (see AGENTS.md):
+# Distribution rules (see AGENTS.md and scripts/sync-instruction.txt, which
+# scripts/check-rules.py enforces against the fetched model list):
 #   - Each chain is ordered best-first by model quality (intelligence benchmark),
-#     descending; the strongest model for the profile sits at the top.
+#     descending; the strongest model for the profile sits at the top. `large`
+#     is the exception: it sorts by context window descending, then intelligence.
+#   - Profile membership, so a model lands where it is meant to be used:
+#       smart  intelligence >= 25, any context window
+#       work   the smart pool extended down to intelligence >= 15. The
+#              tiny-model drop is NOT waived for dedicated code models, so
+#              cohere/north-mini-code (9.9) stays out of `work` and qualifies
+#              only through `large`.
+#       fast   intelligence < 25 or an id containing flash-lite / lightning /
+#              nano / gemma / lfm / laguna-xs, capped at 10 distinct models
+#              (counted before the key expansion, so the chain is longer)
+#       large  context_length >= 200000 only
 #   - Every NVIDIA NIM model is emitted as a consecutive nvidia / nvidia2 / nvidia3
 #     trio (same model id, three API keys) so a 429 on one key falls through to the
 #     next key on the same model instead of failing the request. No NVIDIA-NIM model
 #     ever appears on only one key. Likewise every CommandCode model is emitted as a
 #     consecutive commandcode / commandcode2 pair (same model id, two API keys on the
 #     shared localhost:3050 proxy) so a rate-limited key falls through to the next.
-#     CommandCode models are the four free-tier deals published at
-#     https://commandcode.ai/docs/resources/pricing-limits:
-#       stealth/space-bunny-alpha, poolside/laguna-s-2.1-free,
-#       inclusionai/ling-3.0-flash-sante:free, meituan/longcat-2.0-free
-#   - The LAST entry of every chain is that profile's "auto" fallback. It is now
-#     always kilocode `kilo-auto/free`: the opencode key is authenticated but not
-#     entitled to the free tier, so every opencode model returns 403 FreeTierError
-#     (verified 2026-09-29, free and paid alike — the attribution headers in
-#     proxy.go do not change the outcome). opencode endpoints are therefore
-#     excluded from the chains, and fetch-free-models.py now verifies each
-#     opencode model with a real request before emitting it, so the nightly sync
-#     cannot re-add them. regenerate_config.py likewise only picks an auto
-#     fallback among providers that actually appear in the chain.
+#     CommandCode models are NOT enumerated anywhere, in this file or in the
+#     tooling. There is no free-tier flag to read and a hand-maintained list
+#     goes stale the moment a deal ends: meituan/longcat-2.0-free stayed listed
+#     long after it stopped being free (probed 2026-10-01: HTTP 400 "You have
+#     insufficient credits ... Please purchase more credits"). `fetch-free-models
+#     .py` selects candidates by the provider's own free-suffix convention plus a
+#     small seed list, then PROVES each one with a real 1-token completion, and
+#     `scripts/check-rules.py` rule 3 requires that probe verdict rather than
+#     membership of any list. A deal that ends leaves on the next sync; a deal
+#     that starts is admitted without editing anything.
+#   - The LAST entry of every chain is that profile's "auto" fallback, and it is
+#     chosen on a PROBE VERDICT, never on popularity. `fetch-free-models.py
+#     --probe-auto` calls each router with one real 1-token completion and
+#     records the verdict in the model list: `verified: true` = it answered,
+#     `verified: false` = the provider REFUSED it (4xx), absent = no verdict
+#     (not probed, or the probe hit a 429/5xx/timeout — a missing verdict is
+#     absence of evidence, so a flaky network neither moves the terminator nor
+#     blocks a sync). A verdict also goes stale: older than 7 days
+#     (AUTO_PROBE_MAX_AGE_DAYS) it counts as no verdict, so a fetcher that
+#     stops running cannot pin the terminator to a router that died meanwhile.
+#     The ladder:
+#       preferred = opencode `big-pickle` only when the chain contains opencode
+#                  endpoints and no kilocode ones; otherwise kilocode
+#                  `kilo-auto/free`
+#       live or no verdict -> use the preferred router
+#       refused           -> use the other router ONLY if it probed live (the
+#                            rescue is always available, so one degenerate
+#                            chain cannot strand the other three); if nothing
+#                            probed live, do not write the file at all and
+#                            leave this config as it is. A refused terminator
+#                            fails every exhausted request, so regenerating
+#                            anyway would replace a working config with a worse
+#                            one. scripts/check-rules.py enforces exactly this
+#                            ladder — it calls the generator's own decision
+#                            function, and also checks that each terminator's
+#                            trailing comment matches the probe record, so the
+#                            evidence in this file cannot drift from the data.
 #
-#     (Previously this was a raw kilocode-vs-opencode count comparison, which
+#     The opencode key authenticates but is not entitled to the free tier: 11 of
+#     its 12 models return 403 FreeTierError, `big-pickle` included (re-probed
+#     2026-09-30, still 403) — the attribution headers in proxy.go do not change
+#     the outcome. So the opencode rescue is an emergency path for a confirmed
+#     outage, not a routine choice.
+#
+#     A run that cannot obtain a verdict (no keys, SKIP_AUTO_PROBE=1, a stale
+#     record, an offline fixture) does NOT rewrite these comments. It leaves the
+#     claim it cannot check exactly as it found it, and scripts/check-rules.py
+#     reports an unverifiable claim as its own problem rather than demanding a
+#     different comment — so an offline regeneration cannot quietly turn a
+#     recorded "probed live" into "not probed", and cannot quietly pass either.
+#
+#     (Earlier this was a raw kilocode-vs-opencode count comparison, which
 #     appended opencode `big-pickle` as the last-resort endpoint for `smart`
-#     while that endpoint 403'd on every call.)
+#     while that endpoint 403'd on every call. Counts are not a health signal.
+#     The fetcher is: it probes every opencode candidate with a real 1-token
+#     completion and only emits the ones that answer, so the nightly sync cannot
+#     re-add a dead endpoint. An opencode model that passes that probe is still
+#     a legitimate chain entry — currently `space-bunny-free` — it just may
+#     never be the terminator.)
 #
 # Every concrete endpoint carries a `vision:` boolean (true/false) taken from the
 # source model's capabilities, driving capability-aware routing (vision requests go
@@ -162,64 +216,64 @@ models:
   smart:
     chain:
       - provider: nvidia
-        model: z-ai/glm-5.3  # 44.8  elo=1619
+        model: z-ai/glm-5.3  # 44.8  elo=1623
         vision: false
         intelligence: 44.8
         context_length: 131072
       - provider: nvidia2
-        model: z-ai/glm-5.3  # 44.8  elo=1619
+        model: z-ai/glm-5.3  # 44.8  elo=1623
         vision: false
         intelligence: 44.8
         context_length: 131072
       - provider: nvidia3
-        model: z-ai/glm-5.3  # 44.8  elo=1619
+        model: z-ai/glm-5.3  # 44.8  elo=1623
         vision: false
         intelligence: 44.8
         context_length: 131072
       - provider: nvidia
-        model: moonshotai/kimi-k3  # 43.6  elo=1660
+        model: moonshotai/kimi-k3  # 43.6  elo=1659
         vision: false
         intelligence: 43.6
       - provider: nvidia2
-        model: moonshotai/kimi-k3  # 43.6  elo=1660
+        model: moonshotai/kimi-k3  # 43.6  elo=1659
         vision: false
         intelligence: 43.6
       - provider: nvidia3
-        model: moonshotai/kimi-k3  # 43.6  elo=1660
+        model: moonshotai/kimi-k3  # 43.6  elo=1659
         vision: false
         intelligence: 43.6
       - provider: nvidia
-        model: z-ai/glm-5.3-flash  # 41.8  elo=1619
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1623
         vision: false
         intelligence: 41.8
         context_length: 131072
       - provider: nvidia2
-        model: z-ai/glm-5.3-flash  # 41.8  elo=1619
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1623
         vision: false
         intelligence: 41.8
         context_length: 131072
       - provider: nvidia3
-        model: z-ai/glm-5.3-flash  # 41.8  elo=1619
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1623
         vision: false
         intelligence: 41.8
         context_length: 131072
       - provider: nvidia
-        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621
+        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1620
         vision: false
         intelligence: 39.5
         context_length: 131072
       - provider: nvidia2
-        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621
+        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1620
         vision: false
         intelligence: 39.5
         context_length: 131072
       - provider: nvidia3
-        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621
+        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1620
         vision: false
         intelligence: 39.5
         context_length: 131072
       - provider: kilocode
-        model: qwen/qwen3.8-27b:free  # 33.7  elo=1672
+        model: qwen/qwen3.8-27b:free  # 33.7  elo=1671
         vision: true
         intelligence: 33.7
         context_length: 262144
@@ -228,11 +282,6 @@ models:
         vision: false
         intelligence: 29.2
         context_length: 262144
-      - provider: kilocode
-        model: thinkingmachines/inkling-small:free  # 27.8
-        vision: true
-        intelligence: 27.8
-        context_length: 1048576
       - provider: nvidia
         model: moonshotai/kimi-k2.6  # 27.0
         vision: false
@@ -245,6 +294,19 @@ models:
         model: moonshotai/kimi-k2.6  # 27.0
         vision: false
         intelligence: 27.0
+      - provider: kilocode
+        model: thinkingmachines/inkling-small:free  # 25.7
+        vision: true
+        intelligence: 25.7
+        context_length: 1048576
+      - provider: commandcode
+        model: inclusionai/ling-3.1-flash:free  # 25.0  floor
+        vision: false
+        intelligence: 25.0
+      - provider: commandcode2
+        model: inclusionai/ling-3.1-flash:free  # 25.0  floor
+        vision: false
+        intelligence: 25.0
       - provider: kilocode
         model: poolside/laguna-s-2.1:free  # 25.0  floor
         vision: false
@@ -285,69 +347,69 @@ models:
         intelligence: 25.0
         context_length: 1000000
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (5 vs 1)
+        model: kilo-auto/free  # last: kilocode (auto router probed live; opencode auto not entitled to free tier)
         vision: true
   work:
     chain:
       - provider: nvidia
-        model: z-ai/glm-5.3  # 44.8  elo=1619
+        model: z-ai/glm-5.3  # 44.8  elo=1623
         vision: false
         intelligence: 44.8
         context_length: 131072
       - provider: nvidia2
-        model: z-ai/glm-5.3  # 44.8  elo=1619
+        model: z-ai/glm-5.3  # 44.8  elo=1623
         vision: false
         intelligence: 44.8
         context_length: 131072
       - provider: nvidia3
-        model: z-ai/glm-5.3  # 44.8  elo=1619
+        model: z-ai/glm-5.3  # 44.8  elo=1623
         vision: false
         intelligence: 44.8
         context_length: 131072
       - provider: nvidia
-        model: moonshotai/kimi-k3  # 43.6  elo=1660
+        model: moonshotai/kimi-k3  # 43.6  elo=1659
         vision: false
         intelligence: 43.6
       - provider: nvidia2
-        model: moonshotai/kimi-k3  # 43.6  elo=1660
+        model: moonshotai/kimi-k3  # 43.6  elo=1659
         vision: false
         intelligence: 43.6
       - provider: nvidia3
-        model: moonshotai/kimi-k3  # 43.6  elo=1660
+        model: moonshotai/kimi-k3  # 43.6  elo=1659
         vision: false
         intelligence: 43.6
       - provider: nvidia
-        model: z-ai/glm-5.3-flash  # 41.8  elo=1619
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1623
         vision: false
         intelligence: 41.8
         context_length: 131072
       - provider: nvidia2
-        model: z-ai/glm-5.3-flash  # 41.8  elo=1619
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1623
         vision: false
         intelligence: 41.8
         context_length: 131072
       - provider: nvidia3
-        model: z-ai/glm-5.3-flash  # 41.8  elo=1619
+        model: z-ai/glm-5.3-flash  # 41.8  elo=1623
         vision: false
         intelligence: 41.8
         context_length: 131072
       - provider: nvidia
-        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621
+        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1620
         vision: false
         intelligence: 39.5
         context_length: 131072
       - provider: nvidia2
-        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621
+        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1620
         vision: false
         intelligence: 39.5
         context_length: 131072
       - provider: nvidia3
-        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1621
+        model: deepseek-ai/deepseek-v4.1-flash  # 39.5  elo=1620
         vision: false
         intelligence: 39.5
         context_length: 131072
       - provider: kilocode
-        model: qwen/qwen3.8-27b:free  # 33.7  elo=1672
+        model: qwen/qwen3.8-27b:free  # 33.7  elo=1671
         vision: true
         intelligence: 33.7
         context_length: 262144
@@ -356,11 +418,6 @@ models:
         vision: false
         intelligence: 29.2
         context_length: 262144
-      - provider: kilocode
-        model: thinkingmachines/inkling-small:free  # 27.8
-        vision: true
-        intelligence: 27.8
-        context_length: 1048576
       - provider: nvidia
         model: moonshotai/kimi-k2.6  # 27.0
         vision: false
@@ -373,6 +430,19 @@ models:
         model: moonshotai/kimi-k2.6  # 27.0
         vision: false
         intelligence: 27.0
+      - provider: kilocode
+        model: thinkingmachines/inkling-small:free  # 25.7
+        vision: true
+        intelligence: 25.7
+        context_length: 1048576
+      - provider: commandcode
+        model: inclusionai/ling-3.1-flash:free  # 25.0  floor
+        vision: false
+        intelligence: 25.0
+      - provider: commandcode2
+        model: inclusionai/ling-3.1-flash:free  # 25.0  floor
+        vision: false
+        intelligence: 25.0
       - provider: kilocode
         model: poolside/laguna-s-2.1:free  # 25.0  floor
         vision: false
@@ -412,21 +482,6 @@ models:
         vision: false
         intelligence: 25.0
         context_length: 1000000
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
-        vision: false
-        intelligence: 24.9
-        context_length: 262144
-      - provider: commandcode
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
-        vision: false
-        intelligence: 24.9
-        context_length: 262144
-      - provider: commandcode2
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
-        vision: false
-        intelligence: 24.9
-        context_length: 262144
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9
         vision: false
@@ -458,42 +513,25 @@ models:
         intelligence: 22.2
         context_length: 1048576
       - provider: kilocode
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
+        vision: false
+        intelligence: 20.1
+        context_length: 262144
+      - provider: commandcode
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
+        vision: false
+        intelligence: 20.1
+        context_length: 262144
+      - provider: commandcode2
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
+        vision: false
+        intelligence: 20.1
+        context_length: 262144
+      - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 19.5
         vision: true
         intelligence: 19.5
         context_length: 262144
-      - provider: commandcode
-        model: meituan/longcat-2.0-free  # 19.1
-        vision: false
-        intelligence: 19.1
-        context_length: 1048576
-      - provider: commandcode2
-        model: meituan/longcat-2.0-free  # 19.1
-        vision: false
-        intelligence: 19.1
-        context_length: 1048576
-      - provider: ollama
-        model: gemma4:31b  # 19.0
-        vision: true
-        intelligence: 19.0
-        context_length: 262144
-      - provider: gemini
-        model: gemma-4-31b-it  # 19.0
-        vision: false
-        intelligence: 19.0
-        context_length: 262144
-      - provider: nvidia
-        model: google/gemma-4-31b-it  # 19.0
-        vision: false
-        intelligence: 19.0
-      - provider: nvidia2
-        model: google/gemma-4-31b-it  # 19.0
-        vision: false
-        intelligence: 19.0
-      - provider: nvidia3
-        model: google/gemma-4-31b-it  # 19.0
-        vision: false
-        intelligence: 19.0
       - provider: nvidia
         model: meta/muse-glimmer-30b  # 17.5
         vision: false
@@ -512,7 +550,7 @@ models:
         intelligence: 16.7
         context_length: 262144
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode dominates (8 vs 1)
+        model: kilo-auto/free  # last: kilocode (auto router probed live; opencode auto not entitled to free tier)
         vision: true
   fast:
     chain:
@@ -520,21 +558,6 @@ models:
         model: poolside/laguna-xs-2.1:free  # 25.0  floor
         vision: false
         intelligence: 25.0
-        context_length: 262144
-      - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
-        vision: false
-        intelligence: 24.9
-        context_length: 262144
-      - provider: commandcode
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
-        vision: false
-        intelligence: 24.9
-        context_length: 262144
-      - provider: commandcode2
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
-        vision: false
-        intelligence: 24.9
         context_length: 262144
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9
@@ -567,49 +590,56 @@ models:
         intelligence: 22.2
         context_length: 1048576
       - provider: kilocode
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
+        vision: false
+        intelligence: 20.1
+        context_length: 262144
+      - provider: commandcode
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
+        vision: false
+        intelligence: 20.1
+        context_length: 262144
+      - provider: commandcode2
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
+        vision: false
+        intelligence: 20.1
+        context_length: 262144
+      - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 19.5
         vision: true
         intelligence: 19.5
         context_length: 262144
-      - provider: commandcode
-        model: meituan/longcat-2.0-free  # 19.1
+      - provider: nvidia
+        model: meta/muse-glimmer-30b  # 17.5
         vision: false
-        intelligence: 19.1
-        context_length: 1048576
-      - provider: commandcode2
-        model: meituan/longcat-2.0-free  # 19.1
+        intelligence: 17.5
+      - provider: nvidia2
+        model: meta/muse-glimmer-30b  # 17.5
         vision: false
-        intelligence: 19.1
-        context_length: 1048576
-      - provider: ollama
-        model: gemma4:31b  # 19.0
-        vision: true
-        intelligence: 19.0
+        intelligence: 17.5
+      - provider: nvidia3
+        model: meta/muse-glimmer-30b  # 17.5
+        vision: false
+        intelligence: 17.5
+      - provider: gemini
+        model: gemma-4-26b-a4b-it  # 16.7
+        vision: false
+        intelligence: 16.7
         context_length: 262144
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode (only verified provider; opencode unavailable)
+        model: kilo-auto/free  # last: kilocode (auto router probed live; opencode auto not entitled to free tier)
         vision: true
   large:
     chain:
       - provider: kilocode
-        model: thinkingmachines/inkling-small:free  # 27.8
+        model: thinkingmachines/inkling-small:free  # 25.7
         vision: true
-        intelligence: 27.8
+        intelligence: 25.7
         context_length: 1048576
       - provider: gemini
         model: gemini-flash-lite-latest  # 22.2
         vision: true
         intelligence: 22.2
-        context_length: 1048576
-      - provider: commandcode
-        model: meituan/longcat-2.0-free  # 19.1
-        vision: false
-        intelligence: 19.1
-        context_length: 1048576
-      - provider: commandcode2
-        model: meituan/longcat-2.0-free  # 19.1
-        vision: false
-        intelligence: 19.1
         context_length: 1048576
       - provider: commandcode
         model: stealth/space-bunny-alpha  # 25.0  floor
@@ -657,7 +687,7 @@ models:
         intelligence: 25.0
         context_length: 512000
       - provider: kilocode
-        model: qwen/qwen3.8-27b:free  # 33.7  elo=1672
+        model: qwen/qwen3.8-27b:free  # 33.7  elo=1671
         vision: true
         intelligence: 33.7
         context_length: 262144
@@ -677,39 +707,39 @@ models:
         intelligence: 25.0
         context_length: 262144
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
         vision: false
-        intelligence: 24.9
+        intelligence: 20.1
         context_length: 262144
       - provider: commandcode
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
         vision: false
-        intelligence: 24.9
+        intelligence: 20.1
         context_length: 262144
       - provider: commandcode2
-        model: inclusionai/ling-3.0-flash-sante:free  # 24.9
+        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
         vision: false
-        intelligence: 24.9
+        intelligence: 20.1
         context_length: 262144
       - provider: kilocode
         model: stepfun/step-3.7-flash:free  # 19.5
         vision: true
         intelligence: 19.5
         context_length: 262144
-      - provider: ollama
-        model: gemma4:31b  # 19.0
-        vision: true
-        intelligence: 19.0
-        context_length: 262144
-      - provider: gemini
-        model: gemma-4-31b-it  # 19.0
-        vision: false
-        intelligence: 19.0
-        context_length: 262144
       - provider: gemini
         model: gemma-4-26b-a4b-it  # 16.7
         vision: false
         intelligence: 16.7
+        context_length: 262144
+      - provider: ollama
+        model: gemma4:31b  # 14.7
+        vision: true
+        intelligence: 14.7
+        context_length: 262144
+      - provider: gemini
+        model: gemma-4-31b-it  # 14.7
+        vision: false
+        intelligence: 14.7
         context_length: 262144
       - provider: ollama
         model: nemotron-3-super  # 12.8
@@ -777,5 +807,5 @@ models:
         intelligence: 9.9
         context_length: 256000
       - provider: kilocode
-        model: kilo-auto/free  # last: kilocode (only verified provider; opencode unavailable)
+        model: kilo-auto/free  # last: kilocode (auto router probed live; opencode auto not entitled to free tier)
         vision: true
