@@ -200,6 +200,7 @@ Two properties make any such list awkward, and neither is a bug to be fixed:
 - `cd94156` config.yaml: regenerate — longcat gone, ling-3.1-flash:free admitted
 - `8977724` router_realconfig_test.go: assert the shipped config's chain invariants
 - `b9964b5` ci: run the config suites and the mutation harness in CI
+- `7271803` Cooldown: a client error must not take the endpoint out of rotation
     reports every entry as "not an unpushed commit (it may have been pushed or
     rewritten)". That is the check being right, and it means something far more
     mundane than a corrupted handoff: someone else pushed.
