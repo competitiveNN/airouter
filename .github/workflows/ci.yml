@@ -287,13 +287,36 @@ jobs:
       - name: validate config
         run: python3 scripts/validate-config.py config.yaml
 
+      # The distribution rules the nightly model sync is supposed to follow,
+      # checked against the fetched model list. CI has no model list (no API
+      # keys), so this runs the structural half and prints a NOTICE for the
+      # data-dependent half rather than reporting a pass it did not earn; the
+      # nightly sync re-runs it with the list in place.
+      - name: check config rules
+        run: python3 scripts/check-rules.py --config config.yaml
+
       # Regression tests for the config generator, which once destroyed the
-      # whole providers: section on every run via an unanchored regex.
+      # whole providers: section on every run via an unanchored regex, and for
+      # the auto-fallback probe whose verdict decides the chain terminator.
+      # scripts/run-config-tests.py, not `python3 -m pytest`: it asserts a
+      # collection floor, so a suite that fails to COLLECT cannot be reported as
+      # a suite with no tests.
       - name: test config generator
-        run: python3 -m pytest scripts/test_regenerate_config.py -q
+        run: python3 scripts/run-config-tests.py
+
+      # Proves the tests above can fail. Each mutation is anchored, verified to
+      # change bytes, and the tree is restored afterwards; a MISSED fails the job
+      # rather than printing a count for a human to interpret.
+      # Preflight is its own step: it is what notices a tree left dirty by a
+      # sweep killed mid-mutation, and it must fail before anything is planted.
+      - name: mutation preflight
+        run: python3 scripts/mutation-check.py --preflight
+
+      - name: mutation-check the sync chain
+        run: python3 scripts/mutation-check.py
 
       - name: compile python scripts
-        run:           python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/sse-check.py scripts/fake-sse-upstream.py scripts/audit-drift-check.py scripts/audit-attribution-check.py
+        run:           python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/check-rules.py scripts/sse-check.py scripts/fake-sse-upstream.py scripts/audit-drift-check.py scripts/audit-attribution-check.py
 
   # End-to-end assertion of the SSE termination contract. The bug this guards
   # (a `data: [DONE]` released ahead of the real chunks, so the client silently
