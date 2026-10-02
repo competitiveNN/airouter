@@ -34,7 +34,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"testing"
 	"time"
 )
@@ -88,18 +87,48 @@ func TestUnknownStatusIsNeverTheLongSoftBan(t *testing.T) {
 	}
 }
 
-// TestSSEErrorIsClassifiedAsBadGateway makes the chat path agree with the
-// /v1/responses path, which already used 502 via statusForStreamError.
-func TestSSEErrorIsClassifiedAsBadGateway(t *testing.T) {
-	sse := &SSEError{Data: `{"message":"JSON error injected into SSE stream","type":"upstream_error"}`}
-	if got := sse.Status(); got != http.StatusBadGateway {
-		t.Errorf("SSEError.Status() = %d, want %d to match statusForStreamError's "+
-			"default for an upstream protocol error", got, http.StatusBadGateway)
+// TestSSEErrorIsTreatedAsAnOrdinaryError pins the reverted contract: an upstream
+// SSE error event carries no HTTP status and takes the ordinary cooldown path,
+// exactly like any other non-ProviderError.
+//
+// It used to carry Status() 502 so the chat path would agree with
+// statusForStreamError on /v1/responses. That made the error TYPE decide its own
+// penalty, which is the thing that let one injected fault be a bounded 30s on
+// one API surface and a 24h ban on the other. If SSEError grows a Status()
+// method again, or the router starts honouring one, this fails -- and it fails
+// at the type level rather than only at the duration, which is where the
+// regression actually started.
+func TestSSEErrorIsTreatedAsAnOrdinaryError(t *testing.T) {
+	sse := &SSEError{Data: `{"message":"injected","type":"upstream_error"}`}
+
+	var statuser interface{ Status() int }
+	if errors.As(error(sse), &statuser) {
+		t.Fatalf("SSEError exposes Status()=%d; it must be an ordinary error with "+
+			"no status of its own, so it takes the normal cooldown path",
+			statuser.Status())
+	}
+
+	// And the router must not manufacture a status for it either: one applied
+	// three times has to stay status 0, exactly like a timeout.
+	r := NewRouter(&Config{}, "")
+	ep := &ModelEndpoint{Provider: "commandcode", Model: "stealth/space-bunny-alpha"}
+	for i := 0; i < 3; i++ {
+		r.ApplyCooldownFromError(ep, error(&SSEError{Data: `{"message":"injected"}`}))
+	}
+	status, count := cooldownStatusForTest(t, r, ep)
+	if status != 0 {
+		t.Errorf("status_code = %d, want 0: an SSE error carries no HTTP status and "+
+			"must be recorded as the ordinary statusless failure it is", status)
+	}
+	if count < 3 {
+		t.Errorf("error_count = %d, want >= 3", count)
 	}
 }
 
 // TestASSEErrorTakesTheTransientPath is the end-to-end statement of the bug:
 // the reported error, applied three times, must not ban the endpoint for a day.
+// Status 0 is transient and bounded, so reverting the 502 special case does not
+// resurrect the 24h ban that fix originally removed.
 func TestASSEErrorTakesTheTransientPath(t *testing.T) {
 	r := NewRouter(&Config{}, "")
 	ep := &ModelEndpoint{Provider: "commandcode", Model: "stealth/space-bunny-alpha"}
@@ -110,20 +139,18 @@ func TestASSEErrorTakesTheTransientPath(t *testing.T) {
 	}
 
 	status, count := cooldownStatusForTest(t, r, ep)
-	if status == 0 {
-		t.Errorf("an SSE error event recorded status_code 0; it must be classified "+
-			"as %d so the cooldown logic has something to work with",
-			http.StatusBadGateway)
-	}
-	if status != http.StatusBadGateway {
-		t.Errorf("status_code = %d, want %d", status, http.StatusBadGateway)
+	if status != 0 {
+		t.Errorf("status_code = %d, want 0 for an ordinary statusless SSE error", status)
 	}
 	if count < 3 {
 		t.Errorf("error_count = %d, want >= 3", count)
 	}
 	if d := r.cooldownForError(status, count); d >= 24*time.Hour {
-		t.Errorf("three SSE error events produce a %v cooldown; the chat path and "+
-			"the /v1/responses path must agree", d)
+		t.Errorf("three SSE error events produce a %v cooldown; a statusless failure "+
+			"is transient and bounded, never a soft ban", d)
+	}
+	if d := r.cooldownForError(status, count); d < time.Second {
+		t.Errorf("got %v, want a real backoff rather than none", d)
 	}
 }
 
