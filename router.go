@@ -1331,16 +1331,20 @@ func (r *Router) ApplyCooldownFromErrorForSession(ep *ModelEndpoint, err error, 
 	var providerErr *ProviderError
 	if errors.As(err, &providerErr) {
 		statusCode = providerErr.StatusCode
-	} else {
-		// Not every failure is a ProviderError. A transport error, a parse
-		// failure, or an SSE error event carries no HTTP status, and leaving
-		// it at 0 made the cooldown classifier treat "unknown" as
-		// "probably permanent". Honour a Status() method when one is offered.
-		var statuser interface{ Status() int }
-		if errors.As(err, &statuser) {
-			statusCode = statuser.Status()
-		}
 	}
+	// Anything else keeps statusCode 0, including an upstream SSE error event.
+	// That used to be special-cased into a 502 via a Status() method on SSEError
+	// so the chat path would agree with statusForStreamError on /v1/responses.
+	// It is deliberately NOT special-cased any more: an SSE error is an ordinary
+	// failure and takes the ordinary cooldown/backoff path, like every other
+	// non-ProviderError. A type deciding its own penalty is the thing that let
+	// the same injected fault be a bounded 30s on one API surface and a 24h ban
+	// on the other.
+	//
+	// Status 0 is still bounded, not a soft ban: cooldownForError treats a
+	// statusless failure as transient (30s escalating, capped at 30 minutes),
+	// because "no HTTP status" means a transport, parse or upstream-protocol
+	// fault -- all transient by definition.
 	errMsg := err.Error()
 	retryAfter := time.Duration(0)
 	if errors.As(err, &providerErr) {
