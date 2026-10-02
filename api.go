@@ -1040,6 +1040,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			cancel()
+
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
@@ -1059,6 +1060,28 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		cancel()
+
+		// An endpoint addressed with the Responses API answers with a Responses
+		// envelope; the client asked for Chat Completions. Translate here so
+		// everything after this point -- TPS accounting, the headers copied to
+		// the client, the body written out -- sees the shape it expects.
+		//
+		// A translation failure is treated as a failed attempt rather than
+		// forwarded: emitting an envelope the client cannot parse would be a
+		// silent corruption, while falling back gets a real answer from the
+		// next endpoint.
+		if ep.UpstreamProtocol() == protocolResponses {
+			converted, cerr := responsesBodyToChat(respBody, req.Model)
+			if cerr != nil {
+				log.Printf("[debug] session=%s model=%s -> responses->chat translation failed: %v", sessionID, req.Model, cerr)
+				tried[ep.Key()] = true
+				g.router.ApplyCooldownForSession(ep, 502, cerr.Error(), sessionID, 0)
+				g.recordCooldown()
+				continue
+			}
+			respBody = converted
+		}
+
 		g.router.RecordSuccess(ep)
 		attemptDur := time.Since(attemptStart)
 		g.recordAttempt(ep, attemptDur, true)
