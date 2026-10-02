@@ -75,6 +75,14 @@ set -uo pipefail
 # the base not containing the work, so that is what is asserted now. If a case is
 # moved out of the environment-dependent branch, or one is added, this arithmetic
 # is what goes stale, and the run reports it.
+#
+# EXPECTED_CLONE is reached by TWO different skips, both of which drop exactly
+# cases 5-6 and nothing else: the patch artifact being absent, and master being
+# fully pushed. It is one number for both because they remove the same
+# assertions -- which is itself the check that a third skip reason has not
+# started removing a different set. Measured 2026-10-02: with master fully
+# pushed the run reports 11 passed / 0 failed, matching EXPECTED_CLONE, so the
+# second trigger removed the environment-dependent cases and no others.
 EXPECTED_FULL=18
 EXPECTED_CLONE=11
 
@@ -282,7 +290,26 @@ echo "attribution-selftest: case 5 -- recovered mode matches by content"
 DST="$TMPROOT/recovered-dst"
 PATCH="$REPO/dist/airouter-unpushed.patch"
 BASE_SHA=$(git -C "$REPO" rev-parse origin/master)
-if [ ! -r "$PATCH" ]; then
+# The premise of cases 5-6 is a NON-EMPTY unpushed set: the replay exists to
+# reproduce unpushed commits under fresh hashes. When master is fully pushed
+# there is nothing to replay, and `git am` of a stale patch onto the base it was
+# already generated from applies nothing.
+#
+# That is a state of the world, not a defect in the code under test, so it skips
+# loudly rather than reporting FAIL. Reporting it as FAIL is what this case did
+# on 2026-10-02: four red lines all describing an empty origin/master..HEAD,
+# none of them about --recovered. A harness that cries wolf about its own
+# environment is a harness whose red lines stop being read.
+#
+# It must not skip quietly either -- a case that stops running has to move the
+# expected total below, which is the arithmetic that catches exactly this.
+UNPUSHED=$(git -C "$REPO" rev-list origin/master..HEAD)
+if [ -z "$UNPUSHED" ]; then
+  printf '  skip cases 5-6: origin/master..HEAD is empty (master fully pushed), so\n' >&2
+  printf '               there is no unpushed commit for the replay to reproduce\n' >&2
+  printf '               (commit something, or push, to run them)\n' >&2
+  SKIPPED_RECOVERY=1
+elif [ ! -r "$PATCH" ]; then
   # dist/airouter-unpushed.patch is a GENERATED artifact and is gitignored, so
   # it is legitimately absent from a fresh clone or a CI checkout of a tag.
   # Skipping loudly is correct here; what is NOT correct would be to let the
