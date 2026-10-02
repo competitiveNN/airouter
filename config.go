@@ -221,7 +221,25 @@ type ModelEndpoint struct {
 	// `large` profile exists specifically for large-context work, so
 	// advertising nothing for it is the worst case.
 	ContextLength int `yaml:"context_length,omitempty"`
+
+	// Protocol selects the wire shape used to reach this endpoint:
+	// "responses" (POST <url>/responses) or, when absent or unrecognized,
+	// "chat" (POST <url>/chat/completions), which is the default.
+	//
+	// It is per-endpoint rather than per-provider because capability is not
+	// uniform across a provider's catalog. Measured live 2026-10-02 against
+	// opencode.ai: space-bunny-free answers
+	// `400 ModelProtocolUnsupported: Model does not support this protocol.`
+	// on /responses while answering 200 on /chat/completions.
+	//
+	// An unrecognized value falls back to chat rather than failing validation:
+	// a typo must not take a working endpoint out of rotation, and
+	// chat/completions is the shape every provider understands.
+	Protocol string `yaml:"protocol,omitempty"`
 }
+
+// UpstreamProtocol resolves the configured Protocol, defaulting to chat.
+func (e ModelEndpoint) UpstreamProtocol() protocol { return protocolFor(e.Protocol) }
 
 // HasIntelligence reports whether an intelligence score is known. Endpoints
 // without one are only ever compared by chain position.
