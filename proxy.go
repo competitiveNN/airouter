@@ -234,10 +234,29 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 		for k, v := range opencodeRequestHeaders() {
 			req.Header.Set(k, v)
 		}
-		if sessionID != "" {
-			// The gateway id is "ctx:<hex>", a shape it rejects with 403, so
-			// map it onto the canonical ses_ form instead of forwarding it.
-			req.Header.Set("x-opencode-session", opencodeSessionFor(sessionID))
+		// The free tier asks for a session id that is stable "for each
+		// conversation", so it is anchored on the conversation rather than on
+		// the gateway session id, which is a hash of the whole messages array
+		// and therefore drifts on every turn. `body` is the client's original
+		// body on purpose: the logical model is part of the anchor, and using
+		// backendBody would key the anchor on the endpoint's substituted model
+		// name and split one conversation across a fallback chain.
+		// Both spellings carry the same id. Setting only the canonical
+		// x-opencode-session would leave X-Session-ID holding the per-request
+		// random id from opencodeRequestHeaders, so the two would disagree and
+		// the routing backend would read the unstable one.
+		setSession := func(id string) {
+			ses := opencodeSessionFor(id)
+			req.Header.Set("x-opencode-session", ses)
+			req.Header.Set("X-Session-ID", ses)
+		}
+		if conv := opencodeConversationID(body); conv != "" {
+			setSession(conv)
+		} else if sessionID != "" {
+			// No anchor available (unparseable body). Fall back to the gateway
+			// session id, mapped onto the canonical ses_ form rather than
+			// forwarded: "ctx:<hex>" is a shape the gateway rejects with 403.
+			setSession(sessionID)
 		}
 	}
 	// Provider-level header overrides from config take precedence over the

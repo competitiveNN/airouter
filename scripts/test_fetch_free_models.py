@@ -723,6 +723,86 @@ def test_opencode_headers_carry_the_gate_preconditions():
     assert h["Authorization"] == "Bearer k"
 
 
+def test_opencode_ua_matches_the_gateway():
+    """The gateway and this fetcher must present the same official UA.
+
+    OpenCode asks third-party gateways for "the correct, official User-Agent
+    string (matching opencode/<version>)". The version lives in two files in two
+    languages, and nothing else keeps them equal -- the proxy probes and the
+    gateway serves requests with independently hardcoded copies, so bumping one
+    silently leaves the other claiming to be a version that no longer exists.
+    """
+    go = (REPO / "config.go").read_text()
+    m = re.search(r'"User-Agent":\s*"(opencode/[^"]+)"', go)
+    assert m, "config.go no longer sets a User-Agent for the opencode gateway"
+    assert m.group(1) == ff.OPENCODE_UA, (
+        f"config.go sends {m.group(1)} but the fetcher sends {ff.OPENCODE_UA}; "
+        "bump both from https://registry.npmjs.org/opencode-ai/latest"
+    )
+
+
+def test_opencode_ua_version_parses_the_shape():
+    """The parser must not invent a version out of a string it cannot read."""
+    assert ff.opencode_ua_version("opencode/1.18.34/cli") == "1.18.34"
+    assert ff.opencode_ua_version(ff.OPENCODE_UA) == ff.OPENCODE_UA.split("/")[1]
+    for bad in ("", "Go-http-client/1.1", "opencode/", "opencode"):
+        assert ff.opencode_ua_version(bad) == "", bad
+
+
+def _ua_registry(monkeypatch, payload):
+    monkeypatch.setattr(ff, "fetch_json", lambda *a, **k: payload)
+
+
+def test_opencode_ua_check_reports_a_stale_version(monkeypatch, capsys):
+    monkeypatch.delenv("SKIP_OPENCODE_UA_CHECK", raising=False)
+    monkeypatch.setattr(ff, "opencode_ua_version", lambda *a: "1.18.31")
+    _ua_registry(monkeypatch, {"latest": "1.18.34"})
+    assert ff.check_opencode_ua_version() == "1.18.34"
+    err = capsys.readouterr().err
+    assert "stale" in err
+    # The warning has to be actionable, or it is just noise.
+    assert "1.18.31" in err and "1.18.34" in err
+    assert "OPENCODE_UA" in err and "config.go" in err
+
+
+def test_opencode_ua_check_is_silent_when_current(monkeypatch, capsys):
+    monkeypatch.delenv("SKIP_OPENCODE_UA_CHECK", raising=False)
+    monkeypatch.setattr(ff, "opencode_ua_version", lambda *a: "1.18.34")
+    _ua_registry(monkeypatch, {"latest": "1.18.34"})
+    assert ff.check_opencode_ua_version() is None
+    assert capsys.readouterr().err == ""
+
+
+def test_opencode_ua_check_is_opt_out(monkeypatch, capsys):
+    """SKIP_OPENCODE_UA_CHECK=1 must suppress the check AND its network call.
+
+    It is opt-out rather than opt-in because the failure it hunts is silent and
+    slow-moving: a check you have to remember to run is the check that does not
+    run. The opt-out has to be complete, though — an air-gapped machine must not
+    pay a registry round trip just to be told nothing.
+    """
+    monkeypatch.setenv("SKIP_OPENCODE_UA_CHECK", "1")
+    monkeypatch.setattr(
+        ff, "fetch_json",
+        lambda *a, **k: pytest.fail("opt-out must not reach the network"),
+    )
+    assert ff.check_opencode_ua_version() is None
+    assert capsys.readouterr().err == ""
+
+
+def test_opencode_ua_check_survives_a_dead_registry(monkeypatch, capsys):
+    """A sync must not fail, or nag, because a version lookup did.
+
+    The registry being unreachable is not evidence about the UA, and this
+    script's exit code is consumed by the sync timer.
+    """
+    monkeypatch.delenv("SKIP_OPENCODE_UA_CHECK", raising=False)
+    for payload in (None, {}, {"latest": None}, {"latest": 7}, ["nope"]):
+        _ua_registry(monkeypatch, payload)
+        assert ff.check_opencode_ua_version() is None, payload
+    assert capsys.readouterr().err == ""
+
+
 def test_probe_endpoint_uses_the_gate_body_for_opencode():
     """`big-pickle` was recorded permanently dead because its probe 403'd on its
     own request shape."""

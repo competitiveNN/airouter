@@ -350,7 +350,10 @@ MUTATIONS: list[Mutation] = [
 # count and the floor cannot be maintained in two places — and
 # test_every_test_suite_has_a_floor() fails if a new suite is added without one.
 SUITE_TEST_FLOORS = {
-    "scripts/test_fetch_free_models.py": 41,
+    # 47: test_opencode_ua_matches_the_gateway, plus the five tests covering
+    # check_opencode_ua_version (stale / current / opt-out / dead registry) and
+    # opencode_ua_version's parser.
+    "scripts/test_fetch_free_models.py": 47,
     "scripts/test_mutation_check.py": 19,
     "scripts/test_regenerate_config.py": 48,
     # EXACT, matching every other floor in this table (48/48, 18/18, 17/17).
