@@ -151,10 +151,7 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `cb5e22c` opencode: satisfy the free tier's X-Session-ID and versioned
-  User-Agent
-- `1b8de17` config.yaml: regenerate from the live model list
-- `8070ef9` gates: four failures that outlived the conditions they described
+- `2c7e900` Cooldown: treat an upstream SSE error as an ordinary error
 
 
 That is the whole required list as of this writing — commits that touch only
