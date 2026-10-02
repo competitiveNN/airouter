@@ -372,9 +372,17 @@ CHECK_RULE_CASES = [
         "rule3: smart nvidia3 is missing",
     ),
     (
-        "dropped commandcode key",
-        lambda t: _drop_provider_entry(t, "smart", "commandcode2"),
-        "rule3: smart commandcode2 is missing",
+        # A second rule3 instance, so the rule is proven on more than one
+        # provider. It used to target commandcode2, but the commandcode catalog
+        # no longer offers any free model (checked 2026-10-02: all 26 ids are
+        # paid, no :free/-free suffix and neither seed present), so the
+        # regeneration correctly dropped commandcode/commandcode2 from every
+        # chain. _drop_provider_entry asserts rather than silently no-opping,
+        # which is the right failure: a case that plants nothing and then
+        # "passes" the suite it was meant to break is worse than no case.
+        "dropped second provider key",
+        lambda t: _drop_provider_entry(t, "smart", "nvidia2"),
+        "rule3: smart nvidia2 is missing",
     ),
     (
         "terminator replaced by a model",

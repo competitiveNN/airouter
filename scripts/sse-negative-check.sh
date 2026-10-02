@@ -29,13 +29,25 @@ TESTS='TestStreamSSE_BuffersPreReleaseEventsUntilReleasePoint|TestStreamSSE_Wire
 restore() {
   if [ -n "${BACKUP:-}" ] && [ -f "$BACKUP" ]; then
     cp "$BACKUP" proxy.go
-    rm -f "$BACKUP"
   fi
 }
-trap restore EXIT INT TERM
+# PRE must outlive restore() — it is the reference the restore is checked
+# against — so the temp files are swept by their own trap, not by restore().
+cleanup() {
+  restore
+  [ -n "${BACKUP:-}" ] && rm -f "$BACKUP"
+  [ -n "${PRE:-}" ] && rm -f "$PRE"
+  return 0
+}
+trap cleanup EXIT INT TERM
 
 BACKUP=$(mktemp)
 cp proxy.go "$BACKUP"
+# PRE is the file as it was BEFORE this run touched anything. It is the only
+# honest reference for "restore worked": the run must leave the working tree
+# exactly as it found it, whatever state that was.
+PRE=$(mktemp)
+cp proxy.go "$PRE"
 
 echo "sse-negative-check: baseline (unmutated) must PASS"
 if ! go test -run "$TESTS" ./... >/dev/null 2>&1; then
@@ -118,12 +130,19 @@ if ! go test -run "$TESTS" ./... >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! git diff --quiet proxy.go; then
-  echo "  FAIL: proxy.go differs from HEAD after restore." >&2
+# Compare against PRE, not HEAD. This used to be `git diff --quiet proxy.go`,
+# which asks a different question: it reports whether proxy.go matches the last
+# COMMIT, not whether the restore put it back. Those agree only on a clean tree.
+# With legitimate uncommitted work in proxy.go -- exactly the file this script
+# mutates -- the old check failed every run for work it had not touched, and the
+# obvious "fix" of committing first would have destroyed that work. `cmp` against
+# PRE is what the stage actually means: byte-identical to where it started.
+if ! cmp -s proxy.go "$PRE"; then
+  echo "  FAIL: proxy.go was not restored to its pre-run contents." >&2
   git --no-pager diff --stat proxy.go >&2
   exit 1
 fi
-echo "  ok (and proxy.go is byte-identical to HEAD)"
+echo "  ok (and proxy.go is byte-identical to its pre-run contents)"
 
 echo
 echo "sse-negative-check: PASS — the ordering guard demonstrably has teeth."
