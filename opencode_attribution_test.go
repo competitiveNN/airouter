@@ -25,6 +25,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"regexp"
 	"strings"
 	"testing"
@@ -46,6 +47,7 @@ var opencodeHeaderKeys = []string{
 	"x-opencode-project",
 	"x-opencode-request",
 	"x-opencode-session",
+	"x-session-id",
 }
 
 // attributionProviders are the provider names in opencodeProviderPrefixes.
@@ -171,6 +173,15 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 	if got := h["x-opencode-request"]; !msgIDPattern.MatchString(got) {
 		t.Errorf("%s: x-opencode-request = %q, want msg_ + 32 hex chars", where, got)
 	}
+
+	// X-Session-ID is the routing backend's name for the same conversation.
+	// It must equal the canonical session id: if the two disagree, the backend
+	// reads the other one and loses the affinity the id exists to buy.
+	if got, canonical := h["x-session-id"], h["x-opencode-session"]; got != canonical {
+		t.Errorf("%s: X-Session-ID = %q, want the same id as x-opencode-session = %q "+
+			"(the backend reads both; a disagreement forfeits routing affinity)",
+			where, got, canonical)
+	}
 }
 
 // TestOpencodeRequestHeadersExactMap pins the map opencodeRequestHeaders
@@ -210,7 +221,7 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 	ctx := context.Background()
 	body := []byte(`{"model":"smart","messages":[{"role":"user","content":"hi"}],"max_tokens":8}`)
 
-	build := func(t *testing.T, provider string, extra map[string]string, sessionID string) map[string]string {
+	buildFor := func(t *testing.T, provider string, extra map[string]string, sessionID string, body []byte) map[string]string {
 		t.Helper()
 		pc := ProviderConfig{
 			URL:       "https://opencode.ai/zen/v1",
@@ -234,6 +245,10 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 		// Lower-cased so the assertions below can index it with the same
 		// literals used everywhere else in this file.
 		return lowerKeys(out)
+	}
+	build := func(t *testing.T, provider string, extra map[string]string, sessionID string) map[string]string {
+		t.Helper()
+		return buildFor(t, provider, extra, sessionID, body)
 	}
 
 	t.Run("opencode providers get the full header set", func(t *testing.T) {
@@ -266,41 +281,160 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 		}
 	})
 
-	t.Run("session id is pinned to the gateway session", func(t *testing.T) {
-		// Sticky routing is only cache-effective upstream if the same session
-		// presents the same id on every request. The gateway id itself is
-		// `ctx:<hex>`, which the gateway answers with 403, so it is mapped onto
-		// the canonical form rather than forwarded.
+	t.Run("session id holds still across the turns of one conversation", func(t *testing.T) {
+		// The requirement is a session id stable "for each conversation". The
+		// gateway session id cannot supply that: bodySessionID hashes the whole
+		// messages array, so it changes every turn as the conversation grows.
+		// Anchor on the conversation's opening instead, or the upstream prompt
+		// cache misses on every request.
+		const (
+			turn1 = `{"model":"smart","stream":true,"messages":[` +
+				`{"role":"system","content":"you are a coding agent"},` +
+				`{"role":"user","content":"add a feature to foo.go"}]}`
+			turn2 = `{"model":"smart","stream":true,"messages":[` +
+				`{"role":"system","content":"you are a coding agent"},` +
+				`{"role":"user","content":"add a feature to foo.go"},` +
+				`{"role":"assistant","content":"done"},` +
+				`{"role":"user","content":"now add a test"}]}`
+			turn3 = `{"model":"smart","stream":true,"messages":[` +
+				`{"role":"system","content":"you are a coding agent"},` +
+				`{"role":"user","content":"add a feature to foo.go"},` +
+				`{"role":"assistant","content":"done"},` +
+				`{"role":"user","content":"now add a test"},` +
+				`{"role":"assistant","content":"added"},` +
+				`{"role":"user","content":"does it race?"}]}`
+		)
+		turns := []string{turn1, turn2, turn3}
+
+		// Guard the premise: if bodySessionID ever stopped drifting, this test
+		// would pass vacuously and stop testing anything.
+		drifted := map[string]bool{}
+		for _, b := range turns {
+			drifted[bodySessionID([]byte(b))] = true
+		}
+		if len(drifted) != len(turns) {
+			t.Fatalf("premise broken: the %d turns share %d gateway session ids, "+
+				"so the conversation-anchor test below would pass vacuously",
+				len(turns), len(drifted))
+		}
+
+		first := buildFor(t, "opencode", nil, bodySessionID([]byte(turn1)), []byte(turn1))["x-opencode-session"]
+		for i, b := range turns[1:] {
+			h := buildFor(t, "opencode", nil, bodySessionID([]byte(b)), []byte(b))
+			if got := h["x-opencode-session"]; got != first {
+				t.Errorf("turn %d: x-opencode-session = %q, want the turn-1 value %q "+
+					"(a per-turn id forfeits the upstream prompt cache)", i+2, got, first)
+			}
+			// The routing backend reads this name, so it has to hold still too,
+			// not just the free-tier-gate spelling.
+			if got := h["x-session-id"]; got != first {
+				t.Errorf("turn %d: X-Session-ID = %q, want the turn-1 value %q", i+2, got, first)
+			}
+			assertAttributionPresent(t, "multi-turn", h)
+		}
+	})
+
+	t.Run("distinct conversations get distinct session ids", func(t *testing.T) {
+		// The anchor must still separate conversations, or every client
+		// collapses into one upstream session.
+		//
+		// The gateway session id is deliberately held CONSTANT across all three
+		// bodies. A single retry loop reuses one session id while the body grows
+		// (api.go captures it before the loop), so holding it constant is the
+		// realistic shape -- and it is the only shape in which this test can fail.
+		// Deriving the header from bodySessionID instead of the body would give
+		// the same answer here and pass vacuously.
+		const sid = "ctx:0000000000000001"
+		mk := func(model, task string) []byte {
+			return []byte(`{"model":"` + model + `","stream":true,"messages":[` +
+				`{"role":"system","content":"you are a coding agent"},` +
+				`{"role":"user","content":"` + task + `"}]}`)
+		}
+		seen := map[string]string{}
+		for _, b := range [][]byte{
+			mk("smart", "add a feature to foo.go"),
+			mk("smart", "add a test for bar.go"),  // different task
+			mk("work", "add a feature to foo.go"), // different logical model
+		} {
+			got := buildFor(t, "opencode", nil, sid, b)["x-opencode-session"]
+			if prev, dup := seen[got]; dup {
+				t.Errorf("two distinct conversations both mapped to %q (%s and %s)",
+					got, prev, b)
+			}
+			seen[got] = string(b)
+		}
+	})
+
+	t.Run("a fallback chain keeps one conversation on one session id", func(t *testing.T) {
+		// A retried conversation hits a different endpoint model each step. If
+		// the anchor were taken from the post-substitution body, one
+		// conversation would fragment across the chain and lose its cache
+		// mid-flight -- and the fragmentation would be invisible until a
+		// fallback actually fired, which is the worst time to find it.
+		//
+		// The gateway session id is held constant across the chain because that
+		// is what a retry loop does: it captures sessionID once, before the
+		// loop, and never recomputes it from the mutated body. So a constant sid
+		// here is the realistic shape, and it is the only shape in which this
+		// test can catch the substitution bug.
+		b := []byte(`{"model":"smart","stream":true,"messages":[` +
+			`{"role":"user","content":"add a feature to foo.go"}]}`)
+		const sid = "ctx:0000000000000002"
+		first := buildFor(t, "opencode", nil, sid, b)["x-opencode-session"]
+		for _, model := range []string{"space-bunny-free", "big-pickle", "grok-code"} {
+			pc := ProviderConfig{URL: "https://opencode.ai/zen/v1", APIKeyEnv: "OPENCODE_API_KEY"}
+			t.Setenv("OPENCODE_API_KEY", "test-key")
+			p := NewProxy(&Config{Providers: map[string]ProviderConfig{"p": pc}})
+			req, err := p.buildRequest(context.Background(), b,
+				ModelEndpoint{Provider: "opencode", Model: model}, &pc, true, sid)
+			if err != nil {
+				t.Fatalf("model %s: buildRequest: %v", model, err)
+			}
+			if got := req.Header.Get("x-opencode-session"); got != first {
+				t.Errorf("endpoint model %s: x-opencode-session = %q, want %q "+
+					"(the chain must not fragment one conversation)", model, got, first)
+			}
+			// And the substitution really did happen, so the test is not passing
+			// because the model name was ignored.
+			sent, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("model %s: read body: %v", model, err)
+			}
+			if !strings.Contains(string(sent), `"model":"`+model+`"`) {
+				t.Errorf("endpoint model %s: the endpoint model was not substituted", model)
+			}
+		}
+	})
+
+	t.Run("with no anchor in the body it falls back to the gateway session id", func(t *testing.T) {
+		// Nothing to anchor on: the body has no system or user message. The
+		// header must still be the canonical ses_ form, because "ctx:<hex>" is
+		// answered with 403.
 		const sid = "ctx:abcdef0123456789"
-		h := build(t, "opencode", nil, sid)
+		h := buildFor(t, "opencode", nil, sid, []byte(`{"model":"smart"}`))
 		want := opencodeSessionFor(sid)
 		if got := h["x-opencode-session"]; got != want {
-			t.Errorf("x-opencode-session = %q, want %q", got, want)
+			t.Errorf("x-opencode-session = %q, want the mapped gateway session %q", got, want)
 		}
 		if h["x-opencode-session"] == sid {
 			t.Errorf("x-opencode-session = %q, want the ctx: id mapped, not forwarded raw",
 				h["x-opencode-session"])
 		}
-		// Still well-formed for the request id, which is always generated.
 		if got := h["x-opencode-request"]; !msgIDPattern.MatchString(got) {
 			t.Errorf("x-opencode-request = %q, want msg_ + 32 hex chars", got)
 		}
-		assertAttributionPresent(t, "pinned session", h)
+		assertAttributionPresent(t, "no-anchor fallback", h)
 	})
 
-	t.Run("same gateway session always maps to the same opencode session", func(t *testing.T) {
-		// The whole point of pinning is prompt-cache affinity, which breaks if
-		// the id is re-minted per request.
+	t.Run("the same gateway session is deterministic", func(t *testing.T) {
+		// Idempotence: a client that re-sends a request must land on the same
+		// upstream session as the original attempt.
 		const sid = "ctx:deadbeefcafebabe"
 		first := build(t, "opencode", nil, sid)["x-opencode-session"]
 		for i := 0; i < 5; i++ {
 			if got := build(t, "opencode", nil, sid)["x-opencode-session"]; got != first {
 				t.Fatalf("call %d: x-opencode-session = %q, want the stable %q", i, got, first)
 			}
-		}
-		other := build(t, "opencode", nil, "ctx:0000000000000000")["x-opencode-session"]
-		if other == first {
-			t.Errorf("two different gateway sessions both mapped to %q", first)
 		}
 	})
 

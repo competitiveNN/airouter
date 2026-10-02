@@ -1019,7 +1019,105 @@ def probe_auto_fallbacks(
 #
 # Items 1, 3 and 4 are also why the gateway needs them at request time; item 2 is
 # the same constraint airouterRequestHeaders() in config.go has to satisfy.
-OPENCODE_UA = "opencode/1.18.31/cli"
+#
+# The version is not cosmetic. OpenCode asks third-party gateways to send "the
+# correct, official User-Agent string (matching opencode/<version>)", and the
+# fix it documents for its own frontends is "update past <version>" — so a UA
+# that trails the published release is not the official string. Bump it from
+# https://registry.npmjs.org/opencode-ai/latest, and keep it equal to the
+# User-Agent in config.go: test_opencode_ua_matches_the_gateway asserts the two
+# agree, because nothing else stops them drifting apart.
+OPENCODE_UA = "opencode/1.18.34/cli"
+
+# Where the published version is read from. The dist-tags endpoint, NOT the
+# package document: https://registry.npmjs.org/opencode-ai is ~5MB of every
+# version ever published, and parsing that on every sync to read one string is
+# absurd. The same reason there is a dedicated `latest` tag rather than taking
+# the max: the tags list also carries `latest-0`, `latest-1` and dozens of
+# `snapshot-*` builds, and "highest version wins" over all of them would pick a
+# snapshot.
+OPENCODE_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/opencode-ai/dist-tags"
+
+
+def opencode_ua_version(ua: str = OPENCODE_UA) -> str:
+    """The `opencode/<version>/cli` version out of a User-Agent string.
+
+    Tolerates the surrounding shape rather than assuming it: if the string is
+    ever edited into something this cannot parse, the caller reports "unknown"
+    instead of claiming a version that was never there.
+    """
+    m = re.match(r"^opencode/([^/]+)/", ua or "")
+    return m.group(1) if m else ""
+
+
+def check_opencode_ua_version() -> str | None:
+    """Warn when OPENCODE_UA trails the published opencode release.
+
+    Returns the version found to be behind, or None when it is current, the
+    check is disabled, or the answer could not be established.
+
+    WHY THIS EXISTS
+    test_opencode_ua_matches_the_gateway proves config.go and this file agree.
+    It cannot prove either is *current*: the repo sat on 1.18.31 while the
+    published release reached 1.18.34, both copies agreeing perfectly the whole
+    time. Nothing but a lookup against the real registry catches that.
+
+    OPT-OUT, not opt-in. This runs on every invocation, including the scheduled
+    sync, because the failure it exists to catch is silent and slow-moving —
+    a check you have to remember to run is the check that does not run. Set
+    SKIP_OPENCODE_UA_CHECK=1 to suppress it, for air-gapped machines and for
+    runs where a registry round trip is not wanted.
+
+    Advisory only. It never fails the run and never affects the model list:
+    a lagging UA is a thing to fix, not a reason to refuse to sync, and this
+    script's exit code is consumed by the sync timer.
+    """
+    if os.environ.get("SKIP_OPENCODE_UA_CHECK") == "1":
+        return None
+
+    have = opencode_ua_version()
+    if not have:
+        print(
+            f"OpenCode UA check: cannot parse a version out of {OPENCODE_UA!r}; "
+            "expected opencode/<version>/cli",
+            file=sys.stderr,
+        )
+        return None
+
+    tags = fetch_json(OPENCODE_DIST_TAGS_URL)
+    latest = tags.get("latest") if isinstance(tags, dict) else None
+    if not isinstance(latest, str) or not latest:
+        # Offline, rate limited, or the registry changed shape. Staying quiet
+        # is right: a sync must not fail because a version lookup did.
+        return None
+
+    if latest == have:
+        return None
+
+    # Only ever nag about being behind. A newer-looking `latest` (a rollback, a
+    # re-publish) is not something to act on blindly, and the warning text tells
+    # the reader to look rather than to overwrite.
+    print("", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print(f"OpenCode UA is stale: sending opencode/{have}, published is {latest}",
+          file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  OpenCode asks third-party gateways for \"the correct, official",
+          file=sys.stderr)
+    print("  User-Agent string (matching opencode/<version>)\".", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  Bump BOTH of these, then re-run scripts/check-rules.py:", file=sys.stderr)
+    print(f"    fetch-free-models.py  OPENCODE_UA = \"opencode/{latest}/cli\"",
+          file=sys.stderr)
+    print(f"    config.go             \"User-Agent\": \"opencode/{latest}/cli\"",
+          file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  test_opencode_ua_matches_the_gateway will fail if only one is bumped.",
+          file=sys.stderr)
+    print("  Suppress with SKIP_OPENCODE_UA_CHECK=1.", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print("", file=sys.stderr)
+    return latest
 # The gate counts tool NAMES and ignores the schemas. `bash`+`read` is the
 # minimal passing set: `read`+`edit`+`glob`, a single `bash`, and two arbitrary
 # names (`foo`,`bar`) were each measured as 403.
@@ -2134,6 +2232,11 @@ def main() -> None:
              "call (a 429, 5xx or timeout is recorded as unknown, never as dead).",
     )
     args = parser.parse_args()
+
+    # Before any provider work: the UA version is independent of every provider
+    # and its key, so this still reports on a run where nothing else is
+    # reachable. Advisory — never affects the exit code or the model list.
+    check_opencode_ua_version()
 
     # Default to table if no format specified
     if not (args.json or args.csv or args.table):

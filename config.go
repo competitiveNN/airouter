@@ -95,15 +95,86 @@ func opencodeSessionFor(sessionID string) string {
 	return sb.String()
 }
 
+// opencodeConversationID derives the identity of the *conversation* a request
+// belongs to, for use as the x-opencode-session anchor.
+//
+// It deliberately is NOT bodySessionID. bodySessionID hashes the entire messages
+// array, so it changes on every turn as the conversation grows — verified on
+// 2026-10-02: turns 1 and 2 of one conversation hashed to
+// ses_dffbfe945e634cljkHio0gqPnr and ses_234deac3449ad7AA327gYNHOu0. A session
+// id that drifts per turn is a prompt-cache miss on every single request, which
+// is the precise thing the free tier asks the id to prevent ("a stable session
+// ID ... for each conversation so we can optimize routing and prompt caching").
+//
+// So the anchor is the *opening* of the conversation: the logical model plus the
+// first system and first user message. Those are fixed for the life of a
+// conversation; later turns are appended after them and cannot move it.
+//
+// The cost is that two conversations opened with an identical first message
+// share an id. That is the cheaper error of the two. The upstream prompt cache
+// is keyed by the message prefix, so an identical opening genuinely does share
+// a cache entry and the collision costs nothing a miss would not have cost;
+// drifting, by contrast, forfeits the cache on every request.
+//
+// The model is the *logical* name from the client's body, not the endpoint's
+// substituted one. A fallback chain retries a single conversation against
+// several models, and anchoring on the substituted name would split that one
+// conversation into several upstream sessions.
+//
+// Returns "" when there is nothing to anchor on (unparseable body, or no
+// system/user message at all), so the caller can fall back.
+func opencodeConversationID(body []byte) string {
+	var partial struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &partial); err != nil || partial.Model == "" {
+		return ""
+	}
+
+	h := sha256.New()
+	h.Write([]byte(partial.Model))
+	anchored := false
+	for _, role := range []string{"system", "user"} {
+		for _, m := range partial.Messages {
+			if m.Role != role {
+				continue
+			}
+			h.Write([]byte{0})
+			h.Write(m.Content)
+			anchored = true
+			break
+		}
+	}
+	if !anchored {
+		return ""
+	}
+	return "conv:" + hex.EncodeToString(h.Sum(nil)[:16])
+}
+
 // opencodeRequestHeaders returns the OpenCode client-attribution headers that
 // must accompany every request to an OpenCode gateway. The session/request IDs
 // are generated fresh per call so the upstream sees a distinct identity each
 // time, exactly like the official CLI.
+//
+// `X-Session-ID` is a second name for the same conversation, not a third
+// identity. OpenCode's /zen/v1 routing backend validates a session id and reads
+// it under both spellings: x-opencode-session carries the canonical
+// `ses_<12hex><14base62>` form the free-tier gate accepts, while X-Session-ID is
+// the plain routing-backend name for it. A third-party gateway that sends only
+// the first is treated as having no session, which loses routing and cache
+// affinity even though the free-tier check passes. Both are set from one value
+// in buildRequest so they cannot drift apart.
 func opencodeRequestHeaders() map[string]string {
+	sess := opencodeSessionID()
 	return map[string]string{
-		"User-Agent":         "opencode/1.18.31/cli",
+		"User-Agent":         "opencode/1.18.34/cli",
 		"x-opencode-client":  "cli",
-		"x-opencode-session": opencodeSessionID(),
+		"x-opencode-session": sess,
+		"X-Session-ID":       sess,
 		"x-opencode-request": "msg_" + randomHex(16),
 		"x-opencode-project": "default",
 	}
