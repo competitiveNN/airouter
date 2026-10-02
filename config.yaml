@@ -284,6 +284,11 @@ models:
         model: mimo-v2.6-flash-free  # 37.9
         vision: false
         intelligence: 37.9
+      - provider: opencode
+        model: deepseek-v4-flash-free  # 34.3  elo=1581
+        vision: false
+        intelligence: 34.3
+        context_length: 131072
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1590
         vision: true
@@ -307,10 +312,19 @@ models:
         vision: false
         intelligence: 27.0
       - provider: kilocode
+        model: apodex/apodex-1.1-mini:free  # 26.4
+        vision: false
+        intelligence: 26.4
+        context_length: 262144
+      - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 25.7
         vision: true
         intelligence: 25.7
         context_length: 1048576
+      - provider: opencode
+        model: fledge-alpha-free  # 25.0  floor
+        vision: false
+        intelligence: 25.0
       - provider: kilocode
         model: poolside/laguna-s-2.1:free  # 25.0  floor
         vision: false
@@ -334,16 +348,6 @@ models:
         model: longcat-2.5-preview-free  # 25.0  floor
         vision: false
         intelligence: 25.0
-      - provider: commandcode
-        model: stealth/space-bunny-alpha  # 25.0  floor
-        vision: false
-        intelligence: 25.0
-        context_length: 1000000
-      - provider: commandcode2
-        model: stealth/space-bunny-alpha  # 25.0  floor
-        vision: false
-        intelligence: 25.0
-        context_length: 1000000
       - provider: kilocode
         model: kilo-auto/free  # last: kilocode (auto router probed live; opencode auto not entitled to free tier)
         vision: true
@@ -418,6 +422,11 @@ models:
         model: mimo-v2.6-flash-free  # 37.9
         vision: false
         intelligence: 37.9
+      - provider: opencode
+        model: deepseek-v4-flash-free  # 34.3  elo=1581
+        vision: false
+        intelligence: 34.3
+        context_length: 131072
       - provider: kilocode
         model: qwen/qwen3.8-27b:free  # 33.7  elo=1590
         vision: true
@@ -441,10 +450,19 @@ models:
         vision: false
         intelligence: 27.0
       - provider: kilocode
+        model: apodex/apodex-1.1-mini:free  # 26.4
+        vision: false
+        intelligence: 26.4
+        context_length: 262144
+      - provider: kilocode
         model: thinkingmachines/inkling-small:free  # 25.7
         vision: true
         intelligence: 25.7
         context_length: 1048576
+      - provider: opencode
+        model: fledge-alpha-free  # 25.0  floor
+        vision: false
+        intelligence: 25.0
       - provider: kilocode
         model: poolside/laguna-s-2.1:free  # 25.0  floor
         vision: false
@@ -468,16 +486,6 @@ models:
         model: longcat-2.5-preview-free  # 25.0  floor
         vision: false
         intelligence: 25.0
-      - provider: commandcode
-        model: stealth/space-bunny-alpha  # 25.0  floor
-        vision: false
-        intelligence: 25.0
-        context_length: 1000000
-      - provider: commandcode2
-        model: stealth/space-bunny-alpha  # 25.0  floor
-        vision: false
-        intelligence: 25.0
-        context_length: 1000000
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9
         vision: false
@@ -508,22 +516,16 @@ models:
         vision: false
         intelligence: 22.9
         context_length: 1000000
+      - provider: opencode
+        model: ling-3.0-flash-fin-free  # 22.6
+        vision: false
+        intelligence: 22.6
       - provider: gemini
         model: gemini-flash-lite-latest  # 22.2
         vision: true
         intelligence: 22.2
         context_length: 1048576
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
-        vision: false
-        intelligence: 20.1
-        context_length: 262144
-      - provider: commandcode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
-        vision: false
-        intelligence: 20.1
-        context_length: 262144
-      - provider: commandcode2
         model: inclusionai/ling-3.0-flash-sante:free  # 20.1
         vision: false
         intelligence: 20.1
@@ -590,22 +592,16 @@ models:
         vision: false
         intelligence: 22.9
         context_length: 1000000
+      - provider: opencode
+        model: ling-3.0-flash-fin-free  # 22.6
+        vision: false
+        intelligence: 22.6
       - provider: gemini
         model: gemini-flash-lite-latest  # 22.2
         vision: true
         intelligence: 22.2
         context_length: 1048576
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
-        vision: false
-        intelligence: 20.1
-        context_length: 262144
-      - provider: commandcode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
-        vision: false
-        intelligence: 20.1
-        context_length: 262144
-      - provider: commandcode2
         model: inclusionai/ling-3.0-flash-sante:free  # 20.1
         vision: false
         intelligence: 20.1
@@ -642,16 +638,6 @@ models:
         vision: true
         intelligence: 22.2
         context_length: 1048576
-      - provider: commandcode
-        model: stealth/space-bunny-alpha  # 25.0  floor
-        vision: false
-        intelligence: 25.0
-        context_length: 1000000
-      - provider: commandcode2
-        model: stealth/space-bunny-alpha  # 25.0  floor
-        vision: false
-        intelligence: 25.0
-        context_length: 1000000
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9
         vision: false
@@ -703,6 +689,11 @@ models:
         intelligence: 29.2
         context_length: 262144
       - provider: kilocode
+        model: apodex/apodex-1.1-mini:free  # 26.4
+        vision: false
+        intelligence: 26.4
+        context_length: 262144
+      - provider: kilocode
         model: poolside/laguna-s-2.1:free  # 25.0  floor
         vision: false
         intelligence: 25.0
@@ -713,16 +704,6 @@ models:
         intelligence: 25.0
         context_length: 262144
       - provider: kilocode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
-        vision: false
-        intelligence: 20.1
-        context_length: 262144
-      - provider: commandcode
-        model: inclusionai/ling-3.0-flash-sante:free  # 20.1
-        vision: false
-        intelligence: 20.1
-        context_length: 262144
-      - provider: commandcode2
         model: inclusionai/ling-3.0-flash-sante:free  # 20.1
         vision: false
         intelligence: 20.1
