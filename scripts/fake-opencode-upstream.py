@@ -151,6 +151,19 @@ class Handler(BaseHTTPRequestHandler):
         session = self.headers.get("x-opencode-session", "")
         if not SESSION_PATTERN.match(session):
             return f"x-opencode-session={session!r} is not ses_<12hex><14base62>"
+        # The routing backend validates a session id under this second name as
+        # well, and reads it alongside x-opencode-session. A gateway that sets
+        # only the first is treated as having no session at all: routing and
+        # prompt-cache affinity are lost even though the free-tier gate passed.
+        # It carries the same value, so a disagreement is also a failure.
+        routing_session = self.headers.get("X-Session-ID", "")
+        if not routing_session:
+            return "X-Session-ID is absent; the routing backend sees no session"
+        if not SESSION_PATTERN.match(routing_session):
+            return f"X-Session-ID={routing_session!r} is not ses_<12hex><14base62>"
+        if routing_session != session:
+            return (f"X-Session-ID={routing_session!r} disagrees with "
+                    f"x-opencode-session={session!r}")
         return None
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
