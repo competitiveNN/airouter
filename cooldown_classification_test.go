@@ -320,3 +320,87 @@ func TestAClientErrorIsStillRecorded(t *testing.T) {
 		t.Error("last_error is empty; the diagnostic value of the entry is lost")
 	}
 }
+
+// TestProtocolRefusalIsNotAClientError is the live bug, reproduced.
+//
+// From the running daemon on 2026-10-02:
+//
+//	cooldown opencode/muse-spark-1.3-contributor-free status=400 errors=15 for 0s:
+//	  {"type":"error","error":{"type":"ModelProtocolUnsupported",...}}
+//
+// ModelProtocolUnsupported arrives as HTTP 400, and a 400 is classified as a
+// client request error: zero cooldown, on the reasoning that a byte-identical
+// retry will be rejected identically. True of a bad request; false here,
+// because this 400 is the provider saying the MODEL cannot serve the protocol
+// at all. Zero cooldown kept the endpoint in rotation, so every request paid a
+// full round trip that could never succeed and the error count climbed without
+// bound. Verified directly against opencode.ai: that model answers 400 on
+// /zen/v1/chat/completions.
+func TestProtocolRefusalIsNotAClientError(t *testing.T) {
+	const body = `{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}`
+	r := NewRouter(&Config{}, "")
+	ep := &ModelEndpoint{Provider: "opencode", Model: "muse-spark-1.3-contributor-free"}
+
+	// The classifier alone still says "client error, don't retry" -- it only
+	// sees a status. The correction happens where the body is available.
+	if !isClientRequestError(400) {
+		t.Fatal("premise broken: 400 is no longer classified as a client error")
+	}
+
+	d := r.ApplyCooldownForSession(ep, 400, body, "s", 0)
+	if d <= 0 {
+		t.Fatalf("got cooldown %v, want > 0: a model that cannot serve the protocol "+
+			"must leave rotation, or every request re-pays the rejected round trip", d)
+	}
+	if d < time.Hour {
+		t.Errorf("got cooldown %v, want a long one: this incompatibility is permanent", d)
+	}
+
+	// And the entry must actually be recorded, so the endpoint stops being
+	// selected rather than merely being reported.
+	r.mu.Lock()
+	cd, ok := r.cooldowns[ep.Key()]
+	r.mu.Unlock()
+	if !ok {
+		t.Fatal("no cooldown recorded; the endpoint would still be selected next request")
+	}
+	if cd.StatusCode != 400 {
+		t.Errorf("recorded status = %d, want the upstream 400 preserved", cd.StatusCode)
+	}
+	if cd.ErrorCount != 1 {
+		t.Errorf("error_count = %d, want 1", cd.ErrorCount)
+	}
+}
+
+// TestProtocolRefusalIsNarrow guards the correction above from over-reaching.
+// It changes a "never retry" verdict into a "back off hard" one, so a false
+// positive would park a healthy endpoint for a day over an ordinary bad
+// request.
+func TestProtocolRefusalIsNarrow(t *testing.T) {
+	if !isProtocolUnsupported(400, `{"error":{"type":"ModelProtocolUnsupported","message":"x"}}`) {
+		t.Error("the canonical refusal was not recognised")
+	}
+	if !isProtocolUnsupported(400, `{"error":{"message":"Model does not support this protocol."}}`) {
+		t.Error("the message form was not recognised")
+	}
+	// An ordinary 400 must stay a client error with no cooldown.
+	for _, other := range []string{
+		`{"error":{"type":"invalid_request","message":"max_tokens is not supported"}}`,
+		`{"error":{"message":"rate limited"}}`,
+		`garbage`,
+		``,
+	} {
+		if isProtocolUnsupported(400, other) {
+			t.Errorf("an ordinary 400 body was read as a protocol refusal: %q", other)
+		}
+		r := NewRouter(&Config{}, "")
+		ep := &ModelEndpoint{Provider: "p", Model: "m"}
+		if d := r.ApplyCooldownForSession(ep, 400, other, "s", 0); d != 0 {
+			t.Errorf("ordinary 400 %q produced a %v cooldown, want 0", other, d)
+		}
+	}
+	// The same body at a status that is not a refusal still cools normally.
+	if isProtocolUnsupported(503, `{"error":{"type":"ModelProtocolUnsupported"}}`) {
+		t.Error("a 503 carrying the text was read as a protocol refusal")
+	}
+}

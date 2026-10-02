@@ -230,10 +230,11 @@ func (c *cooldownSaveState) stop() {
 }
 
 type Router struct {
-	config       *atomic.Pointer[Config]
-	sessions     map[string]sessionEntry
-	cooldowns    map[string]CooldownEntry
-	noVision     map[string]bool // endpoints that rejected an image request
+	config    *atomic.Pointer[Config]
+	sessions  map[string]sessionEntry
+	cooldowns map[string]CooldownEntry
+	noVision  map[string]bool // endpoints that rejected an image request
+
 	tps          map[string]float64
 	circuits     map[string]*CircuitBreaker
 	cooldownPath string
@@ -973,6 +974,11 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 		cd.ErrorCount = 100
 	}
 	duration := r.cooldownForError(statusCode, cd.ErrorCount)
+	// A protocol refusal outranks the generic 400 classification above, which
+	// would otherwise return zero and keep the endpoint in rotation forever.
+	if isProtocolUnsupported(statusCode, errMsg) {
+		duration = protocolUnsupportedCooldown
+	}
 	// Honor the upstream's Retry-After as a floor: never cool down for less
 	// than the provider asked, since it knows its own rate-limit windows.
 	// Honour Retry-After for genuine provider-side throttling only. On a client
@@ -1379,6 +1385,43 @@ func isClientRequestError(statusCode int) bool {
 	}
 	return false
 }
+
+// isProtocolUnsupported reports whether a provider body is the refusal
+// "this model does not support this protocol" -- OpenCode's
+// ModelProtocolUnsupported, measured live 2026-10-02.
+//
+// It needs its own predicate because it arrives as HTTP 400, and 400 is
+// otherwise classified as a client request error: no cooldown, ever. That is
+// correct for a genuinely bad request, where a byte-identical retry is
+// rejected identically and re-asking wastes a round trip. It is exactly wrong
+// here, because this 400 is not about the request. It is the provider saying
+// the MODEL cannot serve the protocol we are speaking -- a permanent property
+// of the endpoint, identical in kind to a model that has been removed.
+//
+// The symptom this fixes, from the live daemon on 2026-10-02:
+//
+//	cooldown opencode/muse-spark-1.3-contributor-free status=400 errors=15 for 0s:
+//	  {"type":"error","error":{"type":"ModelProtocolUnsupported",...}}
+//
+// Zero-second cooldown, so the endpoint stayed in rotation, so every single
+// request paid a full round trip to opencode that could never succeed, and the
+// error count climbed forever. Verified directly: that model answers 400 on
+// /zen/v1/chat/completions, so the incompatibility is permanent.
+func isProtocolUnsupported(statusCode int, body string) bool {
+	if statusCode != 400 && statusCode != 404 && statusCode != 422 && statusCode != 501 {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "modelprotocolunsupported") ||
+		strings.Contains(lower, "model does not support this protocol")
+}
+
+// protocolUnsupportedCooldown is how long an endpoint that refused the
+// protocol is taken out for. Matched to the 404 case: the model cannot serve
+// us, and nothing we send will change that, so the only question is how long
+// before a human or a sync changes it. Short of a hard ban, every request keeps
+// paying for a rejection.
+const protocolUnsupportedCooldown = 24 * time.Hour
 
 func baseCooldownForError(statusCode int) time.Duration {
 	switch statusCode {
