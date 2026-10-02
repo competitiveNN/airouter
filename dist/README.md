@@ -151,7 +151,9 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `2c7e900` Cooldown: treat an upstream SSE error as an ordinary error
+- `8867d60` Add per-endpoint Responses-API upstream support
+- `d7b4ace` Cooldown: a protocol refusal must not be treated as a client error
+- `209437d` config: add the per-endpoint `protocol` field
 
 
 That is the whole required list as of this writing — commits that touch only
