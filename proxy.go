@@ -20,7 +20,11 @@ import (
 )
 
 type Proxy struct {
-	client            *http.Client
+	client *http.Client
+	// baseTransport is the shared transport. An attempt that needs its own
+	// header-timeout budget clones it (Clone shares the connection pool), so
+	// per-attempt timeouts do not cost pooling.
+	baseTransport     *http.Transport
 	config            *atomic.Pointer[Config]
 	toolCalls         atomic.Bool
 	streamIdleTimeout time.Duration
@@ -77,6 +81,7 @@ func NewProxy(cfg *Config) *Proxy {
 		},
 		streamIdleTimeout: 60 * time.Second,
 	}
+	p.baseTransport = p.client.Transport.(*http.Transport)
 	p.config = &atomic.Pointer[Config]{}
 	p.config.Store(cfg)
 	return p
@@ -200,7 +205,27 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	}
 	backendBody = sanitizeRequestBody(backendBody, endpoint.Provider)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", providerCfg.URL+"/chat/completions", bytes.NewReader(backendBody))
+	// Upstream protocol. `chat` is the historical default and every provider
+	// understands it; `responses` addresses a model that speaks the Responses
+	// API instead. The translation happens here, at the edge, so the router,
+	// the fallback loop and the cooldown classifier keep speaking the one
+	// canonical shape regardless of what the provider speaks.
+	proto := endpoint.UpstreamProtocol()
+	path := proto.upstreamPath()
+	if proto == protocolResponses {
+		translated, terr := chatBodyToResponses(backendBody, endpoint.Model)
+		if terr != nil {
+			// Fail toward the shape that always works. A translation bug must
+			// never be the reason a provider stops serving this model.
+			log.Printf("[debug] provider=%s model=%s -> responses translation failed (%v); using chat/completions",
+				endpoint.Provider, endpoint.Model, terr)
+			path = protocolChatCompletions.upstreamPath()
+		} else {
+			backendBody = translated
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", providerCfg.URL+path, bytes.NewReader(backendBody))
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +398,35 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		return "", nil, 0, err
 	}
 
-	resp, err := p.client.Do(req)
+	// The header wait is bounded by the SAME size-based budget as
+	// time-to-first-token, not by the transport's global 30s.
+	//
+	// This was a live failure, not a theoretical one. The streaming path passed
+	// the unbounded parent context, so `timeout` only started counting once the
+	// headers had already arrived -- and for a large prompt the provider does
+	// its prefill BEFORE sending them. A ~44k-token request against NVIDIA
+	// therefore sat for the full 30s ResponseHeaderTimeout on every endpoint,
+	// and two of those exhausted the 45s fallback budget:
+	//
+	//	request -> nvidia/z-ai/glm-5.3 (timeout=10s, ~44473 tokens)
+	//	... 30s later ...
+	//	stream fallback budget exhausted after 3 attempts in 1m0.718s (budget 45s)
+	//
+	// The client saw "all models unavailable" when the real problem was that
+	// each attempt was allowed to run three times longer than its own budget.
+	//
+	// A cloned transport carries a per-attempt ResponseHeaderTimeout. Clone
+	// shares the connection pool, so this costs no pooling. The body phase is
+	// deliberately left unbounded: this deadline governs headers only, and a
+	// long generation must still be allowed to run to completion.
+	client := p.client
+	if p.baseTransport != nil {
+		tr := p.baseTransport.Clone()
+		tr.ResponseHeaderTimeout = timeout
+		client = &http.Client{Transport: tr}
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", nil, 0, &ProviderError{Err: err}
 	}
@@ -403,7 +456,18 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// hanging the client indefinitely.
 	firstCtx, firstCancel := context.WithTimeout(ctx, timeout)
 	defer firstCancel()
-	guarded := &firstByteReader{r: resp.Body, firstCtx: firstCtx}
+
+	// When the endpoint was addressed with the Responses API, translate the
+	// upstream stream back into Chat Completions SSE before anything else sees
+	// it. Everything downstream -- the buffering-until-first-content rule, the
+	// tool-call accumulation, the [DONE] framing -- is protocol-agnostic and
+	// works unchanged on the translated bytes.
+	var src io.Reader = resp.Body
+	if endpoint.UpstreamProtocol() == protocolResponses {
+		src = newResponsesSSEToChatReader(resp.Body)
+	}
+
+	guarded := &firstByteReader{r: src, firstCtx: firstCtx}
 	idle := newIdleTimeoutReader(guarded, p.streamIdleTimeout)
 	defer idle.Close()
 
