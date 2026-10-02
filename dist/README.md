@@ -151,23 +151,10 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-  give the Go suite a size contract
-  a push exposed it
-  in the checkout participates in the gate's tree fingerprint, so an editor opening
-  a file mid-run turns the run INVALID
-  uncommitted work — `git checkout -- <path>` on a dirty file discards the whole
-  file, and the result is indistinguishable from a clean tree
-  and the two routing stages documented as non-interchangeable
-  tracked-only rule left just-written scripts unlinted
-  gate-invariant suite — live proof that the gateway routes to OpenCode, plus the
-  hermetic proof that the check itself can fail
-  fires — it printed timestamps instead of paths, and never fired at all unless
-  the gate was run from the repo root
-  ban — three consecutive network timeouts were serving a 24h ban (ten, a week),
-  because "no status" fell through to the permanent-soft-ban branch instead of
-  the bounded 5xx branch
-- `8edfffb` opencode: the free-tier probe was deleting working models, and never
-  passed the gate
+- `cb5e22c` opencode: satisfy the free tier's X-Session-ID and versioned
+  User-Agent
+- `1b8de17` config.yaml: regenerate from the live model list
+- `8070ef9` gates: four failures that outlived the conditions they described
 
 
 That is the whole required list as of this writing — commits that touch only
