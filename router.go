@@ -235,6 +235,26 @@ type Router struct {
 	cooldowns map[string]CooldownEntry
 	noVision  map[string]bool // endpoints that rejected an image request
 
+	// learnedProtocol remembers, per endpoint, which wire shape actually
+	// works. It is populated only by an explicit
+	// "Model does not support this protocol" refusal, which is a statement
+	// about the PROTOCOL, not about the model's health.
+	//
+	// This exists because the refusal is per-protocol, not per-model. Measured
+	// live 2026-10-02 against opencode.ai, same key, same gate headers:
+	//
+	//	muse-spark-1.3-contributor-free   chat 400 ProtocolUnsupported
+	//	                                  /responses  200
+	//	big-pickle                        chat  200
+	//	                                  /responses 400 ProtocolUnsupported
+	//
+	// So one catalog holds chat-only and responses-only models side by side,
+	// and the only way to tell them apart is to be told. Treating the refusal
+	// as "this endpoint is broken" cooled working models out of rotation for a
+	// day; treating it as "try the other protocol" is what the free tier is
+	// actually asking for.
+	learnedProtocol map[string]protocol
+
 	tps          map[string]float64
 	circuits     map[string]*CircuitBreaker
 	cooldownPath string
@@ -342,15 +362,16 @@ func (r *Router) CircuitHalfOpenProbes() int {
 
 func NewRouter(cfg *Config, cooldownPath string) *Router {
 	r := &Router{
-		sessions:     make(map[string]sessionEntry),
-		cooldowns:    make(map[string]CooldownEntry),
-		noVision:     make(map[string]bool),
-		tps:          make(map[string]float64),
-		circuits:     make(map[string]*CircuitBreaker),
-		cooldownPath: cooldownPath,
-		priorityPath: strings.TrimSuffix(cooldownPath, ".json") + ".priority.json",
-		sessionsDone: make(chan struct{}),
-		cooldownSave: &cooldownSaveState{},
+		sessions:        make(map[string]sessionEntry),
+		cooldowns:       make(map[string]CooldownEntry),
+		noVision:        make(map[string]bool),
+		learnedProtocol: make(map[string]protocol),
+		tps:             make(map[string]float64),
+		circuits:        make(map[string]*CircuitBreaker),
+		cooldownPath:    cooldownPath,
+		priorityPath:    strings.TrimSuffix(cooldownPath, ".json") + ".priority.json",
+		sessionsDone:    make(chan struct{}),
+		cooldownSave:    &cooldownSaveState{},
 	}
 	r.config = &atomic.Pointer[Config]{}
 	r.config.Store(cfg)
@@ -1513,6 +1534,30 @@ func (r *Router) ResetCooldown(ep *ModelEndpoint) {
 // MarkNoVision records that an endpoint rejected an image request, so it is
 // skipped for subsequent vision requests (without a cooldown, since the model
 // itself is healthy). Runtime-only; not persisted.
+// LearnProtocol records which protocol answered for this endpoint after the
+// other one refused.
+func (r *Router) LearnProtocol(ep *ModelEndpoint, p protocol) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.learnedProtocol[ep.Key()] = p
+}
+
+// ProtocolFor returns the protocol to address ep with: a learned one if the
+// endpoint has proved which shape it speaks, otherwise the configured one.
+func (r *Router) ProtocolFor(ep *ModelEndpoint) protocol {
+	r.mu.Lock()
+	learned, ok := r.learnedProtocol[ep.Key()]
+	r.mu.Unlock()
+	if ok {
+		// A learned protocol outranks the configured one in BOTH directions.
+		// The common case is exactly this: an endpoint configured for chat that
+		// turned out to be responses-only. Returning the configured value
+		// whenever that is chat would ignore the learning forever.
+		return learned
+	}
+	return ep.UpstreamProtocol()
+}
+
 func (r *Router) MarkNoVision(ep *ModelEndpoint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

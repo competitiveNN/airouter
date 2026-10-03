@@ -37,6 +37,7 @@ func main() {
 	cooldownPath := filepath.Join(filepath.Dir(*configPath), "cooldowns.json")
 	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
+	proxy.SetProtocolResolver(router.ProtocolFor)
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
 	router.SetMetrics(gateway.metrics)
 	proxy.SetMetrics(gateway.metrics)
