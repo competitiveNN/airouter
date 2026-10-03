@@ -33,30 +33,53 @@ def main() -> int:
             "smart/work/fast/large (see LogicalModels in config.go)"
         )
 
-    # Models that the opencode key provably cannot call. Verified 2026-09-29:
-    # 11 of 12 return 403 FreeTierError, paid big-pickle included; the
-    # attribution headers do not change it. Listing them in a chain costs a
-    # guaranteed round trip per request that reaches them.
+    # Models that the opencode key provably cannot serve, with the reason each
+    # one fails. Listing such a model in a chain costs a guaranteed round trip
+    # per request that reaches it.
+    #
+    # MEASURED 2026-10-02 with an AGENT-SHAPED request -- stream:true, a tools
+    # array carrying both `bash` and `read`, and the full client-attribution
+    # header set. The shape matters, and getting it wrong is exactly how this
+    # list came to be wrong in the first place.
+    #
+    # The previous version held 11 models, justified by "verified 2026-09-29:
+    # 11 of 12 return 403 FreeTierError". That verification used a BARE probe
+    # -- no stream, no tools -- and a bare probe is rejected by opencode's
+    # free-tier gate REGARDLESS of whether the model is entitled. Re-measured
+    # with the correct shape, 6 of those 11 answer HTTP 200:
+    #
+    #   big-pickle, mimo-v2.5-free, mimo-v2.6-flash-free,
+    #   longcat-2.5-preview-free, nemotron-3-ultra-free, nemotron-3.5-lightning-free
+    #
+    # They were being blocked out of every chain, and because the generator
+    # keeps emitting them (correctly -- they ARE available) the nightly sync
+    # then failed validation and restored the previous config, so the model list
+    # could never update at all. One wrong list froze the whole pipeline.
+    #
+    # The same bare-probe defect was fixed in fetch-free-models.py by 8edfffb;
+    # this copy of it survived there.
+    #
+    # Note the failures below are NOT all 403. Three refuse the protocol
+    # outright and one has been removed upstream, so the reason is recorded per
+    # model rather than asserted as a blanket FreeTierError.
+    # Only models that refuse BOTH shapes are dead. The gateway speaks
+    # /chat/completions and /responses and switches between them on an explicit
+    # "does not support this protocol" refusal, so a model that answers on
+    # either one is usable and must not be blocked.
     OPENCODE_DEAD_MODELS = {
-        "big-pickle",
-        "jev-1.13-free",
-        "deepseek-v4-flash-free",
-        "muse-spark-1.2-contributor-free",
-        "muse-spark-1.3-contributor-free",
-        "mimo-v2.5-free",
-        "mimo-v2.6-flash-free",
-        "longcat-2.5-preview-free",
-        "nemotron-3-ultra-free",
-        "nemotron-3.5-lightning-free",
-        "ling-3.0-flash-fin-free",
+        "jev-1.13-free": "400 ModelProtocolUnsupported on both",
+        "deepseek-v4-flash-free": "400 Model is unavailable on both",
+        "ling-3.0-flash-fin-free": "404 on chat; 400 ProtocolUnsupported on /responses",
+        "fledge-alpha-free": "403, not available in this region, on both",
     }
     for name, mc in models.items():
         for i, ep in enumerate((mc or {}).get("chain") or []):
             if str(ep.get("provider", "")).startswith("opencode"):
-                if ep.get("model") in OPENCODE_DEAD_MODELS:
+                reason = OPENCODE_DEAD_MODELS.get(ep.get("model"))
+                if reason:
                     problems.append(
-                        f"{name}[{i}]: opencode/{ep['model']} returns 403 "
-                        "FreeTierError and can never serve traffic"
+                        f"{name}[{i}]: opencode/{ep['model']} answers {reason} "
+                        "and can never serve traffic"
                     )
 
     # Provider groups: models from these sources must appear on every provider
