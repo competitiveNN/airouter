@@ -933,6 +933,10 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	// It is local to this goroutine so concurrent requests with the same
 	// session ID don't interfere with each other's endpoint selection.
 	tried := map[string]bool{}
+	// protocolFlips bounds protocol switching to ONE flip per endpoint per
+	// request. Without it, an endpoint that refuses both shapes would bounce
+	// between them forever inside the fallback budget.
+	protocolFlips := map[string]bool{}
 
 	for {
 		if ctx.Err() != nil {
@@ -1041,6 +1045,34 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			resp.Body.Close()
 			cancel()
 
+			// "This model does not support this protocol" is a statement about
+			// the PROTOCOL, not about the endpoint's health: the same catalog
+			// holds chat-only and responses-only models side by side. Measured
+			// live 2026-10-02 against opencode.ai with one key:
+			//
+			//	muse-spark-1.3-contributor-free  chat 400 -> /responses 200
+			//	big-pickle                       chat 200 -> /responses 400
+			//
+			// So the refusal means "use the other shape", and the endpoint keeps
+			// serving. Cooling it down would park a working model for a day.
+			// Only once BOTH shapes have refused is the endpoint genuinely
+			// unusable, and that falls through to the long cooldown below.
+			if isProtocolUnsupported(resp.StatusCode, string(respBody)) {
+				key := ep.Key()
+				if !protocolFlips[key] {
+					protocolFlips[key] = true
+					flip := protocolResponses
+					if g.proxy.effectiveProtocol(ep) == protocolResponses {
+						flip = protocolChatCompletions
+					}
+					log.Printf("[debug] session=%s model=%s -> %s/%s refuses this protocol; "+
+						"retrying the same endpoint over %s and remembering it",
+						sessionID, req.Model, ep.Provider, ep.Model, flip)
+					g.router.LearnProtocol(ep, flip)
+					continue
+				}
+			}
+
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
@@ -1140,6 +1172,10 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	// session ID (e.g. duplicate client retries) don't interfere with each
 	// other's endpoint selection through a shared tried set.
 	tried := map[string]bool{}
+	// protocolFlips bounds protocol switching to ONE flip per endpoint per
+	// request. Without it, an endpoint that refuses both shapes would bounce
+	// between them forever inside the fallback budget.
+	protocolFlips := map[string]bool{}
 
 	// doneSent tracks whether we've already written the [DONE] sentinel to
 	// the client. We must always send it before returning so the client
@@ -1279,6 +1315,25 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			// Client went away; nothing to resume and no point cooling a model.
 			g.recordRequest(req.Model, 499, time.Since(start))
 			return
+		}
+
+		// Same protocol-refusal handling as the non-streaming path: the model
+		// refuses this SHAPE, not this endpoint. See the comment in
+		// handleCompletion; the measurement is identical.
+		var protoErr *ProviderError
+		if errors.As(err, &protoErr) &&
+			isProtocolUnsupported(protoErr.StatusCode, string(protoErr.Body)) &&
+			!protocolFlips[ep.Key()] {
+			protocolFlips[ep.Key()] = true
+			flip := protocolResponses
+			if g.proxy.effectiveProtocol(ep) == protocolResponses {
+				flip = protocolChatCompletions
+			}
+			log.Printf("[debug] session=%s model=%s -> %s/%s refuses this protocol; "+
+				"retrying the same endpoint over %s and remembering it",
+				sessionID, req.Model, ep.Provider, ep.Model, flip)
+			g.router.LearnProtocol(ep, flip)
+			continue
 		}
 
 		// Mark this endpoint as tried in THIS request's local fallback set so

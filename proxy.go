@@ -24,7 +24,13 @@ type Proxy struct {
 	// baseTransport is the shared transport. An attempt that needs its own
 	// header-timeout budget clones it (Clone shares the connection pool), so
 	// per-attempt timeouts do not cost pooling.
-	baseTransport     *http.Transport
+	baseTransport *http.Transport
+
+	// protocolFor resolves an endpoint's effective protocol, consulting the
+	// router's learned map. Injected after construction for the same reason
+	// metrics is: the proxy is built before the router exists.
+	protocolMu        sync.RWMutex
+	protocolFn        func(*ModelEndpoint) protocol
 	config            *atomic.Pointer[Config]
 	toolCalls         atomic.Bool
 	streamIdleTimeout time.Duration
@@ -39,6 +45,27 @@ type Proxy struct {
 // SetMetrics attaches the shared metrics collector to the proxy so stream-level
 // signals (SSE comment routing) are recorded. Nil disables recording, which is
 // the case for the many unit tests that build a bare &Proxy{}.
+// SetProtocolResolver wires the router's learned-protocol lookup.
+func (p *Proxy) SetProtocolResolver(fn func(*ModelEndpoint) protocol) {
+	p.protocolMu.Lock()
+	p.protocolFn = fn
+	p.protocolMu.Unlock()
+}
+
+// effectiveProtocol is the protocol this attempt should use.
+func (p *Proxy) effectiveProtocol(ep *ModelEndpoint) protocol {
+	if p == nil {
+		return protocolChatCompletions
+	}
+	p.protocolMu.RLock()
+	fn := p.protocolFn
+	p.protocolMu.RUnlock()
+	if fn == nil {
+		return ep.UpstreamProtocol()
+	}
+	return fn(ep)
+}
+
 func (p *Proxy) SetMetrics(m *Metrics) {
 	p.metricsMu.Lock()
 	p.metrics = m
@@ -210,7 +237,7 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	// API instead. The translation happens here, at the edge, so the router,
 	// the fallback loop and the cooldown classifier keep speaking the one
 	// canonical shape regardless of what the provider speaks.
-	proto := endpoint.UpstreamProtocol()
+	proto := p.effectiveProtocol(&endpoint)
 	path := proto.upstreamPath()
 	if proto == protocolResponses {
 		translated, terr := chatBodyToResponses(backendBody, endpoint.Model)
@@ -463,7 +490,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// tool-call accumulation, the [DONE] framing -- is protocol-agnostic and
 	// works unchanged on the translated bytes.
 	var src io.Reader = resp.Body
-	if endpoint.UpstreamProtocol() == protocolResponses {
+	if p.effectiveProtocol(&endpoint) == protocolResponses {
 		src = newResponsesSSEToChatReader(resp.Body)
 	}
 
