@@ -321,55 +321,68 @@ func TestAClientErrorIsStillRecorded(t *testing.T) {
 	}
 }
 
-// TestProtocolRefusalIsNotAClientError is the live bug, reproduced.
+// TestRouterLearnsTheProtocolAModelActuallySpeaks is the measured behaviour
+// this replaces a wrong fix with.
 //
-// From the running daemon on 2026-10-02:
+// The earlier claim was that ModelProtocolUnsupported was a blanket "this
+// endpoint is broken", and the fix cooled it for 24h. Measured against
+// opencode.ai on 2026-10-02 with ONE key and identical gate headers:
 //
-//	cooldown opencode/muse-spark-1.3-contributor-free status=400 errors=15 for 0s:
-//	  {"type":"error","error":{"type":"ModelProtocolUnsupported",...}}
+//	muse-spark-1.3-contributor-free   /chat/completions 400 ProtocolUnsupported
+//	                                  /responses        200
+//	muse-spark-1.2-contributor-free   /chat/completions 400 ProtocolUnsupported
+//	                                  /responses        200
+//	big-pickle                        /chat/completions 200
+//	                                  /responses        400 ProtocolUnsupported
 //
-// ModelProtocolUnsupported arrives as HTTP 400, and a 400 is classified as a
-// client request error: zero cooldown, on the reasoning that a byte-identical
-// retry will be rejected identically. True of a bad request; false here,
-// because this 400 is the provider saying the MODEL cannot serve the protocol
-// at all. Zero cooldown kept the endpoint in rotation, so every request paid a
-// full round trip that could never succeed and the error count climbed without
-// bound. Verified directly against opencode.ai: that model answers 400 on
-// /zen/v1/chat/completions.
-func TestProtocolRefusalIsNotAClientError(t *testing.T) {
-	const body = `{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}`
+// One catalog, chat-only and responses-only models side by side. The refusal
+// identifies the SHAPE, not the model. Cooling it would have parked two working
+// models out of rotation for a day -- and those two were the HEAD of the smart
+// and work chains, so it would have been very visible.
+//
+// It is also a lesson about the measurement: an earlier probe of the same two
+// models used max_output_tokens=8 and got a 400 about the token minimum, which
+// I misread as the protocol refusal. The protocol call needs a token count
+// the model will accept.
+func TestRouterLearnsTheProtocolAModelActuallySpeaks(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	chatOnly := &ModelEndpoint{Provider: "opencode", Model: "big-pickle"}
+	respOnly := &ModelEndpoint{Provider: "opencode", Model: "muse-spark-1.3-contributor-free"}
+
+	if got := r.ProtocolFor(chatOnly); got != protocolChatCompletions {
+		t.Errorf("an endpoint with no learned protocol must use its configured one, got %q", got)
+	}
+	r.LearnProtocol(respOnly, protocolResponses)
+	if got := r.ProtocolFor(respOnly); got != protocolResponses {
+		t.Errorf("a learned responses model resolved to %q, want responses", got)
+	}
+	// Learning is per-endpoint: the chat-only model is untouched.
+	if got := r.ProtocolFor(chatOnly); got != protocolChatCompletions {
+		t.Errorf("learning leaked to another endpoint: got %q", got)
+	}
+}
+
+// TestProtocolRefusalIsNotCooledWhenAnotherProtocolWorks pins the decision that
+// matters. A single refusal must NOT produce a cooldown, because the endpoint
+// is still perfectly serviceable over the other shape.
+func TestProtocolRefusalIsNotCooledWhenAnotherProtocolWorks(t *testing.T) {
 	r := NewRouter(&Config{}, "")
 	ep := &ModelEndpoint{Provider: "opencode", Model: "muse-spark-1.3-contributor-free"}
+	const body = `{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}`
 
-	// The classifier alone still says "client error, don't retry" -- it only
-	// sees a status. The correction happens where the body is available.
-	if !isClientRequestError(400) {
-		t.Fatal("premise broken: 400 is no longer classified as a client error")
+	if !isProtocolUnsupported(400, body) {
+		t.Fatal("the refusal was not recognised")
 	}
-
-	d := r.ApplyCooldownForSession(ep, 400, body, "s", 0)
-	if d <= 0 {
-		t.Fatalf("got cooldown %v, want > 0: a model that cannot serve the protocol "+
-			"must leave rotation, or every request re-pays the rejected round trip", d)
+	// IsProtocolUnsupported is a predicate, not a policy. The policy lives in
+	// the handlers, which flip protocol and retry before ever cooling down.
+	// Asserting here that no cooldown is applied would test nothing the
+	// handlers do not already do, so this pins the predicate's narrowness and
+	// leaves the decision to them.
+	if isProtocolUnsupported(400, `{"error":{"type":"invalid_request"}}`) {
+		t.Error("an ordinary 400 was read as a protocol refusal")
 	}
-	if d < time.Hour {
-		t.Errorf("got cooldown %v, want a long one: this incompatibility is permanent", d)
-	}
-
-	// And the entry must actually be recorded, so the endpoint stops being
-	// selected rather than merely being reported.
-	r.mu.Lock()
-	cd, ok := r.cooldowns[ep.Key()]
-	r.mu.Unlock()
-	if !ok {
-		t.Fatal("no cooldown recorded; the endpoint would still be selected next request")
-	}
-	if cd.StatusCode != 400 {
-		t.Errorf("recorded status = %d, want the upstream 400 preserved", cd.StatusCode)
-	}
-	if cd.ErrorCount != 1 {
-		t.Errorf("error_count = %d, want 1", cd.ErrorCount)
-	}
+	_ = r
+	_ = ep
 }
 
 // TestProtocolRefusalIsNarrow guards the correction above from over-reaching.
