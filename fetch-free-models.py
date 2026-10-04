@@ -1226,6 +1226,33 @@ class OpenCodeRateLimited(Exception):
     """
 
 
+# The two paths opencode_gate_bodies() tries, and the config-side name for each.
+# "chat" is the default everywhere (config.go's protocolFor falls back to it), so
+# it is only ever written when it was PROVED, which is what keeps the emitted
+# config free of a field that says nothing.
+PROBE_PATH_PROTOCOLS = {
+    "/chat/completions": "chat",
+    "/responses": "responses",
+}
+
+
+def protocol_for_probe_detail(detail: str) -> str | None:
+    """The protocol a probe detail says answered, or None when it says nothing.
+
+    Only a 200 names a shape. A detail made of refusals ("/chat/completions 400
+    Model does not support this protocol.; /responses 200") does name one, and
+    that is the case that matters: the model is fine, it just speaks the other
+    wire shape, and writing that down is the difference between a working chain
+    and a failed round trip on every process start.
+    """
+    if not detail:
+        return None
+    for path, protocol in PROBE_PATH_PROTOCOLS.items():
+        if f"{path} 200" in detail:
+            return protocol
+    return None
+
+
 def opencode_session_id() -> str:
     """Mint a canonical `ses_<12 hex><14 base62>` id.
 
@@ -1366,6 +1393,16 @@ def opencode_probe(model_id: str, api_key: str, opener: Any = None) -> tuple[str
         for attempt in range(OPENCODE_429_RETRIES):
             code, detail = _opencode_post(path, body, headers, opener)
             if code == 200:
+                # The detail names the shape that answered, and that is the whole
+                # point: a model can be reachable only over one of the two
+                # protocols. Measured on opencode.ai 2026-10-02 --
+                # muse-spark-1.{2,3}-contributor-free answer
+                # `400 ModelProtocolUnsupported` on /chat/completions and 200 on
+                # /responses, big-pickle is the other way round. The router
+                # recovers at runtime by flipping and retrying (api.go), but that
+                # costs a failed round trip per endpoint per process start, and
+                # nothing carried the answer into config.yaml. See
+                # protocol_for_probe_detail().
                 return "ok", f"{path} 200"
             if code == 429:
                 seen.append(f"{path} 429")
@@ -1489,6 +1526,12 @@ def fetch_opencode() -> list[dict[str, Any]]:
             normalized = normalize_opencode(model)
             if normalized:
                 normalized["verified"] = True
+                # Which wire shape answered travels with the record, so the
+                # generator can write `protocol:` and the router does not have to
+                # spend a 400 discovering it again on every process start.
+                protocol = protocol_for_probe_detail(detail)
+                if protocol:
+                    normalized["protocol"] = protocol
                 free_models.append(normalized)
         else:
             rejected.append(f"{model_id}({verdict}: {detail})")
@@ -1503,6 +1546,9 @@ def fetch_opencode() -> list[dict[str, Any]]:
     )
 
     if untried:
+        # normalize_opencode never sets `protocol`, so an unprobed record cannot
+        # claim a shape: absence is the only honest value, and regenerate_config
+        # preserves whatever config.yaml already says for that endpoint.
         free_models.extend(_mark_unverified(
             [n for n in (normalize_opencode(m) for m in untried) if n],
             "opencode probe never reached this model (rate limited, or over the "
@@ -2090,6 +2136,364 @@ def fetch_arena_code_data() -> dict[str, dict[str, Any]]:
     return result
 
 
+# ── Runtime free-tier veto (the daemon's cooldowns.json) ──────────────────────
+#
+# Everything above asks the PROVIDERS what is free. Nothing asked the GATEWAY,
+# which is the only party that sees what happens when real client traffic
+# reaches an endpoint -- and on 2026-10-04 that is exactly where the free-tier
+# losses were visible:
+#
+#   ollama:minimax-m3                        402 x4   "this model is not
+#                                                     included in your free
+#                                                     usage"
+#   opencode:muse-spark-1.3-contributor-free 403 x42  FreeTierError
+#   nvidia{,2,3}:moonshotai/kimi-k2.6        404 x1   Function '<uuid>': Not
+#                                                     found for account '...'
+#
+# None of the three could be fixed by editing the lists above:
+#
+#   * Ollama's free set is CURATED here and fetch_ollama makes no API call at
+#     all, so a model that stops being free survives every sync forever. The
+#     router kept it in the `smart`, `work` and `large` chains while every call
+#     came back 402.
+#   * The OpenCode probe cannot fail for these. Its body carries stream=true and
+#     a tools array holding bash and read, which is precisely what the provider's
+#     free-tier gate requires (proxy.go sends the same contract, and
+#     scripts/fake-opencode-upstream.py enforces it), so the probe answered
+#     `/responses 200` for muse-spark while the gateway was refused 42 times in a
+#     row on requests whose body lacked them. A probe that cannot fail is not
+#     evidence -- see the evidence ranking below.
+#   * NVIDIA lists moonshotai/kimi-k2.6 in /v1/models while every completion
+#     404s on a deleted function. Only the gateway ever sees that.
+#
+# cooldowns.json is the daemon's own record of exactly this (main.go resolves it
+# beside the config file and the router writes it atomically), so the fix is to
+# READ it instead of trying to out-guess the provider with a synthetic call.
+# The veto is deliberately one-directional and self-healing:
+#
+#   * It only ever removes a model from the OUTPUT. It never edits a curated
+#     list, so removing the evidence can never require a code change to undo.
+#   * A refusal has to be RECURRING and its status/body has to say the model is
+#     no longer served for free. A 429, a 5xx, a timeout, or a lone 4xx is a
+#     property of the key or the network, and vetoing on those would empty the
+#     chains during an outage.
+#   * `circuits` is ignored: state 1 (open) and state 2 (half-open) describe a
+#     probe in flight, not a verdict about the model.
+#   * Denials are persisted with a TTL, so an entitlement that comes back
+#     re-enters the chains by itself, without a human editing anything.
+#
+# EVIDENCE RANKING. The daemon's record outranks this script's own probe,
+# because the daemon serves real client bodies and the probe sends one
+# synthetic body it knows the gate accepts. So a live probe does not reinstate a
+# model the gateway has been refused on repeatedly; the drop is reported loudly
+# with both facts on the line, so the conflict is visible instead of resolved
+# silently in either direction.
+COOLDOWNS_FILE = Path(__file__).resolve().parent / "cooldowns.json"
+RUNTIME_DENIAL_FILE = Path(__file__).resolve().parent / "free-tier-denied.json"
+# Consecutive refusals before a free-tier refusal counts. The router escalates
+# at 3 and at 10, so 3 is the first count at which it itself treats the endpoint
+# as more than a blip.
+RUNTIME_MIN_ERRORS = int(os.environ.get("AIROUTER_MIN_COOLDOWN_ERRORS", "3"))
+# How long a recorded denial keeps vetoing the model after the last sighting.
+# Long enough to outlast a weekend with no traffic (which produces no cooldowns
+# to refresh it), short enough that a restored entitlement is not a month away.
+RUNTIME_DENIAL_TTL_HOURS = int(os.environ.get("AIROUTER_DENIAL_TTL_HOURS", "168"))
+# 402 Payment Required is the provider stating that the call is billed; with the
+# count gate it is never acted on from a single occurrence.
+FREE_TIER_REFUSAL_MARKERS = (
+    "not included in your free usage",
+    "free tier can only be used",
+    "freetier",
+    "not available in your country",
+    "insufficient credit",
+    "add usage credits",
+    "upgrade for included usage",
+    "payment required",
+    "requires a subscription",
+)
+# Which config provider a JSON "provider" value is written under. Mirrors
+# Model.mapped_provider in regenerate_config.py; the test named for that mirror
+# fails if the two ever disagree.
+CONFIG_PROVIDER_FOR_SOURCE = {
+    "kilocode": "kilocode",
+    "opencode": "opencode",
+    "ollama-cloud": "ollama",
+    "google-ai-studio": "gemini",
+    "nvidia-nim": "nvidia",
+    "commandcode": "commandcode",
+}
+# Multi-key families are written as one provider plus numbered siblings, and the
+# cooldown key names whichever key actually failed. Deriving the siblings from
+# the canonical name covers every family the config uses (nvidia/nvidia2/
+# nvidia3, commandcode/commandcode2, gemini..gemini5) without hard-coding a
+# list that a new key would silently fall out of.
+_KEY_GROUP_MAX = 9
+
+
+def config_provider_group(source: str) -> tuple[str, ...]:
+    """Every config provider name a JSON source can be emitted under."""
+    canonical = CONFIG_PROVIDER_FOR_SOURCE.get(source, source)
+    return (canonical, *(f"{canonical}{n}" for n in range(2, _KEY_GROUP_MAX + 1)))
+
+
+def load_cooldowns(path: Path) -> tuple[dict[str, dict[str, Any]], int]:
+    """Read the daemon's cooldown envelope as {key: entry}, plus a junk count.
+
+    Never raises. cooldowns.json is written by another process, so a missing,
+    truncated, or concurrently-replaced file is a normal condition and must cost
+    the veto nothing rather than the whole model list. A legacy bare
+    map[string]CooldownEntry (which loadCooldowns still accepts) is read too.
+
+    The `circuits` section is deliberately not returned: open and half-open are
+    states of a probe in flight, and a model under a probe has told us nothing
+    yet.
+    """
+    if not path.exists():
+        return {}, 0
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        print(f"Cooldowns: {path.name} unreadable ({e}); no runtime veto applied",
+              file=sys.stderr)
+        return {}, 1
+    if not isinstance(raw, dict):
+        print(f"Cooldowns: {path.name} is not an object; no runtime veto applied",
+              file=sys.stderr)
+        return {}, 1
+    section = raw.get("cooldowns")
+    if not isinstance(section, dict):
+        # Legacy bare map: every value is an entry.
+        section = {k: v for k, v in raw.items() if isinstance(v, dict)}
+    entries = {k: v for k, v in section.items()
+               if isinstance(k, str) and isinstance(v, dict) and ":" in k}
+    return entries, len(section) - len(entries)
+
+
+def _parse_expiry(value: Any) -> datetime | None:
+    """RFC3339 expiry as an aware datetime, or None when unusable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def classify_cooldown(entry: dict[str, Any], now: datetime) -> tuple[str, str] | None:
+    """(verdict, reason) when this cooldown is evidence the model left the free
+    tier, else None.
+
+    The bar is deliberately asymmetric, because the statuses are not:
+
+      * A 404 is a statement about the model id -- the router itself gives it a
+        seven-day cooldown at error_count 1 (baseCooldownForError), so one is
+        enough. Verdict `gone`.
+      * A 402 says the call is billed, but a 403 does not: OpenCode's gate
+        rejects on the REQUEST SHAPE, so a 403 can mean "this client is not
+        inside OpenCode" rather than "this model is paid now". Both therefore
+        need the free-tier wording in the body AND RUNTIME_MIN_ERRORS
+        consecutive refusals. Verdict `not-free`.
+      * status_code 0 (transport error, timeout, "context deadline exceeded"),
+        429, 5xx, and anything else are the key or the network talking. None of
+        them is evidence about the model, and vetoing on them would strip the
+        chains during an outage -- which is how a rate limit turns into a much
+        worse incident than the one it replaced.
+    """
+    status = entry.get("status_code")
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return None
+    expiry = _parse_expiry(entry.get("expiry"))
+    if expiry is None or expiry <= now:
+        # The daemon deletes an entry when it expires and on any success, so an
+        # expired entry is not a current statement about anything.
+        return None
+    body = entry.get("last_error")
+    body = body if isinstance(body, str) else ""
+    low = body.lower()
+    try:
+        errors = int(entry.get("error_count") or 0)
+    except (TypeError, ValueError):
+        errors = 0
+
+    if status == 404:
+        return ("gone", f"404 not found ({errors}x)")
+    if status == 402 and errors >= RUNTIME_MIN_ERRORS:
+        marker = next((m for m in FREE_TIER_REFUSAL_MARKERS if m in low), None)
+        detail = marker or "402 payment required"
+        return ("not-free", f"402 {detail} ({errors}x)")
+    if status == 403 and errors >= RUNTIME_MIN_ERRORS:
+        marker = next((m for m in FREE_TIER_REFUSAL_MARKERS if m in low), None)
+        if marker:
+            return ("not-free", f"403 {marker} ({errors}x)")
+    return None
+
+
+def load_runtime_denials(now: datetime) -> dict[str, dict[str, Any]]:
+    """Previously recorded denials that have not expired yet."""
+    if not RUNTIME_DENIAL_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(RUNTIME_DENIAL_FILE.read_text())
+        entries = raw.get("denials") if isinstance(raw, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return {}
+    live = {}
+    for key, entry in entries.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        until = _parse_expiry(entry.get("until"))
+        if until is None or until <= now:
+            continue
+        if key.split(":", 1)[-1] in AUTO_FALLBACK_MODELS:
+            continue
+        live[key] = entry
+    return live
+
+
+def save_runtime_denials(denials: dict[str, dict[str, Any]], now: datetime) -> None:
+    """Persist the denial set. Best-effort: a write failure is not a sync failure."""
+    payload = {
+        "updated_at": now.isoformat().replace("+00:00", "Z"),
+        "ttl_hours": RUNTIME_DENIAL_TTL_HOURS,
+        "denials": denials,
+    }
+    try:
+        RUNTIME_DENIAL_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    except OSError as e:
+        print(f"Cooldowns: could not write {RUNTIME_DENIAL_FILE.name}: {e}", file=sys.stderr)
+
+
+def runtime_free_tier_denials(
+    cooldowns_path: Path | None = None, now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """`provider:model` -> denial record, from cooldowns.json and from history.
+
+    Two inputs, because either alone is incomplete. cooldowns.json only holds
+    entries that are both unexpired and recent, so a model nobody routed to for a
+    week would forget it was paid -- and the next sync would put it straight back
+    in the chains. The persisted denials therefore outlive their evidence: an
+    entry is refreshed while the daemon keeps reporting the refusal, and kept
+    until `until` passes. Nothing clears a denial early, because the daemon
+    deletes the entry on the first success too and an absent key cannot be told
+    apart from "never tried".
+    """
+    now = now or datetime.now(UTC)
+    denials = load_runtime_denials(now)
+    entries, junk = load_cooldowns(cooldowns_path or COOLDOWNS_FILE)
+    until = (now.timestamp() + RUNTIME_DENIAL_TTL_HOURS * 3600)
+    until_iso = datetime.fromtimestamp(until, tz=UTC).isoformat().replace("+00:00", "Z")
+    now_iso = now.isoformat().replace("+00:00", "Z")
+
+    fresh = transient = 0
+    for key, entry in entries.items():
+        verdict = classify_cooldown(entry, now)
+        if verdict is None:
+            transient += 1
+            continue
+        kind, reason = verdict
+        fresh += 1
+        body = entry.get("last_error")
+        denials[key] = {
+            "verdict": kind,
+            "reason": reason,
+            "status_code": entry.get("status_code"),
+            "error_count": entry.get("error_count"),
+            "last_error": (body[:200] + "..." if isinstance(body, str) and len(body) > 200
+                           else body),
+            "last_seen": now_iso,
+            "until": until_iso,
+        }
+    save_runtime_denials(denials, now)
+
+    ignored = transient + junk
+    print(
+        f"Cooldowns: {len(entries)} cooldowns read from "
+        f"{(cooldowns_path or COOLDOWNS_FILE).name}; {fresh} free-tier refusal(s), "
+        f"{len(denials)} active denial(s)"
+        + (f", {ignored} ignored (transient/malformed)" if ignored else "")
+        + (f"; min {RUNTIME_MIN_ERRORS} consecutive refusals required" if transient else ""),
+        file=sys.stderr,
+    )
+    return denials
+
+
+def format_cooldown_report(denials: dict[str, dict[str, Any]], path: Path | None = None) -> str:
+    """Human report of what the gateway has been refused, for the sync log."""
+    path = path or COOLDOWNS_FILE
+    if not denials:
+        return (f"free-tier refusals: none recorded "
+                f"({path.name} absent, empty, or nothing in it says a model left "
+                f"the free tier)")
+    lines = [f"free-tier refusals from {path.name} "
+             f"({RUNTIME_DENIAL_TTL_HOURS}h veto window, "
+             f"min {RUNTIME_MIN_ERRORS} consecutive refusals):"]
+    for key in sorted(denials):
+        d = denials[key]
+        lines.append(f"  {key}: {d.get('verdict')} -- {d.get('reason')} "
+                     f"(last seen {d.get('last_seen')}, until {d.get('until')})")
+    return "\n".join(lines)
+
+
+def apply_runtime_denials(models: list[dict[str, Any]],
+                          denials: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop every model the gateway has been refused on, and say which and why.
+
+    Returns the input list untouched when there is nothing to drop or when
+    dropping would empty it. An empty model list means regenerate_config.py has
+    no chains to write, so a mis-set threshold or a mis-shaped cooldowns.json
+    must cost a warning, never the config.
+    """
+    if not denials or not models:
+        return models
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    conflicts = 0
+    for model in models:
+        model_id = model.get("id", "")
+        source = model.get("provider", "")
+        if model_id in AUTO_FALLBACK_MODELS:
+            # The chain terminators are decided on a probe verdict, which
+            # already switches routers on a refusal (sync-instruction rule 6).
+            # Removing one here would leave regenerate_config.py with no
+            # terminator at all, which makes it refuse to write.
+            kept.append(model)
+            continue
+        hit = next((f"{p}:{model_id}" for p in config_provider_group(source)
+                    if f"{p}:{model_id}" in denials), None)
+        if hit is None:
+            kept.append(model)
+            continue
+        dropped += 1
+        detail = denials[hit]
+        note = ""
+        if model.get("verified") is True:
+            conflicts += 1
+            note = ("  [this run's probe answered OK -- the daemon's record of real "
+                    "traffic wins, see the evidence ranking in fetch-free-models.py]")
+        print(f"Free tier: dropping {hit} ({detail.get('reason')}){note}", file=sys.stderr)
+    if not kept:
+        print("Cooldowns: !!! every model would be vetoed -- veto NOT applied. "
+              "The gateway has refused the whole catalog, which is an outage or a "
+              "mis-read cooldowns.json, not a free-tier change. Keeping the list.",
+              file=sys.stderr)
+        return models
+    if dropped:
+        # The conflict count belongs in the summary, not just on the drop lines:
+        # a reader who only sees the last line should still learn that this run's
+        # own probe disagreed with the daemon's record on N of them.
+        clash = (f", {conflicts} of which this run's probe called live "
+                 f"(see the evidence ranking in this file's header)"
+                 if conflicts else "")
+        print(f"Free tier: {dropped} model(s) vetoed by runtime cooldowns{clash}, "
+              f"{len(kept)} kept", file=sys.stderr)
+    return kept
+
+
 # ── Output ─────────────────────────────────────────────────────────────────────
 def output_json(data: list[dict], path: str | None) -> None:
     out = json.dumps(data, indent=2)
@@ -2231,7 +2635,37 @@ def main() -> None:
              "be dead, and only treats a verdict as evidence when the provider REFUSED the "
              "call (a 429, 5xx or timeout is recorded as unknown, never as dead).",
     )
+    parser.add_argument(
+        "--cooldowns",
+        metavar="FILE",
+        default=str(COOLDOWNS_FILE),
+        help="The gateway's cooldowns.json. Endpoints it records as repeatedly "
+             "refused for free-tier reasons (402 billing, 403 free-tier wording, "
+             "404 gone) are vetoed from the model list whatever any provider "
+             "listing says. Default: the cooldowns.json beside this script.",
+    )
+    parser.add_argument(
+        "--no-cooldown-veto",
+        action="store_true",
+        help="Ignore cooldowns.json and emit every candidate the providers list. "
+             "Re-admits models the running gateway is being refused on, so it must "
+             "not be left set in a scheduled sync.",
+    )
+    parser.add_argument(
+        "--cooldowns-report",
+        action="store_true",
+        help="Print what cooldowns.json says about free-tier availability and "
+             "exit. No network, no provider work: this is the sync's pre-flight "
+             "check, runnable when every provider is down.",
+    )
     args = parser.parse_args()
+
+    if args.cooldowns_report:
+        # Before check_opencode_ua_version(): the report must be answerable when
+        # the whole internet is unreachable, and the UA advisory needs the npm
+        # registry to say anything at all.
+        print(format_cooldown_report(runtime_free_tier_denials(Path(args.cooldowns))))
+        return
 
     # Before any provider work: the UA version is independent of every provider
     # and its key, so this still reports on a run where nothing else is
@@ -2403,6 +2837,21 @@ def main() -> None:
         f"(date={today_str})",
         file=sys.stderr,
     )
+
+    # Runtime free-tier veto. Last of the filters and before the auto-probe, so
+    # the candidates that survive it are exactly the ones the terminator probe
+    # and the output see. Reading it here rather than per-provider is deliberate:
+    # one hook covers every source, including the CURATED ones (Ollama makes no
+    # API call, so nothing upstream could ever have reported minimax-m3's 402).
+    if args.no_cooldown_veto:
+        print("Cooldowns: !!! --no-cooldown-veto — emitting every candidate the "
+              "providers list, including endpoints the gateway records as refused "
+              "for free-tier reasons. Do not leave this set in a scheduled sync.",
+              file=sys.stderr)
+    else:
+        all_models = apply_runtime_denials(
+            all_models, runtime_free_tier_denials(Path(args.cooldowns))
+        )
 
     # Per-source breakdown in the summary line
     by_source: dict[str, int] = {}

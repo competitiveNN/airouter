@@ -183,6 +183,11 @@ class Model:
     vision: bool
     raw: dict
     released: str | int | None = None
+    # The wire shape this endpoint speaks upstream, as PROVED by a probe
+    # ("responses" or "chat"), or None when nothing established it. None is the
+    # only honest value for an unprobed record, and absence in config.yaml means
+    # chat, which is the default (config.go protocolFor).
+    protocol: str | None = None
     # fetch-free-models.py sets verified=True on a candidate that answered a
     # real 1-token completion and verified=False on one it probed and REJECTED.
     # None means no verdict: not probed, or the probe could not reach one (429,
@@ -290,6 +295,7 @@ def load_models(json_path: str) -> list[Model]:
             vision=caps.get('vision', False),
             raw=item.get('raw', {}),
             released=item.get('released'),
+            protocol=_normalize_protocol(item.get('protocol')),
             verified=item.get('verified'),
             probe_only=bool(item.get('probe_only', False)),
             probe_checked_at=_parse_release_date(
@@ -570,6 +576,60 @@ def auto_fallback_terminator(
     )
 
 
+def _normalize_protocol(value: object) -> str | None:
+    """The protocol name to write, or None when there is nothing to write.
+
+    Only a value the fetcher actually proved is emitted. An unrecognized value
+    is dropped rather than passed through: config.go already falls back to chat
+    for anything it does not recognize, so writing `protocol: respones` would be
+    a claim in the file that means nothing and looks deliberate.
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    return v if v in ("responses", "chat") else None
+
+
+def parse_protocols(config_text: str) -> dict[tuple[str, str], str]:
+    """Every (provider, model) -> protocol the current config declares.
+
+    Needed because the generator owns the whole `models:` section, so any field
+    it does not know about is DELETED on the next sync. That is not hypothetical
+    for `protocol:`: the router learned to flip wire shape on a
+    ModelProtocolUnsupported refusal (api.go), but a hand-written
+    `protocol: responses` did not survive regeneration, so the model went back to
+    answering 400 on /chat/completions after every sync. So a record with no
+    verdict of its own keeps whatever the file already says for that endpoint.
+
+    Parsed over the whole models section rather than per profile: the same
+    endpoint appears in several chains and they must not disagree.
+    """
+    out: dict[tuple[str, str], str] = {}
+    section = re.search(r'(?ms)^models:\n(.*?)(?=^\w+:|\Z)', config_text)
+    if not section:
+        return out
+    provider = model = None
+    for line in section.group(1).splitlines():
+        prov = re.match(r'^\s*- provider: (\S+)\s*$', line)
+        if prov:
+            provider, model = prov.group(1), None
+            continue
+        mod = re.match(r'^\s+model: (\S+)', line)
+        if mod:
+            model = mod.group(1)
+            continue
+        # The trailing comment is tolerated, exactly as parse_terminators does for
+        # the model line. A hand-written `protocol: responses  # because ...` is
+        # the field this function exists to preserve, and a regex that required
+        # end-of-line would drop it -- deleting the very thing it was added for.
+        proto = re.match(r'^\s+protocol: (\S+)(?:\s+#.*)?\s*$', line)
+        if proto and provider and model:
+            name = _normalize_protocol(proto.group(1))
+            if name:
+                out[(provider, model)] = name
+    return out
+
+
 def parse_terminators(config_text: str) -> dict[str, tuple[str, str, str]]:
     """Extract each profile's current terminator as (provider, model, comment).
 
@@ -609,50 +669,57 @@ def build_chain(
     profile: str,
     records: dict[tuple[str, str], Model] | None = None,
     previous: tuple[str, str, str] | None = None,
+    protocols: dict[tuple[str, str], str] | None = None,
 ) -> list[dict]:
     """Build fallback chain for a profile.
 
     `records` is the full (mapped_provider, id) -> Model catalog used for the
     terminator liveness check; see auto_fallback_terminator. `previous` is this
     profile's current terminator, so an unverifiable run preserves its comment.
+
+    `protocols` is the (provider, model) -> protocol map parsed out of the config
+    being regenerated. It is the fallback for a record that carries no protocol
+    of its own, which is the only case where this function would otherwise
+    delete a field a human or an earlier run put there.
     """
     if records is None:
         records = {}
+    if protocols is None:
+        protocols = {}
+
+    def entry_for(provider: str, m: Model) -> dict:
+        """One emitted endpoint.
+
+        The protocol is the record's own verdict when it has one, and the
+        config's existing value otherwise. Order matters: a fresh probe verdict
+        outranks whatever is written down, and absence of a verdict must not
+        delete a correct value.
+        """
+        protocol = m.protocol or protocols.get((provider, m.id))
+        return {
+            'provider': provider,
+            'model': m.id,
+            'vision': m.vision,
+            'intelligence': m.score,
+            'context_length': m.context_length,
+            'protocol': protocol,
+            'comment': m.get_comment(),
+        }
+
     chain = []
 
     for m in models:
         if m.mapped_provider == 'nvidia':
             # Emit trio: nvidia, nvidia2, nvidia3
             for prov in ['nvidia', 'nvidia2', 'nvidia3']:
-                chain.append({
-                    'provider': prov,
-                    'model': m.id,
-                    'vision': m.vision,
-                    'intelligence': m.score,
-                    'context_length': m.context_length,
-                    'comment': m.get_comment()
-                })
+                chain.append(entry_for(prov, m))
         elif m.mapped_provider == 'commandcode':
             # Emit pair: commandcode, commandcode2 (two API keys on the same
             # upstream proxy) so a rate-limited key falls through to the next.
             for prov in ['commandcode', 'commandcode2']:
-                chain.append({
-                    'provider': prov,
-                    'model': m.id,
-                    'vision': m.vision,
-                    'intelligence': m.score,
-                    'context_length': m.context_length,
-                    'comment': m.get_comment()
-                })
+                chain.append(entry_for(prov, m))
         else:
-            chain.append({
-                'provider': m.mapped_provider,
-                'model': m.id,
-                'vision': m.vision,
-                'intelligence': m.score,
-                'context_length': m.context_length,
-                'comment': m.get_comment()
-            })
+            chain.append(entry_for(m.mapped_provider, m))
 
     # The last-resort endpoint must itself be callable, so the choice is a
     # liveness question, never a popularity one.
@@ -690,6 +757,13 @@ def format_chain_yaml(chain: list[dict], indent: int = 6) -> str:
         ctx = entry.get('context_length')
         if ctx and ctx > 0:
             lines.append(f"{' ' * (indent + 2)}context_length: {ctx}")
+        # Only written when it says something: absence means chat/completions,
+        # which is the default every provider understands (config.go
+        # protocolFor). Emitting `protocol: chat` on all ~80 endpoints would
+        # bury the two that actually need the field.
+        protocol = _normalize_protocol(entry.get('protocol'))
+        if protocol and protocol != 'chat':
+            lines.append(f"{' ' * (indent + 2)}protocol: {protocol}")
     return '\n'.join(lines)
 
 
@@ -958,10 +1032,17 @@ def main(argv: list[str] | None = None):
     # comment the file already carries instead of replacing a recorded claim
     # with a different one. See auto_fallback_terminator.
     previous = parse_terminators(config)
-    smart_chain = build_chain(smart_models, 'smart', records, previous.get('smart'))
-    work_chain = build_chain(work_models, 'work', records, previous.get('work'))
-    fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'))
-    large_chain = build_chain(large_models, 'large', records, previous.get('large'))
+    # The wire shape each endpoint already declares. The generator rewrites the
+    # whole models section, so a field it cannot re-emit is a field it deletes:
+    # an unprobed record must keep the configured protocol rather than reset it.
+    protocols = parse_protocols(config)
+    if protocols:
+        print(f"Preserving {len(protocols)} configured protocol(s) for unprobed "
+              f"records: {', '.join(f'{p}/{m}={v}' for (p, m), v in sorted(protocols.items()))}")
+    smart_chain = build_chain(smart_models, 'smart', records, previous.get('smart'), protocols)
+    work_chain = build_chain(work_models, 'work', records, previous.get('work'), protocols)
+    fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'), protocols)
+    large_chain = build_chain(large_models, 'large', records, previous.get('large'), protocols)
     
     # Generate new models section
     new_models = f"""models:

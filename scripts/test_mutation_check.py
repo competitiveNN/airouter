@@ -303,6 +303,40 @@ def _in_profile(text, profile, old, new):
     return text[:m.start(2)] + block.replace(old, new, 1) + text[m.end(2):]
 
 
+def _rename_a_provider_entry(text, profile, new_name):
+    """Point one concrete endpoint of `profile` at a provider that does not exist.
+
+    Derived from the live config, for the same reason _drop_provider_entry is:
+    a case that spells out a model id is a no-op the moment a regeneration drops
+    that model. This one bit for real: the case planted `notaprovider` on
+    `ollama/minimax-m3`, which the runtime free-tier veto removed from every chain
+    on 2026-10-04 after Ollama answered 402 "not included in your free usage"
+    four times. The case then planted nothing and reported a red suite as a pass.
+
+    Two entries are skipped so the diagnostic is about rule10 and nothing else:
+    a member of a multi-key group (renaming one would also trip rule3, whose
+    sibling keys would then be missing) and the chain TERMINATOR (renaming it
+    would also trip rule6). Note that "kilocode" and "opencode" are mostly
+    concrete endpoints here, not terminators -- only the last entry is.
+    """
+    pattern = re.compile(rf"(?ms)(^  {re.escape(profile)}:\n    chain:\n)(.*?)(?=^  \w+:|\Z)")
+    m = pattern.search(text)
+    assert m, f"no block for {profile}"
+    lines = m.group(2).splitlines(keepends=True)
+    entries = [i for i, ln in enumerate(lines)
+               if re.match(r"^      - provider: \S+\s*$", ln)]
+    assert entries, f"the {profile} chain has no entries"
+    for i in entries[:-1]:
+        name = lines[i].split("provider:", 1)[1].strip()
+        if re.fullmatch(r"(?:nvidia|commandcode)\d*", name):
+            continue
+        lines[i] = f"      - provider: {new_name}\n"
+        return text[:m.start(2)] + "".join(lines) + text[m.end(2):]
+    raise AssertionError(
+        f"no renameable provider entry in the {profile} chain "
+        f"(saw {len(entries)} entries, all grouped or terminators)")
+
+
 def _drop_provider_entry(text, profile, provider):
     """Remove the first `provider` entry from `profile`'s chain.
 
@@ -361,9 +395,10 @@ CHECK_RULE_CASES = [
         "chain is empty",
     ),
     (
+        # Was pinned to `ollama/minimax-m3`, which the free-tier veto removed from
+        # the chains on 2026-10-04 (402, four times). Derived from the file now.
         "unknown provider",
-        lambda t: t.replace("      - provider: ollama\n        model: minimax-m3",
-                            "      - provider: notaprovider\n        model: minimax-m3", 1),
+        lambda t: _rename_a_provider_entry(t, "smart", "notaprovider"),
         "undefined provider",
     ),
     (
@@ -574,7 +609,7 @@ def test_checker_passes_the_real_config_through_its_own_cli(tmp_path):
     text = (REPO / "config.yaml").read_text()
     result = _check_cli(REPO / "config.yaml", _model_list_from_config(text, tmp_path))
     assert result.returncode == 0, result.stdout
-    assert "OK: rules 3-11 hold" in result.stdout
+    assert "OK: rules 3-13 hold" in result.stdout
 
     real = Path("/tmp/free-models.json")
     if real.exists():

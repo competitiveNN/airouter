@@ -13,6 +13,10 @@ arena-code-cache.json
 aa-enrichment-cache.json
 first-seen-cache.json
 opencode-probe-cache.json
+# Free-tier denials distilled from cooldowns.json by fetch-free-models.py.
+# Runtime state like cooldowns.json itself: a sync rewrites it, and an
+# untracked file here would flip scripts/gate.sh's tree fingerprint.
+free-tier-denied.json
 
 # Runtime state (regenerated on startup)
 cooldowns.json

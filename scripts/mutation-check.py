@@ -273,6 +273,124 @@ MUTATIONS: list[Mutation] = [
         "An ssl.SSLError or RemoteDisconnected would abort the nightly sync "
         "and lose the whole model list.",
     ),
+    # The runtime free-tier veto (fetch-free-models.py reading cooldowns.json).
+    # Each of these removes one of the guards that keep a runtime failure from
+    # being read as "this model left the free tier" -- which is the one way the
+    # veto can take the chains DOWN instead of pruning them.
+    Mutation(
+        "a single 403 vetoes the model",
+        "fetch-free-models.py",
+        "    if status == 403 and errors >= RUNTIME_MIN_ERRORS:",
+        "    if status == 403:",
+        "One mis-shaped request would delete a model from every chain. "
+        "OpenCode's gate refuses on the REQUEST SHAPE, so a low count is often "
+        "one odd client rather than a lost entitlement.",
+    ),
+    Mutation(
+        "a 403 without free-tier wording vetoes the model",
+        "fetch-free-models.py",
+        "        marker = next((m for m in FREE_TIER_REFUSAL_MARKERS if m in low), None)\n        if marker:\n            return (\"not-free\", f\"403 {marker} ({errors}x)\")",
+        "        return (\"not-free\", f\"403 ({errors}x)\")",
+        "Rotated or revoked credentials produce a plain 403 that never mentions "
+        "the free tier; treating that as a billing verdict turns an auth problem "
+        "into a routing outage.",
+    ),
+    Mutation(
+        "an expired cooldown vetoes the model",
+        "fetch-free-models.py",
+        "    if expiry is None or expiry <= now:",
+        "    if expiry is None:",
+        "The daemon deletes an entry when it expires, so believing a stale one "
+        "keeps vetoing a model on evidence the gateway has already discarded.",
+    ),
+    Mutation(
+        "a denial never expires",
+        "fetch-free-models.py",
+        "        if until is None or until <= now:\n            continue",
+        "        if until is None:\n            continue",
+        "A restored quota or a fixed key could never put the model back: the "
+        "veto would need a hand edit to the persisted denials, which is exactly "
+        "the manual step this exists to remove.",
+    ),
+    Mutation(
+        "one key's refusal misses the family",
+        "fetch-free-models.py",
+        "    return (canonical, *(f\"{canonical}{n}\" for n in range(2, _KEY_GROUP_MAX + 1)))",
+        "    return (canonical,)",
+        "nvidia2 is not a different model, so its refusal would not reach the "
+        "nvidia-nim record the chains are built from, and a deleted upstream "
+        "function would be re-added on every sync.",
+    ),
+    Mutation(
+        "the veto can empty the model list",
+        "fetch-free-models.py",
+        "    if not kept:\n        print(\"Cooldowns: !!! every model would be vetoed",
+        "    if False:\n        print(\"Cooldowns: !!! every model would be vetoed",
+        "A gateway that is merely DOWN refuses everything, and an empty model "
+        "list leaves regenerate_config.py with no chains to write.",
+    ),
+    Mutation(
+        "the curated free list is edited by the veto",
+        "fetch-free-models.py",
+        "        dropped += 1\n        detail = denials[hit]",
+        "        dropped += 1\n        OLLAMA_FREE_MODELS.discard(model_id)\n        detail = denials[hit]",
+        "A veto that mutated a curated list would need a code change to undo, "
+        "and a later upstream change to the real free tier would leave the "
+        "curated list wrong forever.",
+    ),
+    # The `protocol:` field. Each mutation removes one of the three ways the
+    # field can silently stop being written, and none of them crashes: the
+    # config still loads and still routes, it just addresses every endpoint in
+    # the wire shape it refuses.
+    Mutation(
+        "protocol dropped from the emitter",
+        "regenerate_config.py",
+        "        protocol = _normalize_protocol(entry.get('protocol'))\n        if protocol and protocol != 'chat':\n            lines.append(f\"{' ' * (indent + 2)}protocol: {protocol}\")",
+        "        protocol = None",
+        "A responses-only endpoint goes back to POST /chat/completions and 400s "
+        "on every call, with the router flipping and retrying behind it.",
+    ),
+    Mutation(
+        "configured protocol not preserved",
+        "regenerate_config.py",
+        "        protocol = m.protocol or protocols.get((provider, m.id))",
+        "        protocol = m.protocol",
+        "The generator owns the whole models section, so a field it cannot "
+        "re-emit is a field it deletes: a hand-written protocol: responses would "
+        "be erased by the next nightly sync.",
+    ),
+    Mutation(
+        "junk protocol accepted by validate-config",
+        "scripts/validate-config.py",
+        "            if _bad_protocol(ep):",
+        "            if False:",
+        "`protocol: respones` would load silently: config.go falls back to chat, "
+        "so the file would claim a shape the router never uses.",
+    ),
+    Mutation(
+        "protocol rule not enforced",
+        "scripts/check-rules.py",
+        '            src_proto = getattr(src, "protocol", None)',
+        '            src_proto = None',
+        "Nothing would compare the field against the record that proved it, so "
+        "the shape could drift with no failure anywhere.",
+    ),
+    Mutation(
+        "a commented protocol is not parsed",
+        "regenerate_config.py",
+        "        proto = re.match(r'^\\s+protocol: (\\S+)(?:\\s+#.*)?\\s*$', line)",
+        "        proto = re.match(r'^\\s+protocol: (\\S+)\\s*$', line)",
+        "A hand-written `protocol: responses  # because ...` would be dropped, so "
+        "the generator would delete the field it exists to preserve.",
+    ),
+    Mutation(
+        "protocol carried to only the first key of a trio",
+        "regenerate_config.py",
+        "                chain.append(entry_for(prov, m))\n        elif m.mapped_provider == 'commandcode':",
+        "                chain.append(entry_for(prov, m) if prov == 'nvidia' else {'provider': prov, 'model': m.id, 'vision': m.vision, 'intelligence': m.score, 'context_length': m.context_length, 'protocol': None, 'comment': m.get_comment()})\n        elif m.mapped_provider == 'commandcode':",
+        "nvidia2/nvidia3 would keep addressing a responses-only model with the "
+        "chat shape, so the failure would look like an intermittent provider bug.",
+    ),
     # The emit path and the profile floors. A defect here does not crash
     # anything: it produces a config that parses, loads, and routes — just
     # wrongly. Nothing but a test can tell.
@@ -350,13 +468,37 @@ MUTATIONS: list[Mutation] = [
 # count and the floor cannot be maintained in two places — and
 # test_every_test_suite_has_a_floor() fails if a new suite is added without one.
 SUITE_TEST_FLOORS = {
-    # 47: test_opencode_ua_matches_the_gateway, plus the five tests covering
-    # check_opencode_ua_version (stale / current / opt-out / dead registry) and
-    # opencode_ua_version's parser.
-    "scripts/test_fetch_free_models.py": 47,
+    # 66: 47 through the opencode UA tests, plus the 16 covering the runtime
+    # free-tier veto (the cooldowns.json pass): a 402 vetoes a curated model
+    # without editing the curated list, a 429/5xx/timeout never vetoes, one 403
+    # is not a verdict but three are, a 403 without free-tier wording is not one
+    # either, a 404 needs no repetition, an expired cooldown is not evidence, one
+    # key's refusal covers its multi-key family, terminators are never vetoed,
+    # the daemon's record outranks a fresh probe (and says so on the drop line),
+    # the veto can never empty the list, a denial expires and survives a quiet
+    # week, the reader survives garbage, circuits are not verdicts, the report is
+    # offline, and the provider mirror still matches regenerate_config; plus the
+    # 3 covering which wire shape a model speaks, because the probe already knows
+    # it and the record has to say so (2026-10-04).
+    "scripts/test_fetch_free_models.py": 66,
     "scripts/test_mutation_check.py": 19,
-    "scripts/test_regenerate_config.py": 48,
-    # EXACT, matching every other floor in this table (48/48, 18/18, 17/17).
+    # 48 through the distribution rules and the terminator/comment machinery,
+    # plus the 11 covering the `protocol:` field: emitted when a probe proved a
+    # shape, never emitted for chat, an unrecognised value dropped rather than
+    # passed through, an unprobed record keeping the configured value, a fresh
+    # verdict outranking the file, the field reaching every key of a trio, its
+    # position in the emitter key order, the config parser, and rule 13 in both
+    # directions (missing field reported, present field clean, junk rejected);
+    # plus the 4 giving scripts/validate-config.py its first coverage at all --
+    # a mutation aimed at it was reported MISSED, because the sync's structural
+    # check had no test and a rule added to it was a rule nothing could see --
+    # and 2 more after the first sync applied the protocol rule: the parser test
+    # that pinned the shipped config's contents instead of the parser's
+    # behaviour, replaced by fixtures plus two properties that hold whatever the
+    # file contains (every declared protocol is one the router honours, and a
+    # declared protocol survives a regeneration).
+    "scripts/test_regenerate_config.py": 65,
+    # EXACT, matching every other floor in this table (66/66, 65/65, 19/19).
     # An earlier version of this entry sat at 14 against 22 functions on the
     # theory that a floor should have slack so that adding tests needs no edit.
     # That is not this repository's convention, and the slack bought nothing:

@@ -17,6 +17,7 @@ passes happily on a config that has lost every provider.
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -228,7 +229,7 @@ def test_write_refuses_invalid_config(tmp_path, monkeypatch):
 
 
 def _model(model_id, provider, score=None, *, ctx=0, vision=False, elo=None,
-           source=None, verified=None, probe_age_days=None):
+           source=None, verified=None, probe_age_days=None, protocol=None):
     from datetime import UTC, datetime, timedelta
     return gen.Model(
         id=model_id,
@@ -241,6 +242,7 @@ def _model(model_id, provider, score=None, *, ctx=0, vision=False, elo=None,
         elo=elo,
         vision=vision,
         raw={},
+        protocol=protocol,
         verified=verified,
         probe_checked_at=(
             None if probe_age_days is None
@@ -1214,3 +1216,298 @@ def test_a_regenerated_chain_is_non_increasing_by_score(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------
+# The `protocol:` field.
+#
+# opencode.ai's catalog is mixed within one provider, measured live 2026-10-02
+# against one key with identical gate headers:
+#
+#   muse-spark-1.3-contributor-free   /chat/completions 400 ProtocolUnsupported
+#                                     /responses        200
+#   big-pickle                        /chat/completions 200
+#                                     /responses        400 ProtocolUnsupported
+#
+# A responses-only model left on the chat path 400s on every call. The router
+# recovers by flipping and retrying (api.go), so the field is not about
+# correctness of the final answer -- it is about not paying a failed round trip
+# on every process start, and about the generator not deleting a field it does
+# not understand.
+# --------------------------------------------------------------------------
+
+
+def _entry_yaml(entry, indent=6):
+    return gen.format_chain_yaml([entry], indent)
+
+
+def test_a_proved_protocol_is_emitted():
+    chain = gen.build_chain([_model("resp-only-free", "opencode", 40.0,
+                                    protocol="responses")], "work")
+    assert "protocol: responses" in _entry_yaml(chain[0])
+
+
+def test_chat_is_never_written_because_absence_means_chat():
+    """Emitting `protocol: chat` on all ~80 endpoints would bury the two that
+    need the field, and config.go's protocolFor already treats absence as chat."""
+    chain = gen.build_chain([_model("chat-only-free", "opencode", 40.0,
+                                    protocol="chat")], "work")
+    assert "protocol" not in _entry_yaml(chain[0])
+
+
+def test_an_unrecognised_protocol_is_dropped_not_passed_through():
+    """config.go falls back to chat for anything it does not recognise, so
+    `protocol: respones` in the file is a claim that means nothing and looks
+    deliberate."""
+    assert gen._normalize_protocol("respones") is None
+    assert gen._normalize_protocol(None) is None
+    assert gen._normalize_protocol(7) is None
+    assert gen._normalize_protocol(" Responses ") == "responses"
+    chain = gen.build_chain([_model("typo-free", "opencode", 40.0,
+                                    protocol="respones")], "work")
+    assert "protocol" not in _entry_yaml(chain[0])
+
+
+def test_an_unprobed_record_keeps_the_configured_protocol():
+    """The regression this field's plumbing exists for.
+
+    regenerate_config.py owns the whole `models:` section, so a field it cannot
+    re-emit is a field it DELETES. A hand-written `protocol: responses` used to
+    vanish on the next nightly sync and the model went back to answering 400 on
+    /chat/completions afterwards -- the fix undone by the tool that maintains it.
+    """
+    protocols = {("opencode", "resp-only-free"): "responses"}
+    chain = gen.build_chain([_model("resp-only-free", "opencode", 40.0)],
+                            "work", protocols=protocols)
+    assert "protocol: responses" in _entry_yaml(chain[0])
+
+
+def test_a_fresh_probe_verdict_outranks_the_configured_protocol():
+    protocols = {("opencode", "m"): "chat"}
+    chain = gen.build_chain([_model("m", "opencode", 40.0, protocol="responses")],
+                            "work", protocols=protocols)
+    assert "protocol: responses" in _entry_yaml(chain[0])
+
+
+def test_the_protocol_reaches_every_key_of_a_multi_key_group():
+    """nvidia-nim is one model id on three config providers. A protocol attached
+    to only one of them is a bug that only shows up on one key."""
+    models = [_model("some/nim-model", "nvidia-nim", 40.0, protocol="responses")]
+    chain = gen.build_chain(models, "work")
+    trio = [e for e in chain if e["model"] == "some/nim-model"]
+    assert len(trio) == 3, trio
+    assert all("protocol: responses" in _entry_yaml(e) for e in trio)
+
+
+def test_protocol_is_the_last_field_so_the_order_check_stays_honest():
+    """check-rules.py compares the key order literally, so the emitter and the
+    checker have to agree on where the field goes."""
+    chain = gen.build_chain([_model("m", "opencode", 40.0, ctx=1000,
+                                    protocol="responses")], "work")
+    keys = [ln.split(":")[0].strip().lstrip("- ")
+            for ln in _entry_yaml(chain[0]).splitlines()]
+    assert keys == ["provider", "model", "vision", "intelligence",
+                    "context_length", "protocol"], keys
+
+
+def test_parse_protocols_reads_every_chain_and_ignores_junk():
+    """Fixtures, never the shipped config.yaml.
+
+    An earlier version of this asserted `parse_protocols(CONFIG.read_text()) ==
+    {}` — "the shipped config declares no protocol". That is an accident of the
+    file at a moment in time, not a property of the parser: the nightly sync
+    legitimately added `protocol: responses` to the two muse-spark-1.2 entries,
+    and the assertion failed for work that was correct. Five further tests failed
+    with it, because they run the real suites and a red suite reads as a broken
+    harness. A test that pins the content of a regenerated artifact is a test that
+    will fail the next time the artifact is regenerated.
+    """
+    shaped = """models:
+  smart:
+    chain:
+      - provider: opencode
+        model: a-free
+        vision: false
+        intelligence: 40.0
+        protocol: responses
+      - provider: opencode
+        model: b-free
+        vision: false
+        intelligence: 30.0
+        protocol: nonsense
+  work:
+    chain:
+      - provider: opencode
+        model: a-free
+        vision: false
+        intelligence: 40.0
+"""
+    assert gen.parse_protocols(shaped) == {("opencode", "a-free"): "responses"}
+    assert gen.parse_protocols("providers:\n  x:\n    url: y\n") == {}
+
+    # A trailing comment must not hide the field. parse_terminators tolerates one
+    # on the model line for the same reason: this parser exists to preserve a
+    # value a human put in the file, and a regex requiring end-of-line would
+    # delete the very line it was written for.
+    commented = shaped.replace("        protocol: responses",
+                               "        protocol: responses  # measured: chat 400s")
+    assert gen.parse_protocols(commented) == {("opencode", "a-free"): "responses"}
+
+
+def test_every_protocol_in_the_shipped_config_is_one_the_router_honours():
+    """The invariant that holds whatever the file contains, unlike its contents.
+
+    config.go's protocolFor maps anything unrecognised to chat, so a value here
+    that is not chat/responses is a file claiming a shape the router never uses.
+    The shipped config is generated, so this reads it rather than assuming
+    anything about it.
+    """
+    for (provider, model), protocol in gen.parse_protocols(CONFIG.read_text()).items():
+        assert protocol in ("chat", "responses"), (provider, model, protocol)
+
+
+def test_a_declared_protocol_survives_a_regeneration():
+    """The property the preservation path exists for, asserted end to end.
+
+    The generator owns the whole models section, so a field it cannot re-emit is
+    a field it deletes. parse_protocols -> build_chain -> format_chain_yaml has to
+    round-trip a declared protocol through a run that has no probe record for it,
+    or the fix for the 400 is undone by the tool that maintains the config.
+    """
+    declared = gen.parse_protocols(CONFIG.read_text())
+    if not declared:
+        pytest.skip("the shipped config declares no protocol to preserve")
+    (provider, model), protocol = sorted(declared.items())[0]
+    entry = {
+        "provider": provider, "model": model, "vision": False,
+        "intelligence": 40.0, "context_length": 0,
+        "protocol": protocol, "comment": "# 40.0",
+    }
+    assert f"protocol: {protocol}" in gen.format_chain_yaml([entry])
+
+
+def test_rule13_reports_a_missing_protocol_the_record_proves():
+    """Without the rule the field is written once and drifts silently, because
+    nothing fails when an endpoint is configured for the shape it refuses."""
+    problems = _checker_problems()
+    assert problems == [] or not any(p.startswith("rule13") for p in problems), problems
+
+
+def test_rule13_fires_when_the_config_drops_a_proved_protocol(tmp_path):
+    models_path = tmp_path / "models.json"
+    models_path.write_text(json.dumps([{
+        "id": "resp-only-free", "name": "r", "provider": "opencode",
+        "context_length": 1000, "intelligence": 40.0, "elo": None,
+        "capabilities": {"vision": False}, "raw": {}, "released": "2026-01-01",
+        "protocol": "responses",
+    }]))
+    config = f"""models:
+  smart:
+    chain:
+      - provider: opencode
+        model: resp-only-free  # 40.0
+        vision: false
+        intelligence: 40.0
+        context_length: 1000
+      - provider: kilocode
+        model: kilo-auto/free
+        vision: true
+  work:
+    chain:
+      - provider: opencode
+        model: resp-only-free  # 40.0
+        vision: false
+        intelligence: 40.0
+        context_length: 1000
+      - provider: kilocode
+        model: kilo-auto/free
+        vision: true
+  fast:
+    chain:
+      - provider: kilocode
+        model: kilo-auto/free
+        vision: true
+  large:
+    chain:
+      - provider: kilocode
+        model: kilo-auto/free
+        vision: true
+"""
+    problems = _checker_problems(config, models_path)
+    assert [p for p in problems if p.startswith("rule13")], problems
+    # Once the field is written, the same config is clean.
+    fixed = config.replace("        context_length: 1000\n",
+                           "        context_length: 1000\n        protocol: responses\n")
+    assert not [p for p in _checker_problems(fixed, models_path)
+                if p.startswith("rule13")]
+
+
+def test_rule13_rejects_an_unrecognised_protocol_value():
+    models_path = Path("/tmp/free-models.json")
+    if not models_path.exists():
+        pytest.skip("no fetched model list on this machine")
+    text = CONFIG.read_text()
+    broken = text.replace("        vision: false\n",
+                          "        vision: false\n        protocol: respones\n", 1)
+    problems = _checker_problems(broken, models_path)
+    assert [p for p in problems if "neither chat nor responses" in p], problems
+
+
+# --------------------------------------------------------------------------
+# scripts/validate-config.py.
+#
+# It had NO test at all, which mutation-check proved the moment a mutation was
+# aimed at it: the planted defect was reported MISSED, not caught. It is the
+# check the sync runs before it accepts a regenerated config, and it is the only
+# thing standing between a hand-edited file and a daemon that loads it, so a
+# rule added to it is a rule nothing can see.
+#
+# It takes no path argument -- it opens ./config.yaml in the current directory
+# -- so it is exercised the way the sync runs it: with the config in the working
+# directory. (Passing `--config path` is silently ignored, which is a footgun
+# this harness deliberately does not rely on.)
+# --------------------------------------------------------------------------
+
+
+def _validate_config(tmp_path, config_text):
+    (tmp_path / "config.yaml").write_text(config_text)
+    return subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "validate-config.py")],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+
+
+def test_validate_config_accepts_the_shipped_config(tmp_path):
+    run = _validate_config(tmp_path, CONFIG.read_text())
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
+@pytest.mark.parametrize("value", ["respones", "chat/completions", "", "RESPONSES!"])
+def test_validate_config_rejects_a_protocol_the_router_would_ignore(tmp_path, value):
+    """config.go's protocolFor maps anything unrecognised to chat, so a typo is a
+    file that claims `responses` while every request goes to /chat/completions."""
+    broken = CONFIG.read_text().replace(
+        "        vision: false\n", f"        vision: false\n        protocol: {value}\n", 1)
+    run = _validate_config(tmp_path, broken)
+    assert run.returncode == 1, run.stdout
+    assert "protocol must be" in run.stdout, run.stdout
+
+
+def test_validate_config_accepts_both_real_protocols(tmp_path):
+    for value in ("chat", "responses"):
+        shaped = CONFIG.read_text().replace(
+            "        vision: false\n", f"        vision: false\n        protocol: {value}\n", 1)
+        run = _validate_config(tmp_path, shaped)
+        assert run.returncode == 0, f"{value}: " + run.stdout
+
+
+def test_the_validate_config_harness_has_teeth_beyond_the_protocol_rule(tmp_path):
+    """Otherwise "the protocol rule is enforced" could pass because the harness
+    never rejects anything at all."""
+    unknown_provider = CONFIG.read_text().replace("      - provider: opencode",
+                                                  "      - provider: notaprovider", 1)
+    assert _validate_config(tmp_path, unknown_provider).returncode == 1
+
+    bad_vision = CONFIG.read_text().replace("        vision: false",
+                                            "        vision: maybe", 1)
+    assert _validate_config(tmp_path, bad_vision).returncode == 1
