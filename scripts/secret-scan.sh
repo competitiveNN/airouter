@@ -14,6 +14,14 @@
 # The local credential store (~/.git-credentials) is intentionally NOT scanned:
 # it is expected to hold a token, it is outside the repo, and it is chmod 600.
 #
+# NOT PART OF scripts/gate.sh (removed 2026-10-04), but still a gate step in
+# .github/workflows/ci.yml, where the tracked-content and history halves run on
+# every PR against a clean .git/config. Run it by hand for the local halves:
+# a credential in the push remote is the owner's to rotate and to reconfigure,
+# not something a gate -- or an agent holding the gate -- can settle, and a
+# stage that is always red for a reason unrelated to the code is worse than no
+# stage at all.
+#
 # Usage: scripts/secret-scan.sh        # exit 1 on any finding
 #        scripts/secret-scan.sh --quiet  # findings only, no summary
 

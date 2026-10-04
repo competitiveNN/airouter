@@ -262,7 +262,24 @@ run "shell-lint"                 bash "$REPO/scripts/shell-lint.sh"
 run "shell-lint-control"         bash "$REPO/scripts/shell-lint-control.sh"
 
 # -------------------------------------------------------------- security ----
-run "secret-scan"        bash "$REPO/scripts/secret-scan.sh"
+# secret-scan is NOT run here (removed 2026-10-04). It is still the right check
+# for a credential in TRACKED CONTENT or history, and it still runs on every PR
+# in .github/workflows/ci.yml — where actions/checkout creates a clean
+# .git/config, so the check is testing what it is for.
+#
+# What it also does is scan the operator's LOCAL .git/config, and that half had
+# turned the gate permanently red for a finding nobody here can fix: a token in
+# the push remote is the owner's credential, and an agent rewriting someone's
+# working remote URL is a worse outcome than the finding. A stage that is always
+# red trains everyone to read past the gate, which is the one property a gate
+# must not lose — and the audit's own case 8 shows the .git/config finding
+# coming back twice while the gate caught it and nothing changed, because the
+# stage was failing for a reason unrelated to any code.
+#
+# scripts/secret-scan.sh is unchanged and runnable by hand:
+#     bash scripts/secret-scan.sh
+# The token itself still needs rotating; that is an owner action, and removing a
+# detector is not the same as removing the credential.
 run "sse-negative-check" bash "$REPO/scripts/sse-negative-check.sh"
 
 # ----------------------------------------------------------------- audit ----

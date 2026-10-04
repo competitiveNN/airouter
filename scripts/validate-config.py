@@ -6,6 +6,21 @@ import sys
 import yaml
 
 
+def _bad_protocol(ep: dict) -> bool:
+    """Whether an endpoint declares a `protocol:` the router would not honour.
+
+    Presence, not truthiness: `protocol:` with no value parses to None, which is
+    indistinguishable from an absent field by value alone, and a field with no
+    value is a claim with no content. config.go's protocolFor maps anything it
+    does not recognise to chat, so both a typo and an empty value produce a file
+    that says one thing and routes another.
+    """
+    if "protocol" not in ep:
+        return False
+    value = ep.get("protocol")
+    return value is None or str(value).strip().lower() not in ("chat", "responses")
+
+
 def main() -> int:
     try:
         with open("config.yaml") as f:
@@ -107,6 +122,16 @@ def main() -> int:
             vision = ep.get("vision")
             if vision is not None and not isinstance(vision, bool):
                 problems.append(f"{name}[{i}]: vision must be a boolean, got {vision!r}")
+            # The wire shape. Not a style rule: config.go's protocolFor maps
+            # anything it does not recognise to chat, so a typo here is a file
+            # that says `responses` while the router posts to /chat/completions.
+            if _bad_protocol(ep):
+                problems.append(
+                    f"{name}[{i}]: protocol must be 'chat' or 'responses', got "
+                    f"{ep.get('protocol')!r} (config.go falls back to chat for "
+                    f"anything else, so the file would claim a shape the router "
+                    f"ignores)"
+                )
 
         last_model = chain[-1].get("model")
         if last_model not in ("kilo-auto/free", "big-pickle"):
