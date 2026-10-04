@@ -178,14 +178,29 @@ func TestStatusBearingErrorsAreUnaffected(t *testing.T) {
 	if got := r.cooldownForError(429, 3); got <= 30*time.Second {
 		t.Errorf("429 with 3 errors = %v, want escalation above the 30s base", got)
 	}
-	// 404 is the 7-day misconfiguration ban on FIRST sight; from three
-	// consecutive failures the soft-ban branch deliberately takes over with 24h.
-	// That predates this change and is intentional, so pin both.
+	// 404 is the 7-day misconfiguration ban, and it stays that way however
+	// often it fails. The soft-ban branch used to take over at three consecutive
+	// failures with a flat 24h, which meant a model not found was benched for
+	// SEVEN days on the first two failures and for ONE day on the third: the
+	// cooldown shrank by 3.5x because the endpoint kept failing. The soft ban is
+	// still applied where it is longer than the base (402/403: 24h from the third
+	// failure); it is just never allowed to be shorter.
 	if got := r.cooldownForError(404, 1); got != 7*24*time.Hour {
 		t.Errorf("404 first failure = %v, want the 7-day misconfiguration cooldown", got)
 	}
-	if got := r.cooldownForError(404, 3); got != 24*time.Hour {
-		t.Errorf("404 with 3 failures = %v, want the 24h soft ban", got)
+	for _, n := range []int{2, 3, 9, 10, 50} {
+		if got := r.cooldownForError(404, n); got != 7*24*time.Hour {
+			t.Errorf("404 with %d failures = %v, want it to stay at the 7-day "+
+				"misconfiguration cooldown rather than shorten", n, got)
+		}
+	}
+	// 402 has no 7-day base, so the soft ban does apply: 30s, then 24h at the
+	// third consecutive failure, 7 days at the tenth.
+	if got := r.cooldownForError(402, 2); got != 30*time.Second {
+		t.Errorf("402 with 2 failures = %v, want the 30s base", got)
+	}
+	if got := r.cooldownForError(402, 3); got != 24*time.Hour {
+		t.Errorf("402 with 3 failures = %v, want the 24h soft ban", got)
 	}
 	if got := r.cooldownForError(401, 2); got != 30*time.Minute {
 		t.Errorf("401 = %v, want 30m", got)
@@ -415,5 +430,102 @@ func TestProtocolRefusalIsNarrow(t *testing.T) {
 	// The same body at a status that is not a refusal still cools normally.
 	if isProtocolUnsupported(503, `{"error":{"type":"ModelProtocolUnsupported"}}`) {
 		t.Error("a 503 carrying the text was read as a protocol refusal")
+	}
+}
+
+// TestTransientEscalationReachesItsCeiling is the direct regression test for the
+// 2026-10-04 "cooldowns are too low" report.
+//
+// The transient branch was `base * errorCount` with the factor capped at 10, so
+// with the 30s base a 429, a 5xx or a transport timeout could not exceed 300s --
+// five minutes, on the hundredth consecutive failure as well as the tenth. The
+// ceiling the function documented (and still declares as maxCooldown) was 30
+// minutes, and no code path could ever produce it.
+//
+// Nothing caught it, because every test in this area asserted an upper bound.
+// `TestUnknownStatusEscalatesLikeATransientError` checks `got > wantMax`, so 90s
+// passes a check written for 30 minutes. A ceiling with no floor is a check that
+// cannot fail on a cooldown that is too short, which is the only direction this
+// regressed in.
+//
+// The live symptom: on 2026-10-04 nvidia{,2,3}:z-ai/glm-5.3-flash each carried
+// error_count 22 -- twenty-two consecutive `context deadline exceeded` -- on a
+// 5-minute cooldown. The models never answered, and the router kept paying full
+// request timeouts to them.
+func TestTransientEscalationReachesItsCeiling(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	// status 0 is the one that mattered live: a transport timeout is the most
+	// transient failure there is, and it is also the one a low ceiling hurts
+	// most, because it is what a provider in trouble produces.
+	for _, status := range []int{0, 429, 500, 502, 503, 504} {
+		for _, n := range []int{50, 100} {
+			if got := r.cooldownForError(status, n); got != maxCooldown {
+				t.Errorf("status %d with %d consecutive failures -> %v, want the %v "+
+					"ceiling: the escalation must actually be able to reach the bound "+
+					"it documents", status, n, got, maxCooldown)
+			}
+		}
+	}
+}
+
+// TestTransientEscalationIsMonotonicAndFast pins the shape rather than one
+// number: each consecutive failure must at least DOUBLE, and never regress.
+//
+// Doubling is what the comment in cooldownForError has promised since commit
+// b681a01 ("a gentler exponential-ish curve so a persistently rate-limited model
+// backs off to minutes (not seconds)") while the code multiplied linearly. The
+// linear curve is what made a model that never answers look almost healthy: by
+// the fifth failure, when a chain needs the endpoint gone, it was only at 2m30s.
+func TestTransientEscalationIsMonotonicAndFast(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	for _, status := range []int{0, 429, 500} {
+		prev := time.Duration(0)
+		for n := 1; n <= 10; n++ {
+			got := r.cooldownForError(status, n)
+			if got < prev {
+				t.Fatalf("status %d: error %d gave %v, less than error %d's %v: a "+
+					"cooldown that shrinks as failures pile up is not escalation",
+					status, n, got, n-1, prev)
+			}
+			if got > prev && n <= 6 && got < 2*prev {
+				t.Errorf("status %d: error %d gave %v, under double the previous %v; "+
+					"by the sixth consecutive failure the endpoint must be out for "+
+					"minutes, not seconds", status, n, got, prev)
+			}
+			prev = got
+		}
+		// Minutes, not seconds, by the time a chain has given it six chances.
+		if got := r.cooldownForError(status, 6); got < 8*time.Minute {
+			t.Errorf("status %d: six consecutive failures gave %v, want at least 8m",
+				status, got)
+		}
+	}
+}
+
+// TestCooldownNeverShrinksAsErrorsAccumulate covers the 404 branch, where the
+// base is ALREADY longer than the soft ban it used to fall back to.
+//
+//	baseCooldownForError(404) is 7 days, but the permanent-looking branch
+//
+// returned a flat 24h from error_count 3. So a model not found was benched for
+// seven days on the first two failures and for ONE day on the third: the
+// cooldown shrank by 3.5x because the endpoint failed more often. The soft ban
+// is now only ever applied when it is longer than the base.
+func TestCooldownNeverShrinksAsErrorsAccumulate(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	for _, status := range []int{402, 401, 403, 404, 405, 409, 418, 451} {
+		prev := time.Duration(-1)
+		for n := 1; n <= 30; n++ {
+			got := r.cooldownForError(status, n)
+			if prev >= 0 && got < prev {
+				t.Errorf("status %d: error %d gave %v, less than error %d's %v",
+					status, n, got, n-1, prev)
+			}
+			prev = got
+		}
+	}
+	if got := r.cooldownForError(404, 3); got != 7*24*time.Hour {
+		t.Errorf("a 404 that keeps failing must not be benched for less than a 404 "+
+			"that failed once: got %v", got)
 	}
 }
