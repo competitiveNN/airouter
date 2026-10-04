@@ -28,7 +28,18 @@ models:
     chain:
       - provider: <name>
         model: <upstream-model>
+        protocol: responses      # optional; absent means chat/completions
 ```
+
+`protocol` is per ENDPOINT, not per provider, because a provider's catalog is
+not uniformly Responses-capable: measured 2026-10-02, opencode's
+`muse-spark-1.{2,3}-contributor-free` answer `400 ModelProtocolUnsupported` on
+`/chat/completions` while answering 200 on `/responses`, and `big-pickle` is the
+other way round. Without the field the router still recovers — it flips and
+retries the same endpoint — at the cost of one failed round trip per endpoint
+per process start. `fetch-free-models.py` records the shape its probe proved,
+`regenerate_config.py` writes it, and `check-rules.py` rule 13 compares the two.
+Never write `protocol: chat`: absence already means it.
 
 ### Logical models
 
@@ -72,21 +83,68 @@ shipping unbounded, bound only by a loose 10-minute timeout.
 ### Cooldowns
 
 Cooldowns are persisted to `cooldowns.json` (atomic tmp+rename) next to the
-config file. Durations by status code:
+config file. `ErrorCount` is the number of CONSECUTIVE failures: it is reset by
+`RecordSuccess` (any successful response deletes the entry) and capped at 100.
+With a 30 s base the transient ladder is 30 s, 1 m, 2 m, 4 m, 8 m, 16 m, and
+then the 30-minute ceiling for every failure after the sixth.
 
-| Status | Base cooldown | Escalation | Cap |
-|--------|---------------|------------|-----|
-| 429    | 30 s          | +50 % per consecutive failure | 30 min |
-| 500/502/503 | 30 s      | +50 % per consecutive failure | 30 min |
-| 504    | 60 s          | +50 % per consecutive failure | 30 min |
-| 401/403| 30 min        | — | 30 min |
-| 404    | 7 days        | — | 7 days |
-| default| 30 s          | +50 % | 30 min |
+| Status | Base cooldown | Escalation | Ceiling |
+|--------|---------------|------------|---------|
+| 429    | 30 s          | ×2 per consecutive failure | 30 min |
+| 500/502/503 | 30 s      | ×2 per consecutive failure | 30 min |
+| 504    | 60 s          | ×2 per consecutive failure | 30 min |
+| 0 (timeout, transport, upstream SSE) | 30 s | ×2 per consecutive failure | 30 min |
+| 401/403 | 30 min       | 24 h at 3 failures, 7 days at 10 | 7 days |
+| 402    | 30 s          | 24 h at 3 failures, 7 days at 10 | 7 days |
+| 404    | 7 days        | — (never shortens) | 7 days |
+| 400/413/422 | none (client error) | — | none |
+| 400 `ModelProtocolUnsupported` | 24 h | — | 24 h |
 
-`ErrorCount` is capped at 100 and reset by `RecordSuccess` (any 200 response
-clears the entry). Transient errors (429/5xx) receive up to 25% random jitter
-(`cooldown_jitter` in preferences) to break thundering herds. A 429's upstream
-`Retry-After` header is honored as a floor on the computed cooldown.
+Three properties of that table are deliberate, and each one was a bug once:
+
+- **A cooldown never shortens as failures accumulate.** A 404's base is already
+  longer than the 24 h soft ban, so the soft ban is only applied when it is
+  longer than the base. Returning it unconditionally made a model not found sit
+  out seven days on the first two failures and one day on the third.
+- **The transient ceiling is reachable.** It used to be `base × errorCount` with
+  the factor capped at 10, which with a 30 s base cannot exceed five minutes —
+  a twelfth of the pre-2026-08-30 behaviour and unreachable in practice, so a
+  model that never answered sat on a 5-minute bench indefinitely.
+- **"No HTTP status" is transient, not fatal.** Status 0 is a transport error, a
+  parse failure or an upstream SSE event; treating it as "probably permanent"
+  handed three consecutive timeouts a 24-hour ban.
+
+Transient errors (429/5xx) receive up to 25% random jitter (`cooldown_jitter` in
+preferences) to break thundering herds. A 429's upstream `Retry-After` header is
+honored as a floor on the computed cooldown — but not on a client error, where
+the provider is not asking us to back off.
+
+#### Cooldowns are also the free-tier oracle
+
+A cooldown is not only a backoff: it is the only record of what happens when
+real client traffic reaches an endpoint, and no provider API answers that
+question. `fetch-free-models.py` reads this file on every sync (step 0 of
+`scripts/sync-models.sh`, `--cooldowns-report`) and vetoes any endpoint it finds
+recurrently refused for free-tier reasons — 402 billing, 403 with free-tier
+wording, 404 gone — persisting the verdict to `free-tier-denied.json` so a quiet
+week does not erase it.
+
+Inspect what a sync will act on, without touching the network:
+
+    python3 fetch-free-models.py --cooldowns-report
+
+| In cooldowns.json | Verdict |
+|-------------------|---------|
+| 402 / 403 with free-tier wording, ≥3 consecutive | `not-free` → vetoed |
+| 404 | `gone` → vetoed |
+| 429, 5xx, `context deadline exceeded`, `status_code: 0` | transient → ignored |
+| the `circuits` section | ignored (open/half-open are probes in flight) |
+
+Two things follow for operations. A model in the chains with an active denial
+will fail: clear it by fixing the entitlement, or wait out the 168 h window
+(`AIROUTER_DENIAL_TTL_HOURS`). And a chain that stops growing after a provider
+drops a free model is the veto working, not a bug — `free-tier-denied.json`
+names the endpoint and the error that removed it.
 
 ## Metrics
 

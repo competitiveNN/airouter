@@ -407,8 +407,9 @@ func (r *Router) cleanupStaleEntries() {
 			continue
 		}
 		// Cap ErrorCount so a persistently-failing model's counter can't grow
-		// without bound. The cooldown is already at maxCooldown by errorCount=10,
-		// so further increments only waste memory.
+		// without bound. The cooldown is already at maxCooldown by errorCount=7
+		// (30s doubling to the 30-minute ceiling), so further increments only
+		// waste memory.
 		if cd := r.cooldowns[k]; cd.ErrorCount > 100 {
 			cd.ErrorCount = 100
 			r.cooldowns[k] = cd
@@ -763,6 +764,10 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
+// minCooldownWait reads r.cooldowns and r.noVision directly, so the CALLER must
+// hold r.mu. Both call sites are inside SelectEndpoint, which takes the write lock
+// for its whole body; a future caller that does not would be a data race, and
+// nothing at the call site would look wrong.
 func (r *Router) minCooldownWait(chain []ModelEndpoint, requireVision bool) time.Duration {
 	minWait := time.Duration(0)
 	for _, ep := range chain {
@@ -989,8 +994,9 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 	}
 	cd.ErrorCount++
 	// Cap ErrorCount so a persistently-failing model's counter can't grow
-	// without bound. The cooldown is already at maxCooldown by errorCount=10,
-	// so further increments only waste memory.
+	// without bound. The cooldown is already at maxCooldown by errorCount=7
+	// (30s doubling to the 30-minute ceiling), so further increments only
+	// waste memory.
 	if cd.ErrorCount > 100 {
 		cd.ErrorCount = 100
 	}
@@ -1444,6 +1450,16 @@ func isProtocolUnsupported(statusCode int, body string) bool {
 // paying for a rejection.
 const protocolUnsupportedCooldown = 24 * time.Hour
 
+// maxCooldown is the ceiling on the TRANSIENT escalation (status 0, 429, 5xx).
+//
+// It is a real bound and not decoration: it is what keeps a burst of rate limits
+// from disabling a model for hours. It was also, until 2026-10-04, a bound
+// nothing could reach -- the escalation was linear (`base * errorCount`, factor
+// capped at 10), so with the 30s base a 429 or a transport timeout topped out at
+// 5 minutes and stayed there for the hundredth failure. See the transient branch
+// in cooldownForError.
+const maxCooldown = 30 * time.Minute
+
 func baseCooldownForError(statusCode int) time.Duration {
 	switch statusCode {
 	case 429:
@@ -1499,12 +1515,25 @@ func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration 
 	// 2026-10-01: 15 of 23 cooldown entries carried status_code 0, mostly
 	// `net/http: timeout awaiting response headers`.
 	if statusCode == 0 || statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
-		factor := time.Duration(errorCount)
-		if factor > 10 {
-			factor = 10
+		// Doubling, which is the "gentler exponential-ish curve" the comment
+		// above has always promised. The linear `base * errorCount` this
+		// replaced could not reach maxCooldown at all for any real base: 30s
+		// times the old factor cap of 10 is 300s, so every persistently failing
+		// model -- every 429, 5xx and transport timeout -- sat at FIVE minutes
+		// forever, six times below the ceiling this function documents and a
+		// twelfth of the 1-hour cap it had before commit c041d50. Live on
+		// 2026-10-04: nvidia{,2,3}:z-ai/glm-5.3-flash carried error_count 22
+		// (twenty-two consecutive timeouts) on a 5-minute cooldown, so the
+		// router kept paying full timeouts to a model that never answered.
+		//
+		// With a 30s base: 30s, 1m, 2m, 4m, 8m, 16m, then the 30-minute
+		// ceiling from the seventh consecutive failure. The loop stops as soon
+		// as the ceiling is reached, so the doubling cannot overflow even
+		// though ErrorCount goes to 100.
+		d := base
+		for i := 1; i < errorCount && d < maxCooldown; i++ {
+			d *= 2
 		}
-		d := base * factor
-		const maxCooldown = 30 * time.Minute
 		if d > maxCooldown {
 			d = maxCooldown
 		}
@@ -1519,7 +1548,13 @@ func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration 
 		if errorCount >= 10 {
 			return 7 * 24 * time.Hour // 7 days
 		}
-		return 24 * time.Hour
+		// Never shorter than the base. A 404's base IS 7 days, so returning
+		// the 24h soft-ban here made a cooldown SHRINK as failures piled up:
+		// 7d at error_count 1 and 2, then 24h at 3. Escalation that punishes
+		// the endpoint less for failing more is not escalation.
+		if softBan := 24 * time.Hour; softBan > base {
+			return softBan
+		}
 	}
 	return base
 }
