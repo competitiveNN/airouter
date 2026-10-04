@@ -486,18 +486,27 @@ func TestRouterCooldownEscalation(t *testing.T) {
 
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
-	// A 500 error has a 30s base; repeated consecutive failures escalate the
-	// backoff (factor 1..6, capped), but never beyond the 10m ceiling. The
-	// error count is reset on a successful request (RecordSuccess), so this
-	// reflects only recent consecutive failures.
+	// A 500 error has a 30s base; repeated consecutive failures DOUBLE the
+	// backoff, and never beyond the 30m ceiling (maxCooldown). The error count
+	// is reset on a successful request (RecordSuccess), so this reflects only
+	// recent consecutive failures.
+	//
+	// The ladder used to be linear (base * errorCount, factor capped at 10), and
+	// this test pinned it: 30s, 1m, 1m30s, 2m, 2m30s, 3m, then a flat 5m for
+	// every failure after the tenth. That is the "too low" regression -- a model
+	// that never answers sat on a 5-minute bench forever, a twelfth of the 1h
+	// ceiling the function had before commit c041d50, and the documented 30m
+	// ceiling was arithmetic no code path could reach. The ceiling is now
+	// reachable, and reaching it is what this test asserts.
 	base := 30 * time.Second
 	want := []time.Duration{
-		base,     // 1st
-		2 * base, // 2nd
-		3 * base, // 3rd
-		4 * base, // 4th
-		5 * base, // 5th
-		6 * base, // 6th
+		base,        // 1st
+		2 * base,    // 2nd
+		4 * base,    // 3rd
+		8 * base,    // 4th
+		16 * base,   // 5th
+		32 * base,   // 6th: 16m, still under the ceiling
+		maxCooldown, // 7th: 32m would exceed the ceiling
 	}
 	var cd CooldownEntry
 	for i, w := range want {
@@ -516,21 +525,14 @@ func TestRouterCooldownEscalation(t *testing.T) {
 		}
 	}
 
-	// Keep applying errors until we hit the factor cap (factor 10).
-	for i := 6; i < 10; i++ {
+	// Keep applying errors: the ceiling holds, it does not keep growing.
+	capDur := maxCooldown
+	for i := 6; i < 20; i++ {
 		router.ApplyCooldown(ep, 500, "server error")
-	}
-	cd = router.GetAllCooldowns()[ep.Key()]
-	capDur := 10 * base // factor 10 * 30s base = 5m (capped by factor)
-	if got := time.Until(cd.Expiry); got < capDur-5*time.Second || got > capDur+5*time.Second {
-		t.Errorf("expected cooldown capped at %v, got %v", capDur, got)
-	}
-
-	// Beyond the factor cap the cooldown stays at the ceiling.
-	router.ApplyCooldown(ep, 500, "server error")
-	cd = router.GetAllCooldowns()[ep.Key()]
-	if got := time.Until(cd.Expiry); got < capDur-5*time.Second || got > capDur+5*time.Second {
-		t.Errorf("expected cooldown to stay capped at %v after more errors, got %v", capDur, got)
+		cd = router.GetAllCooldowns()[ep.Key()]
+		if got := time.Until(cd.Expiry); got < capDur-5*time.Second || got > capDur+5*time.Second {
+			t.Errorf("after %d errors: expected cooldown capped at %v, got %v", i+1, capDur, got)
+		}
 	}
 }
 
@@ -3354,23 +3356,32 @@ func TestModelCooldownDuration(t *testing.T) {
 
 // TestCooldownEscalation429 verifies that repeated 429s escalate the cooldown
 // to a longer duration (not stuck at a short one), preventing the infinite
-// retry loop that caused error counts to climb into the thousands. With the
-// linear escalation (base * factor, capped at 10x), 10 consecutive 429s
-// yields a 5-minute cooldown instead of the base 30s.
+// retry loop that caused error counts to climb into the thousands.
+//
+// This asserts the ladder EXACTLY, from both sides. It used to assert only an
+// upper bound -- "after 10 consecutive 429s the cooldown is ~5 minutes" -- and
+// that is precisely how a cooldown that had become far too short stayed green:
+// every assertion in the file could be satisfied by a ladder that collapsed
+// towards its base, so the only thing pinned was that escalation did not run
+// away. The floor matters as much as the ceiling, and a test that cannot fail
+// on a too-short cooldown is not evidence of anything.
 func TestCooldownEscalation429(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	ep := &ModelEndpoint{Provider: "openai", Model: "gpt-4"}
 
-	// After 10 consecutive 429s, the cooldown should be 5 minutes
-	// (30s base * 10 factor = 300s), not the base 30s.
-	for i := 0; i < 10; i++ {
-		router.ApplyCooldown(ep, 429, "rate limited")
+	// 30s doubling, clamped at the ceiling: 30s, 1m, 2m, 4m, 8m, 16m, 30m.
+	want := []time.Duration{
+		30 * time.Second, 1 * time.Minute, 2 * time.Minute, 4 * time.Minute,
+		8 * time.Minute, 16 * time.Minute, maxCooldown, maxCooldown,
 	}
-	cd := router.GetAllCooldowns()[ep.Key()]
-	wait := time.Until(cd.Expiry)
-	if wait < 4*time.Minute || wait > 6*time.Minute {
-		t.Errorf("after 10 consecutive 429s, cooldown should be ~5min, got %v", wait)
+	for i, w := range want {
+		router.ApplyCooldown(ep, 429, "rate limited")
+		cd := router.GetAllCooldowns()[ep.Key()]
+		got := time.Until(cd.Expiry)
+		if got < w-5*time.Second || got > w+5*time.Second {
+			t.Errorf("after %d consecutive 429s: want ~%v, got %v", i+1, w, got)
+		}
 	}
 }
 
