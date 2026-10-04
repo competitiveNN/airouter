@@ -1,5 +1,6 @@
 [Unit]
-Description=Airouter model sync (fetch free models, rebuild config.yaml via maki)
+Description=Airouter model sync (refresh the free-model list, veto what the gateway is refused on, rebuild config.yaml)
+Documentation=file:%h/dev/airouter/scripts/sync-instruction.txt
 After=network.target
 
 [Service]
@@ -12,3 +13,15 @@ WorkingDirectory=%h/dev/airouter
 # and resolves no intra-file references).
 ExecStart=/bin/bash -c 'set -a; . %h/dev/airouter/.envrc; set +a; exec %h/dev/airouter/scripts/sync-models.sh'
 TimeoutStartSec=30min
+# This is a scheduled refresh of a file the daemon hot-reloads, not the
+# request path. The fetcher issues a few dozen API calls (six provider
+# listings, the opencode gate probes, two terminator probes) and rewrites
+# cooldowns-independent caches, so run it strictly below the daemon.
+Nice=10
+IOSchedulingClass=idle
+# The sync reads cooldowns.json while the daemon is writing it. That is safe by
+# construction, not by luck: loadCooldowns/saveCooldowns rename a temp file into
+# place (router.go), so this sees either the old envelope or the new one, never a
+# half-written one — which is why scripts/sync-models.sh can treat an unreadable
+# file as "no evidence" instead of failing the sync.
+SyslogIdentifier=airouter-model-sync

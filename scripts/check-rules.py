@@ -15,6 +15,13 @@ sync is supposed to follow (see scripts/sync-instruction.txt):
   8  no invented ids, no stealth/* outside commandcode, no content-safety
  10  providers exist, nvidia trios and commandcode pairs complete + adjacent
  11  a numeric intelligence on every concrete endpoint, absent on the auto one
+ 13  the wire shape (`protocol:`) matches the record that proved it
+
+Rule 12 is enforced upstream, in fetch-free-models.py, which reads the daemon's
+cooldowns.json and vetoes endpoints the gateway has been refused on. It cannot be
+a check here: a checker that rejects a denied model fails, the sync restores the
+PREVIOUS config, and that config still contains the model, so the only thing that
+could remove it would keep restoring it.
 
 Provider mapping and exclusion logic are imported from regenerate_config.py
 rather than re-implemented, so the checker cannot drift from the generator it
@@ -181,6 +188,21 @@ def _no_verdict(rc, providers_present: set[str], index) -> bool:
     return "not probed" in unverified or "unverified" in unverified
 
 
+def _bad_protocol(ep: dict) -> bool:
+    """Whether an endpoint declares a `protocol:` the router would not honour.
+
+    Presence, not truthiness: `protocol:` with no value parses to None, which is
+    indistinguishable from an absent field by value alone, and a field with no
+    value is a claim with no content. config.go's protocolFor maps anything it
+    does not recognise to chat, so both a typo and an empty value produce a file
+    that says one thing and routes another.
+    """
+    if "protocol" not in ep:
+        return False
+    value = ep.get("protocol")
+    return value is None or str(value).strip().lower() not in ("chat", "responses")
+
+
 def check(
     rc,
     cfg: dict,
@@ -302,10 +324,13 @@ def check(
             ctx = ep.get("context_length") or 0
             contexts.append(int(ctx))
 
-            # field order: provider, model, vision, intelligence, [context_length]
+            # field order: provider, model, vision, intelligence,
+            # [context_length], [protocol]
             want_keys = ["provider", "model", "vision", "intelligence"]
             if "context_length" in ep:
                 want_keys.append("context_length")
+            if "protocol" in ep:
+                want_keys.append("protocol")
             if list(ep) != want_keys:
                 problems.append(f"rule7/11: {tag} field order {list(ep)} != {want_keys}")
 
@@ -331,6 +356,35 @@ def check(
             if bool(src.vision) != bool(ep.get("vision")):
                 problems.append(
                     f"rule7: {tag} vision={ep.get('vision')!r} but the source record says {src.vision}"
+                )
+            # rule 13: the wire shape must agree with what the probe proved.
+            #
+            # opencode.ai is mixed within one catalog: measured 2026-10-02,
+            # muse-spark-1.{2,3}-contributor-free answer 400
+            # ModelProtocolUnsupported on /chat/completions and 200 on
+            # /responses, while big-pickle is the other way round. A
+            # responses-only model left on the chat path is not broken, it just
+            # 400s on every call -- and the router recovers by flipping and
+            # retrying (api.go), so the symptom is one wasted round trip per
+            # endpoint per process start rather than an outage. Silent is
+            # exactly the wrong property for a field nobody reads, so it is
+            # checked here against the record that proved it.
+            # Presence, not truthiness: `protocol:` with no value parses to None
+            # and would otherwise slip past this as if the field were absent.
+            proto = ep.get("protocol")
+            if _bad_protocol(ep):
+                problems.append(
+                    f"rule13: {tag} protocol={proto!r} is neither chat nor responses; "
+                    f"config.go falls back to chat for anything it does not "
+                    f"recognise, so the file would claim a shape the router ignores"
+                )
+            src_proto = getattr(src, "protocol", None)
+            if src_proto == "responses" and str(proto or "").strip().lower() != "responses":
+                problems.append(
+                    f"rule13: {tag} has no `protocol: responses` but the fetched "
+                    f"record says the model answered 200 on /responses and refuses "
+                    f"/chat/completions. Every call to it pays a failed round trip "
+                    f"while the router rediscovers the same fact."
                 )
             # rule 4: nothing with an unknown score belongs in a chain.
             if src.score is None:
@@ -464,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     profiles = ", ".join(f"{p}={len(c['chain'])}" for p, c in sorted((cfg['models']).items()))
-    print(f"OK: rules 3-11 hold ({profiles})" + ("" if index else "; vision/score checks skipped"))
+    print(f"OK: rules 3-13 hold ({profiles})" + ("" if index else "; vision/score checks skipped"))
     return 0
 
 

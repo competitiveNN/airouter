@@ -192,7 +192,7 @@ go test -race -count=1 ./...   # the full suite; run it before committing
 gofmt -l .                     # must print nothing
 go vet ./...
 python3 scripts/validate-config.py config.yaml
-bash scripts/secret-scan.sh
+bash scripts/secret-scan.sh   # manual: scans local .git/config too, so it is not a gate stage
 python3 scripts/audit-drift-check.py
 ```
 
