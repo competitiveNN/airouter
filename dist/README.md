@@ -151,8 +151,6 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `db96c25` responses: a required field that flattens to empty is still required
-- `2003af6` Cooldown: a timeout has to back off harder than a rate limit
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
