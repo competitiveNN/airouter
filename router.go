@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -986,6 +987,14 @@ func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string)
 // (429/5xx) also receive up to 25% random jitter to break thundering herds when
 // many clients hit the same rate-limited model simultaneously.
 func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string, retryAfter time.Duration) time.Duration {
+	return r.applyCooldown(ep, statusCode, errMsg, sessionID, retryAfter, false)
+}
+
+// applyCooldown is ApplyCooldownForSession with one extra input: timedOut, which
+// the caller knows from the error's TYPE (see isTimeoutFailure) but which does not
+// survive as a field anywhere else. Every other caller passes false and gets the
+// ordinary classification, which is what a provider HTTP response is.
+func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string, retryAfter time.Duration, timedOut bool) time.Duration {
 	r.mu.Lock()
 	key := ep.Key()
 	cd, ok := r.cooldowns[key]
@@ -1005,6 +1014,16 @@ func (r *Router) ApplyCooldownForSession(ep *ModelEndpoint, statusCode int, errM
 	// would otherwise return zero and keep the endpoint in rotation forever.
 	if isProtocolUnsupported(statusCode, errMsg) {
 		duration = protocolUnsupportedCooldown
+	}
+	// A TIMEOUT is the one statusless failure that gets a steeper ramp than its
+	// neighbours, because it is the only one that has already cost the caller
+	// real time. Gated on statusCode == 0 so a provider that answers "timeout"
+	// with an HTTP status keeps its status-specific curve, and so a statusless
+	// failure that is not a timeout -- a parse error, an upstream SSE error event
+	// -- keeps the generic 30s base. The ceiling is unchanged: this is a steeper
+	// ramp up to the same bound, not a new ban.
+	if statusCode == 0 && (timedOut || isTimeoutMessage(errMsg)) {
+		duration = escalateCooldown(timeoutCooldownBase, cd.ErrorCount)
 	}
 	// Honor the upstream's Retry-After as a floor: never cool down for less
 	// than the provider asked, since it knows its own rate-limit windows.
@@ -1383,7 +1402,11 @@ func (r *Router) ApplyCooldownFromErrorForSession(ep *ModelEndpoint, err error, 
 	if errors.As(err, &providerErr) {
 		retryAfter = providerErr.RetryAfter
 	}
-	r.ApplyCooldownForSession(ep, statusCode, errMsg, sessionID, retryAfter)
+	// The typed error, not the message: this is the only place in the cooldown
+	// path where the real error is still available, and a deadline is
+	// recognisable by its type in every shape it arrives in (see
+	// isTimeoutFailure).
+	r.applyCooldown(ep, statusCode, errMsg, sessionID, retryAfter, isTimeoutFailure(err))
 }
 
 // isClientRequestError reports whether a status blames the REQUEST rather than
@@ -1460,6 +1483,85 @@ const protocolUnsupportedCooldown = 24 * time.Hour
 // in cooldownForError.
 const maxCooldown = 30 * time.Minute
 
+// timeoutCooldownBase is the FIRST cooldown for a request that timed out, and it
+// is four times the base every other statusless failure starts from.
+//
+// A timeout is not the same kind of event as the other failures that share its
+// status code. A 429 or a 5xx comes back in milliseconds, so starting at 30s
+// costs the caller almost nothing. A response-header timeout has already cost
+// the entire wait: proxy.go sets ResponseHeaderTimeout to 30s, so each of these
+// failures burns 30 seconds of the caller's latency and returns nothing at all.
+// Asking again after a 30s gap gets the same 30s back, because the upstream is
+// not slow to answer, it is not answering.
+//
+// The live symptom this fixes, 2026-10-05:
+//
+//	cooldown nvidia3/deepseek-ai/deepseek-v4.1-flash status=0 errors=4 for 4m0s:
+//	  Post "https://integrate.api.nvidia.com/v1/chat/completions":
+//	  net/http: timeout awaiting response headers
+//
+// FOUR consecutive timeouts put the endpoint back in rotation after four
+// minutes, because a timeout was sharing the 30s-doubling curve with rate
+// limits. From the caller's side that is four full 30-second stalls in a
+// session whose fallback chain exists precisely so it keeps moving.
+//
+// 2m doubling to the SAME 30m ceiling: 2m, 4m, 8m, 16m, then the ceiling from
+// the fifth consecutive timeout, where the generic curve needs seven. The
+// ceiling is deliberately not raised. A statusless failure stays bounded and is
+// never soft-banned -- that decision is load-bearing (see
+// cooldown_classification_test.go) -- and the circuit breaker, not this number,
+// is what retires an endpoint that never answers at all.
+const timeoutCooldownBase = 2 * time.Minute
+
+// isTimeoutFailure reports whether err is a deadline, by TYPE rather than by
+// message. net.Error.Timeout() is true for context.DeadlineExceeded, for the
+// *url.Error that wraps it, and for net/http's own header timeout, so one check
+// covers every shape a deadline takes in this codebase -- including the
+// per-request context.WithTimeout in api.go/responses_api.go, whose message
+// ("context deadline exceeded") is shared with several unrelated failures.
+func isTimeoutFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nerr net.Error
+	return errors.As(err, &nerr) && nerr.Timeout()
+}
+
+// isTimeoutMessage is the fallback for a deadline whose type did not survive the
+// trip to the cooldown path -- an error rebuilt from its message, a body replayed
+// as one. Only consulted for a failure with NO HTTP status (see the call site in
+// applyCooldown), so a provider whose body happens to mention a timeout can never
+// reach it.
+func isTimeoutMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, s := range []string{
+		"timeout awaiting response headers",
+		"client.timeout exceeded",
+		"i/o timeout",
+		"tls handshake timeout",
+		"deadline exceeded",
+	} {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// escalateCooldown doubles base once per consecutive failure and stops at
+// maxCooldown. This is the transient curve, given the base to climb from, so a
+// steeper base costs one argument instead of a second copy of the loop.
+func escalateCooldown(base time.Duration, errorCount int) time.Duration {
+	d := base
+	for i := 1; i < errorCount && d < maxCooldown; i++ {
+		d *= 2
+	}
+	if d > maxCooldown {
+		d = maxCooldown
+	}
+	return d
+}
+
 func baseCooldownForError(statusCode int) time.Duration {
 	switch statusCode {
 	case 429:
@@ -1530,14 +1632,10 @@ func (r *Router) cooldownForError(statusCode int, errorCount int) time.Duration 
 		// ceiling from the seventh consecutive failure. The loop stops as soon
 		// as the ceiling is reached, so the doubling cannot overflow even
 		// though ErrorCount goes to 100.
-		d := base
-		for i := 1; i < errorCount && d < maxCooldown; i++ {
-			d *= 2
-		}
-		if d > maxCooldown {
-			d = maxCooldown
-		}
-		return d
+		//
+		// A TIMEOUT does not use this base: see timeoutCooldownBase in
+		// applyCooldown, which reroutes it onto the same curve two steps up.
+		return escalateCooldown(base, errorCount)
 	}
 	// Permanent-looking (4xx / repeated): after a few consecutive failures,
 	// treat as a soft ban so we stop hammering the chain on every request.
