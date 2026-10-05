@@ -353,6 +353,148 @@ func TestChatBodyToResponsesConvertsToolResults(t *testing.T) {
 	}
 }
 
+// TestChatBodyToResponsesEmitsEmptyToolOutput is the regression for the live
+// failure on 2026-10-04, where opencode/muse-spark-1.2-contributor-free answered
+//
+//	{"error":{"code":null,"message":"`input[5]` missing required field `output`"}}
+//
+// for every session that carried a tool call which returned no text. `output`
+// is required by the Responses schema, but an empty tool result is a perfectly
+// ordinary thing for a client to send, so the key has to be present and empty
+// rather than absent.
+//
+// The assertion is on the raw body on purpose: decoding into a struct cannot
+// tell an absent key from an empty one, which is exactly the confusion that
+// shipped the bug.
+func TestChatBodyToResponsesEmitsEmptyToolOutput(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[
+		{"role":"user","content":"run it"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":""}]}`)
+	got, err := chatBodyToResponses(body, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"type":"function_call_output"`) {
+		t.Fatalf("tool result was dropped entirely:\n%s", got)
+	}
+	if !strings.Contains(string(got), `"output":""`) {
+		t.Errorf("required `output` is missing on the empty tool result; the provider "+
+			"answers \"`input[N] missing required field `output`\" and, being a 400, "+
+			"no endpoint ever cools down:\n%s", got)
+	}
+}
+
+// TestChatBodyToResponsesEmitsToolOutputForImageOnlyResult covers the other way a
+// tool result flattens to nothing: the tool returned content the flattener
+// drops (an image part carries no text), so `output` was empty while the
+// client had certainly sent a result.
+func TestChatBodyToResponsesEmitsToolOutputForImageOnlyResult(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[
+		{"role":"user","content":"look"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"c7","function":{"name":"screenshot","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c7","content":[{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`)
+	got, err := chatBodyToResponses(body, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"output":""`) {
+		t.Errorf("image-only tool result lost its required `output` key:\n%s", got)
+	}
+}
+
+// TestChatBodyToResponsesPairsCallIDWithToolCallID pins the identity of call_id.
+// The function_call_output carries the client's `tool_call_id`; if the
+// function_call does not carry the same string, every tool result answers a call
+// the model never saw, which the provider rejects as an unknown tool result (or
+// silently drops). The function NAME is not an acceptable substitute: it is not
+// unique per call, so two calls to the same tool collide.
+func TestChatBodyToResponsesPairsCallIDWithToolCallID(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[
+		{"role":"user","content":"run it"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"call_abc","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]},
+		{"role":"tool","tool_call_id":"call_abc","content":"a.txt"}]}`)
+	got, err := chatBodyToResponses(body, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Input []struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatal(err)
+	}
+	var callID, resultID string
+	for _, it := range out.Input {
+		switch it.Type {
+		case "function_call":
+			callID = it.CallID
+		case "function_call_output":
+			resultID = it.CallID
+		}
+	}
+	if callID == "" || resultID == "" {
+		t.Fatalf("missing a call/result pair: call_id=%q result=%q\n%s", callID, resultID, got)
+	}
+	if callID != resultID {
+		t.Errorf("function_call call_id %q does not match function_call_output call_id %q; "+
+			"the result answers a call the model never made:\n%s", callID, resultID, got)
+	}
+	if callID == "bash" {
+		t.Errorf("call_id is the function name, not the tool call id:\n%s", got)
+	}
+}
+
+// TestChatBodyToResponsesEmitsRequiredFunctionCallFields covers the remaining
+// required-but-empty fields on a function_call. A zero-argument tool call is
+// ordinary; sending `arguments` absent or "" is not, because the field is
+// required and must be a JSON string.
+func TestChatBodyToResponsesEmitsRequiredFunctionCallFields(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"c2","function":{"name":"now","arguments":""}}]}]}`)
+	got, err := chatBodyToResponses(body, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"arguments":"{}"`) {
+		t.Errorf("empty tool-call arguments were dropped or left empty; the field is "+
+			"required and must be valid JSON:\n%s", got)
+	}
+	if !strings.Contains(string(got), `"name":"now"`) {
+		t.Errorf("required function_call `name` missing:\n%s", got)
+	}
+}
+
+// TestChatBodyToResponsesKeepsContentOnEmptyMessage covers a user turn whose
+// content flattens to nothing. `content` is required on a message item, so the
+// key must survive an empty turn instead of vanishing.
+func TestChatBodyToResponsesKeepsContentOnEmptyMessage(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":""}]}`)
+	got, err := chatBodyToResponses(body, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Input []struct {
+			Type    string            `json:"type"`
+			Content []json.RawMessage `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Input) != 1 || out.Input[0].Type != "message" {
+		t.Fatalf("input = %s, want one message item", got)
+	}
+	if len(out.Input[0].Content) == 0 {
+		t.Errorf("message item lost its required `content`:\n%s", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Response direction
 // ---------------------------------------------------------------------------

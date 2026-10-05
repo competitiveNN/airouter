@@ -102,12 +102,19 @@ func buildResponseEnvelope(chat *ChatCompletionResponse, logicalModel string) *r
 	return env
 }
 
-// firstNonEmpty returns s if it is non-empty, otherwise fallback.
-func firstNonEmpty(s, fallback string) string {
+// firstNonEmpty returns s if it is non-empty, otherwise the first non-empty
+// fallback. Multiple fallbacks are tried in order, so a caller can spell out
+// every acceptable substitute for an absent id rather than picking one blind.
+func firstNonEmpty(s string, fallbacks ...string) string {
 	if s != "" {
 		return s
 	}
-	return fallback
+	for _, f := range fallbacks {
+		if f != "" {
+			return f
+		}
+	}
+	return ""
 }
 
 // parseChatResponse decodes an upstream Chat Completions body. A body that is

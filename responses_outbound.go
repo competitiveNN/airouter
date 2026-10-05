@@ -105,6 +105,82 @@ type chatRequestBody struct {
 	Stop        *[]string `json:"stop"`
 }
 
+// upstreamItem is one entry of the Responses `input` array as it goes ON THE
+// WIRE to a provider.
+//
+// It is deliberately a different type from `item`. `item` serves the
+// client-facing envelope, where omitempty keeps a message item from carrying an
+// empty `"role"` or a contentless part; it cannot express the difference
+// between a field that is absent and a field that is present and empty, and
+// the Responses schema requires several of those fields unconditionally. Here a
+// nil pointer means "omit the key" and a pointer to "" means `"field":""`.
+//
+// This is not a hypothetical hardening. Measured live 2026-10-04 against
+// opencode zen (muse-spark-1.2-contributor-free, `protocol: responses` in
+// config.yaml):
+//
+//	cooldown opencode/muse-spark-1.2-contributor-free status=400 errors=11 for 0s:
+//	  {"model":"muse-spark-1.2-contributor-free","error":{"code":null,
+//	   "message":"`input[5]` missing required field `output`", ...}}
+//
+// The `output` of a tool result that flattens to "" -- a command that printed
+// nothing, a read of an empty file, a tool that returned only an image -- was
+// dropped by `omitempty` and the provider's validator refused the whole
+// request. A 400 is then classified as a client-request error: no cooldown, so
+// every request in that session paid the same round trip and the endpoint's
+// error count climbed forever. `name` and `arguments` on function_call fail the
+// same way.
+type upstreamItem struct {
+	Type    string         `json:"type"`
+	Role    string         `json:"role,omitempty"`
+	Content []upstreamPart `json:"content,omitempty"`
+
+	// call_id pairs a function_call with the function_call_output that
+	// answers it, on both sides of the crossing.
+	CallID string  `json:"call_id,omitempty"`
+	Name   *string `json:"name,omitempty"`
+	// arguments is a JSON string and is required: an absent key is a schema
+	// error, and an empty one is not valid JSON either, so the caller
+	// normalizes it through toolCallArguments.
+	Arguments *string `json:"arguments,omitempty"`
+	// output is required on function_call_output and legitimately empty.
+	Output *string `json:"output,omitempty"`
+}
+
+// upstreamPart is one content part on the wire, for the same reason as
+// upstreamItem: a text part carries `text` even when the text is empty.
+type upstreamPart struct {
+	Type     string   `json:"type"`
+	Text     *string  `json:"text,omitempty"`
+	ImageURL imageRef `json:"image_url,omitempty"`
+}
+
+// upstreamParts converts decoded parts to their wire form. A message with no
+// parts at all still needs `content`, so it gets one empty text part rather
+// than the key disappearing.
+func upstreamParts(parts []contentPart) []upstreamPart {
+	if len(parts) == 0 {
+		return []upstreamPart{{Type: "input_text", Text: strPtr("")}}
+	}
+	out := make([]upstreamPart, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, upstreamPart{Type: p.Type, Text: strPtr(p.Text), ImageURL: p.ImageURL})
+	}
+	return out
+}
+
+// toolCallArguments normalizes a tool call's argument string into something the
+// Responses schema accepts. An empty arguments field is a real occurrence --
+// a zero-argument tool call the client serialized sloppily -- and both the
+// omitted key and the empty string are rejected, so "{}" is the one encoding
+// that is present and parseable.
+func toolCallArguments(args string) string {
+	if strings.TrimSpace(args) == "" {
+		return "{}"
+	}
+	return args
+}
+
 // chatBodyToResponses rewrites a Chat Completions request body into the
 // Responses request shape.
 //
@@ -139,42 +215,50 @@ func chatBodyToResponses(body []byte, endpointModel string) ([]byte, error) {
 		rest = rest[1:]
 	}
 
-	items := make([]item, 0, len(rest))
+	items := make([]upstreamItem, 0, len(rest))
 	for _, m := range rest {
 		switch m.Role {
 		case "assistant":
 			// An assistant turn can carry text and tool calls. The Responses
 			// shape splits those into separate items, so emit both.
 			if text := flatText(m.Content); text != "" {
-				items = append(items, item{
+				items = append(items, upstreamItem{
 					Type:    "message",
 					Role:    "assistant",
-					Content: []contentPart{{Type: "output_text", Text: text}},
+					Content: []upstreamPart{{Type: "output_text", Text: strPtr(text)}},
 				})
 			}
 			for i, tc := range m.ToolCalls {
-				items = append(items, item{
+				// call_id has to be the tool call's OWN id, because the
+				// function_call_output further down carries `tool_call_id`
+				// and the provider matches the pair. Sending the function
+				// name here instead leaves every tool result answering a
+				// call the model never made.
+				items = append(items, upstreamItem{
 					Type:      "function_call",
-					CallID:    firstNonEmpty(tc.Function.Name, fmt.Sprintf("call_%d", i)),
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
+					CallID:    firstNonEmpty(tc.ID, tc.Function.Name, fmt.Sprintf("call_%d", i)),
+					Name:      strPtr(tc.Function.Name),
+					Arguments: strPtr(toolCallArguments(tc.Function.Arguments)),
 				})
 			}
 		case "tool":
-			items = append(items, item{
+			// `output` is emitted even when the tool produced no text. It is
+			// a required field, and a tool that legitimately returns nothing
+			// is not a malformed request.
+			items = append(items, upstreamItem{
 				Type:   "function_call_output",
 				CallID: m.ToolCallID,
-				Output: flatText(m.Content),
+				Output: strPtr(flatText(m.Content)),
 			})
 		default: // "user" and anything else
 			parts, err := chatContentToParts(m.Content)
 			if err != nil {
 				return nil, err
 			}
-			items = append(items, item{
+			items = append(items, upstreamItem{
 				Type:    "message",
 				Role:    firstNonEmpty(m.Role, "user"),
-				Content: parts,
+				Content: upstreamParts(parts),
 			})
 		}
 	}
