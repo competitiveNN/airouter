@@ -151,8 +151,8 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `3edcd43` Cooldown: an escalation that can actually reach its ceiling
-- `12c6d7e` config sync: learn from the gateway's own record, and carry the wire shape
+- `db96c25` responses: a required field that flattens to empty is still required
+- `2003af6` Cooldown: a timeout has to back off harder than a rate limit
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
