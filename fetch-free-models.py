@@ -473,8 +473,11 @@ def normalize_opencode(model: dict[str, Any]) -> dict[str, Any] | None:
             "cache_write": 0,
         },
         "capabilities": {
+            # opencode's /models exposes no capability metadata, so vision is
+            # hardcoded: space-bunny-free routes to Space Bunny Alpha, which
+            # is multimodal (text+image+video input) per its provider catalog.
             "reasoning": False,
-            "vision": False,
+            "vision": model_id == "space-bunny-free",
             "open_weights": False,
         },
         "source": "opencode",
@@ -1665,8 +1668,12 @@ def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
             "cache_write": 0,
         },
         "capabilities": {
+            # commandcode's provider endpoint exposes no capability metadata,
+            # so vision is hardcoded: stealth/space-bunny-alpha is Space Bunny
+            # Alpha, which is multimodal (text+image+video input) per its
+            # provider catalog (kilocode reports vision: true for it).
             "reasoning": False,
-            "vision": False,
+            "vision": model_id == "stealth/space-bunny-alpha",
             "open_weights": False,
         },
         "source": "commandcode",
