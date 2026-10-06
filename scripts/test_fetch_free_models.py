@@ -23,7 +23,7 @@ import json
 import re
 import sys
 import urllib.error
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1342,3 +1342,159 @@ def test_an_unprobed_opencode_record_claims_no_protocol(tmp_path, monkeypatch):
     out = ff.fetch_opencode()
     assert [m["id"] for m in out] == ["untried-free"]
     assert "protocol" not in out[0], out[0]
+
+
+# ── First-seen cache ─────────────────────────────────────────────────────
+# The cache is committed to the repo, so it must round-trip exactly,
+# tolerate the format it had before the prune rule existed, and prune
+# only on the rule the sync depends on: absent from a full census for
+# FIRST_SEEN_MISSING_DAYS.
+
+
+def test_first_seen_state_round_trips_both_maps(tmp_path, monkeypatch):
+    monkeypatch.setattr(ff, "FIRST_SEEN_CACHE_FILE", tmp_path / "fs.json")
+    ff.save_first_seen_cache(
+        {"a-free": "2026-09-26"}, {"b-free": "2026-10-01"}
+    )
+    assert ff.load_first_seen_state() == (
+        {"a-free": "2026-09-26"},
+        {"b-free": "2026-10-01"},
+    )
+
+
+def test_first_seen_loader_returns_empty_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(ff, "FIRST_SEEN_CACHE_FILE", tmp_path / "nope.json")
+    assert ff.load_first_seen_state() == ({}, {})
+
+
+def test_first_seen_loader_tolerates_the_pre_prune_format(tmp_path, monkeypatch):
+    """The committed cache predates missing_since; it must still load."""
+    path = tmp_path / "fs.json"
+    path.write_text(json.dumps({
+        "fetched_at": "2026-10-06T00:00:00Z",
+        "first_seen": {"a-free": "2026-09-26"},
+    }))
+    monkeypatch.setattr(ff, "FIRST_SEEN_CACHE_FILE", path)
+    assert ff.load_first_seen_state() == ({"a-free": "2026-09-26"}, {})
+
+
+@pytest.mark.parametrize("payload", ["", "{not json", "[]", "42", '{"first_seen": 7}'])
+def test_first_seen_loader_survives_garbage(tmp_path, monkeypatch, payload):
+    path = tmp_path / "fs.json"
+    path.write_text(payload)
+    monkeypatch.setattr(ff, "FIRST_SEEN_CACHE_FILE", path)
+    assert ff.load_first_seen_state() == ({}, {})
+
+
+def test_first_seen_prunes_a_model_unlisted_for_a_month():
+    """30 days without a listing deletes the entry and the countdown."""
+    today = date(2026, 10, 6)
+    first_seen = {"gone-free": "2026-09-01"}
+    missing_since = {"gone-free": "2026-09-06"}  # exactly 30 days
+    newly, pruned = ff.update_first_seen_cache(
+        first_seen, missing_since, census=set(), models=[], today=today,
+    )
+    assert (newly, pruned) == (0, 1)
+    assert first_seen == {}
+    assert missing_since == {}
+
+
+def test_first_seen_keeps_a_model_unlisted_under_a_month():
+    """A day short of a month is still a possible transient outage."""
+    today = date(2026, 10, 6)
+    first_seen = {"gone-free": "2026-09-01"}
+    missing_since = {"gone-free": "2026-09-07"}  # 29 days
+    _, pruned = ff.update_first_seen_cache(
+        first_seen, missing_since, census=set(), models=[], today=today,
+    )
+    assert pruned == 0
+    assert first_seen == {"gone-free": "2026-09-01"}
+    assert missing_since == {"gone-free": "2026-09-07"}
+
+
+def test_first_seen_resets_the_countdown_when_a_model_is_listed_again():
+    """A returning model keeps its original first-seen date."""
+    today = date(2026, 10, 6)
+    first_seen = {"back-free": "2026-09-01"}
+    missing_since = {"back-free": "2026-09-20"}
+    _, pruned = ff.update_first_seen_cache(
+        first_seen, missing_since, census={"back-free"}, models=[],
+        today=today,
+    )
+    assert pruned == 0
+    assert missing_since == {}
+    assert first_seen == {"back-free": "2026-09-01"}
+
+
+def test_first_seen_starts_the_countdown_on_the_first_absence():
+    today = date(2026, 10, 6)
+    first_seen = {"gone-free": "2026-09-01"}
+    missing_since = {}
+    _, pruned = ff.update_first_seen_cache(
+        first_seen, missing_since, census=set(), models=[], today=today,
+    )
+    assert pruned == 0
+    assert first_seen == {"gone-free": "2026-09-01"}
+    assert missing_since == {"gone-free": "2026-10-06"}
+
+
+def test_first_seen_never_prunes_on_a_partial_fetch():
+    """A --*-only run is not a census, so absence proves nothing."""
+    today = date(2026, 10, 6)
+    first_seen = {"gone-free": "2026-09-01"}
+    missing_since = {"gone-free": "2026-08-01"}  # long overdue
+    _, pruned = ff.update_first_seen_cache(
+        first_seen, missing_since, census=set(), models=[],
+        today=today, prune=False,
+    )
+    assert pruned == 0
+    assert first_seen == {"gone-free": "2026-09-01"}
+    assert missing_since == {"gone-free": "2026-08-01"}
+
+
+def test_first_seen_records_then_reuses_the_first_date():
+    today = date(2026, 10, 6)
+    first_seen, missing_since = {}, {}
+    models = [{"id": "new-free", "released": None}]
+    newly, _ = ff.update_first_seen_cache(
+        first_seen, missing_since, {"new-free"}, models, today,
+    )
+    assert newly == 1
+    assert models[0]["released"] == "2026-10-06"
+    assert models[0]["released_source"] == "first-seen (this run)"
+
+    # The provider never grew a real date, so the cached one answers.
+    again = [{"id": "new-free", "released": None}]
+    newly, _ = ff.update_first_seen_cache(
+        first_seen, missing_since, {"new-free"}, again, today,
+    )
+    assert newly == 0
+    assert again[0]["released"] == "2026-10-06"
+    assert again[0]["released_source"] == "first-seen cache"
+
+
+def test_first_seen_never_overrides_a_release_date():
+    """AA already dated the model; the cache must not stamp over it."""
+    models = [{"id": "dated-free", "released": "2025-01-01"}]
+    first_seen, missing_since = {}, {}
+    newly, _ = ff.update_first_seen_cache(
+        first_seen, missing_since, {"dated-free"}, models, date(2026, 10, 6),
+    )
+    assert newly == 0
+    assert models[0]["released"] == "2025-01-01"
+    assert "released_source" not in models[0]
+    assert first_seen == {}
+
+
+def test_first_seen_ignores_meta_router_models():
+    """The auto-fallback terminators are never real candidates."""
+    today = date(2026, 10, 6)
+    for mid in ff.AUTO_FALLBACK_MODELS:
+        first_seen, missing_since = {}, {}
+        models = [{"id": mid, "released": None}]
+        newly, _ = ff.update_first_seen_cache(
+            first_seen, missing_since, {mid}, models, today,
+        )
+        assert newly == 0
+        assert models[0]["released"] is None
+        assert first_seen == {}

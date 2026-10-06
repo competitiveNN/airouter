@@ -7,11 +7,12 @@ airouter
 __pycache__/
 *.bak
 
-# Regenerable caches
+# Regenerable caches.  first-seen-cache.json is NOT here: it only
+# changes when a model appears or a month passes without a listing,
+# and it is committed so the first-seen dates survive a fresh clone.
 free-models-cache.json
 arena-code-cache.json
 aa-enrichment-cache.json
-first-seen-cache.json
 opencode-probe-cache.json
 # Free-tier denials distilled from cooldowns.json by fetch-free-models.py.
 # Runtime state like cooldowns.json itself: a sync rewrites it, and an
