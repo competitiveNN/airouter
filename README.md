@@ -269,11 +269,7 @@ being exported as a histogram whose finite buckets were all `0` while its own
 `config.yaml` is the output of a nightly pipeline, not a hand-edited
 file. `scripts/sync-models.sh` (the timer's unit) runs:
 
-1. **Cooldown report** — `fetch-free-models.py --cooldowns-report` reads
-   `cooldowns.json`, the gateway's own record of what real client traffic
-   did to each endpoint, and prints which endpoints the gateway is being
-   *refused* on for free-tier reasons. Touches no network.
-2. **Fetch** — `fetch-free-models.py --json --probe-auto` pulls the free
+1. **Fetch** — `fetch-free-models.py --json --probe-auto` pulls the free
    model listings from every provider (NVIDIA NIM, Kilocode, OpenCode,
    Ollama Cloud, Google AI Studio, CommandCode), enriches each candidate
    with an intelligence score (Artificial Analysis index, or a normalized
@@ -282,35 +278,22 @@ file. `scripts/sync-models.sh` (the timer's unit) runs:
    a model is callable. It also probes both chain terminators
    (kilocode `kilo-auto/free`, opencode `big-pickle`) and records a
    live/dead verdict per router, prunes models the providers no longer
-   list, and vetoes every endpoint step 1 found refused, persisting the
-   denial to `free-tier-denied.json` (168h TTL,
-   `AIROUTER_DENIAL_TTL_HOURS`) so a quiet week does not forget it.
-   First-seen dates are committed in `first-seen-cache.json`, so they
+   list. First-seen dates are committed in `first-seen-cache.json`, so they
    survive a fresh clone.
-3. **Regenerate** — `regenerate_config.py --write` rewrites the
+2. **Regenerate** — `regenerate_config.py --write` rewrites the
    `models:` section deterministically (same input, same output, ~0.1s,
    no agent, no commits): profile membership (smart ≥ 25, work ≥ 15,
    fast < 25 or small-model ids capped at 10, large ≥ 200k context),
    best-first ordering, the NVIDIA three-key and CommandCode two-key
    expansions, and the auto-fallback terminator chosen on the probe
    verdict — never on a count, because counts are not a health signal.
-4. **Verify** — `validate-config.py`, then `scripts/check-rules.py`,
+3. **Verify** — `validate-config.py`, then `scripts/check-rules.py`,
    which enforces the distribution rules against the fetched list. Any
    failure restores the previous `config.yaml` and fails the sync.
 
-Two properties of the veto are worth internalising. It needs a *recurring*
-refusal with free-tier wording (402 billing, 403 free-tier wording, 404
-gone) — a 429, a 5xx, a timeout, and the `circuits` section are never
-evidence, because vetoing on those would strip the chains during an
-outage, which is far worse than the rate limit it replaced. And it lives
-in the fetcher, not the rules checker: a checker that rejects a denied
-model fails the sync, the sync restores the previous config, and that
-config still contains the denied model. A restored entitlement comes back
-by itself when the TTL expires.
-
 The daemon hot-reloads the result within 3s, so a sync needs no restart.
 `SKIP_AUTO_PROBE=1` makes the fetcher touch no network (offline /
-fixture runs); `NO_COOLDOWN_VETO=1` reads the report without acting on it.
+fixture runs).
 
 ## Cooldowns
 
@@ -373,7 +356,7 @@ cooldowns); it carries no secrets.
 | `proxy.go` | Upstream request/stream handling, SSE framing, mid-stream failover, OpenCode attribution |
 | `metrics.go` | Metric registry, cardinality bounding, exposition |
 | `config.go` | Config schema, defaults, validation |
-| `fetch-free-models.py` | Fetches, enriches, probes and vetoes the free-model list |
+| `fetch-free-models.py` | Fetches, enriches and probes the free-model list |
 | `regenerate_config.py` | Deterministic `config.yaml` generation from the fetched list |
 | `model_utils.py`, `model-tester.py` | Shared model utilities, ad-hoc model testing |
 | `systemd/` | User units: the daemon and the model-sync service + timer |
