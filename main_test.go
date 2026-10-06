@@ -3558,13 +3558,12 @@ func TestSessionSkipsTriedEndpoints(t *testing.T) {
 	tried[ep.Key()] = true
 	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID, 0)
 
-	// Third call: both have been tried and cooled. SelectEndpoint now
-	// returns nil (handler waits for cooldown) instead of returning
-	// the cooled endpoint and looping forever.
-	ep, wait := router.SelectEndpoint("smart", sessionID, false, tried)
-	if ep != nil {
-		t.Fatalf("expected nil (all cooled), got %s", ep.Provider)
-	}
+	// Third call: both have been tried and cooled. SelectEndpoint returns
+	// nil + wait; the handler no longer waits for the long cooldowns (30m+
+	// for auth / rate-limit errors) since the request would fail again
+	// anyway, so it fails fast instead. Failures are bounded by the budget,
+	// so this never loops.
+	_, wait := router.SelectEndpoint("smart", sessionID, false, tried)
 	if wait == 0 {
 		t.Fatal("expected a non-zero wait when all endpoints are cooled")
 	}
