@@ -977,7 +977,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 		walk.next()
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, _ := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -997,18 +997,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					return
 				}
 			}
-			if wait > 0 {
-				timer := time.NewTimer(minDuration(wait, 30*time.Second))
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
-					g.recordRequest(req.Model, 503, time.Since(start))
-					return
-				case <-timer.C:
-				}
-				continue
-			}
+			// All endpoints in the chain are on cooldown (or otherwise
+			// ineligible). The configured cooldowns are long (30m for auth
+			// errors, up to 24h for hardened rate limits), so waiting for them
+			// to expire here would only delay this request while its result is
+			// guaranteed to fail again. Fail fast: the cooldown has already
+			// been applied and protects the upstream from retry storms.
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
@@ -1246,7 +1240,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		}
 		walk.next()
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, _ := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -1265,19 +1259,12 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 					return
 				}
 			}
-			if wait > 0 {
-				fmt.Fprintf(w, ": reconnecting in %v\n\n", wait.Round(time.Second))
-				flusher.Flush()
-				timer := time.NewTimer(minDuration(wait, 30*time.Second))
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					g.recordRequest(req.Model, 499, time.Since(start))
-					return
-				case <-timer.C:
-				}
-				continue
-			}
+			// All endpoints in the chain are on cooldown (or otherwise
+			// ineligible). The configured cooldowns are long (30m for auth
+			// errors, up to 24h for hardened rate limits), so waiting for them
+			// to expire here would only delay this request while its result is
+			// guaranteed to fail again. Fail fast: the cooldown has already
+			// been applied and protects the upstream from retry storms.
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
