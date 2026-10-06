@@ -479,8 +479,13 @@ SUITE_TEST_FLOORS = {
     # week, the reader survives garbage, circuits are not verdicts, the report is
     # offline, and the provider mirror still matches regenerate_config; plus the
     # 3 covering which wire shape a model speaks, because the probe already knows
-    # it and the record has to say so (2026-10-04).
-    "scripts/test_fetch_free_models.py": 66,
+    # it and the record has to say so (2026-10-04); plus the 12 covering the
+    # first-seen cache: both maps round-trip, the pre-prune format and garbage
+    # load as empty, a model unlisted for 30 days is pruned while 29 days is
+    # not, a returning model resets its countdown and keeps its date, the
+    # countdown starts on first absence, a partial fetch never prunes, and the
+    # record/reuse/no-override/meta-router rules (2026-10-06).
+    "scripts/test_fetch_free_models.py": 78,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
