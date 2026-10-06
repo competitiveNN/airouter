@@ -27,7 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -90,37 +90,127 @@ SMART_FLOOR = 25.0
 # for that model (it is the model's true first-appearance date in this
 # pipeline, not a moving target).
 FIRST_SEEN_CACHE_FILE = Path(__file__).resolve().parent / "first-seen-cache.json"
-FIRST_SEEN_TTL_HOURS = 24 * 365  # effectively permanent; only pruned manually
+FIRST_SEEN_TTL_HOURS = 24 * 365  # a listed model's date is permanent;
+                                # only absence prunes, via
+                                # FIRST_SEEN_MISSING_DAYS
+# A cached model that no provider lists for this many consecutive
+# days is gone upstream: its entry (and its absence record) are
+# deleted.  Shorter outages -- a provider re-indexing, a day of
+# 5xx -- reset the countdown the moment the model is listed again,
+# so a returning model keeps its original first-seen date.
+FIRST_SEEN_MISSING_DAYS = 30
 
 
-def load_first_seen_cache() -> dict[str, str]:
-    """Load the first-seen cache, or return {} if absent/unreadable.
+def load_first_seen_state() -> tuple[dict[str, str], dict[str, str]]:
+    """Load the first-seen cache, or ({}, {}) if absent/unreadable.
 
-    The cache file is a JSON object with two keys:
+    The cache file is a JSON object with three keys:
       - ``fetched_at``: ISO-8601 timestamp of the last save
       - ``first_seen``: the actual ``{model_id: date_str}`` map
+      - ``missing_since``: ``{model_id: date_str}`` for cached
+        models absent from the last full fetch -- the deletion
+        countdown
+
+    ``missing_since`` is absent from files written before the
+    prune rule existed; those load as an empty map, which is
+    safe: a model starts its countdown from the first full
+    fetch that misses it.
     """
     if not FIRST_SEEN_CACHE_FILE.exists():
-        return {}
+        return {}, {}
     try:
         data = json.loads(FIRST_SEEN_CACHE_FILE.read_text())
         if not isinstance(data, dict):
-            return {}
-        inner = data.get("first_seen")
-        if not isinstance(inner, dict):
-            return {}
-        return {str(k): str(v) for k, v in inner.items()}
+            return {}, {}
+        first = data.get("first_seen")
+        missing = data.get("missing_since")
+        first_map = (
+            {str(k): str(v) for k, v in first.items()}
+            if isinstance(first, dict) else {}
+        )
+        missing_map = (
+            {str(k): str(v) for k, v in missing.items()}
+            if isinstance(missing, dict) else {}
+        )
+        return first_map, missing_map
     except (json.JSONDecodeError, OSError):
-        return {}
+        return {}, {}
 
 
-def save_first_seen_cache(cache: dict[str, str]) -> None:
+def save_first_seen_cache(
+    first_seen: dict[str, str],
+    missing_since: dict[str, str],
+) -> None:
     """Persist the first-seen cache with a timestamp for debugging."""
     payload = {
         "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "first_seen": cache,
+        "first_seen": first_seen,
+        "missing_since": missing_since,
     }
     FIRST_SEEN_CACHE_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def update_first_seen_cache(
+    first_seen: dict[str, str],
+    missing_since: dict[str, str],
+    census: set[str],
+    models: list[dict[str, Any]],
+    today: date,
+    prune: bool = True,
+) -> tuple[int, int]:
+    """Record first-seen dates for ``models`` and prune gone entries.
+
+    ``census`` is the set of model ids the providers listed this
+    run.  A cached model absent from it starts (or continues) a
+    countdown of FIRST_SEEN_MISSING_DAYS days, after which its
+    entry is deleted: the provider stopped listing the model, so
+    there is nothing left for its first-seen date to date.  A
+    model that reappears resets the countdown and keeps its
+    original date.
+
+    ``prune=False`` skips the bookkeeping entirely: a partial
+    fetch (``--*-only``) is not a census, so absence proves
+    nothing.
+
+    Returns ``(newly_seen, pruned)``.
+    """
+    newly_seen = 0
+    pruned = 0
+    if prune:
+        # Still listed: any countdown it had is over.
+        for mid in list(missing_since):
+            if mid in census:
+                del missing_since[mid]
+        # Newly missing: day one of the countdown (or a later
+        # day, if it was already counting).
+        for mid in first_seen:
+            if mid not in census:
+                missing_since.setdefault(mid, today.isoformat())
+        # Overdue: the model has not been listed for a month.
+        for mid in list(missing_since):
+            try:
+                since = datetime.strptime(missing_since[mid], "%Y-%m-%d").date()
+            except ValueError:
+                continue  # garbage stays garbage; never prune on it
+            if (today - since).days >= FIRST_SEEN_MISSING_DAYS:
+                first_seen.pop(mid, None)
+                del missing_since[mid]
+                pruned += 1
+    for model in models:
+        mid = model.get("id", "")
+        if not mid or mid in AUTO_FALLBACK_MODELS:
+            continue
+        if model.get("released") is not None:
+            continue
+        if mid in first_seen:
+            model["released"] = first_seen[mid]
+            model["released_source"] = "first-seen cache"
+        else:
+            first_seen[mid] = today.isoformat()
+            model["released"] = today.isoformat()
+            model["released_source"] = "first-seen (this run)"
+            newly_seen += 1
+    return newly_seen, pruned
 
 
 # Meta-router auto-fallback models. They are never real candidates, so they
@@ -2692,6 +2782,12 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Only a fetch of every provider is a census of what is listed.
+    # The first-seen prune below keys on it: absence from a partial
+    # fetch proves nothing (the model may simply belong to a provider
+    # this run skipped).
+    full_fetch = only_count == 0
+
     # Fetch data
     all_models = []
 
@@ -2722,6 +2818,15 @@ def main() -> None:
     if not all_models:
         print("No free models found", file=sys.stderr)
         sys.exit(1)
+
+    # Census of every model id any provider listed this run.  The
+    # first-seen prune uses it to notice models that stopped appearing
+    # upstream.  Taken before any filter: the hide list and the
+    # cooldown veto drop models the providers still list, and those
+    # must not start an absence countdown.
+    census = {m.get("id", "") for m in all_models}
+    census.discard("")
+    census -= AUTO_FALLBACK_MODELS
 
     # Enrich with Artificial Analysis data (intelligence scores + release dates)
     aa_data = fetch_artificial_analysis_data()
@@ -2821,29 +2926,27 @@ def main() -> None:
     # `released` field.  Once recorded, the date is stable across runs.
     # Done AFTER the hide-list filter so we don't waste cache entries on
     # models we would never route to anyway.
-    first_seen = load_first_seen_cache()
-    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
-    newly_seen = 0
-    for model in all_models:
-        mid = model.get("id", "")
-        if not mid or mid in AUTO_FALLBACK_MODELS:
-            continue
-        if model.get("released") is not None:
-            continue
-        if mid in first_seen:
-            model["released"] = first_seen[mid]
-            model["released_source"] = "first-seen cache"
-        else:
-            first_seen[mid] = today_str
-            model["released"] = today_str
-            model["released_source"] = "first-seen (this run)"
-            newly_seen += 1
-    save_first_seen_cache(first_seen)
-    print(
-        f"First-seen: {len(first_seen)} cached, {newly_seen} newly recorded "
-        f"(date={today_str})",
-        file=sys.stderr,
+    today = datetime.now(UTC).date()
+    first_seen, missing_since = load_first_seen_state()
+    loaded = (dict(first_seen), dict(missing_since))
+    newly_seen, pruned = update_first_seen_cache(
+        first_seen, missing_since, census, all_models, today,
+        prune=full_fetch,
     )
+    # The cache is committed to the repo and is stable across runs, so
+    # only write it when the maps actually changed -- a scheduled sync
+    # must not dirty the tree with a fresh timestamp every day.
+    if (first_seen, missing_since) != loaded:
+        save_first_seen_cache(first_seen, missing_since)
+    summary_line = (
+        f"First-seen: {len(first_seen)} cached, {newly_seen} newly recorded "
+        f"(date={today.isoformat()})"
+    )
+    if pruned:
+        summary_line += (
+            f", {pruned} pruned (unlisted for {FIRST_SEEN_MISSING_DAYS}+ days)"
+        )
+    print(summary_line, file=sys.stderr)
 
     # Runtime free-tier veto. Last of the filters and before the auto-probe, so
     # the candidates that survive it are exactly the ones the terminator probe
