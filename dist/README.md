@@ -153,6 +153,7 @@ What `origin/master` is missing, oldest first:
 
 - `bc08edf` config: prune three vetoed free-tier models, add Ollama gemma4:31b; fix check-rules test
 - `f272281` fetch-free-models: mark Space Bunny models as vision-capable
+- `704d208` config: regenerate to mark space-bunny-free as vision-capable in chains
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
