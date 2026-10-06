@@ -15,13 +15,7 @@ sync is supposed to follow (see scripts/sync-instruction.txt):
   8  no invented ids, no stealth/* outside commandcode, no content-safety
  10  providers exist, nvidia trios and commandcode pairs complete + adjacent
  11  a numeric intelligence on every concrete endpoint, absent on the auto one
- 13  the wire shape (`protocol:`) matches the record that proved it
-
-Rule 12 is enforced upstream, in fetch-free-models.py, which reads the daemon's
-cooldowns.json and vetoes endpoints the gateway has been refused on. It cannot be
-a check here: a checker that rejects a denied model fails, the sync restores the
-PREVIOUS config, and that config still contains the model, so the only thing that
-could remove it would keep restoring it.
+ 12  the wire shape (`protocol:`) matches the record that proved it
 
 Provider mapping and exclusion logic are imported from regenerate_config.py
 rather than re-implemented, so the checker cannot drift from the generator it
@@ -357,7 +351,7 @@ def check(
                 problems.append(
                     f"rule7: {tag} vision={ep.get('vision')!r} but the source record says {src.vision}"
                 )
-            # rule 13: the wire shape must agree with what the probe proved.
+            # rule 12: the wire shape must agree with what the probe proved.
             #
             # opencode.ai is mixed within one catalog: measured 2026-10-02,
             # muse-spark-1.{2,3}-contributor-free answer 400

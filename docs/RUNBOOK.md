@@ -119,33 +119,6 @@ preferences) to break thundering herds. A 429's upstream `Retry-After` header is
 honored as a floor on the computed cooldown — but not on a client error, where
 the provider is not asking us to back off.
 
-#### Cooldowns are also the free-tier oracle
-
-A cooldown is not only a backoff: it is the only record of what happens when
-real client traffic reaches an endpoint, and no provider API answers that
-question. `fetch-free-models.py` reads this file on every sync (step 0 of
-`scripts/sync-models.sh`, `--cooldowns-report`) and vetoes any endpoint it finds
-recurrently refused for free-tier reasons — 402 billing, 403 with free-tier
-wording, 404 gone — persisting the verdict to `free-tier-denied.json` so a quiet
-week does not erase it.
-
-Inspect what a sync will act on, without touching the network:
-
-    python3 fetch-free-models.py --cooldowns-report
-
-| In cooldowns.json | Verdict |
-|-------------------|---------|
-| 402 / 403 with free-tier wording, ≥3 consecutive | `not-free` → vetoed |
-| 404 | `gone` → vetoed |
-| 429, 5xx, `context deadline exceeded`, `status_code: 0` | transient → ignored |
-| the `circuits` section | ignored (open/half-open are probes in flight) |
-
-Two things follow for operations. A model in the chains with an active denial
-will fail: clear it by fixing the entitlement, or wait out the 168 h window
-(`AIROUTER_DENIAL_TTL_HOURS`). And a chain that stops growing after a provider
-drops a free model is the veto working, not a bug — `free-tier-denied.json`
-names the endpoint and the error that removed it.
-
 ## Metrics
 
 Prometheus text-format metrics are exposed at `GET /metrics`, authenticated

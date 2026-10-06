@@ -273,71 +273,6 @@ MUTATIONS: list[Mutation] = [
         "An ssl.SSLError or RemoteDisconnected would abort the nightly sync "
         "and lose the whole model list.",
     ),
-    # The runtime free-tier veto (fetch-free-models.py reading cooldowns.json).
-    # Each of these removes one of the guards that keep a runtime failure from
-    # being read as "this model left the free tier" -- which is the one way the
-    # veto can take the chains DOWN instead of pruning them.
-    Mutation(
-        "a single 403 vetoes the model",
-        "fetch-free-models.py",
-        "    if status == 403 and errors >= RUNTIME_MIN_ERRORS:",
-        "    if status == 403:",
-        "One mis-shaped request would delete a model from every chain. "
-        "OpenCode's gate refuses on the REQUEST SHAPE, so a low count is often "
-        "one odd client rather than a lost entitlement.",
-    ),
-    Mutation(
-        "a 403 without free-tier wording vetoes the model",
-        "fetch-free-models.py",
-        "        marker = next((m for m in FREE_TIER_REFUSAL_MARKERS if m in low), None)\n        if marker:\n            return (\"not-free\", f\"403 {marker} ({errors}x)\")",
-        "        return (\"not-free\", f\"403 ({errors}x)\")",
-        "Rotated or revoked credentials produce a plain 403 that never mentions "
-        "the free tier; treating that as a billing verdict turns an auth problem "
-        "into a routing outage.",
-    ),
-    Mutation(
-        "an expired cooldown vetoes the model",
-        "fetch-free-models.py",
-        "    if expiry is None or expiry <= now:",
-        "    if expiry is None:",
-        "The daemon deletes an entry when it expires, so believing a stale one "
-        "keeps vetoing a model on evidence the gateway has already discarded.",
-    ),
-    Mutation(
-        "a denial never expires",
-        "fetch-free-models.py",
-        "        if until is None or until <= now:\n            continue",
-        "        if until is None:\n            continue",
-        "A restored quota or a fixed key could never put the model back: the "
-        "veto would need a hand edit to the persisted denials, which is exactly "
-        "the manual step this exists to remove.",
-    ),
-    Mutation(
-        "one key's refusal misses the family",
-        "fetch-free-models.py",
-        "    return (canonical, *(f\"{canonical}{n}\" for n in range(2, _KEY_GROUP_MAX + 1)))",
-        "    return (canonical,)",
-        "nvidia2 is not a different model, so its refusal would not reach the "
-        "nvidia-nim record the chains are built from, and a deleted upstream "
-        "function would be re-added on every sync.",
-    ),
-    Mutation(
-        "the veto can empty the model list",
-        "fetch-free-models.py",
-        "    if not kept:\n        print(\"Cooldowns: !!! every model would be vetoed",
-        "    if False:\n        print(\"Cooldowns: !!! every model would be vetoed",
-        "A gateway that is merely DOWN refuses everything, and an empty model "
-        "list leaves regenerate_config.py with no chains to write.",
-    ),
-    Mutation(
-        "the curated free list is edited by the veto",
-        "fetch-free-models.py",
-        "        dropped += 1\n        detail = denials[hit]",
-        "        dropped += 1\n        OLLAMA_FREE_MODELS.discard(model_id)\n        detail = denials[hit]",
-        "A veto that mutated a curated list would need a code change to undo, "
-        "and a later upstream change to the real free tier would leave the "
-        "curated list wrong forever.",
-    ),
     # The `protocol:` field. Each mutation removes one of the three ways the
     # field can silently stop being written, and none of them crashes: the
     # config still loads and still routes, it just addresses every endpoint in
@@ -484,15 +419,18 @@ SUITE_TEST_FLOORS = {
     # load as empty, a model unlisted for 30 days is pruned while 29 days is
     # not, a returning model resets its countdown and keeps its date, the
     # countdown starts on first absence, a partial fetch never prunes, and the
-    # record/reuse/no-override/meta-router rules (2026-10-06).
-    "scripts/test_fetch_free_models.py": 78,
+    # record/reuse/no-override/meta-router rules (2026-10-06); minus
+    # the 16 that covered the runtime free-tier veto, removed together
+    # with the veto itself (2026-10-06) -- cooldowns.json, owned and
+    # updated by the daemon, is now the only refusal record.
+    "scripts/test_fetch_free_models.py": 62,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
     # shape, never emitted for chat, an unrecognised value dropped rather than
     # passed through, an unprobed record keeping the configured value, a fresh
     # verdict outranking the file, the field reaching every key of a trio, its
-    # position in the emitter key order, the config parser, and rule 13 in both
+    # position in the emitter key order, the config parser, and rule 12 in both
     # directions (missing field reported, present field clean, junk rejected);
     # plus the 4 giving scripts/validate-config.py its first coverage at all --
     # a mutation aimed at it was reported MISSED, because the sync's structural

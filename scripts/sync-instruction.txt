@@ -3,22 +3,16 @@ free-model list in /tmp/free-models.json (output of fetch-free-models.py).
 Read /tmp/free-models.json and ./config.yaml before editing anything.
 
 When you are done, run `python3 scripts/check-rules.py`. It enforces rules 3-11
-and 13 below against the fetched model list (key-group completeness, terminator,
+and 12 below against the fetched model list (key-group completeness, terminator,
 vision/score sync, the wire shape, no dead or invented ids); the nightly sync
 restores the previous config if it reports anything. Do not hand-verify instead
-of running it. Rule 12 is not in that list on purpose, and says why.
+of running it.
 
 Offline or fixture-driven regeneration: set SKIP_AUTO_PROBE=1 so the fetcher
 touches no network and leaves existing verdicts alone. The generator then reads
 both routers as unprobed, which keeps kilocode and cannot detect an outage —
 and check-rules.py will flag any chain whose comment still claims a live probe,
 so an offline run cannot leave a claim the data does not support.
-
-Before regenerating, read cooldowns.json (the gateway's own record of what real
-client traffic does to an endpoint) and report what it says about free-tier
-availability — `python3 fetch-free-models.py --cooldowns-report`, which the
-nightly sync runs as its step 0 and which touches no network. Rule 12 says what
-to do with the result.
 
 Rules:
 
@@ -183,53 +177,7 @@ Rules:
       without the field. Keep the trailing comment score and the `intelligence:`
       field in sync.
 
-  12. A model the GATEWAY has been refused on is not a free model, whatever any
-      provider listing says. cooldowns.json is the only record of that, because
-      no provider API answers it:
-
-      - Ollama's free set is curated in fetch-free-models.py and fetch_ollama
-        makes no API call at all, so a model that stops being free can never be
-        seen upstream. `ollama:minimax-m3` answered 402 "this model is not
-        included in your free usage" four times while sitting in `smart`, `work`
-        and `large` — every one of those entries a guaranteed failed round trip.
-      - The OpenCode gate probe cannot fail for a request-shape refusal: its
-        body carries stream=true and a tools array with bash and read, which is
-        exactly what the provider requires (proxy.go sends the same contract), so
-        it answered `/responses 200` for `muse-spark-1.3-contributor-free`
-        while the gateway was refused 42 times in a row.
-      - NVIDIA still lists `moonshotai/kimi-k2.6` in /v1/models while every
-        completion 404s on a deleted function.
-
-      fetch-free-models.py reads cooldowns.json, vets those refusals out of the
-      list before it is written, and persists the verdict to
-      free-tier-denied.json so a quiet week does not forget it. So:
-
-      - never hand-add, or keep, an endpoint named by that report, and never
-        re-add one to a curated free list to "fix" the config: the next sync
-        vetoes it again, so the edit buys one run.
-      - the veto needs a RECURRING refusal with free-tier wording. A 429, a 5xx,
-        a timeout, `context deadline exceeded`, and the `circuits` section
-        (open/half-open describe probes in flight, not verdicts) are never
-        evidence. Vetoing on those would strip the chains during an outage, which
-        is a far worse incident than the rate limit it replaced.
-      - where this rule and a live probe disagree, this rule wins: the daemon
-        serves real client bodies, the probe sends one synthetic body the gate
-        accepts. fetch-free-models.py prints the conflict on the drop line rather
-        than resolving it silently.
-      - a restored entitlement comes back by itself — the denial carries a TTL
-        (168h, refreshed while the daemon keeps reporting) and nothing else has
-        to be edited. If a model stays out for weeks, raise
-        AIROUTER_DENIAL_TTL_HOURS / AIROUTER_MIN_COOLDOWN_ERRORS rather than
-        hard-coding a verdict in a curated list, where a later upstream change
-        would leave it wrong forever.
-      - check-rules.py deliberately does NOT enforce this rule, and adding it
-        there would deadlock the sync: a checker that rejects a denied model
-        fails, the sync restores the PREVIOUS config, and that config still
-        contains the denied model — so the one thing that could remove it is the
-        one thing that would keep restoring it. The veto lives upstream, in the
-        step that decides what may enter the list at all.
-
-  13. Emit `protocol: responses` on an endpoint whose record says it answered on
+  12. Emit `protocol: responses` on an endpoint whose record says it answered on
       /responses. OpenCode's catalog is mixed within one provider, measured live
       2026-10-02 against one key with identical gate headers:
 
@@ -259,5 +207,5 @@ Rules:
         retrying the same endpoint (api.go), so a missing field costs one wasted
         round trip per process start — annoying, not fatal. Inventing a wrong one
         costs a real failure on every request.
-      - check-rules.py rule 13 compares the field against the record that proved
+      - check-rules.py rule 12 compares the field against the record that proved
         it, so do not reword or hand-tune it.
