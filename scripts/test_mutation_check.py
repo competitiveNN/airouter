@@ -309,9 +309,9 @@ def _rename_a_provider_entry(text, profile, new_name):
     Derived from the live config, for the same reason _drop_provider_entry is:
     a case that spells out a model id is a no-op the moment a regeneration drops
     that model. This one bit for real: the case planted `notaprovider` on
-    `ollama/minimax-m3`, which the runtime free-tier veto removed from every chain
-    on 2026-10-04 after Ollama answered 402 "not included in your free usage"
-    four times. The case then planted nothing and reported a red suite as a pass.
+    `ollama/minimax-m3`, which left every chain on 2026-10-04 after Ollama
+    answered 402 "not included in your free usage" four times. The case then
+    planted nothing and reported a red suite as a pass.
 
     Two entries are skipped so the diagnostic is about rule10 and nothing else:
     a member of a multi-key group (renaming one would also trip rule3, whose
@@ -385,7 +385,8 @@ def _invent_a_model_id(text):
 
     Derived from the live config rather than pinned: a case that spells out a
     model id is a no-op the moment a regeneration drops that id (for example
-    `qwen/qwen3.8-27b:free`, vetoed by the free-tier refusal on 2026-10-06),
+    `qwen/qwen3.8-27b:free`, which left the chains on 2026-10-06 after a
+    free-tier refusal),
     and a case that plants nothing and then "passes" the suite it was meant to
     break is worse than no case.
     """
@@ -426,8 +427,8 @@ CHECK_RULE_CASES = [
         "chain is empty",
     ),
     (
-        # Was pinned to `ollama/minimax-m3`, which the free-tier veto removed from
-        # the chains on 2026-10-04 (402, four times). Derived from the file now.
+        # Was pinned to `ollama/minimax-m3`, which left the chains on
+        # 2026-10-04 (402, four times). Derived from the file now.
         "unknown provider",
         lambda t: _rename_a_provider_entry(t, "smart", "notaprovider"),
         "undefined provider",
