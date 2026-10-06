@@ -263,10 +263,6 @@ models:
         intelligence: 41.1
         context_length: 262144
       - provider: opencode
-        model: ling-3.1-flash-free  # 41.1
-        vision: false
-        intelligence: 41.1
-      - provider: opencode
         model: muse-spark-1.2-contributor-free  # 39.6
         vision: false
         intelligence: 39.6
@@ -290,11 +286,6 @@ models:
         model: mimo-v2.6-flash-free  # 37.9
         vision: false
         intelligence: 37.9
-      - provider: kilocode
-        model: qwen/qwen3.8-27b:free  # 33.7  elo=1591
-        vision: true
-        intelligence: 33.7
-        context_length: 262144
       - provider: kilocode
         model: apodex/apodex-1.1-mini:free  # 26.4
         vision: false
@@ -381,10 +372,6 @@ models:
         intelligence: 41.1
         context_length: 262144
       - provider: opencode
-        model: ling-3.1-flash-free  # 41.1
-        vision: false
-        intelligence: 41.1
-      - provider: opencode
         model: muse-spark-1.2-contributor-free  # 39.6
         vision: false
         intelligence: 39.6
@@ -408,11 +395,6 @@ models:
         model: mimo-v2.6-flash-free  # 37.9
         vision: false
         intelligence: 37.9
-      - provider: kilocode
-        model: qwen/qwen3.8-27b:free  # 33.7  elo=1591
-        vision: true
-        intelligence: 33.7
-        context_length: 262144
       - provider: kilocode
         model: apodex/apodex-1.1-mini:free  # 26.4
         vision: false
@@ -448,11 +430,6 @@ models:
         intelligence: 25.0
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9
-        vision: false
-        intelligence: 22.9
-        context_length: 1000000
-      - provider: opencode
-        model: nemotron-3-ultra-free  # 22.9
         vision: false
         intelligence: 22.9
         context_length: 1000000
@@ -523,11 +500,6 @@ models:
         vision: false
         intelligence: 22.9
         context_length: 1000000
-      - provider: opencode
-        model: nemotron-3-ultra-free  # 22.9
-        vision: false
-        intelligence: 22.9
-        context_length: 1000000
       - provider: ollama
         model: nemotron-3-ultra  # 22.9
         vision: false
@@ -580,6 +552,11 @@ models:
         vision: false
         intelligence: 16.7
         context_length: 262144
+      - provider: ollama
+        model: gemma4:31b  # 14.7
+        vision: true
+        intelligence: 14.7
+        context_length: 262144
       - provider: kilocode
         model: kilo-auto/free  # last: kilocode (auto router probed live; opencode auto not entitled to free tier)
         vision: true
@@ -597,11 +574,6 @@ models:
         context_length: 1048576
       - provider: kilocode
         model: nvidia/nemotron-3-ultra-550b-a55b:free  # 22.9
-        vision: false
-        intelligence: 22.9
-        context_length: 1000000
-      - provider: opencode
-        model: nemotron-3-ultra-free  # 22.9
         vision: false
         intelligence: 22.9
         context_length: 1000000
@@ -639,11 +611,6 @@ models:
         model: inclusionai/ling-3.1-flash  # 41.1
         vision: false
         intelligence: 41.1
-        context_length: 262144
-      - provider: kilocode
-        model: qwen/qwen3.8-27b:free  # 33.7  elo=1591
-        vision: true
-        intelligence: 33.7
         context_length: 262144
       - provider: kilocode
         model: apodex/apodex-1.1-mini:free  # 26.4

@@ -380,6 +380,37 @@ def _score_below_floor(text, profile, floor):
     return text[:m.start(2)] + new_block + text[m.end(2):]
 
 
+def _invent_a_model_id(text):
+    """Point one scored endpoint at a model id that does not exist in the fetched list.
+
+    Derived from the live config rather than pinned: a case that spells out a
+    model id is a no-op the moment a regeneration drops that id (for example
+    `qwen/qwen3.8-27b:free`, vetoed by the free-tier refusal on 2026-10-06),
+    and a case that plants nothing and then "passes" the suite it was meant to
+    break is worse than no case.
+    """
+    entry = re.compile(
+        r"(?m)^        model: (?P<id>\S+)\s+# (?P<score>\d+\.\d)\n"
+        r"        vision: (?:true|false)\n"
+        r"        intelligence: (?P<int>\d+\.\d)"
+    )
+    m = entry.search(text)
+    assert m, "no scored entry to invent into"
+    old_id = m.group("id")
+    new_id = f"{old_id}-checkrules-test-invented"
+    # Sanity check: the invented id must not be an existing real model, or
+    # rule8 never fires and the mutation is a no-op. Load the fetched list if
+    # available; the format itself (a "-checkrules-test-invented" suffix)
+    # makes a collision implausible.
+    try:
+        ids = [r["id"] for r in json.load(open(REPO / "free-models-cache.json"))]
+    except (OSError, json.JSONDecodeError):
+        ids = []
+    assert new_id not in ids, f"invented id {new_id!r} collides with a real model id"
+    new_text = text[:m.start("id")] + new_id + text[m.end("id"):]
+    return new_text
+
+
 # (label, mutation applied to config.yaml, expected substring in the output)
 CHECK_RULE_CASES = [
     (
@@ -451,7 +482,7 @@ CHECK_RULE_CASES = [
     ),
     (
         "invented model id",
-        lambda t: t.replace("        model: qwen/qwen3.8-27b:free", "        model: qwen/qwen9.9-27b:free", 1),
+        lambda t: _invent_a_model_id(t),
         "is not in the fetched model list",
     ),
     (
