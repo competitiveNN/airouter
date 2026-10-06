@@ -313,7 +313,7 @@ models:
         context_length: 512000
       - provider: opencode
         model: space-bunny-free  # 25.0  floor
-        vision: false
+        vision: true
         intelligence: 25.0
       - provider: opencode
         model: longcat-2.5-preview-free  # 25.0  floor
@@ -422,7 +422,7 @@ models:
         context_length: 512000
       - provider: opencode
         model: space-bunny-free  # 25.0  floor
-        vision: false
+        vision: true
         intelligence: 25.0
       - provider: opencode
         model: longcat-2.5-preview-free  # 25.0  floor
