@@ -425,12 +425,12 @@ def _probe_with(body_bytes, code):
 
 
 @pytest.mark.parametrize("message", [
-    "You have insufficient credits to make this request. Please purchase more credits.",
-    "Insufficient balance on the account",
     "Payment required for this model",
+    "Upgrade to Pro to access this model",
+    "billing is required for this request",
 ])
 def test_billing_language_is_a_paid_verdict_even_on_http_400(message, monkeypatch):
-    """The provider says 400, not 402, for insufficient credits.
+    """The provider says 400, not 402, for billed calls.
 
     Keying on the status code alone misses the exact case that shipped, so the
     message is inspected instead. A paid verdict must be DEFINITIVE: it is the
@@ -441,19 +441,53 @@ def test_billing_language_is_a_paid_verdict_even_on_http_400(message, monkeypatc
     assert ff.commandcode_probe("meituan/longcat-2.0-free", "k") == "paid"
 
 
-def test_longcat_is_not_free():
-    """The specific regression, stated as its own case.
+@pytest.mark.parametrize("message", [
+    "You have insufficient credits to make this request. Please purchase more credits to continue using the service.",
+    "Insufficient balance on the account",
+    "Please purchase more credits",
+    "add credit to continue",
+])
+def test_account_balance_errors_are_credit_exhausted_not_paid(message, monkeypatch):
+    """The balance family describes the CALLER, not the deal.
 
-    If this starts passing without a real re-probe, the fetcher has gone back to
-    trusting a list instead of the provider.
+    Probed live on 2026-10-06 with a dry account, every commandcode
+    candidate — free deals and paid catalog alike — answered HTTP 400
+    "You have insufficient credits to make this request" while
+    inclusionai/ling-3.1-flash:free was serving production traffic
+    through the gateway. The probe must report that as account state;
+    whether it means "paid" for a specific model is decided per run by
+    fetch_commandcode(), from what the other candidates answered.
     """
-    orig = ff.urllib.request.urlopen
-    ff.urllib.request.urlopen = _probe_with(
-        b'{"error":{"message":"You have insufficient credits to make this request."}}', 400)
-    try:
-        assert ff.commandcode_probe("meituan/longcat-2.0-free", "k") == "paid"
-    finally:
-        ff.urllib.request.urlopen = orig
+    monkeypatch.setattr(ff.urllib.request, "urlopen",
+                        _probe_with(message.encode(), 400))
+    assert ff.commandcode_probe("meituan/longcat-2.0-free", "k") == "credit_exhausted"
+
+
+def test_longcat_is_not_free(monkeypatch):
+    """The specific 2026-10-01 regression, at the layer that decides it.
+
+    The account was FUNDED (stealth/space-bunny-alpha answered 200) and
+    meituan/longcat-2.0-free answered 400 "insufficient credits" — so the
+    exhaustion was per-model evidence: that deal is billed, and it must
+    leave the list. If this starts passing without a real re-probe, the
+    fetcher has gone back to trusting a list instead of the provider.
+    """
+    catalog = {"data": [
+        {"id": "stealth/space-bunny-alpha"},
+        {"id": "meituan/LongCat-2.0"},
+    ]}
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
+    monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+
+    def fake_probe(model_id, key):
+        return "ok" if "space-bunny" in model_id else "credit_exhausted"
+
+    monkeypatch.setattr(ff, "commandcode_probe", fake_probe)
+    out = ff.fetch_commandcode()
+    ids = [m["id"] for m in out]
+    assert "stealth/space-bunny-alpha" in ids, ids
+    assert not any("longcat" in i for i in ids), ids
+    assert all(m.get("verified") is True for m in out), out
 
 
 @pytest.mark.parametrize("code,body", [
@@ -537,6 +571,73 @@ def test_fetch_commandcode_drops_paid_and_reports_inconclusive(monkeypatch):
     # glm-5.3 is paid catalog noise and was never a candidate.
     assert not any("glm" in i for i in ids), ids
     assert all(m.get("verified") is True for m in out), out
+
+
+def test_fetch_commandcode_keeps_candidates_when_the_account_is_dry(monkeypatch):
+    """A dry account must not read as every deal ending at once.
+
+    Probed live 2026-10-06: all four free candidates answered the same
+    "insufficient credits" error while the deals were still live (one of
+    them was serving production traffic at the time). The balance error
+    is a fact about the caller, so with no candidate succeeding to prove
+    the account can pay, the candidates stay in the list — unverified
+    (`verified` unset, which the generator and check-rules read as
+    "unknown"), never dropped and never marked dead.
+    """
+    catalog = {"data": [
+        {"id": "meituan/LongCat-2.0"},
+        {"id": "poolside/laguna-s-2.1-free"},
+        {"id": "inclusionai/ling-3.0-flash-sante:free"},
+        {"id": "inclusionai/ling-3.1-flash:free"},
+    ]}
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
+    monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+    monkeypatch.setattr(
+        ff, "commandcode_probe",
+        lambda model_id, key: "credit_exhausted",
+    )
+    out = ff.fetch_commandcode()
+    ids = sorted(m["id"] for m in out)
+    assert ids == [
+        "inclusionai/ling-3.0-flash-sante:free",
+        "inclusionai/ling-3.1-flash:free",
+        "meituan/longcat-2.0-free",
+        "poolside/laguna-s-2.1-free",
+    ], ids
+    assert all(m.get("verified") is None for m in out), out
+    assert all("credit exhausted" in m.get("unverified_reason", "")
+               for m in out), out
+
+
+def test_credit_exhaustion_is_paid_when_another_candidate_succeeds(monkeypatch):
+    """The mixed case: a funded account makes the balance error per-model.
+
+    One candidate succeeds while another answers "insufficient
+    credits" — the account can pay, so THIS model is billed. The
+    2026-10-01 longcat evidence, and the verdict is definitive:
+    the model leaves the list.
+    """
+    catalog = {"data": [
+        {"id": "stealth/space-bunny-alpha"},
+        {"id": "meituan/LongCat-2.0"},
+        {"id": "poolside/laguna-s-2.1-free"},
+    ]}
+    monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
+    monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+
+    def fake_probe(model_id, key):
+        if "longcat" in model_id.lower():
+            return "credit_exhausted"
+        return "ok"
+
+    monkeypatch.setattr(ff, "commandcode_probe", fake_probe)
+    out = ff.fetch_commandcode()
+    ids = [m["id"] for m in out]
+    assert not any("longcat" in i for i in ids), ids
+    assert "stealth/space-bunny-alpha" in ids, ids
+    assert "poolside/laguna-s-2.1-free" in ids, ids
+    assert all(m.get("verified") is True for m in out), out
+
 
 def _opener(routes):
     """Build a urlopen stand-in. `routes` maps a URL suffix to a callable
