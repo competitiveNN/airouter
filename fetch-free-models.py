@@ -202,6 +202,16 @@ def update_first_seen_cache(
             continue
         if model.get("released") is not None:
             continue
+        # AA enrichment ran first and had no date for this model (it
+        # would have filled `released` itself), so a provider-given
+        # date is the best available fact: the provider's own
+        # per-model timestamp beats the first-seen proxy, which only
+        # bounds the release date from above.
+        provider_released = model.get("provider_released")
+        if provider_released:
+            model["released"] = provider_released
+            model["released_source"] = "provider listing"
+            continue
         if mid in first_seen:
             model["released"] = first_seen[mid]
             model["released_source"] = "first-seen cache"
@@ -501,9 +511,18 @@ def fetch_json(
 def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
     """Convert Kilo model format to common schema.
 
-    The Kilo Code API returns a placeholder `created` value (0) for every
-    model rather than the actual model release date.  Leave `released` as
-    None so the Artificial Analysis enrichment can supply the real date.
+    The Kilo Code API answers a per-model `created` Unix timestamp
+    (probed live 2026-10-07: dots-studio/dots-3-note-preview:free
+    answered 1786680361 = 2026-08-14, a date unique to the model).
+    It is carried as `provider_released`, NOT `released`: the
+    Artificial Analysis enrichment fills `released` first when it
+    knows the model's general release date, and the provider date
+    takes over only where AA has nothing — ahead of the first-seen
+    proxy, which only bounds the date from above. (The OpenCode
+    listing is the opposite case: its `created` is one timestamp
+    shared by every model in the listing, so it carries no per-model
+    date at all, and normalize_opencode rightly leaves `released`
+    None.)
     """
     pricing = model.get("pricing", {})
     def to_float(v: Any) -> float:
@@ -511,6 +530,15 @@ def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
             return float(v)
         except (TypeError, ValueError):
             return 0.0
+
+    created = model.get("created")
+    provider_released = None
+    # The API used to answer a placeholder 0 for every model; a
+    # pre-2020 timestamp is that placeholder, not a date (the same
+    # guard the NVIDIA NIM normalizer applies).
+    if isinstance(created, (int, float)) and created >= 1577836800:
+        provider_released = datetime.fromtimestamp(
+            int(created), tz=UTC).strftime("%Y-%m-%d")
 
     return {
         "id": model.get("id"),
@@ -520,6 +548,7 @@ def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
         "intelligence": None,
         "elo": None,
         "released": None,
+        "provider_released": provider_released,
         "pricing": {
             "input": to_float(pricing.get("prompt", 0)),
             "output": to_float(pricing.get("completion", 0)),

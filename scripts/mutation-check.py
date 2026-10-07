@@ -427,8 +427,12 @@ SUITE_TEST_FLOORS = {
     # family is an account-state verdict, not a per-model "paid" one,
     # a dry account keeps every candidate unverified, and exhaustion is
     # "paid" only when another candidate succeeded in the same run
-    # (2026-10-06).
-    "scripts/test_fetch_free_models.py": 65,
+    # (2026-10-06); plus the 3 covering the kilocode release date:
+    # the provider's per-model `created` timestamp is carried as
+    # provider_released (AA still arbitrates first), it beats the
+    # first-seen proxy in the first-seen fallback, and OpenCode's
+    # listing-wide `created` is deliberately not a date (2026-10-07).
+    "scripts/test_fetch_free_models.py": 68,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
