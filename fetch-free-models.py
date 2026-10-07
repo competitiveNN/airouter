@@ -1837,13 +1837,29 @@ def commandcode_is_free_candidate(model_id: str) -> bool:
     return name.endswith("-free") or name.endswith(":free") or model_id in COMMANDCODE_FREE_SEEDS
 
 
-# Verbs in a provider error body that mean "this call is billed", i.e. the model
-# is NOT on a free deal. Matched case-insensitively against the message.
-_COMMANDCODE_PAID_MARKERS = (
+# Verbs in a provider error body that mean the CALLER's balance is
+# exhausted. Matched case-insensitively against the message.
+#
+# This is an account-state error, not a verdict about any one model:
+# probed live on 2026-10-06, with the account dry, every free deal
+# and the paid catalog alike answered HTTP 400 "You have insufficient
+# credits to make this request. Please purchase more credits to
+# continue using the service." while inclusionai/ling-3.1-flash:free
+# was serving production traffic through this very gateway. Whether
+# the same words mean "this deal is billed" is a per-run question,
+# answered by fetch_commandcode() from what the other candidates
+# answered: on a funded account, credit exhaustion on one model while
+# others succeed IS per-model evidence (the 2026-10-01 longcat case).
+_COMMANDCODE_CREDIT_MARKERS = (
     "insufficient credit",
     "insufficient balance",
     "purchase more credit",
     "add credit",
+)
+
+# Verbs in a provider error body that mean "this call is billed", i.e. the model
+# is NOT on a free deal. Matched case-insensitively against the message.
+_COMMANDCODE_PAID_MARKERS = (
     "payment required",
     "upgrade to",
     "billing",
@@ -1855,23 +1871,34 @@ def commandcode_probe(model_id: str, api_key: str) -> str:
 
     Returns one of:
 
-      "ok"      — the call succeeded, so the deal is live and free.
-      "paid"    — the provider said the call is billed. This is a DEFINITIVE
-                  verdict and the model is excluded.
-      "unknown" — a transient or inconclusive condition (capacity, rate limit,
-                  5xx, timeout, or a plan restriction). NOT evidence that the
-                  deal ended, so it must not be treated as "paid".
+      "ok"               — the call succeeded, so the deal is live and free.
+      "paid"             — the provider said the call is billed. This is a
+                           DEFINITIVE verdict and the model is excluded.
+      "credit_exhausted" — the account cannot pay for any call right now. A
+                           fact about the caller, not about the deal: a dry
+                           account gets this for free and paid models alike,
+                           so fetch_commandcode() decides per run whether it
+                           means "paid" for this model.
+      "unknown"          — a transient or inconclusive condition (capacity,
+                           rate limit, 5xx, timeout, or a plan restriction).
+                           NOT evidence that the deal ended, so it must not
+                           be treated as "paid".
 
-    The distinction between "paid" and "unknown" is the whole point. Probed live
-    on 2026-10-01 through the endpoint the gateway actually uses:
+    The distinction between a verdict about the deal and a verdict about the
+    caller is the whole point. Probed live on 2026-10-01 through the endpoint
+    the gateway actually uses, on a funded account:
 
-      meituan/longcat-2.0             400 insufficient credits   -> "paid"
+      meituan/longcat-2.0             400 insufficient credits   -> "credit_exhausted"
       stealth/space-bunny-alpha       200                        -> "ok"
       poolside/laguna-s-2.1-free      502 providers at capacity  -> "unknown"
 
-    Treating all three as one "unusable" bucket is what the old hardcoded list
-    got wrong in the other direction: a capacity blip would look like a deal
-    ending.
+    On that run space-bunny succeeded, so longcat's credit exhaustion was
+    per-model evidence: billed. Probed 2026-10-06 with a dry account, every
+    candidate answered the same way while ling-3.1-flash:free served
+    production traffic — account state, not four ended deals. Collapsing
+    either direction into one bucket is what the old hardcoded list got
+    wrong: a capacity blip would look like a deal ending, and a dry account
+    would look like every deal ending at once.
     """
     body = json.dumps({
         "model": model_id,
@@ -1896,6 +1923,10 @@ def commandcode_probe(model_id: str, api_key: str) -> str:
         text = raw.decode("utf-8", "replace").lower()
         # Billing language wins over the status code: this provider returns 400
         # (not 402) for "insufficient credits", so keying on 402 alone misses it.
+        # The balance family is reported separately: it describes the caller, and
+        # only fetch_commandcode() can tell it apart from a billed model.
+        if any(marker in text for marker in _COMMANDCODE_CREDIT_MARKERS):
+            return "credit_exhausted"
         if any(marker in text for marker in _COMMANDCODE_PAID_MARKERS):
             return "paid"
         if e.code in (401, 403):
@@ -1959,11 +1990,14 @@ def fetch_commandcode() -> list[dict[str, Any]]:
     free_models = []
     dropped = []
     unknown = []
+    exhausted = []
     for model in candidates:
         verdict = commandcode_probe(model["id"], cc_key)
         if verdict == "ok":
             model["verified"] = True
             free_models.append(model)
+        elif verdict == "credit_exhausted":
+            exhausted.append(model)
         elif verdict == "paid":
             dropped.append(f"{model['id']}(paid)")
         else:
@@ -1971,6 +2005,40 @@ def fetch_commandcode() -> list[dict[str, Any]]:
             # we have not seen succeed) but reported, so a capacity blip is
             # visible instead of silently shrinking the chain.
             unknown.append(f"{model['id']}({verdict})")
+
+    if exhausted:
+        if free_models or unknown or dropped:
+            # Some candidate got a verdict that is not about the caller's
+            # balance, so the account CAN discriminate: it can pay, and
+            # these models specifically cannot. That is the 2026-10-01
+            # longcat case — per-model evidence the deal is billed, and
+            # definitive.
+            dropped.extend(f"{m['id']}(paid)" for m in exhausted)
+        else:
+            # Every candidate answered with the same balance error. A dry
+            # account gets that for free and paid models alike, so it cannot
+            # separate a live deal from an ended one — and dropping on it
+            # would empty the whole CommandCode chain on account state,
+            # which is not a property of any model. Keep the candidates,
+            # unverified: `verified` stays unset, which the generator and
+            # check-rules read as "unknown" — never "dead" — so the chains
+            # are untouched. Recharging re-verifies them on the next sync,
+            # and a model that is genuinely dead is backed off at request
+            # time by the daemon's cooldowns. Known limit, accepted
+            # deliberately: an account that can pay while EVERY deal has
+            # ended also looks like this, and is kept rather than wiped —
+            # the safe direction of the two mistakes.
+            for m in exhausted:
+                m.pop("verified", None)
+                m["unverified_reason"] = "commandcode probe: account credit exhausted"
+                free_models.append(m)
+            print(
+                "CommandCode: account credit exhausted — the provider refused "
+                "every candidate with the same balance error, which is not "
+                f"evidence that a deal ended; keeping {len(exhausted)} "
+                "unverified",
+                file=sys.stderr,
+            )
 
     if dropped:
         print(
@@ -1984,7 +2052,8 @@ def fetch_commandcode() -> list[dict[str, Any]]:
             file=sys.stderr,
         )
     print(
-        f"CommandCode: {len(free_models)}/{len(candidates)} candidates verified free",
+        f"CommandCode: {sum(1 for m in free_models if m.get('verified') is True)}"
+        f"/{len(candidates)} candidates verified free",
         file=sys.stderr,
     )
     return free_models

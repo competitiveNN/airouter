@@ -422,8 +422,13 @@ SUITE_TEST_FLOORS = {
     # record/reuse/no-override/meta-router rules (2026-10-06); minus
     # the 16 that covered the runtime free-tier veto, removed together
     # with the veto itself (2026-10-06) -- cooldowns.json, owned and
-    # updated by the daemon, is now the only refusal record.
-    "scripts/test_fetch_free_models.py": 62,
+    # updated by the daemon, is now the only refusal record; plus the 3
+    # covering the commandcode credit-exhaustion split: the balance
+    # family is an account-state verdict, not a per-model "paid" one,
+    # a dry account keeps every candidate unverified, and exhaustion is
+    # "paid" only when another candidate succeeded in the same run
+    # (2026-10-06).
+    "scripts/test_fetch_free_models.py": 65,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
