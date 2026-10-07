@@ -1262,6 +1262,74 @@ def test_first_seen_never_overrides_a_release_date():
     assert first_seen == {}
 
 
+def test_first_seen_prefers_the_provider_date_over_the_proxy():
+    """A provider-given date beats the first-seen proxy.
+
+    Kilocode's per-model `created` is a real timestamp; the
+    first-seen cache only records the day the listing was first
+    seen, which can be months later. AA still wins — it ran
+    before this and would have filled `released` itself.
+    """
+    mid = "dots-studio/dots-3-note-preview:free"
+    models = [{
+        "id": mid,
+        "released": None,
+        "provider_released": "2026-08-14",
+    }]
+    first_seen = {mid: "2026-09-26"}
+    missing_since: dict[str, str] = {}
+    newly, _ = ff.update_first_seen_cache(
+        first_seen, missing_since, {mid}, models, date(2026, 10, 6),
+    )
+    assert newly == 0
+    assert models[0]["released"] == "2026-08-14"
+    assert models[0]["released_source"] == "provider listing"
+    assert first_seen == {mid: "2026-09-26"}
+
+
+def test_kilo_uses_the_provider_created_timestamp():
+    """Kilocode's `created` is per-model, unlike OpenCode's."""
+    model = ff.normalize_kilo({
+        "id": "dots-studio/dots-3-note-preview:free",
+        "name": "Dots3-Note Preview",
+        "created": 1786680361,
+        "context_length": 512000,
+        "pricing": {"prompt": "0", "completion": "0"},
+        "architecture": {"input_modalities": ["text", "image"]},
+        "supported_parameters": ["reasoning"],
+    })
+    assert model is not None
+    # AA arbitrates first; the provider date waits in reserve.
+    assert model["released"] is None
+    assert model["provider_released"] == "2026-08-14"
+
+    # The placeholder the API used to answer is not a date.
+    placeholder = ff.normalize_kilo({"id": "x-free", "created": 0})
+    assert placeholder is not None
+    assert placeholder["provider_released"] is None
+
+    # Neither is anything pre-2020.
+    ancient = ff.normalize_kilo({"id": "y-free", "created": 1577836799})
+    assert ancient is not None
+    assert ancient["provider_released"] is None
+
+
+def test_opencode_created_is_not_a_release_date():
+    """OpenCode's `created` is one listing-wide timestamp.
+
+    Probed live 2026-10-07: every model in the listing, from
+    space-bunny-free to claude-fable-5, answers the same
+    `created` (1791346252, the moment the listing was
+    generated), so it cannot date any individual model and
+    normalize_opencode must keep leaving `released` None.
+    """
+    model = ff.normalize_opencode(
+        {"id": "space-bunny-free", "created": 1791346252})
+    assert model is not None
+    assert model["released"] is None
+    assert "provider_released" not in model
+
+
 def test_first_seen_ignores_meta_router_models():
     """The auto-fallback terminators are never real candidates."""
     today = date(2026, 10, 6)
