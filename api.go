@@ -1567,6 +1567,12 @@ func (g *GatewayContext) ReloadConfig(cfg *Config) {
 	// push it across explicitly on every reload. Without this a config change
 	// to cooldown_jitter would silently no-op until restart.
 	g.router.SetCooldownJitter(cfg.Preferences.CooldownJitterFraction())
+	// The circuit-breaker knobs are Router-level state too, applied
+	// at construction in NewRouter. Push them across on every reload
+	// like the jitter above, or a config change to them silently
+	// no-ops until restart.
+	g.router.SetCircuitBreakerThreshold(cfg.Preferences.CircuitBreakerThresholdValue())
+	g.router.SetCircuitHalfOpenProbes(cfg.Preferences.CircuitHalfOpenProbesValue())
 	// Same story for the metrics label cap: the collector is built once and
 	// outlives every reload, so a config change to max_label_cardinality has
 	// to be pushed into it or it silently no-ops until restart.

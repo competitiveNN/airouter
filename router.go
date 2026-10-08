@@ -811,7 +811,24 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		se.lastUsed = time.Now()
 		r.sessions[sessionID] = se
 		ep := se.ep
-		available := r.isAvailableLocked(&ep)
+		// The sticky pick is only valid while the pinned endpoint
+		// is still a member of the current chain. A hot-reload (the
+		// nightly model sync rewrites the chains and the file watcher
+		// reloads config.yaml in place) can remove it; isAvailableLocked
+		// knows nothing about chain membership, and the session sweeper
+		// even deletes cooldown entries for endpoints no longer in the
+		// config, so a removed endpoint would otherwise look permanently
+		// available and keep receiving this session's traffic until the
+		// session TTL expires. Falling through re-pins the session to a
+		// current endpoint below.
+		inChain := false
+		for i := range chain.Chain {
+			if chain.Chain[i].Key() == ep.Key() {
+				inChain = true
+				break
+			}
+		}
+		available := inChain && r.isAvailableLocked(&ep)
 		if available && r.visionEligible(&ep, requireVision) && !tried[ep.Key()] {
 			return &ep, 0
 		}

@@ -4114,6 +4114,85 @@ func TestReloadConfigIsAtomic(t *testing.T) {
 	}
 }
 
+// TestReloadConfigRepinsStickySession verifies that a sticky session
+// follows the chain as it exists AFTER a hot-reload. The nightly model
+// sync rewrites the fallback chains and the file watcher reloads
+// config.yaml in place; a session pinned to an endpoint the sync
+// removed from the chain must move to a current endpoint. Without the
+// chain-membership check, isAvailableLocked (which only consults the
+// cooldown/circuit maps) keeps returning the removed endpoint — and the
+// session sweeper deletes cooldown entries for endpoints no longer in
+// the config, so a removed endpoint looks permanently available and the
+// stale pin survives until the session TTL expires.
+func TestReloadConfigRepinsStickySession(t *testing.T) {
+	noRot := 0
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRot},
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: "https://p1.example/v1"},
+			"p2": {URL: "https://p2.example/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p1", Model: "m1"},
+				{Provider: "p2", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	// Pin the session to the head of the old chain. The endpoint is
+	// fully available — no cooldown, no circuit — which is exactly
+	// the state a removed endpoint is in after a sync: the session
+	// sweeper deletes cooldown entries for endpoints no longer in
+	// the config, so the stale pin cannot rely on a cooldown entry
+	// to mask it.
+	ep, _ := router.SelectEndpoint("smart", "sticky", false, nil)
+	if ep == nil || ep.Key() != "p1:m1" {
+		t.Fatalf("initial pick: expected p1:m1, got %+v", ep)
+	}
+
+	// The sync rewrote the chain: p1:m1 removed, p3:m3 added, p2:m2 kept.
+	cfg2 := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRot},
+		Providers: map[string]ProviderConfig{
+			"p2": {URL: "https://p2.example/v1"},
+			"p3": {URL: "https://p3.example/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p2", Model: "m2"},
+				{Provider: "p3", Model: "m3"},
+			}},
+		},
+	}
+	gateway.ReloadConfig(cfg2)
+
+	// The removed endpoint must not be served to the existing session:
+	// the next request re-pins it to a current chain member.
+	ep, _ = router.SelectEndpoint("smart", "sticky", false, nil)
+	if ep == nil {
+		t.Fatal("no endpoint selected after reload")
+	}
+	if ep.Key() != "p2:m2" && ep.Key() != "p3:m3" {
+		t.Errorf("sticky session routed outside the new chain: got %s, want p2:m2 or p3:m3", ep.Key())
+	}
+	if got, ok := router.GetSession("sticky"); !ok || got.Key() != ep.Key() {
+		t.Errorf("session not re-pinned: session map has %+v (ok=%v), selection was %s", got, ok, ep.Key())
+	}
+
+	// A session whose endpoint survives a later reload keeps its pin:
+	// p2:m2 is a member of both chains, so reverting the config must
+	// not disturb it.
+	gateway.ReloadConfig(cfg)
+	ep2, _ := router.SelectEndpoint("smart", "sticky", false, nil)
+	if ep2 == nil || ep2.Key() != "p2:m2" {
+		t.Errorf("surviving endpoint moved after reload: expected p2:m2, got %+v", ep2)
+	}
+}
+
 // TestReloadConfigConcurrent verifies that under concurrent reloads and
 // reads, every individual config load returns a fully-consistent *Config —
 // never nil, never a third (unknown) version, and never a partially-written
