@@ -14,7 +14,7 @@ Usage:
 
 Ollama Cloud free-tier models (hard-coded — there is no public endpoint
 that exposes the free/metered flag):
-    gemma4:31b, nemotron-3-super, nemotron-3-ultra, minimax-m3
+    gemma4:31b, nemotron-3-super, nemotron-3-ultra
 Anything else returned by ollama.com/v1/models is treated as metered.
 """
 
@@ -264,8 +264,7 @@ BACKOFF_BASE = 2
 OLLAMA_FREE_MODELS: set[str] = {
     "gemma4:31b",
     "nemotron-3-super",
-    "nemotron-3-ultra",
-    "minimax-m3",
+    "nemotron-3-ultra"
 }
 
 # Google AI Studio free model patterns (prefix match).
@@ -321,7 +320,6 @@ GOOGLE_AI_STUDIO_PAID_PATTERNS: tuple[str, ...] = (
 # so the ctx column is never 0 in the table.
 OLLAMA_FREE_MODELS_CTX: dict[str, int] = {
     "gemma4:31b":       262_144,
-    "minimax-m3":       262_144,
     "nemotron-3-super": 262_144,
     "nemotron-3-ultra": 1_000_000,
 }

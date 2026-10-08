@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-10-06T13:30:51.686393Z",
+  "fetched_at": "2026-10-08T04:02:41.457108Z",
   "first_seen": {
     "deepseek-ai/deepseek-coder-6.7b-instruct": "2026-09-26",
     "dots-studio/dots-3-note-preview:free": "2026-09-26",
@@ -21,7 +21,13 @@
     "poolside/laguna-s-2.1:free": "2026-09-26",
     "poolside/laguna-xs-2.1:free": "2026-09-26",
     "space-bunny-free": "2026-09-26",
+    "stealth/glyph-cluster:free": "2026-10-08",
     "stealth/space-bunny-alpha": "2026-09-26"
   },
-  "missing_since": {}
+  "missing_since": {
+    "fledge-alpha-free": "2026-10-08",
+    "jev-1.13-free": "2026-10-08",
+    "mimo-v2.5-free": "2026-10-08",
+    "stealth/space-bunny-alpha": "2026-10-08"
+  }
 }
