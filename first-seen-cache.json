@@ -1,8 +1,9 @@
 {
-  "fetched_at": "2026-10-08T04:02:41.457108Z",
+  "fetched_at": "2026-10-09T04:15:35.507080Z",
   "first_seen": {
     "deepseek-ai/deepseek-coder-6.7b-instruct": "2026-09-26",
     "dots-studio/dots-3-note-preview:free": "2026-09-26",
+    "exo-free": "2026-10-08",
     "fledge-alpha-free": "2026-10-02",
     "gemma-4-9b-it": "2026-09-26",
     "ibm/granite-3.0-3b-a800m-instruct": "2026-09-26",
@@ -22,11 +23,13 @@
     "poolside/laguna-xs-2.1:free": "2026-09-26",
     "space-bunny-free": "2026-09-26",
     "stealth/glyph-cluster:free": "2026-10-08",
-    "stealth/space-bunny-alpha": "2026-09-26"
+    "stealth/space-bunny-alpha": "2026-09-26",
+    "step-5-preview-free": "2026-10-08"
   },
   "missing_since": {
+    "exo-free": "2026-10-09",
     "fledge-alpha-free": "2026-10-08",
-    "jev-1.13-free": "2026-10-08",
+    "jev-1.13-free": "2026-10-09",
     "mimo-v2.5-free": "2026-10-08",
     "stealth/space-bunny-alpha": "2026-10-08"
   }
