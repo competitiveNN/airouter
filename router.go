@@ -1847,6 +1847,16 @@ func (r *Router) CooldownExpiry(ep *ModelEndpoint) (time.Time, bool) {
 	return cd.Expiry, true
 }
 
+// CircuitBreakerEnabled reports whether the router's circuit breaker is on at
+// all. A threshold of 0 disables it, which is the production default -- and
+// that distinction is the whole reason the dashboard's circuit column exists.
+// Without it the page cannot tell "no breaker record for this endpoint" from
+// "a breaker record that happens to be closed", and rendering the latter for
+// every healthy endpoint would make the column look like decoration.
+func (r *Router) CircuitBreakerEnabled() bool {
+	return r.circuitBreakerThreshold > 0
+}
+
 // CircuitStateSnapshot is a combined view of an endpoint's circuit breaker and
 // cooldown state, returned by the /v1/airouter/state endpoint so operators
 // can diagnose fail-over behavior from a single call.

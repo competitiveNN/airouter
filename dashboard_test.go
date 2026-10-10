@@ -500,6 +500,13 @@ func TestDashboardHandlerServesHTML(t *testing.T) {
 	if !contains(body, "tokens/s") {
 		t.Errorf("dashboard page missing the tokens/s rate column — the speed leaderboard has no rate")
 	}
+	// The circuit column carries a label so an operator can tell whether it
+	// means anything at all. When the breaker is off every endpoint renders
+	// "" or "closed", and without the label the column looks like
+	// decoration.
+	if !contains(body, "circuit breaker is disabled") {
+		t.Errorf("dashboard page missing the circuit-breaker state label — the circuit column cannot be read without it")
+	}
 }
 
 func contains(s, sub string) bool {
