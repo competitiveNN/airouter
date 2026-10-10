@@ -1780,13 +1780,14 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 	sort.Slice(failures, func(i, j int) bool { return failures[i].Rate > failures[j].Rate })
 
 	resp := dashboardResponse{
-		Chains:    chains,
-		Speed:     speed,
-		Volume:    volume,
-		Failures:  failures,
-		Window:    string(win),
-		Now:       time.Now(),
-		Generated: time.Now(),
+		Chains:         chains,
+		Speed:          speed,
+		Volume:         volume,
+		Failures:       failures,
+		Window:         string(win),
+		Now:            time.Now(),
+		Generated:      time.Now(),
+		CircuitBreaker: g.router.CircuitBreakerEnabled(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

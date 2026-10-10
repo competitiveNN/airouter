@@ -135,6 +135,14 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
+# The broken endpoint flips after its first failure. That is the whole
+# point of this fixture: the first request to broken-model produces the 500
+# that both cools the endpoint and opens its circuit, and the second one
+# answers 200 so the half-open probe succeeds and the breaker closes again.
+# Without the flip the recovery half of the state machine would only ever
+# be exercised by unit tests, which is exactly how the circuit column went
+# unproven by real traffic before.
+broken_becomes_healthy = False
 
 
 def sse(payload):
@@ -159,22 +167,26 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
         if model == "broken-model":
-            # A 500, not a 429. Both go through applyCooldown and so both
-            # produce a cooldown entry, but the distinction matters here: the
-            # smoke run already proves the cooldown column, and the circuit
-            # column has never been exercised by real traffic at all. A 500 is
-            # also what trips the breaker at threshold 1 below, so this one
-            # request lights up both failure reasons on the same endpoint.
-            body = json.dumps({
-                "error": {"message": "internal server error", "type": "internal_error"},
-            }).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            self.close_connection = True
-            return
+            global broken_becomes_healthy
+            if not broken_becomes_healthy:
+                # The first request produces the 500 that both cools the
+                # endpoint and opens its circuit. The flip is what lets the
+                # smoke run also prove the recovery half of the state
+                # machine: the second request finds the circuit half-open,
+                # the probe succeeds, and the breaker closes again.
+                broken_becomes_healthy = True
+                body = json.dumps({
+                    "error": {"message": "internal server error", "type": "internal_error"},
+                }).encode()
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+                return
+            # Recovered: answer like the healthy model, streaming or not.
+            model = "fake-model"
 
         if not streaming:
             # The gateway's non-streaming path parses a JSON body, so an
@@ -416,6 +428,11 @@ if len(down) != 1 or down[0]["endpoint"] != "fake:broken-model":
 # bare "down" here would fail this assertion while still reporting
 # 1/2 operational, which is exactly how the circuit column went
 # unexercised before.
+#
+# This payload was captured BEFORE the recovery request, so the breaker is
+# still open. The recovery path is asserted separately below, against a
+# fresh payload, because asserting "open" here and "closed" there on the
+# same snapshot would be asserting two different things about one moment.
 b = down[0]
 if not b["cooldown"] or b.get("cooldown_until") is None:
     print(f"  FAIL broken-model should carry a cooldown with an expiry, got {b}", file=sys.stderr)
@@ -536,6 +553,124 @@ grep -q "broken-model" <<<"$METRICS" \
 COOLDOWNS="$(curl -s -H "$AUTH" "$BASE/admin/cooldowns")"
 grep -q "broken-model" <<<"$COOLDOWNS" \
   || bad "the 429 produced no cooldown entry for fake:broken-model"
+
+# The payload carries the gateway's clock, which the cooldown countdown is
+# anchored to. A browser's clock is not trustworthy here -- a laptop five
+# minutes ahead renders every cooldown as already expired -- so the gateway
+# supplies its "now" and the page advances the countdown from it. Asserting
+# the field exists and is recent is what pins the anchor: without it the only
+# evidence the countdown is anchored is the comment next to the code.
+python3 - "$DATA" <<'PY' || fail=1
+import json, sys, time
+d = json.loads(sys.argv[1])
+now = d.get("now")
+if now is None:
+    print("  FAIL the payload carries no 'now' field; the cooldown countdown "
+          "has no server clock to anchor to", file=sys.stderr)
+    sys.exit(1)
+# Within 5 seconds of this machine's clock. A stale or fabricated value
+# here would mean the anchor is decorative rather than functional.
+try:
+    parsed = time.mktime(time.strptime(now[:19], "%Y-%m-%dT%H:%M:%S"))
+except ValueError:
+    print(f"  FAIL 'now' is not an ISO timestamp: {now!r}", file=sys.stderr)
+    sys.exit(1)
+if abs(parsed - time.time()) > 5:
+    print(f"  FAIL 'now' is {now!r}, which is not within 5s of this machine's clock",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"  ok payload carries the gateway's clock ({now}) for the countdown anchor")
+PY
+
+# The cooldown_until field is the same contract seen from the other side:
+# it is the instant the countdown counts down TO, and it must be in the
+# future for the endpoint that is actually cooling down.
+python3 - "$DATA" <<'PY' || fail=1
+import json, sys, time
+d = json.loads(sys.argv[1])
+for c in d.get("chains", []):
+    for e in c.get("endpoints", []):
+        if not e.get("eligible"):
+            u = e.get("cooldown_until")
+            if u is None:
+                print(f"  FAIL {e['endpoint']} is down but carries no cooldown_until",
+                      file=sys.stderr)
+                sys.exit(1)
+            try:
+                parsed = time.mktime(time.strptime(u[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                print(f"  FAIL cooldown_until is not an ISO timestamp: {u!r}",
+                      file=sys.stderr)
+                sys.exit(1)
+            if parsed <= time.time():
+                print(f"  FAIL {e['endpoint']} cooldown_until {u!r} is in the past, "
+                      f"so the endpoint should be eligible", file=sys.stderr)
+                sys.exit(1)
+print("  ok every down endpoint carries a future cooldown_until")
+PY
+
+# The RECOVERY half of the circuit breaker, asserted against a fresh payload
+# taken after the recovery request below. The fake upstream flips
+# broken-model to answering 200 on its second call, so that request finds
+# the circuit half-open, the probe succeeds, and the breaker closes again.
+# The client must see a complete stream in both phases -- that is the
+# promise the router exists to keep -- while the telemetry records the
+# failure the client did not see.
+#
+# The cooldown is cleared through the admin API first, for two reasons.
+# One: the recovery probe is blocked by the cooldown, so without clearing
+# it the second request never reaches the flipped endpoint and the
+# half-open transition goes unexercised. Two: the admin clear is itself a
+# real operator action this dashboard exists to support, so proving the
+# recovery path through it covers both the state machine and the control
+# surface in one go.
+curl -s -X DELETE -H "$AUTH" "$BASE/admin/cooldowns?model=fake:broken-model" >/dev/null
+sleep 1
+curl -s -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"model":"work","messages":[{"role":"user","content":"again"}],"stream":true}' \
+  "$BASE/v1/chat/completions" >"$WORK/work_recover.out" || bad "work recovery stream request failed"
+grep -q "PING" "$WORK/work_recover.out" \
+  || bad "work chain's recovery reached the flipped endpoint but the client saw no content"
+grep -q "data: \[DONE\]" "$WORK/work_recover.out" \
+  || bad "work chain's recovery stream did not terminate for the client"
+
+sleep 2
+RECOVER="$(curl -s -H "$AUTH" "$BASE/admin/dashboard/data?window=1d")"
+python3 - "$RECOVER" <<'PY' || fail=1
+import json, sys
+d = json.loads(sys.argv[1])
+for c in d.get("chains", []):
+    if c["model"] != "work":
+        continue
+    broken = next((e for e in c["endpoints"] if e["endpoint"] == "fake:broken-model"), None)
+    if broken is None:
+        print("  FAIL the recovered payload has no broken-model endpoint", file=sys.stderr)
+        sys.exit(1)
+    # The breaker closed again after the successful probe, and ResetCircuit
+    # clears the record, so there is no circuit entry at all. The endpoint is
+    # eligible because the cooldown was cleared and the probe succeeded.
+    # What it must NOT carry is the open circuit or the cooldown from the
+    # first request: those belong to the moment before recovery, and
+    # asserting them here would be asserting two different things about one
+    # snapshot.
+    if broken["circuit"] != "":
+        print(f"  FAIL broken-model's circuit should be gone after the successful "
+              f"probe closed it, got {broken}", file=sys.stderr)
+        sys.exit(1)
+    if broken["cooldown"]:
+        print(f"  FAIL broken-model should not be on cooldown after the admin clear, "
+              f"got {broken}", file=sys.stderr)
+        sys.exit(1)
+    if not broken["eligible"]:
+        print(f"  FAIL broken-model should be eligible again after the probe succeeded, "
+              f"got {broken}", file=sys.stderr)
+        sys.exit(1)
+    print("  ok broken-model recovered: eligible, circuit closed, cooldown cleared")
+    break
+else:
+    print("  FAIL the recovered payload has no 'work' chain", file=sys.stderr)
+    sys.exit(1)
+PY
 
 # --- report -----------------------------------------------------------------
 if [ "$fail" -eq 0 ]; then

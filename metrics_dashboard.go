@@ -82,6 +82,12 @@ type dashboardResponse struct {
 	Window    string                      `json:"window"`
 	Now       time.Time                   `json:"now"`
 	Generated time.Time                   `json:"generated"`
+	// CircuitBreaker is whether the router's breaker is on at all. It is
+	// surfaced rather than left implicit because the column it governs looks
+	// identical either way when the breaker is off: every endpoint renders
+	// "" or "closed", and an operator cannot tell from the page alone whether
+	// the circuit column means anything. The field says so.
+	CircuitBreaker bool `json:"circuit_breaker"`
 }
 
 // dashboardWindowSeconds maps a dashboard window name onto the number of

@@ -120,11 +120,18 @@ function renderChains(chains){
   const c=document.getElementById('chains');
   c.innerHTML='';
   if(!chains || !chains.length){ c.textContent='No chains configured.'; return; }
+  // The breaker flag is rendered in the card's heading, not just shipped in
+  // the JSON: an operator reading the page needs to know whether the
+  // circuit column means anything, and a field they cannot see is a field
+  // that gets forgotten. When the breaker is off every endpoint renders ""
+  // or "closed", and without this label the column looks like decoration.
+  const breaker = d.circuit_breaker;
   for(const ch of chains){
     const row=el('div','chain');
     row.appendChild(el('b',null,ch.model));
-    row.appendChild(el('span','sum',ch.operational+'/'+ch.total+' eligible'));
-    c.appendChild(row);
+    const sum=el('span','sum',ch.operational+'/'+ch.total+' eligible');
+    if(!breaker) sum.title='circuit breaker is disabled; the circuit column is inactive';
+    row.appendChild(sum);
     const eps=el('div');
     eps.style.marginLeft='5rem';
     for(const ep of ch.endpoints){
