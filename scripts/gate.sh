@@ -198,7 +198,14 @@ run_live() {
   elif [ "$got" -eq 77 ]; then
     SKIPPED=$((SKIPPED + 1))
     SKIPPED_NAMES="$SKIPPED_NAMES $name"
-    printf '  SKIP  %s (no credentials on this machine)\n' "$name"
+    # Print the reason the CHECK gives, not a parenthetical this script
+    # guessed. "No credentials on this machine" was the only reason exit 77
+    # could ever mean when the helper was written; it stopped being the only
+    # one when scripts/opencode-routing-check.sh grew a provider preflight,
+    # after which a 429 FreeUsageLimitError also produced 77 -- a different
+    # claim, described wrongly by a phrase saying the key was missing.
+    # The two stderr lines tailed below are the reason; this line labels it.
+    printf '  SKIP  %s (could not be evaluated here; reason below)\n' "$name"
     printf '%s\n' "$out" | tail -2 | sed 's/^/          | /'
   else
     FAILED=$((FAILED + 1))
@@ -260,6 +267,22 @@ run "test-suite-selftest"        bash "$REPO/scripts/test-suite-selftest.sh"
 run "opencode-routing-selftest"  bash "$REPO/scripts/opencode-routing-selftest.sh"
 run "shell-lint"                 bash "$REPO/scripts/shell-lint.sh"
 run "shell-lint-control"         bash "$REPO/scripts/shell-lint-control.sh"
+
+# ---------------------------------------------------------------- end-to-end ----
+# The Go suite proves the dashboard's ring, query and handlers behave in
+# synthetic conditions; this proves the WIRING, which is where the dashboard
+# was actually broken: the route registration in main.go, token recording
+# reaching all four response paths, the ring actually ticking, and cooldowns
+# reaching the chain-status panel. It is hermetic (fake upstream on loopback,
+# dummy key) so it needs nothing this machine might not have, and it is
+# therefore an ordinary stage rather than a `run_live` one.
+#
+# It does not perturb the tree: the config and the built binary both live in a
+# mktemp dir, and the log it writes goes there too. The fingerprint comparison
+# at the end of this script is what would catch it if that ever stopped being
+# true — a log file inside the repo would show up as an untracked path and turn
+# every subsequent run into INVALID RUN (exit 3).
+run "smoke dashboard" bash "$REPO/scripts/smoke_dashboard.sh"
 
 # -------------------------------------------------------------- security ----
 # secret-scan is NOT run here (removed 2026-10-04). It is still the right check
@@ -391,8 +414,13 @@ if [ "$ACCOUNTED" -ne "$REGISTERED" ]; then
 fi
 
 if [ "$SKIPPED" -ne 0 ]; then
-  echo "$P the live stage did NOT run on this machine:$SKIPPED_NAMES"
+  echo "$P a live stage did NOT run on this machine:$SKIPPED_NAMES"
   echo "$P a green run above therefore says nothing about live provider routing."
+  # "the live stage" is now "a live stage" because there is one live stage
+  # today and more than one reason to skip it; the summary line that followed
+  # this one used to name the provider, which was the same over-specification
+  # in the other direction. What a reader needs is the reason, and the stage's
+  # own two stderr lines carry it -- kept verbatim rather than summarised.
 fi
 
 if [ "$END_FP" != "$START_FP" ]; then

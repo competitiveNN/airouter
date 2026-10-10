@@ -341,30 +341,65 @@ func (g *GatewayContext) checkAuth(r *http.Request) bool {
 	if g.gatewayAPIKey == "" {
 		return g.allowNoAuth
 	}
+
+	// The header is the primary form and is what every programmatic client
+	// uses. It is tried first so an existing API caller is unaffected by the
+	// query form below, and so a correct key in the header still wins when a
+	// wrong one is lip-synced into the query string.
 	auth := r.Header.Get("Authorization")
-	if auth == "" {
+	if auth != "" {
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return apiKeysEqual(g.gatewayAPIKey, parts[1])
+		}
+		// A malformed header must not fall through to the query form: a client
+		// that sent "Basic ..." and an api_key= of the wrong key would then be
+		// judged on the query alone, which is the wrong answer to give for a
+		// request that was already malformed.
 		return false
 	}
-	parts := strings.SplitN(auth, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		return false
+
+	// `?api_key=`, so the dashboard can be opened in a browser.
+	//
+	// A browser cannot attach an Authorization header to the URL you type or
+	// to a bookmark, so without this the admin surface — roster, cooldowns,
+	// metrics, dashboard — is reachable only from curl. That is a real
+	// usability wall on a tool whose whole purpose is being looked at.
+	//
+	// The cost is stated plainly rather than buried: a query parameter shows
+	// up in the browser's history, in any access log that records the request
+	// line, and in the Referer of a page it navigates to. The credential is
+	// therefore easier to leak than a header is, which is why the header
+	// stays the primary form. It is not a weaker check — the comparison is
+	// the same constant-time one — it is a credential with a wider footprint,
+	// and an operator who cares should keep using curl.
+	//
+	// Both spellings are accepted because both are common in the wild;
+	// `api_key` is the one the dashboard page documents.
+	if q := r.URL.Query(); q.Has("api_key") {
+		return apiKeysEqual(g.gatewayAPIKey, q.Get("api_key"))
 	}
-	want := []byte(g.gatewayAPIKey)
-	got := []byte(parts[1])
-	// ConstantTimeCompare requires equal-length inputs; always run it to
-	// avoid leaking the key length via timing. Pad the shorter input to
-	// match the longer one (the comparison will fail, but in constant time).
-	if len(want) == len(got) {
-		return subtle.ConstantTimeCompare(want, got) == 1
+	return false
+}
+
+// apiKeysEqual compares a configured key against a presented one in constant
+// time. ConstantTimeCompare requires equal-length inputs, so the shorter value
+// is padded rather than rejected up front: an early length check would answer
+// instantly for a wrong-length key and leak the key's length through timing,
+// which is the leak this exists to avoid. The comparison always runs to
+// completion.
+func apiKeysEqual(want, got string) bool {
+	w := []byte(want)
+	x := []byte(got)
+	if len(w) == len(x) {
+		return subtle.ConstantTimeCompare(w, x) == 1
 	}
-	// Lengths differ: run ConstantTimeCompare on equal-length slices so the
-	// timing doesn't reveal the key length. Result is always false.
-	if len(got) < len(want) {
-		got = append(got, make([]byte, len(want)-len(got))...)
+	if len(x) < len(w) {
+		x = append(x, make([]byte, len(w)-len(x))...)
 	} else {
-		want = append(want, make([]byte, len(got)-len(want))...)
+		w = append(w, make([]byte, len(x)-len(w))...)
 	}
-	return subtle.ConstantTimeCompare(want, got) == 1
+	return subtle.ConstantTimeCompare(w, x) == 1
 }
 
 // bodySessionID derives a stable session identifier from a request body by

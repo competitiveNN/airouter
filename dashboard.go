@@ -86,7 +86,13 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 </div>
 </main>
 <script>
-const apiKey = prompt('Enter gateway API key for admin:') || '';
+// The key comes from ?api_key= in the page URL when present, which is what
+// makes the dashboard usable from a browser at all — a browser cannot set an
+// Authorization header on a typed URL or a bookmark. The prompt stays as the
+// fallback so a URL without the key still works, and so the query form is not
+// the only way in.
+const apiKey = new URLSearchParams(location.search).get('api_key')
+               || prompt('Enter gateway API key for admin:') || '';
 async function req(path, opts={}) {
   const headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
   if(apiKey) headers['Authorization']='Bearer '+apiKey;

@@ -151,6 +151,10 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
+- `0f5f499` dashboard: web UI for chain status and time-windowed leaderboards
+- `16d26b1` sync: refresh intelligence scores and record chain protocols
+- `9a8a680` config tests: make protocol injection structural, and prove it has teeth
+
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
 `scripts/audit-attribution-check.py` then reports every entry as "not an unpushed

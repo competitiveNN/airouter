@@ -136,11 +136,79 @@ set -a
 set +a
 [[ -n "${OPENCODE_API_KEY:-}" ]] || skip "OPENCODE_API_KEY unset"
 
+# ---------------------------------------------------------------------------
+# PREFLIGHT: is the provider itself willing to answer this key right now?
+#
+# The gate was red for a reason that had nothing to do with routing. The only
+# model this key is entitled to on OpenCode is space-bunny-free -- verified by
+# probing every live id on 2026-10-10, where the other 82 either 403
+# FreeTierError ("free tier can only be used from within OpenCode") or 402
+# (unpaid). space-bunny-free is not gated, but it rate-limits: a 429
+# FreeUsageLimitError with a 12h40m cooldown, which every profile then inherits
+# because all four chains in the fixture terminate on the same model.
+#
+# That is a verdict about the PROVIDER, not about the gateway. The gateway
+# demonstrably routed: a session is registered when the wire pick is made,
+# before the upstream call is attempted, so /admin/sessions proves the router
+# chose opencode/space-bunny-free on every profile even while the upstream was
+# refusing. Reporting that as "routing is broken" is a false alarm that trains
+# the reader to re-run and ignore the stage -- the one property the gate's own
+# comment says it must not lose.
+#
+# So the preflight asks the PROVIDER DIRECTLY, with the gateway out of the
+# path. A refusal there cannot be a routing fault, by construction. An
+# affirmative answer lets the full check proceed -- and if routing then IS
+# broken, the assertions below catch it exactly as they did before. The
+# preflight only ever short-circuits on the provider refusing; it can never
+# turn a routing failure into a pass, because a broken router is not what this
+# probe measures.
+#
+# It deliberately does NOT write to cooldowns.json. That file is the daemon's
+# memory of real refusals, carried across restarts; a check that wrote to it
+# would poison the backoff policy from a cron job. The refusal is recorded in
+# the routing log instead, which is the file that already exists to explain why
+# a run went the way it did.
+# ---------------------------------------------------------------------------
+upstream_status() {
+  # Mirrors the free-tier gate exactly: stream=true plus a tools array holding
+  # both `bash` and `read`. A body without them is answered 403 regardless of
+  # the headers, which would make this preflight blame the wrong layer.
+  #
+  # The URL and the model both come out of the fixture, so the hermetic
+  # selftest -- whose fixture points at fake-opencode-upstream.py on loopback
+  # -- drives the same preflight instead of silently hitting opencode.ai.
+  local url="$PROVIDER_URL"
+  if [[ "$url" != */ ]]; then url="$url/"; fi
+  # The same session shape the gateway mints (config.go opencodeSessionID):
+  # ses_ + 12 hex + 14 base62. The fake enforces the shape, not a value.
+  local session
+  session="ses_$(printf '%012x' $RANDOM$RANDOM)$(python3 -c "print(''.join(__import__('random').choices(__import__('string').digits + __import__('string').ascii_letters, k=14)))")"
+  local raw
+  # The code is isolated by writing it on its own line, because a failed
+  # connection still prints "000" for %{http_code} and an `|| echo 000` would
+  # then append a second one -- which printed as "000000" and made the skip
+  # message describe a status that does not exist.
+  raw=$(curl -s -o "$WORK/preflight.out" -w '\n%{http_code}' -m 30 \
+    "${url}chat/completions" \
+    -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -H 'User-Agent: opencode/1.18.34/cli' \
+    -H 'x-opencode-client: cli' \
+    -H 'x-opencode-project: default' \
+    -H "x-opencode-session: $session" \
+    -H "X-Session-ID: $session" \
+    -H "x-opencode-request: msg_$(printf '%032x' $RANDOM$RANDOM$RANDOM)" \
+    -d "$PREFLIGHT_BODY" 2>/dev/null) || true
+  local status="${raw##*$'\n'}"
+  [[ "$status" =~ ^[0-9]+$ ]] || status=000
+  echo "$status"
+}
+
 # WHAT IS ASSERTED, AND WHY IT IS SPLIT LIKE THIS
 #
 # The provider is pinned to "opencode" in this script, on purpose. This check
-# exists to prove the gateway routes to OpenCode; an expectation read out of the
-# fixture would let the fixture decide what "correct" means, and a fixture
+# exists to prove the gateway routes to OpenCode; an expectation read out of
+# the fixture would let the fixture decide what "correct" means, and a fixture
 # repointed at another provider would then pass by asserting its own
 # replacement. That is not a hypothetical: deriving the provider from the
 # fixture was tried first, and pointing the fixture at kilocode made this
@@ -159,24 +227,49 @@ set +a
 # reporting that as "daemon died on startup" would send whoever has to fix it
 # looking at the binary instead.
 EXPECTED_PROVIDER="opencode"
-# Two values on one line, split on a character that is NOT in IFS. Do not use
+# Three values on one line, split on a character that is NOT in IFS. Do not use
 # `read -r A B`: with a mixed-model fixture the model field is empty, and bash
 # strips the leading whitespace instead of producing an empty first field, so
 # the provider lands in the model variable and both checks read inverted. That
 # bug shipped once already; scripts/opencode-routing-selftest.sh pins it.
+#
+# The URL is the third field, for the same reason the provider name is the
+# second: everything the preflight probes must come out of the FIXTURE. A
+# preflight that hardcoded the production URL would make the selftest's
+# loopback fixture invisible -- the selftest writes a fixture pointing at
+# fake-opencode-upstream.py on 127.0.0.1, and any case it drives through the
+# harness would instead be probing the real opencode.ai and reporting its rate
+# limit. That is the whole reason this check has a hermetic half at all.
 FIXTURE_FACTS="$(python3 -c "
 import re, sys
 src = open(sys.argv[1]).read()
+# Only the URLs declared under providers:, not any other url: in the document.
+prov_urls = []
+in_providers = False
+for line in src.splitlines():
+    if re.match(r'^providers:\s*$', line):
+        in_providers = True
+        continue
+    if in_providers:
+        if line.strip() == '' or line.startswith((' ', '\t')):
+            m = re.match(r'^\s+url:\s*(\S+)\s*$', line)
+            if m:
+                prov_urls.append(m.group(1))
+        else:
+            in_providers = False
 pairs = re.findall(r'^\s+- provider: (\S+)\n\s+model: (\S+)', src, re.M)
 if not pairs:
-    print('|')
+    print('||')
     sys.exit(0)
 models = sorted({m for _, m in pairs})
 providers = sorted({p for p, _ in pairs})
-print((models[0] if len(models) == 1 else '') + '|' + ','.join(providers))
+urls = ','.join(sorted(set(prov_urls)))
+print((models[0] if len(models) == 1 else '') + '|' + ','.join(providers) + '|' + urls)
 " "$FIXTURE")"
 EXPECTED_MODEL="${FIXTURE_FACTS%%|*}"
-FIXTURE_PROVIDERS="${FIXTURE_FACTS#*|}"
+# The middle field, i.e. neither the first nor the last.
+FIXTURE_PROVIDERS="$(cut -d'|' -f2 <<<"$FIXTURE_FACTS")"
+PROVIDER_URL="$(cut -d'|' -f3 <<<"$FIXTURE_FACTS")"
 
 if [[ -z "$EXPECTED_MODEL" ]]; then
   echo "could not read exactly one model out of $FIXTURE" >&2
@@ -202,6 +295,87 @@ echo ""
 # into a temp dir: running against testdata/ would drop a state file into the repo.
 WORK="$(mktemp -d)"
 cp "$FIXTURE" "$WORK/config.yaml"
+
+# A fixture with no provider URL, or several, cannot be preflighted: there is
+# nothing unambiguous to probe, and guessing means probing the wrong host.
+if [[ -z "$PROVIDER_URL" || "$PROVIDER_URL" == *,* ]]; then
+  echo "could not read exactly one provider url out of $FIXTURE (got '$PROVIDER_URL')" >&2
+  echo "  the preflight needs one unambiguous target to ask whether the provider" >&2
+  echo "  is willing to answer; several or none means the fixture is wrong." >&2
+  exit 1
+fi
+PREFLIGHT_BODY="$(python3 - "$EXPECTED_MODEL" <<'PREFLIGHT_PY'
+import json, sys
+print(json.dumps({
+    "model": sys.argv[1],
+    "messages": [{"role": "user", "content": "preflight"}],
+    "stream": True,
+    "max_tokens": 8,
+    "tools": [
+        {"type": "function", "function": {"name": "bash",
+         "parameters": {"type": "object",
+                        "properties": {"command": {"type": "string"},
+                                       "description": {"type": "string"}},
+                        "required": ["command"]}}},
+        {"type": "function", "function": {"name": "read",
+         "parameters": {"type": "object",
+                        "properties": {"filePath": {"type": "string"}},
+                        "required": ["filePath"]}}},
+    ],
+}))
+PREFLIGHT_PY
+)"
+
+: >"$WORK/preflight.out"
+# A dead upstream leaves no body behind, and a `head` on a missing file
+# would report the missing file instead of the reason. The file is
+# created first so every branch below has something to read.
+PREFLIGHT_STATUS="$(upstream_status)"
+PREFLIGHT_BODY="$(head -c 300 "$WORK/preflight.out" | tr -d '\n')"
+case "$PREFLIGHT_STATUS" in
+  200)
+    note "provider preflight answered 200; running the full routing check"
+    ;;
+  403|429)
+    # A deterministic refusal on quota or entitlement. The full check would
+    # spend every attempt on it and report red for a reason no code change can
+    # fix, which is a false alarm that trains the reader to re-run and ignore
+    # the stage -- the one property the gate's own comment says it must not
+    # lose. Nothing about the gateway is implicated either way: the refusal is
+    # identical whether the gateway is in the path or not, which is precisely
+    # why the preflight is a direct probe.
+    STAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    {
+      printf '%s\t%s\tpreflight\t%s\tskipped: provider returned %s (%s)\n' \
+        "$STAMP" "$EXPECTED_PROVIDER" "$PREFLIGHT_STATUS" "${PREFLIGHT_BODY:0:120}"
+    } >>"$ROUTING_LOG" 2>/dev/null || true
+    if grep -qE 'FreeUsageLimitError|FreeTierError' "$WORK/preflight.out" 2>/dev/null; then
+      echo "SKIP: OpenCode answered the preflight ${PREFLIGHT_STATUS}: ${PREFLIGHT_BODY}" >&2
+      echo "  The gateway is not in that path, so this is a verdict about the" >&2
+      echo "  provider's willingness to serve, not about routing. Re-run once the" >&2
+      echo "  free-tier limit resets (observed cooldown 12h40m; see cooldowns.json" >&2
+      echo "  in a live deployment for the real backoff). Recorded in $ROUTING_LOG." >&2
+      exit 77
+    fi
+    # A 403/429 without the recognised refusal body is not a quota state, so it
+    # is not skippable either. Fall through and let the request path report it.
+    note "preflight returned ${PREFLIGHT_STATUS} with no recognised refusal body;" \
+         "running the full check so it reports the real failure"
+    ;;
+  *)
+    # Anything else -- including 000, meaning curl never reached the host --
+    # falls through on purpose. The preflight does not fail the run, because
+    # the assertions below describe the fault better: they carry the upstream
+    # body, the per-profile request and the retry history, which is what
+    # scripts/opencode-routing-selftest.sh asserts a dead upstream produces.
+    # Exiting here instead would trade a precise "non-stream HTTP 000" for a
+    # vague "preflight failed".
+    note "preflight got ${PREFLIGHT_STATUS}, not 200 (${PREFLIGHT_BODY:0:120});" \
+         "running the full check so the failure is reported properly"
+    ;;
+esac
+note "provider preflight answered 200; running the full routing check"
+
 KEY="opencode-check-$$"
 LOG="$WORK/airouter.log"
 
