@@ -158,6 +158,7 @@ What `origin/master` is missing, oldest first:
 - `f0e8c94` gofmt: dashboard_test.go
 - `87dc7bf` dashboard: surface the reason an endpoint is down, and rate speed by busy time
 - `0279d6f` dashboard: anchor the cooldown countdown to the gateway's clock, and exercise the circuit column against real traffic
+- `4a6dd83` dashboard: surface the breaker state and prove circuit recovery against real traffic
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
