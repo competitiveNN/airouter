@@ -452,6 +452,22 @@ if top is None or top["endpoint"] != "fake:fake-model":
           f"{top and top['endpoint']}", file=sys.stderr)
     sys.exit(1)
 print(f"  ok speed leaderboard shows {good['tokens']} tokens for fake:fake-model")
+
+# The rate is tokens per SECOND OF BUSY TIME, not per second of window.
+# This endpoint served 9 tokens in the first minute of a 1d window and was
+# idle the rest of it, so a naive "tokens / window" rate would be
+# 9/86400 ≈ 0.0001 tok/s and every endpoint would look equally slow. The
+# busy-time rate is 9/60 = 0.15 tok/s, and multiplying it back by the
+# window must therefore exceed the token count by a wide margin. That
+# margin is the whole point of the denominator, so assert it.
+window_secs = 86400 if d.get("window") == "1d" else 7*86400
+if good["rate"] * window_secs <= good["tokens"] * 2:
+    print(f"  FAIL speed rate {good['rate']} for fake:fake-model implies the "
+          f"endpoint was busy for the whole window; tokens per second of "
+          f"window would be {good['tokens']/window_secs:.6f}, which is not a "
+          f"speed leaderboard", file=sys.stderr)
+    sys.exit(1)
+print(f"  ok speed rate {good['rate']:.4f} tok/s reflects busy time, not the window")
 PY
 
 # Every leaderboard must have a row, or the page renders an empty column and

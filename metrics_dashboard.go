@@ -5,14 +5,21 @@ import "time"
 // dashboardEndpointAgg is the summed telemetry for one endpoint over a time
 // window, as computed by DashboardQuery. It is what the dashboard renders:
 // the raw endpoint string, its attempt count, failure count, total latency,
-// total completion tokens, and the window it was summed over.
+// total completion tokens, the ticks in which it was active, and the window
+// it was summed over.
+//
+// ActiveTicks is the denominator the speed leaderboard divides by, and it is
+// not the window: see attemptTick.activeTicks for why. It is carried on the
+// aggregate rather than recomputed by the handler so the three leaderboards
+// cannot disagree about how long each endpoint was busy.
 type dashboardEndpointAgg struct {
-	Endpoint  string `json:"endpoint"`
-	Attempts  int64  `json:"attempts"`
-	Failures  int64  `json:"failures"`
-	LatencyNS int64  `json:"latency_ns"`
-	Tokens    int64  `json:"tokens"`
-	Window    string `json:"window"`
+	Endpoint    string `json:"endpoint"`
+	Attempts    int64  `json:"attempts"`
+	Failures    int64  `json:"failures"`
+	LatencyNS   int64  `json:"latency_ns"`
+	Tokens      int64  `json:"tokens"`
+	ActiveTicks int64  `json:"active_ticks"`
+	Window      string `json:"window"`
 }
 
 // dashboardLeaderboardEntry is one row of a leaderboard, carrying the
@@ -40,11 +47,18 @@ type dashboardChainStatus struct {
 }
 
 // dashboardEndpointInfo is one endpoint within a chain's status view.
+//
+// CooldownUntil carries the expiry of an active cooldown, when present, so the
+// page can render "down — cooldown until 14:22" instead of a bare "down". It
+// is nil when the endpoint is not on cooldown; leaving it nil rather than
+// zeroing it is what lets the renderer tell "no cooldown" from "cooldown that
+// expired a microsecond ago".
 type dashboardEndpointInfo struct {
-	Endpoint string `json:"endpoint"`
-	Eligible bool   `json:"eligible"`
-	Cooldown bool   `json:"cooldown"`
-	Circuit  string `json:"circuit"`
+	Endpoint      string     `json:"endpoint"`
+	Eligible      bool       `json:"eligible"`
+	Cooldown      bool       `json:"cooldown"`
+	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+	Circuit       string     `json:"circuit"`
 }
 
 // dashboardResponse is the complete dashboard payload, returned by
