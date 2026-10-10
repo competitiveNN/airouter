@@ -64,12 +64,23 @@ type dashboardEndpointInfo struct {
 // dashboardResponse is the complete dashboard payload, returned by
 // /admin/dashboard/data. It bundles the four sections the dashboard renders
 // (chains, speed, volume, failures) so a single request populates the page.
+//
+// Now carries the gateway's wall clock for the same reason the cooldown
+// pills carry an expiry rather than a duration: the browser renders the
+// countdown as expiry minus its own clock, and a clock skew between the
+// browser and the gateway would make it run fast or slow. Anchoring the
+// countdown to the gateway's clock — the same clock that decided the
+// cooldown is still active — keeps the page honest regardless of which
+// clock the user's laptop thinks it is. It is the server's notion of "now",
+// not the client's, because the gateway is the authority on whether the
+// endpoint is still cooling down.
 type dashboardResponse struct {
 	Chains    []dashboardChainStatus      `json:"chains"`
 	Speed     []dashboardLeaderboardEntry `json:"speed"`
 	Volume    []dashboardLeaderboardEntry `json:"volume"`
 	Failures  []dashboardLeaderboardEntry `json:"failures"`
 	Window    string                      `json:"window"`
+	Now       time.Time                   `json:"now"`
 	Generated time.Time                   `json:"generated"`
 }
 

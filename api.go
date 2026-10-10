@@ -1785,6 +1785,7 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		Volume:    volume,
 		Failures:  failures,
 		Window:    string(win),
+		Now:       time.Now(),
 		Generated: time.Now(),
 	}
 

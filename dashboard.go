@@ -155,13 +155,14 @@ function renderChains(chains){
     c.appendChild(eps);
   }
 }
-// Render a cooldown expiry as a countdown ("cooldown 0:02" once under a
-// minute, "cooldown until 14:22" above it), recomputed every second so a page
-// left open shows the remaining time rather than a stale instant. The label
-// is anchored to the page's own clock, not the server's, so it stays
-// consistent with the 30s refresh cadence.
-function cooldownLabel(untilMs){
-  const diff=Math.max(0, untilMs-Date.now());
+// The countdown is anchored to the gateway's clock, not the browser's: the
+// gateway is the authority on whether a cooldown is still active, and a
+// laptop that thinks it is five minutes ahead would render every cooldown
+// as already expired. "now" is the server's notion of the moment the payload
+// was generated, and the countdown advances from it.
+let serverNow = Date.now();
+function cooldownLabel(untilMs, atMs){
+  const diff=Math.max(0, untilMs-atMs);
   const m=Math.floor(diff/60000), s=Math.floor((diff%60000)/1000);
   if(m>0) return 'until '+new Date(untilMs).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
   return m+':'+String(s).padStart(2,'0');
@@ -169,10 +170,12 @@ function cooldownLabel(untilMs){
 setInterval(()=>{
   // Rewrite only the cooldown pills' countdowns; everything else on the page
   // is untouched by this timer, which is why a refresh() does not need to
-  // re-render the whole chain card to keep the label live.
+  // re-render the whole chain card to keep the label live. The anchor is the
+  // server clock plus elapsed time, so skew cannot accumulate across ticks.
+  serverNow += 1000;
   document.querySelectorAll('.pill.cooldown[data-until]').forEach(p=>{
     const t=Number(p.dataset.until);
-    if(Number.isFinite(t)) p.textContent=p.textContent.replace(/cooldown \S+$/, 'cooldown '+cooldownLabel(t));
+    if(Number.isFinite(t)) p.textContent=p.textContent.replace(/cooldown \S+$/, 'cooldown '+cooldownLabel(t, serverNow));
   });
 }, 1000);
 function renderBoard(id, rows, cols){
@@ -191,6 +194,13 @@ function renderBoard(id, rows, cols){
 async function refresh(){
   try{
     const d=await req('/admin/dashboard/data?window='+window);
+    // Anchor the countdown to the gateway's clock. The browser's clock is
+    // not trustworthy here: a laptop five minutes ahead renders every
+    // cooldown as already expired, and one behind makes a cooldown that has
+    // not actually started look like it has hours left. The gateway is the
+    // authority on whether an endpoint is cooling down, so its "now" is the
+    // reference the countdown advances from.
+    if(d.now) serverNow = new Date(d.now).getTime();
     renderWindowSel();
     renderChains(d.chains||[]);
     renderBoard('speed', d.speed||[], [['rate',v=>v.toFixed(1)],['tokens',v=>v]]);
