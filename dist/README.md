@@ -156,6 +156,7 @@ What `origin/master` is missing, oldest first:
 - `9a8a680` config tests: make protocol injection structural, and prove it has teeth
 - `09b7eee` admin: accept ?api_key= so the dashboard opens in a browser
 - `f0e8c94` gofmt: dashboard_test.go
+- `87dc7bf` dashboard: surface the reason an endpoint is down, and rate speed by busy time
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
