@@ -449,7 +449,18 @@ SUITE_TEST_FLOORS = {
     # behaviour, replaced by fixtures plus two properties that hold whatever the
     # file contains (every declared protocol is one the router honours, and a
     # declared protocol survives a regeneration).
-    "scripts/test_regenerate_config.py": 65,
+    #
+    # 66 -- the 65 above plus 1: test_protocol_injection_is_real_when_the_entry
+    # _already_has_one. The harness injected its bad `protocol:` value with a
+    # text.replace keyed on "vision: false", which silently became a NO-OP once
+    # the sync started emitting a real protocol key on chain entries: the bad
+    # key landed before the entry's valid one, YAML duplicate keys are
+    # last-wins, and validate-config.py saw nothing to reject. Five protocol
+    # tests passed green against an injection that never happened. The new test
+    # pins the contract on a SYNTHETIC entry, so it still holds after a
+    # regeneration strips protocols from the shipped file -- which is the state
+    # in which the naive form starts "working" again and the hole re-opens.
+    "scripts/test_regenerate_config.py": 66,
     # EXACT, matching every other floor in this table (66/66, 65/65, 19/19).
     # An earlier version of this entry sat at 14 against 22 functions on the
     # theory that a floor should have slack so that adding tests needs no edit.

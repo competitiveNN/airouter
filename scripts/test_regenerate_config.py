@@ -740,6 +740,79 @@ def _checker_problems(config_text=None, models_path="/tmp/free-models.json"):
     return cr.check(gen, yaml.safe_load(text), text, index)
 
 
+# --------------------------------------------------------------------------
+# Structural protocol injection.
+#
+# WHY NOT text.replace("        vision: false\n", ...) ANY MORE
+#
+# The sync started emitting a real `protocol:` key on chain entries, so the
+# naive injection used to be a no-op in the worst possible way: it inserted a
+# BAD protocol key BEFORE the entry's existing VALID one, YAML's
+# duplicate-key last-wins then shadowed it, and the validator saw nothing to
+# reject. Every protocol test passed against a config whose first entry
+# already declared a protocol, and reported green on an injection that had
+# not happened.
+#
+# So the injection is now structural: it locates the first chain ENTRY rather
+# than the first "vision: false" line anywhere in the file, removes that
+# entry's existing protocol keys, and writes exactly one. That is the field
+# the validator reads, so the test now asserts against what it means to
+# assert against regardless of what the sync emits.
+# --------------------------------------------------------------------------
+
+def _inject_protocol(config_text, value):
+    """Return config_text with the first chain entry declaring protocol=value.
+
+    Any existing `protocol:` key in that entry is removed first, so there is
+    exactly one and its value is the one asked for. Everything else in the
+    file -- comments, blank lines, ordering -- is byte-identical.
+    """
+    lines = config_text.splitlines(keepends=True)
+
+    entry = None
+    for i, line in enumerate(lines):
+        if line.startswith("      - "):
+            entry = i
+            break
+    assert entry is not None, "fixture has no chain entry"
+
+    # The entry's own keys are indented 8 spaces; the next entry starts at 6
+    # with a dash, and a key shallower than 8 ends the models block.
+    end = len(lines)
+    for i in range(entry + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        if line.startswith("      - ") or not line.startswith("        "):
+            end = i
+            break
+
+    body = [j for j in range(entry, end) if lines[j].startswith("        protocol:")]
+    for j in reversed(body):
+        del lines[j]
+        end -= 1
+
+    new_line = f"        protocol: {value}\n" if value else "        protocol:\n"
+
+    # Land it beside the entry's other capability/quality keys so the file
+    # still reads the way the generator writes it.
+    anchor = None
+    for j in range(entry, end):
+        if lines[j].startswith("        vision:"):
+            anchor = j + 1
+            break
+    if anchor is None:
+        for j in range(entry, end):
+            if lines[j].startswith("        model:"):
+                anchor = j + 1
+                break
+    if anchor is None:
+        anchor = entry + 1
+
+    lines.insert(anchor, new_line)
+    return "".join(lines)
+
+
 def test_checker_passes_the_real_config_and_its_real_model_list():
     if not Path("/tmp/free-models.json").exists():
         pytest.skip("no fetched model list on this machine")
@@ -1446,9 +1519,10 @@ def test_rule13_rejects_an_unrecognised_protocol_value():
     models_path = Path("/tmp/free-models.json")
     if not models_path.exists():
         pytest.skip("no fetched model list on this machine")
-    text = CONFIG.read_text()
-    broken = text.replace("        vision: false\n",
-                          "        vision: false\n        protocol: respones\n", 1)
+    broken = _inject_protocol(CONFIG.read_text(), "respones")
+    # Prove the injection actually landed, rather than asserting against a
+    # no-op: the failure this replaces was a test that could not fail.
+    assert yaml.safe_load(broken)["models"]["smart"]["chain"][0].get("protocol") == "respones"
     problems = _checker_problems(broken, models_path)
     assert [p for p in problems if "neither chat nor responses" in p], problems
 
@@ -1486,8 +1560,13 @@ def test_validate_config_accepts_the_shipped_config(tmp_path):
 def test_validate_config_rejects_a_protocol_the_router_would_ignore(tmp_path, value):
     """config.go's protocolFor maps anything unrecognised to chat, so a typo is a
     file that claims `responses` while every request goes to /chat/completions."""
-    broken = CONFIG.read_text().replace(
-        "        vision: false\n", f"        vision: false\n        protocol: {value}\n", 1)
+    broken = _inject_protocol(CONFIG.read_text(), value)
+    # The injection must be real before it is asserted against. An empty
+    # value parses to None, which is the "field with no content" case the
+    # rule deliberately rejects.
+    parsed = yaml.safe_load(broken)["models"]["smart"]["chain"][0]
+    assert "protocol" in parsed, "protocol was not injected; this would pass vacuously"
+    assert parsed["protocol"] in (None, "", value)
     run = _validate_config(tmp_path, broken)
     assert run.returncode == 1, run.stdout
     assert "protocol must be" in run.stdout, run.stdout
@@ -1495,10 +1574,66 @@ def test_validate_config_rejects_a_protocol_the_router_would_ignore(tmp_path, va
 
 def test_validate_config_accepts_both_real_protocols(tmp_path):
     for value in ("chat", "responses"):
-        shaped = CONFIG.read_text().replace(
-            "        vision: false\n", f"        vision: false\n        protocol: {value}\n", 1)
+        shaped = _inject_protocol(CONFIG.read_text(), value)
+        assert yaml.safe_load(shaped)["models"]["smart"]["chain"][0]["protocol"] == value
         run = _validate_config(tmp_path, shaped)
         assert run.returncode == 0, f"{value}: " + run.stdout
+
+
+def test_protocol_injection_is_real_when_the_entry_already_has_one():
+    """The injection must overwrite, not append.
+
+    This is the regression the whole suite was hiding. While every chain entry
+    was protocol-free, `text.replace("vision: false\\n", "vision: false\\n
+    protocol: X\\n")` put X after the last vision line in the file and the validator
+    saw it. Once the sync began emitting a real `protocol:` on entries, the same
+    replace inserted X BEFORE that key, YAML's duplicate-key last-wins shadowed
+    it, and every protocol test passed against an injection that had not
+    happened -- five green tests proving nothing.
+
+    Asserted here against a synthetic entry so the contract holds even after a
+    regeneration strips protocols from the shipped config, which would make the
+    naive form start "working" again and quietly re-open the hole.
+    """
+    with_protocol = (
+        "models:\n"
+        "  smart:\n"
+        "    chain:\n"
+        "      - provider: p1\n"
+        "        model: m1  # 50.0\n"
+        "        vision: false\n"
+        "        intelligence: 50.0\n"
+        "        protocol: responses\n"
+    )
+    injected = _inject_protocol(with_protocol, "chat")
+
+    parsed = yaml.safe_load(injected)
+    assert parsed["models"]["smart"]["chain"][0]["protocol"] == "chat", (
+        "an existing protocol key must be replaced, not shadowed\n" + injected
+    )
+    # Exactly one, or the YAML outcome depends on dict-ordering luck.
+    assert injected.count("protocol:") == 1, injected
+    # And nothing else about the entry moved.
+    assert "vision: false" in injected and "intelligence: 50.0" in injected
+    assert "model: m1  # 50.0" in injected
+
+    # The protocol-free shape must keep working once protocols are stripped.
+    without = (
+        "models:\n"
+        "  smart:\n"
+        "    chain:\n"
+        "      - provider: p1\n"
+        "        model: m1  # 50.0\n"
+        "        vision: false\n"
+        "        intelligence: 50.0\n"
+    )
+    added = _inject_protocol(without, "responses")
+    assert yaml.safe_load(added)["models"]["smart"]["chain"][0]["protocol"] == "responses"
+    assert added.count("protocol:") == 1
+
+    # A present-but-empty key is still a claim with no content.
+    emptied = _inject_protocol(with_protocol, "")
+    assert yaml.safe_load(emptied)["models"]["smart"]["chain"][0]["protocol"] is None
 
 
 def test_the_validate_config_harness_has_teeth_beyond_the_protocol_rule(tmp_path):

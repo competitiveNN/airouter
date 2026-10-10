@@ -412,6 +412,52 @@ def _invent_a_model_id(text):
     return new_text
 
 
+def _checker():
+    """Load check-rules.py as a module, so cases read its rules instead of restating them."""
+    spec = importlib.util.spec_from_file_location(
+        "check_rules", REPO / "scripts" / "check-rules.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _give_a_banned_model_id(text):
+    """Point one scored endpoint at a permanently-excluded model id.
+
+    Derived from the live config rather than pinned, for the same reason as
+    _invent_a_model_id: this case spelled out `stepfun/step-3.7-flash:free`,
+    which the sync dropped from every chain, so `text.replace` matched nothing
+    and the mutation became a no-op — the suite then reported green on a rule
+    that had not been exercised at all.
+
+    The id is built from the entry's OWN id with a banned marker spliced in, so
+    it stays in the provider's namespace (and so does the trailing `# score`
+    comment the line carries). rule8 is evaluated before any comparison against
+    the fetched list, so the diagnostic fires whether or not this machine has
+    one.
+    """
+    entry = re.compile(
+        r"(?m)^        model: (?P<id>\S+)\s+# (?P<score>\d+\.\d)\n"
+        r"        vision: (?:true|false)\n"
+        r"        intelligence: (?P<int>\d+\.\d)"
+    )
+    m = entry.search(text)
+    assert m, "no scored entry to mark banned"
+    # The sync does not suffix free ids with ":free" — free-ness is a PROBE
+    # VERDICT recorded off-file (see sync-instruction.txt), so the chains carry
+    # bare ids like "z-ai/glm-5.3". Splicing the marker onto the tail keeps the
+    # id in the provider's own namespace and leaves the trailing "# score"
+    # comment untouched.
+    new_id = f"{m.group('id')}-content-safety"
+    # The marker must actually be one the checker bans, or rule8 never fires
+    # and this is a no-op wearing a passing label. The pattern is READ from the
+    # checker rather than restated here, so the case cannot drift from the rule
+    # it is supposed to break.
+    banned = _checker().BANNED_ID
+    assert banned.search(new_id.lower()), f"{new_id!r} is not a banned id shape"
+    return text[:m.start("id")] + new_id + text[m.end("id"):]
+
+
 # (label, mutation applied to config.yaml, expected substring in the output)
 CHECK_RULE_CASES = [
     (
@@ -488,7 +534,7 @@ CHECK_RULE_CASES = [
     ),
     (
         "content-safety id",
-        lambda t: t.replace("        model: stepfun/step-3.7-flash:free", "        model: nvidia/nemotron-3.5-content-safety:free", 1),
+        lambda t: _give_a_banned_model_id(t),
         "permanently excluded id",
     ),
     (
