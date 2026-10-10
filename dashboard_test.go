@@ -140,6 +140,11 @@ func TestRecordDashboardTokensRejectsNonPositive(t *testing.T) {
 // TestDashboardChainStatusCountsEligible checks the chain summary the
 // dashboard renders as "operational/total", including the nil-callback case
 // (no eligibility function means nothing is eligible, not a panic).
+//
+// The callback returns three values, not one, because "eligible" is a summary
+// that hides the two different reasons an endpoint can be down. This test
+// exercises both: p2 is down for a cooldown, p3 for an open circuit, and the
+// page must be able to tell them apart rather than rendering both as "down".
 func TestDashboardChainStatusCountsEligible(t *testing.T) {
 	cfg := &Config{Models: map[string]ModelConfig{
 		"smart": {Chain: []ModelEndpoint{
@@ -149,14 +154,25 @@ func TestDashboardChainStatusCountsEligible(t *testing.T) {
 		}},
 	}}
 
-	eligible := func(ep ModelEndpoint) bool { return ep.Provider != "p2" }
+	eligible := func(ep ModelEndpoint) (bool, bool, string, time.Time) {
+		switch ep.Provider {
+		case "p1":
+			return true, false, "closed", time.Time{}
+		case "p2":
+			return false, true, "closed", time.Now().Add(time.Hour) // down, and the reason is the cooldown
+		case "p3":
+			return false, false, "open", time.Time{} // down, and the reason is the breaker
+		default:
+			return false, false, "", time.Time{}
+		}
+	}
 	chains := DashboardChainStatus(cfg, eligible)
 	if len(chains) != 1 {
 		t.Fatalf("want 1 chain, got %d", len(chains))
 	}
 	c := chains[0]
-	if c.Model != "smart" || c.Total != 3 || c.Operational != 2 {
-		t.Fatalf("chain = %+v, want smart 3 total 2 operational", c)
+	if c.Model != "smart" || c.Total != 3 || c.Operational != 1 {
+		t.Fatalf("chain = %+v, want smart 3 total 1 operational", c)
 	}
 	if len(c.Endpoints) != 3 {
 		t.Fatalf("want 3 endpoints, got %d", len(c.Endpoints))
@@ -164,15 +180,106 @@ func TestDashboardChainStatusCountsEligible(t *testing.T) {
 	if c.Endpoints[0].Endpoint != "p1:m1" || !c.Endpoints[0].Eligible {
 		t.Fatalf("endpoints[0] = %+v, want p1:m1 eligible", c.Endpoints[0])
 	}
-	if c.Endpoints[1].Eligible {
-		t.Fatal("p2:m2 must be ineligible")
+	if c.Endpoints[1].Eligible || !c.Endpoints[1].Cooldown || c.Endpoints[1].CooldownUntil == nil {
+		t.Fatalf("endpoints[1] = %+v, want p2:m2 ineligible on cooldown with an expiry", c.Endpoints[1])
+	}
+	if c.Endpoints[2].Eligible || c.Endpoints[2].Cooldown || c.Endpoints[2].Circuit != "open" || c.Endpoints[2].CooldownUntil != nil {
+		t.Fatalf("endpoints[2] = %+v, want p3:m3 ineligible, circuit open, no cooldown", c.Endpoints[2])
 	}
 
-	if got := DashboardChainStatus(cfg, nil); len(got) != 1 || got[0].Operational != 0 {
-		t.Fatalf("nil eligible must report 0 operational, got %+v", got)
+	nilChains := DashboardChainStatus(cfg, nil)
+	if len(nilChains) != 1 || nilChains[0].Operational != 0 {
+		t.Fatalf("nil eligible must report 0 operational, got %+v", nilChains)
+	}
+	// A nil callback must not leave the Cooldown/Circuit fields populated from
+	// a previous iteration — they are zero values, not inherited state.
+	for _, e := range nilChains[0].Endpoints {
+		if e.Cooldown || e.Circuit != "" || e.CooldownUntil != nil {
+			t.Fatalf("nil eligible must not populate cooldown/circuit, got %+v", e)
+		}
 	}
 	if got := DashboardChainStatus(nil, eligible); got != nil {
 		t.Fatal("nil config must return nil")
+	}
+}
+
+// TestDashboardChainStatusDistinguishesCooldownFromCircuit is the property the
+// three-value callback exists for: an endpoint down for a cooldown and one
+// down for an open circuit must render as different states, so the dashboard
+// can show "cooldown until 14:22" rather than a bare "down" that gives the
+// operator no idea which lever to pull.
+func TestDashboardChainStatusDistinguishesCooldownFromCircuit(t *testing.T) {
+	cfg := &Config{Models: map[string]ModelConfig{
+		"fast": {Chain: []ModelEndpoint{
+			{Provider: "p1", Model: "m1"},
+			{Provider: "p2", Model: "m2"},
+		}},
+	}}
+	eligible := func(ep ModelEndpoint) (bool, bool, string, time.Time) {
+		if ep.Provider == "p1" {
+			return false, true, "closed", time.Now().Add(time.Hour)
+		}
+		return false, false, "open", time.Time{}
+	}
+	chains := DashboardChainStatus(cfg, eligible)
+	c := chains[0]
+	if c.Operational != 0 {
+		t.Fatalf("operational = %d, want 0", c.Operational)
+	}
+	// The two failure reasons must differ in at least one rendered field —
+	// which is the whole point of the four-value callback.
+	if c.Endpoints[0].Cooldown == c.Endpoints[1].Cooldown &&
+		c.Endpoints[0].Circuit == c.Endpoints[1].Circuit &&
+		(c.Endpoints[0].CooldownUntil == nil) == (c.Endpoints[1].CooldownUntil == nil) {
+		t.Fatalf("both endpoints render identically: %+v, %+v — the two failure reasons must differ", c.Endpoints[0], c.Endpoints[1])
+	}
+}
+
+// TestDashboardSpeedDividesByBusyTime pins the property that distinguishes the
+// speed leaderboard from a naive "tokens / window" rate: an endpoint that
+// served tokens for one minute of a 7d window and was idle the rest of it is
+// an 8.3 tok/s endpoint, not a 0.000001 tok/s one. Dividing by the window
+// would rank every quiet endpoint near zero and bury the genuinely fast
+// ones, which is the opposite of what a "fastest" leaderboard should do.
+//
+// The ring counts the ticks in which the endpoint was reached (activeTicks),
+// so the denominator is the time it was actually busy. This test records one
+// observation into one tick, advances the ring a full window's worth of ticks
+// so the observation is still inside the 7d window but only 1/10080 of it,
+// and checks the rate reflects the minute, not the week.
+func TestDashboardSpeedDividesByBusyTime(t *testing.T) {
+	m := NewMetrics()
+	stop := m.StartDashboardTelemetry()
+	defer stop()
+
+	m.Attempt("prov:a", 100*time.Millisecond, true)
+	m.RecordDashboardTokens("prov:a", 600) // 600 tokens in one minute = 10 tok/s
+
+	// Advance the ring past one day's worth of ticks. The observation is now
+	// 24 hours old, so it is still inside a 7d window but has only been busy
+	// for one tick of it.
+	for i := 0; i < 24*60; i++ {
+		m.advanceRingTickLocked()
+	}
+
+	rows := m.DashboardQuery(dashboardWindow7d)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row inside the 7d window, got %d", len(rows))
+	}
+	a := rows[0]
+	if a.ActiveTicks != 1 {
+		t.Fatalf("active ticks = %d, want 1 — the endpoint was reached in exactly one tick", a.ActiveTicks)
+	}
+	if a.Tokens != 600 {
+		t.Fatalf("tokens = %d, want 600", a.Tokens)
+	}
+
+	// The rate is tokens per second of busy time: 600 tokens / 60 s = 10.
+	// A naive implementation dividing by the 7d window would produce
+	// 600 / 604800 ≈ 0.001, which this test would catch.
+	got := float64(a.Tokens) / (float64(a.ActiveTicks) * dashboardTickSeconds)
+	if got != 10.0 {
+		t.Fatalf("speed = %v tok/s, want 10 (600 tokens over one busy minute)", got)
 	}
 }
 
@@ -241,6 +348,11 @@ func TestHandleAdminDashboardDataServesPayload(t *testing.T) {
 	g.metrics.Attempt("p1:m1", 100*time.Millisecond, true)
 	g.metrics.Attempt("p2:m2", 100*time.Millisecond, false)
 	g.metrics.RecordDashboardTokens("p1:m1", 500)
+	// Put p2:m2 on cooldown so the chain card renders a cooldown reason with
+	// an expiry, rather than a bare "down". A 429 is the status that produces
+	// a cooldown without tripping the circuit breaker, which is what the card
+	// assertions below rely on.
+	g.router.ApplyCooldown(&ModelEndpoint{Provider: "p2", Model: "m2"}, 429, "rate limited")
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/dashboard/data?window=1d", nil)
 	req.Header.Set("Authorization", "Bearer secret")
@@ -267,6 +379,34 @@ func TestHandleAdminDashboardDataServesPayload(t *testing.T) {
 	// Failures is sorted by failure RATE, so the endpoint that failed leads.
 	if resp.Failures[0].Endpoint != "p2:m2" {
 		t.Fatalf("failures leaderboard = %+v, want p2:m2 first", resp.Failures)
+	}
+	// The chain card must carry the reason an endpoint is down, not just a
+	// bare "down": the handler asks ProbeAvailability (read-only) and threads
+	// the cooldown expiry through so the page can say "cooldown until 14:22".
+	c := resp.Chains[0]
+	byEp := map[string]dashboardEndpointInfo{}
+	for _, e := range c.Endpoints {
+		byEp[e.Endpoint] = e
+	}
+	if !byEp["p1:m1"].Eligible || byEp["p1:m1"].Cooldown || byEp["p1:m1"].Circuit != "" {
+		t.Fatalf("p1:m1 card = %+v, want eligible with no cooldown and no circuit", byEp["p1:m1"])
+	}
+	if byEp["p2:m2"].Eligible || !byEp["p2:m2"].Cooldown || byEp["p2:m2"].CooldownUntil == nil {
+		t.Fatalf("p2:m2 card = %+v, want ineligible on cooldown with an expiry", byEp["p2:m2"])
+	}
+	// The circuit field is "closed", not empty: ApplyCooldown creates a
+	// CircuitBreaker record for the endpoint (see applyCooldown), so the
+	// probe sees a real breaker that happens to be closed. That is the honest
+	// answer and a better one than "" would have been — it says the breaker
+	// exists and is healthy, so the endpoint's problem is the cooldown and
+	// that is what the cooldown column says. The card must not paper over
+	// either value: "" (no breaker yet) and "closed" (breaker, healthy) both
+	// mean "not the circuit's fault", and the renderer treats them the same.
+	if byEp["p2:m2"].Circuit != "closed" {
+		t.Fatalf("p2:m2 card = %+v, want circuit \"closed\" — the 429 produced a cooldown, not a breaker trip", byEp["p2:m2"])
+	}
+	if byEp["p1:m1"].Circuit != "" {
+		t.Fatalf("p1:m1 card = %+v, want no circuit — it never failed", byEp["p1:m1"])
 	}
 }
 

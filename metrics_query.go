@@ -1,5 +1,7 @@
 package main
 
+import "time"
+
 // DashboardQuery sums the attempt ring over the given window and returns the
 // per-endpoint aggregates. It is the single source the three leaderboards are
 // derived from, so they cannot disagree about what happened in the window.
@@ -76,6 +78,14 @@ func (m *Metrics) DashboardQuery(w dashboardWindow) []dashboardEndpointAgg {
 			}
 			a.Tokens += v
 		}
+		for k, v := range t.activeTicks {
+			a := agg[k]
+			if a == nil {
+				a = &dashboardEndpointAgg{}
+				agg[k] = a
+			}
+			a.ActiveTicks += v
+		}
 		for k, ep := range t.endpoints {
 			if _, exists := endpoints[k]; !exists {
 				endpoints[k] = ep
@@ -99,7 +109,18 @@ func (m *Metrics) DashboardQuery(w dashboardWindow) []dashboardEndpointAgg {
 // configured endpoints are currently eligible. Eligibility is computed by the
 // caller (which owns the router) rather than here, because the ring knows
 // nothing about cooldowns or circuits.
-func DashboardChainStatus(cfg *Config, eligible func(ep ModelEndpoint) bool) []dashboardChainStatus {
+//
+// The callback returns four values, not one, because "eligible" is a summary
+// that hides the two different reasons an endpoint can be down — an active
+// cooldown and an open circuit — and hiding them is how an operator ends up
+// staring at a pill that says "down" with no way to know which. All four are
+// surfaced in dashboardEndpointInfo and rendered by the page, including the
+// cooldown's expiry so the pill can say "down — cooldown until 14:22" instead
+// of just "down".
+func DashboardChainStatus(
+	cfg *Config,
+	eligible func(ep ModelEndpoint) (ok, cooldown bool, circuit string, cooldownUntil time.Time),
+) []dashboardChainStatus {
 	if cfg == nil {
 		return nil
 	}
@@ -111,17 +132,26 @@ func DashboardChainStatus(cfg *Config, eligible func(ep ModelEndpoint) bool) []d
 			Endpoints: make([]dashboardEndpointInfo, 0, len(mc.Chain)),
 		}
 		for _, ep := range mc.Chain {
-			ok := false
+			ok, cd, circ, until := false, false, "", time.Time{}
 			if eligible != nil {
-				ok = eligible(ep)
+				ok, cd, circ, until = eligible(ep)
 			}
 			if ok {
 				cs.Operational++
 			}
-			cs.Endpoints = append(cs.Endpoints, dashboardEndpointInfo{
+			info := dashboardEndpointInfo{
 				Endpoint: ep.Key(),
 				Eligible: ok,
-			})
+				Cooldown: cd,
+				Circuit:  circ,
+			}
+			// Carry the expiry only when there is an active cooldown. A
+			// zero time would serialize as 0001-01-01 and read as a real
+			// (if nonsensical) cooldown, so omit it instead.
+			if cd && !until.IsZero() {
+				info.CooldownUntil = &until
+			}
+			cs.Endpoints = append(cs.Endpoints, info)
 		}
 		out = append(out, cs)
 	}

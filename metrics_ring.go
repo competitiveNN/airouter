@@ -9,11 +9,22 @@ import "time"
 // Each map is bounded by labelsCap like the cumulative maps, so a single tick
 // cannot grow without bound even if the config churns. The ring as a whole is
 // bounded by dashboardRingLen ticks, so the memory ceiling is fixed.
+//
+// activeSeconds counts the ticks within the window in which the endpoint was
+// actually reached. It exists because the dashboard's speed leaderboard is
+// tokens per SECOND, and "second" is not the window: an endpoint that served
+// 500 tokens in a minute of a 7d window, then went quiet for the other six
+// days, is not a 0.000001 tok/s endpoint — it is a 8.3 tok/s endpoint that
+// happened to be idle. Dividing by the window would rank every quiet endpoint
+// near zero and bury the genuinely fast ones, which is the opposite of what
+// a "fastest" leaderboard should do. The denominator is the time the endpoint
+// was actually busy, which is what the operator wants to compare.
 type attemptTick struct {
-	attempts  map[labelKey]int64
-	failures  map[labelKey]int64
-	latencyNS map[labelKey]int64
-	tokens    map[labelKey]int64
+	attempts    map[labelKey]int64
+	failures    map[labelKey]int64
+	latencyNS   map[labelKey]int64
+	tokens      map[labelKey]int64
+	activeTicks map[labelKey]int64
 	// endpoints maps a key to the raw endpoint string (e.g. "provider:model")
 	// the dashboard renders. The cumulative maps store the endpoint under the
 	// endpoint= label; the ring keeps the raw string alongside so the
@@ -32,11 +43,12 @@ type attemptTick struct {
 // minutes that actually receive a request reach this function.
 func newAttemptTick() *attemptTick {
 	return &attemptTick{
-		attempts:  make(map[labelKey]int64),
-		failures:  make(map[labelKey]int64),
-		latencyNS: make(map[labelKey]int64),
-		tokens:    make(map[labelKey]int64),
-		endpoints: make(map[labelKey]string),
+		attempts:    make(map[labelKey]int64),
+		failures:    make(map[labelKey]int64),
+		latencyNS:   make(map[labelKey]int64),
+		tokens:      make(map[labelKey]int64),
+		activeTicks: make(map[labelKey]int64),
+		endpoints:   make(map[labelKey]string),
 	}
 }
 
@@ -67,6 +79,7 @@ func (m *Metrics) attemptTickForLocked() *attemptTick {
 func (m *Metrics) recordRingAttemptLocked(key labelKey, endpoint string, ns int64, ok bool) {
 	t := m.attemptTickForLocked()
 	t.attempts[key] = t.attempts[key] + 1
+	t.activeTicks[key] = t.activeTicks[key] + 1
 	if !ok {
 		t.failures[key] = t.failures[key] + 1
 	}

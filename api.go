@@ -1710,9 +1710,17 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 
 	// Eligibility is computed by the router, which owns cooldowns and
 	// circuits. The dashboard ring knows nothing about either, so it must
-	// not be asked.
-	eligible := func(ep ModelEndpoint) bool {
-		return g.router.IsAvailable(&ep)
+	// not be asked. ProbeAvailability rather than IsAvailable: the latter
+	// mutates circuit state (Open→HalfOpen, probe counters) and the dashboard
+	// scrapes every 30s, so asking it here would race the request path over
+	// breakers that are mid-recovery.
+	eligible := func(ep ModelEndpoint) (bool, bool, string, time.Time) {
+		ok, cd, circ := g.router.ProbeAvailability(&ep)
+		var until time.Time
+		if cd {
+			until, _ = g.router.CooldownExpiry(&ep)
+		}
+		return ok, cd, circ, until
 	}
 
 	chains := DashboardChainStatus(cfg, eligible)
@@ -1724,8 +1732,9 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 	volume := make([]dashboardLeaderboardEntry, 0, len(aggs))
 	failures := make([]dashboardLeaderboardEntry, 0, len(aggs))
 
-	// The window duration, in seconds, for rate denominators. A zero or
-	// negative window means "no data": the query already returned nil.
+	// The window duration, in seconds, for the volume leaderboard's rate
+	// denominator. A zero or negative window means "no data": the query
+	// already returned nil.
 	secs := float64(dashboardWindowSeconds(win))
 
 	for _, a := range aggs {
@@ -1736,8 +1745,20 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 			LatencyNS: a.LatencyNS,
 			Tokens:    a.Tokens,
 		}
-		if secs > 0 {
-			entry.Rate = float64(a.Tokens) / secs
+		// Speed is tokens per SECOND OF BUSY TIME, not per second of window.
+		// An endpoint that served 500 tokens in one minute of a 7d window and
+		// was idle the rest of it is an 8.3 tok/s endpoint, not a
+		// 0.000001 tok/s one; dividing by the window would rank every quiet
+		// endpoint near zero and bury the genuinely fast ones, which is the
+		// opposite of what a "fastest" leaderboard should do. The ring counts
+		// the ticks in which the endpoint was reached (activeTicks), so the
+		// denominator is the time it was actually busy.
+		//
+		// An endpoint that was reached but produced no tokens (an error
+		// mid-stream, or a non-chat model) gets a rate of zero rather than a
+		// blank — the entry still appears, which is the honest answer.
+		if a.ActiveTicks > 0 {
+			entry.Rate = float64(a.Tokens) / (float64(a.ActiveTicks) * dashboardTickSeconds)
 		}
 		speed = append(speed, entry)
 

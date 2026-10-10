@@ -43,6 +43,11 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .pill{padding:.15rem .5rem;border-radius:999px;font-size:.75rem;font-family:ui-monospace,monospace}
 .pill.ok{background:#dcfce7;color:#166534}
 .pill.no{background:#fee2e2;color:#991b1b}
+/* A down endpoint can be down for two different reasons, and they need
+   different colours: a cooldown is a planned wait (amber, often transient),
+   while an open circuit is a breaker that needs an operator's eye. */
+.pill.cooldown{background:#fef9c3;color:#854d0e}
+.pill.circuit{background:#f3e8ff;color:#6b21a8}
 .sum{color:#64748b;font-size:.85rem;margin-left:auto}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
@@ -123,13 +128,53 @@ function renderChains(chains){
     const eps=el('div');
     eps.style.marginLeft='5rem';
     for(const ep of ch.endpoints){
-      const p=el('span','pill '+(ep.eligible?'ok':'no'), ep.endpoint+' '+(ep.eligible?'up':'down'));
+      let why, cls;
+      if(ep.eligible){
+        // An eligible endpoint with no circuit record is still "closed" —
+        // the breaker has never been created for it, which is the normal
+        // state, not a missing value. Rendering "" here would leave the
+        // circuit column blank for every healthy endpoint.
+        why='up'+(ep.circuit?' ('+ep.circuit+')':'');
+        cls='ok';
+      }
+      else if(ep.cooldown){
+        cls='cooldown';
+        // The expiry is a wall-clock instant. Render it as a countdown so the
+        // operator can see how long to wait without parsing an ISO string,
+        // and keep it live so a page left open shows the remaining time
+        // ticking down rather than a stale timestamp.
+        const t=new Date(ep.cooldown_until).getTime();
+        why='cooldown '+cooldownLabel(t);
+      } else if(ep.circuit&&ep.circuit!=='closed'){ why=ep.circuit; cls='circuit'; }
+      else { why='down'; cls='no'; }
+      const p=el('span','pill '+cls, ep.endpoint+' '+why);
+      if(ep.cooldown) p.dataset.until=ep.cooldown_until;
       p.style.marginRight='6px';
       eps.appendChild(p);
     }
     c.appendChild(eps);
   }
 }
+// Render a cooldown expiry as a countdown ("cooldown 0:02" once under a
+// minute, "cooldown until 14:22" above it), recomputed every second so a page
+// left open shows the remaining time rather than a stale instant. The label
+// is anchored to the page's own clock, not the server's, so it stays
+// consistent with the 30s refresh cadence.
+function cooldownLabel(untilMs){
+  const diff=Math.max(0, untilMs-Date.now());
+  const m=Math.floor(diff/60000), s=Math.floor((diff%60000)/1000);
+  if(m>0) return 'until '+new Date(untilMs).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  return m+':'+String(s).padStart(2,'0');
+}
+setInterval(()=>{
+  // Rewrite only the cooldown pills' countdowns; everything else on the page
+  // is untouched by this timer, which is why a refresh() does not need to
+  // re-render the whole chain card to keep the label live.
+  document.querySelectorAll('.pill.cooldown[data-until]').forEach(p=>{
+    const t=Number(p.dataset.until);
+    if(Number.isFinite(t)) p.textContent=p.textContent.replace(/cooldown \S+$/, 'cooldown '+cooldownLabel(t));
+  });
+}, 1000);
 function renderBoard(id, rows, cols){
   const tb=document.getElementById(id);
   tb.innerHTML='';

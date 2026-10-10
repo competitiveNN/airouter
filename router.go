@@ -758,6 +758,66 @@ func (r *Router) IsAvailable(ep *ModelEndpoint) bool {
 	return r.isAvailableLocked(ep)
 }
 
+// ProbeAvailability reports whether ep is currently eligible, WITHOUT
+// advancing its state. It mirrors isAvailableLocked's decision but refuses to
+// mutate: where isAvailableLocked would transition an Open circuit to
+// half-open and admit a probe, this returns false, and where it would consume
+// a probe slot it reports the probe would succeed without consuming it.
+//
+// Why this exists separately from IsAvailable: the dashboard's chain-status
+// card calls into the router on every 30s refresh, and calling
+// isAvailableLocked there would race the request path over circuit state —
+// every scrape could flip a circuit open→half-open out from under an in-flight
+// request, and every scrape could burn a probe slot so the real recovery
+// probe had nowhere to go. A read-only probe is the honest answer to "is it
+// up right now", and it is what an operator glancing at a dashboard deserves.
+//
+// The three return values (eligible, on cooldown, circuit state) are the same
+// shape the dashboard renders, so the page can show "down — cooldown until
+// 14:22" instead of just "down".
+func (r *Router) ProbeAvailability(ep *ModelEndpoint) (bool, bool, string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.probeAvailabilityLocked(ep)
+}
+
+func (r *Router) probeAvailabilityLocked(ep *ModelEndpoint) (bool, bool, string) {
+	key := ep.Key()
+	cd, hasCooldown := r.cooldowns[key]
+	cb := r.circuits[key]
+
+	circuit := ""
+	if cb != nil {
+		circuit = cb.State.String()
+	}
+
+	// Half-open: a probe slot is available.
+	if cb != nil && cb.State == CircuitHalfOpen {
+		max := r.circuitHalfOpenProbes
+		if max <= 0 {
+			max = defaultCircuitBreakerHalfOpenProbes
+		}
+		if cb.ProbesSent < max {
+			return true, false, circuit
+		}
+		return false, false, circuit
+	}
+
+	// Active cooldown → down, and the reason is the cooldown.
+	if hasCooldown && time.Now().Before(cd.Expiry) {
+		return false, true, circuit
+	}
+
+	// Circuit open → down, and the reason is the breaker. isAvailableLocked
+	// would transition this to half-open and admit a probe; this probe
+	// refuses, because doing so on a scrape would race the request path.
+	if cb != nil && cb.State == CircuitOpen {
+		return false, false, circuit
+	}
+
+	return true, false, circuit
+}
+
 func minDuration(a, b time.Duration) time.Duration {
 	if a < b {
 		return a
@@ -1772,6 +1832,19 @@ func (r *Router) GetAllCooldowns() map[string]CooldownEntry {
 		result[k] = v
 	}
 	return result
+}
+
+// CooldownExpiry returns the expiry time of the active cooldown for ep, and
+// whether one is set. It is read-only: the dashboard uses it to show "cooldown
+// until 14:22" and must not, in doing so, extend or clear the backoff.
+func (r *Router) CooldownExpiry(ep *ModelEndpoint) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cd, ok := r.cooldowns[ep.Key()]
+	if !ok {
+		return time.Time{}, false
+	}
+	return cd.Expiry, true
 }
 
 // CircuitStateSnapshot is a combined view of an endpoint's circuit breaker and
