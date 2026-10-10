@@ -61,6 +61,7 @@ func main() {
 	mux.HandleFunc("/admin/sessions", gateway.HandleAdminSessions)
 	mux.HandleFunc("/admin/cooldowns", gateway.HandleAdminCooldowns)
 	mux.HandleFunc("/admin/config", gateway.HandleAdminConfig)
+	mux.HandleFunc("/admin/dashboard/data", gateway.HandleAdminDashboardData)
 	mux.HandleFunc("/admin/", gateway.HandleAdminDashboard)
 	mux.HandleFunc("/admin/dashboard", gateway.HandleAdminDashboard)
 	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +113,11 @@ func main() {
 		log.Println("Warming up model profiles in the background...")
 		go proxy.Warmup(ctx)
 	}
+
+	// Start the dashboard attempt ring so the 1d/7d leaderboards are live
+	// from startup rather than only after the first dashboard scrape.
+	stopDashboard := gateway.metrics.StartDashboardTelemetry()
+	defer stopDashboard()
 	for name, p := range cfg.Providers {
 		keyStatus := "no key"
 		if p.APIKey() != "" {

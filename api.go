@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1114,6 +1115,9 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if attemptDur > 0 {
 			if copts := extractCompletionTokens(respBody); copts > 0 {
 				g.router.RecordTPS(*ep, float64(copts)/attemptDur.Seconds())
+				if g.metrics != nil {
+					g.metrics.RecordDashboardTokens(ep.Key(), int64(copts))
+				}
 			}
 		}
 
@@ -1289,6 +1293,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			g.recordAttempt(ep, attemptDur, true)
 			if attemptDur > 0 && completionTokens > 0 {
 				g.router.RecordTPS(*ep, float64(completionTokens)/attemptDur.Seconds())
+				if g.metrics != nil {
+					g.metrics.RecordDashboardTokens(ep.Key(), int64(completionTokens))
+				}
 			}
 			// StreamToClient emits [DONE] on success; mark as sent so the
 			// deferred sendDone() doesn't emit a duplicate.
@@ -1628,78 +1635,103 @@ func (g *GatewayContext) HandleAdminDashboard(w http.ResponseWriter, r *http.Req
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
 		return
 	}
-	// Simple static dashboard HTML
-	html := `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>AI Router Dashboard</title>
-<style>
-body{font-family:system-ui,sans-serif;margin:0;padding:0;background:#f6f7fb;color:#111}
-header{background:#0f172a;color:#fff;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center}
-main{padding:2rem}
-.card{background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.1);padding:1.5rem;margin-bottom:1.5rem}
-h2{margin-top:0}
-textarea{background:#0f172a;color:#e2e8f0;padding:1rem;border-radius:8px;overflow:auto;font-family:ui-monospace,monospace}
-button{background:#2563eb;color:#fff;border:none;padding:.6rem 1rem;border-radius:8px;cursor:pointer;margin-right:.5rem}
-button:disabled{opacity:.5}
-</style>
-</head>
-<body>
-<header><h1>AI Router Dashboard</h1><span id="status"></span></header>
-<main>
-<div class="card">
-<h2>Config Editor</h2>
-<p>Load and edit config (JSON). Save writes back to config.yaml and reloads.</p>
-<button id="load">Load Config</button>
-<button id="save" disabled>Save Config</button>
-<textarea id="editor" rows="30" style="width:100%;"></textarea>
-</div>
-<div class="card">
-<h2>Quick View</h2>
-<div id="summary"></div>
-</div>
-</main>
-<script>
-const apiKey = prompt('Enter gateway API key for admin:') || '';
-async function req(path, opts={}) {
-  const headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
-  if(apiKey) headers['Authorization']='Bearer '+apiKey;
-  const res = await fetch(path,{...opts,headers});
-  if(!res.ok){ const t=await res.text(); throw new Error(t); }
-  return res.headers.get('content-type')?.includes('application/json')? res.json(): res.text();
-}
-let cfg=null;
-const editor=document.getElementById('editor');
-document.getElementById('load').onclick=async()=>{
-  try{
-    cfg=await req('/admin/config');
-    editor.value=JSON.stringify(cfg,null,2);
-    document.getElementById('save').disabled=false;
-    renderSummary(cfg);
-    document.getElementById('status').textContent='Loaded';
-  }catch(e){ alert(e); }
-};
-document.getElementById('save').onclick=async()=>{
-  try{
-    const parsed=JSON.parse(editor.value);
-    await req('/admin/config',{method:'POST',body:JSON.stringify(parsed)});
-    alert('Saved and reloaded');
-    document.getElementById('status').textContent='Saved';
-  }catch(e){ alert('Save failed: '+e); }
-};
-function renderSummary(c){
-  const providers=Object.keys(c.providers||{}).length;
-  const models=Object.keys(c.models||{}).length;
-  document.getElementById('summary').innerHTML='<b>Providers:</b> '+providers+'<br><b>Logical models:</b> '+models;
-}
-document.getElementById('load').click();
-</script>
-</body>
-</html>`
+	if r.Method != http.MethodGet {
+		writeAPIError(w, 405, "Method not allowed", "invalid_request_error", "method_not_allowed")
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
-	w.Write([]byte(html))
+	w.Write([]byte(dashboardHTML))
+}
+
+// HandleAdminDashboardData serves the JSON payload the dashboard page fetches.
+// It bundles chain status and the three leaderboards (speed, volume, failures)
+// so a single request populates the page, and it rejects unknown windows
+// rather than silently defaulting.
+func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http.Request) {
+	if !g.checkAuth(r) {
+		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeAPIError(w, 405, "Method not allowed", "invalid_request_error", "method_not_allowed")
+		return
+	}
+	if g.metrics == nil {
+		writeAPIError(w, 503, "Metrics not available", "server_error", "not_initialized")
+		return
+	}
+
+	raw := r.URL.Query().Get("window")
+	win, ok := dashboardWindowFor(raw)
+	if !ok {
+		writeAPIError(w, 400, "Unknown window", "invalid_request_error", "unknown_window")
+		return
+	}
+
+	cfg := g.router.Config()
+
+	// Eligibility is computed by the router, which owns cooldowns and
+	// circuits. The dashboard ring knows nothing about either, so it must
+	// not be asked.
+	eligible := func(ep ModelEndpoint) bool {
+		return g.router.IsAvailable(&ep)
+	}
+
+	chains := DashboardChainStatus(cfg, eligible)
+	aggs := g.metrics.DashboardQuery(win)
+
+	// Derive the three leaderboards from the same aggregate set so they
+	// cannot disagree about what happened in the window.
+	speed := make([]dashboardLeaderboardEntry, 0, len(aggs))
+	volume := make([]dashboardLeaderboardEntry, 0, len(aggs))
+	failures := make([]dashboardLeaderboardEntry, 0, len(aggs))
+
+	// The window duration, in seconds, for rate denominators. A zero or
+	// negative window means "no data": the query already returned nil.
+	secs := float64(dashboardWindowSeconds(win))
+
+	for _, a := range aggs {
+		entry := dashboardLeaderboardEntry{
+			Endpoint:  a.Endpoint,
+			Attempts:  a.Attempts,
+			Failures:  a.Failures,
+			LatencyNS: a.LatencyNS,
+			Tokens:    a.Tokens,
+		}
+		if secs > 0 {
+			entry.Rate = float64(a.Tokens) / secs
+		}
+		speed = append(speed, entry)
+
+		entry.Rate = 0
+		if secs > 0 {
+			entry.Rate = float64(a.Attempts) / secs
+		}
+		volume = append(volume, entry)
+
+		entry.Rate = 0
+		if a.Attempts > 0 {
+			entry.Rate = float64(a.Failures) / float64(a.Attempts)
+		}
+		failures = append(failures, entry)
+	}
+
+	sort.Slice(speed, func(i, j int) bool { return speed[i].Rate > speed[j].Rate })
+	sort.Slice(volume, func(i, j int) bool { return volume[i].Rate > volume[j].Rate })
+	sort.Slice(failures, func(i, j int) bool { return failures[i].Rate > failures[j].Rate })
+
+	resp := dashboardResponse{
+		Chains:    chains,
+		Speed:     speed,
+		Volume:    volume,
+		Failures:  failures,
+		Window:    string(win),
+		Generated: time.Now(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
