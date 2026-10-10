@@ -526,10 +526,10 @@ func TestDashboardApiKeyQueryAuth(t *testing.T) {
 	g := dashboardTestGateway(t, cfg)
 
 	cases := []struct {
-		name    string
-		header  string
-		query   string
-		want    int
+		name   string
+		header string
+		query  string
+		want   int
 	}{
 		{"key in query is accepted", "", "api_key=secret", 200},
 		{"wrong key in query is rejected", "", "api_key=WRONG", 401},
