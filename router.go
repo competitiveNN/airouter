@@ -989,6 +989,12 @@ func (r *Router) ChainLength(logicalModel string) int {
 	return len(chain.Chain)
 }
 
+// Config returns the current configuration snapshot. It uses atomic.Load,
+// so it satisfies TSan. Used by the dashboard to render chains.
+func (r *Router) Config() *Config {
+	return r.config.Load()
+}
+
 func (r *Router) ApplyCooldown(ep *ModelEndpoint, statusCode int, errMsg string) {
 	r.ApplyCooldownForSession(ep, statusCode, errMsg, "", 0)
 }

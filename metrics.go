@@ -12,6 +12,31 @@ import (
 	"time"
 )
 
+// dashboardWindow names the selectable time windows the dashboard's
+// leaderboards are computed over. They are exposed as query parameters and
+// validated at the handler, so an unknown window is a 400 rather than a
+// silent fallback to "1d".
+type dashboardWindow string
+
+const (
+	dashboardWindow1d dashboardWindow = "1d"
+	dashboardWindow7d dashboardWindow = "7d"
+)
+
+// dashboardTickSeconds is the granularity of the attempt ring. One minute is
+// coarse enough that a tick never spans a request boundary in a way that
+// matters for a leaderboard (a model measured over 60s vs 59s is noise, not
+// signal) and fine enough that the 1d window is 24 samples and 7d is 168 —
+// both cheap to sum at scrape time.
+const dashboardTickSeconds = 60
+
+// dashboardRingLen is the number of ticks held, which must cover the longest
+// window (7d = 10080 minutes) plus one to keep the current tick distinct from
+// the oldest. It is a fixed allocation: memory is bounded by
+// dashboardRingLen * labelsCap regardless of how long the process lives, which
+// is the property the label cap exists to guarantee for the other maps.
+const dashboardRingLen = 10080 + 1
+
 // Metrics collects Prometheus-style metrics for operational visibility.
 // All counters are atomic for thread-safe updates without locks.
 type Metrics struct {
@@ -62,22 +87,56 @@ type Metrics struct {
 	// exporter does not have to sort or merge anything at scrape time.
 	attemptLatencyBounds []float64 // seconds
 	attemptHistByEnd     map[labelKey][]atomic.Int64
+
+	// attemptRing holds one minute of per-endpoint attempt telemetry, rolling
+	// forward on a background ticker, so the dashboard can answer "how fast /
+	// how many requests / how many failures did this endpoint serve in the
+	// last N hours" without needing a time-series database.
+	//
+	// The ring is the only place in the registry that is not bounded by the
+	// label cap: it is a fixed-size array of slots, and each slot holds a
+	// bounded map. The total memory is dashboardRingLen * labelsCap regardless
+	// of how long the process lives, which is the same guarantee the label cap
+	// makes for the cumulative maps — just achieved by size rather than by
+	// collapse.
+	//
+	// Why a ring and not a cumulative counter with a timestamp? The cumulative
+	// maps answer "ever", which is what /metrics exposes. The dashboard needs
+	// "recently", and without a ring the only honest answer would be to walk
+	// every observation ever recorded, which is unbounded. A ring trades a
+	// little precision (a tick boundary can split one observation) for a hard
+	// memory bound, which is the right trade for operator-facing aggregates.
+	//
+	// The tick advances on a background goroutine started by
+	// StartDashboardTelemetry, not by Attempt itself. Attempt therefore never
+	// blocks on the ring and never races with the ticker: the current tick is
+	// read under the write lock, and the ticker only ever writes to the NEXT
+	// slot, which Attempt is not currently touching.
+	attemptRing []*attemptTick
+	// attemptRingNow is the index of the current tick, updated by the
+	// background ticker under the write lock. It is read by Attempt under the
+	// same lock. Kept as an index rather than a time.Time so the tick math is
+	// exact and cannot drift against the wall clock.
+	attemptRingNow int
+	// attemptRingStarted reports whether the background ticker has been
+	// started, so the dashboard can distinguish "no data yet" from "the ring
+	// is empty because nothing has been recorded".
+	attemptRingStarted bool
 	// labelsCap bounds the number of distinct label values any single
 	// label-value map may hold. See boundedAttemptKeyLocked for why this exists and
 	// why the cap is enforced on the stored keys rather than on the output.
 	labelsCap int
-	// attemptAdmitted[i] is the index into the attempt admission ring, and
-	// attemptRing[i] is the label that occupied it. Together they implement a
-	// FIFO admission window over attemptsByEndpoint: the label whose slot is
-	// oldest is the one recycled when a new value needs room. See
-	// boundedAttemptKeyLocked for why FIFO beats a purely "first come, never
-	// evicted" set.
+	// attemptAdmitted[i] is the admission counter for the label at
+	// attemptLabels[i]. Together they implement a FIFO admission window over
+	// attemptsByEndpoint: the label whose slot is oldest is the one recycled
+	// when a new value needs room. See boundedAttemptKeyLocked for why FIFO
+	// beats a purely "first come, never evicted" set.
 	attemptAdmitted []int64 // counter/clock, monotonically increasing
-	attemptRing     []labelKey
+	attemptLabels   []labelKey
 	// attemptClock is the admission counter that attemptAdmitted entries are
 	// compared against.
 	attemptClock int64
-	// attemptIndex maps an admitted label to its position in attemptRing.
+	// attemptIndex maps an admitted label to its position in attemptLabels.
 	attemptIndex map[labelKey]int
 	// labelsEvicted counts labels displaced from the admission window to make
 	// room for a new one. Distinct from labelsOverflowed (collapsed into the
@@ -174,6 +233,7 @@ func NewMetrics() *Metrics {
 		attemptIndex:            make(map[labelKey]int),
 		labelsCap:               defaultMaxLabelValues,
 		overflowKey:             overflowLabelKey,
+		attemptRing:             make([]*attemptTick, dashboardRingLen),
 	}
 	m.attemptLatencyBounds = attemptLatencyBoundaries
 	m.latencyBoundaries = defaultLatencyBuckets
@@ -223,8 +283,8 @@ func (m *Metrics) SetLabelCap(n int) {
 // syncRingLocked drops ring entries whose label is no longer in the attempt
 // map. Caller holds m.mu.
 func (m *Metrics) syncRingLocked() {
-	for i := 0; i < len(m.attemptRing); {
-		ep := m.attemptRing[i]
+	for i := 0; i < len(m.attemptLabels); {
+		ep := m.attemptLabels[i]
 		if _, live := m.attemptsByEndpoint[ep]; live && ep != m.overflowKey {
 			i++
 			continue
@@ -416,6 +476,13 @@ func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
 			m.attemptHistByEnd[m.overflowKey] = make([]atomic.Int64, len(m.attemptLatencyBounds)+1)
 		}
 	}
+	// The dashboard ring is updated here too, under the same lock, so the
+	// cumulative maps and the ring always agree about what happened in this
+	// tick. It is the same "decide once, up front" pattern as
+	// boundedAttemptKeyLocked: the key is resolved here and passed to the ring,
+	// which never calls boundedAttemptKeyLocked itself and so cannot disagree
+	// about which bucket an observation landed in.
+	m.recordRingAttemptLocked(key, endpoint, ns, ok)
 	m.mu.Unlock()
 
 	h[idx].Add(1)
@@ -535,8 +602,8 @@ func (m *Metrics) admitLocked(endpoint labelKey) *atomic.Int64 {
 	}
 	m.attemptClock++
 	m.attemptAdmitted = append(m.attemptAdmitted, m.attemptClock)
-	m.attemptRing = append(m.attemptRing, endpoint)
-	m.attemptIndex[endpoint] = len(m.attemptRing) - 1
+	m.attemptLabels = append(m.attemptLabels, endpoint)
+	m.attemptIndex[endpoint] = len(m.attemptLabels) - 1
 	c := &atomic.Int64{}
 	m.attemptsByEndpoint[endpoint] = c
 	return c
@@ -550,7 +617,7 @@ func (m *Metrics) admitLocked(endpoint labelKey) *atomic.Int64 {
 // would drop observations on the floor and could hand the same label both a real
 // series and a bucket role.
 func (m *Metrics) oldestAdmittedLocked() labelKey {
-	for i, ep := range m.attemptRing {
+	for i, ep := range m.attemptLabels {
 		if i >= len(m.attemptAdmitted) {
 			break
 		}
@@ -568,14 +635,14 @@ func (m *Metrics) oldestAdmittedLocked() labelKey {
 }
 
 // compactRingLocked drops ring/index entry i, keeping attemptAdmitted aligned
-// with attemptRing. Caller holds m.mu.
+// with attemptLabels. Caller holds m.mu.
 func (m *Metrics) compactRingLocked(i int) {
-	ep := m.attemptRing[i]
+	ep := m.attemptLabels[i]
 	delete(m.attemptIndex, ep)
-	m.attemptRing = append(m.attemptRing[:i], m.attemptRing[i+1:]...)
+	m.attemptLabels = append(m.attemptLabels[:i], m.attemptLabels[i+1:]...)
 	m.attemptAdmitted = append(m.attemptAdmitted[:i], m.attemptAdmitted[i+1:]...)
-	for j := i; j < len(m.attemptRing); j++ {
-		m.attemptIndex[m.attemptRing[j]] = j
+	for j := i; j < len(m.attemptLabels); j++ {
+		m.attemptIndex[m.attemptLabels[j]] = j
 	}
 }
 

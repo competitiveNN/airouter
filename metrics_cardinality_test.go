@@ -150,8 +150,8 @@ func TestMetricsCardinalityBoundaryIsExact(t *testing.T) {
 			if len(m.attemptIndex) != ringWanted {
 				t.Errorf("admission index has %d entries, want %d (map size %d)", len(m.attemptIndex), ringWanted, len(m.attemptsByEndpoint))
 			}
-			if len(m.attemptRing) != ringWanted {
-				t.Errorf("admission ring has %d entries, want %d", len(m.attemptRing), ringWanted)
+			if len(m.attemptLabels) != ringWanted {
+				t.Errorf("admission ring has %d entries, want %d", len(m.attemptLabels), ringWanted)
 			}
 			for ep := range m.attemptIndex {
 				if _, ok := m.attemptsByEndpoint[ep]; !ok {

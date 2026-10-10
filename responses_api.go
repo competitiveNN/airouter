@@ -212,6 +212,12 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 
 		g.router.RecordSuccess(ep)
 		g.recordAttempt(ep, time.Since(attemptStart), true)
+		if chat.Usage != nil && chat.Usage.CompletionTokens > 0 {
+			g.router.RecordTPS(*ep, float64(chat.Usage.CompletionTokens)/time.Since(attemptStart).Seconds())
+			if g.metrics != nil {
+				g.metrics.RecordDashboardTokens(ep.Key(), int64(chat.Usage.CompletionTokens))
+			}
+		}
 		env := buildResponseEnvelope(chat, req.Model)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
@@ -315,6 +321,10 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		var buf strings.Builder
 		attempt := newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
 		tokens := estimateTokens(req)
+		// attemptStart times this single upstream attempt; `start` above is
+		// the request-level clock. Sharing them would make the TPS figure a
+		// per-request rather than a per-attempt measurement.
+		attemptStart := time.Now()
 		text, toolCalls, err := g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt)
 		if err != nil {
 			tried[ep.Key()] = true
@@ -337,6 +347,18 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		fmt.Fprint(w, buf.String())
 		flusher.Flush()
 		g.router.RecordSuccess(ep)
+		attemptDur := time.Since(attemptStart)
+		g.recordAttempt(ep, attemptDur, true)
+		// The speed leaderboard is driven by the ring, which needs the token
+		// count. The usage event arrives at the end of the stream — often
+		// after [DONE] — so it is only available now, once the attempt has
+		// succeeded and its usage belongs to output the client received.
+		if n := attempt.usage; n > 0 && attemptDur > 0 {
+			g.router.RecordTPS(*ep, float64(n)/attemptDur.Seconds())
+			if g.metrics != nil {
+				g.metrics.RecordDashboardTokens(ep.Key(), int64(n))
+			}
+		}
 		log.Printf("[debug] session=%s model=%s -> responses stream -> %s/%s (%d chars)", sessionID, req.Model, ep.Provider, ep.Model, tokens)
 		_ = text
 		_ = toolCalls

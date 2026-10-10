@@ -54,6 +54,24 @@ type responsesStreamWriter struct {
 	itemOpen bool
 	sawText  bool
 	acc      strings.Builder
+	// usage holds the completion tokens reported by an upstream usage event.
+	// It is accumulated here (rather than returned by value) because
+	// translateChatSSE returns three values already and a fourth would make
+	// every call site misorder them; the field also survives the fallback
+	// path, where a second attempt's usage must overwrite rather than add to
+	// the first — see setUsage.
+	usage int
+}
+
+// setUsage records the upstream-reported completion token count. It replaces
+// rather than accumulates: when a stream falls back to the next model, the
+// token count belongs to whichever attempt finally succeeded, and adding
+// aborted attempts' tokens would inflate the speed leaderboard with output
+// the client never received.
+func (s *responsesStreamWriter) setUsage(n int) {
+	if n > 0 {
+		s.usage = n
+	}
 }
 
 // flushWriter is the subset of http.Flusher the writer needs, so tests can
@@ -331,9 +349,15 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter) (string, []streamT
 					} `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage *struct {
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
 		}
 		if err := json.Unmarshal(raw, &chunk); err != nil {
 			continue
+		}
+		if chunk.Usage != nil && chunk.Usage.CompletionTokens > 0 {
+			sw.setUsage(chunk.Usage.CompletionTokens)
 		}
 		if len(chunk.Choices) == 0 {
 			continue
