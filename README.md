@@ -390,6 +390,7 @@ bash scripts/gate.sh                # the full serialized gate (flock + tree fin
 go test -race -count=1 ./...        # the Go suite; run it before committing
 gofmt -l .                          # must print nothing
 go vet ./...
+bash scripts/smoke_dashboard.sh     # the dashboard against the real binary
 python3 scripts/run-config-tests.py # config suites; asserts a collection floor
 python3 scripts/mutation-check.py   # plants defects, proves the suites go red
 python3 scripts/validate-config.py config.yaml
@@ -400,6 +401,15 @@ python3 scripts/audit-drift-check.py
 `scripts/sse-negative-check.sh` mutates the SSE ordering logic and asserts
 the tests fail, then restores it — a guard that passes both ways guards
 nothing.
+
+`scripts/smoke_dashboard.sh` boots the gateway against a fake upstream and
+asserts the dashboard reflects real traffic. It is the only check of the
+wiring: the route registration in main.go, token recording reaching all four
+response paths, the attempt ring ticking, and a 429 becoming both a cooldown
+entry and a failure-leaderboard row. Its `work` chain leads with a
+deliberately broken endpoint so the fallback path is exercised — a chain of
+healthy endpoints alone would let the failure leaderboard and the
+"operational N/M" panel stay dead code both green.
 
 CI (`.github/workflows/ci.yml`) runs the Go suite, the config suites
 and the mutation harness, and an end-to-end `sse-contract` job that
