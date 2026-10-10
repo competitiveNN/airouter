@@ -483,6 +483,23 @@ func TestDashboardHandlerServesHTML(t *testing.T) {
 			t.Errorf("dashboard page missing %q", want)
 		}
 	}
+	// The page advertises the failure reasons it renders. Pinning these as
+	// static strings is what catches a regression that removes the
+	// cooldown/circuit distinction from the renderer without touching
+	// anything else: the data endpoint would still return the fields, the
+	// leaderboards would still render, and only the pills would silently
+	// collapse back to "down".
+	for _, want := range []string{"cooldown", "circuit", "cooldown_until", "1d", "7d"} {
+		if !contains(body, want) {
+			t.Errorf("dashboard page missing %q — the cooldown/circuit rendering or the window selector is gone", want)
+		}
+	}
+	// The speed leaderboard must not be labelled "tokens per second of
+	// window", which is the rate that buries quiet endpoints. The label is
+	// the contract for the denominator.
+	if !contains(body, "tokens/s") {
+		t.Errorf("dashboard page missing the tokens/s rate column — the speed leaderboard has no rate")
+	}
 }
 
 func contains(s, sub string) bool {

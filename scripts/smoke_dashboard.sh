@@ -159,10 +159,16 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
         if model == "broken-model":
+            # A 500, not a 429. Both go through applyCooldown and so both
+            # produce a cooldown entry, but the distinction matters here: the
+            # smoke run already proves the cooldown column, and the circuit
+            # column has never been exercised by real traffic at all. A 500 is
+            # also what trips the breaker at threshold 1 below, so this one
+            # request lights up both failure reasons on the same endpoint.
             body = json.dumps({
-                "error": {"message": "rate limited", "type": "rate_limit_error"},
+                "error": {"message": "internal server error", "type": "internal_error"},
             }).encode()
-            self.send_response(429)
+            self.send_response(500)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -240,6 +246,12 @@ providers:
     api_key_env: SMOKE_FAKE_KEY
 preferences:
   initial_rotation_window: 0
+  # A threshold of 1 means the FIRST failure trips the breaker. That is the
+  # setting that lets this run prove the circuit column of the chain card
+  # with a single request: the 500 from broken-model both produces a
+  # cooldown and opens its circuit, so the card must show an open breaker
+  # rather than a bare "down".
+  circuit_breaker_threshold: 1
 models:
   smart:
     chain:
@@ -398,7 +410,22 @@ if len(down) != 1 or down[0]["endpoint"] != "fake:broken-model":
     print(f"  FAIL the cooled endpoint should be fake:broken-model, got "
           f"{[e['endpoint'] for e in down]}", file=sys.stderr)
     sys.exit(1)
-print("  ok work chain reports 1/2 operational and names the cooled endpoint")
+# The card must say WHY it is down, and the two reasons must be
+# distinguishable: a 500 at threshold 1 produces both a cooldown AND an
+# open circuit, so the card carries both. A dashboard that rendered a
+# bare "down" here would fail this assertion while still reporting
+# 1/2 operational, which is exactly how the circuit column went
+# unexercised before.
+b = down[0]
+if not b["cooldown"] or b.get("cooldown_until") is None:
+    print(f"  FAIL broken-model should carry a cooldown with an expiry, got {b}", file=sys.stderr)
+    sys.exit(1)
+if b["circuit"] != "open":
+    print(f"  FAIL broken-model's circuit should be open after a 500 at "
+          f"threshold 1, got {b}", file=sys.stderr)
+    sys.exit(1)
+print("  ok work chain reports 1/2 operational, with the broken endpoint "
+      "carrying a cooldown AND an open circuit")
 PY
 fi
 
