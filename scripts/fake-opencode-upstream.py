@@ -224,10 +224,20 @@ class Handler(BaseHTTPRequestHandler):
         """True when this request should come back 200 with no content.
 
         Reproduces an artifact seen live on 2026-09-30 against
-        opencode.ai/zen/v1: HTTP 200, no cooldown, no timeout, and no usable
-        content. A harness that only treats non-200 as failure calls that a
+        opencode.ai/zen/v1: HTTP 200, no cooldown, no timeout, and no
+        usable content. A harness that only treats non-200 as failure calls that a
         routing fault; it is an upstream artifact and must be retried.
+        Both response modes reproduce it, because airouter's gate-body
+        rewrite sends stream=true upstream for every chat completion.
+
+        The preflight is excepted: it is a liveness probe whose only
+        assertion is the status code, so an artifact here would be
+        unobserved and would spend the --empty-first budget on a
+        request nothing checks. The check marks its preflight with a
+        private header for exactly this purpose.
         """
+        if self.headers.get("x-opencode-preflight"):
+            return False
         if not self.empty_first:
             return False
         return _next_serve_index() <= self.empty_first
@@ -268,11 +278,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
+        empty = self._served_empty()
         body = b""
-        body += chunk(model, {"role": "assistant", "content": ""})
-        for text in CHUNKS:
-            body += chunk(model, {"content": text})
-        body += chunk(model, {}, "stop")
+        if empty:
+            # The streamed form of the artifact _complete reproduces:
+            # the reasoning model spent the whole budget before emitting
+            # any content, so the stream completes with no content
+            # deltas at all -- a reasoning_content delta, then a
+            # finish_reason "length" final chunk. airouter rewrites
+            # every chat completion into the free-tier gate's shape
+            # (stream=true), so this is the path the artifact takes.
+            body += chunk(model, {"role": "assistant"})
+            body += chunk(model, {"reasoning_content": "thinking"})
+            body += chunk(model, {}, "length")
+        else:
+            body += chunk(model, {"role": "assistant", "content": ""})
+            for text in CHUNKS:
+                body += chunk(model, {"content": text})
+            body += chunk(model, {}, "stop")
         body += event(
             {
                 "id": "chatcmpl-fake",
@@ -280,7 +303,8 @@ class Handler(BaseHTTPRequestHandler):
                 "created": 1700000000,
                 "model": model,
                 "choices": [],
-                "usage": {"completion_tokens": 3, "total_tokens": 15},
+                "usage": {"prompt_tokens": 12, "completion_tokens": 32 if empty else 3,
+                          "total_tokens": 44 if empty else 15},
             }
         )
         body += b"data: [DONE]\n\n"
@@ -311,7 +335,7 @@ def main() -> int:
         type=int,
         default=0,
         metavar="N",
-        help="answer the first N non-streaming requests with HTTP 200 and no "
+        help="answer the first N requests with HTTP 200 and no "
              "content, reproducing the empty-completion artifact seen live",
     )
     args = ap.parse_args()

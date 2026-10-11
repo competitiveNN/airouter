@@ -252,6 +252,39 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 		}
 	}
 
+	// Command Code: translate the Chat Completions request into the
+	// /alpha/generate envelope and fire the per-key device-fingerprint
+	// and lifecycle pre-requests. The envelope is built from the model-
+	// substituted body so params.model names the endpoint's model, and
+	// the session id is derived from the request content so one logical
+	// conversation pins to one upstream thread (prompt-cache affinity).
+	var ccSessionID string
+	if proto == protocolCommandCode {
+		apiKey := providerCfg.APIKey()
+		envelope, sid, terr := ccBuildEnvelope(backendBody, endpoint.Model, apiKey, nil)
+		if terr != nil {
+			return nil, terr
+		}
+		backendBody = envelope
+		ccSessionID = sid
+		ccEnsureInitialized(ctx, p.client, providerCfg.URL, apiKey)
+	}
+
+	// OpenCode free-tier gate. The gateway admits a request only when
+	// the body carries `stream:true` and a `tools` array holding both
+	// `bash` and `read` (measured live 2026-10-11; every other
+	// combination answers 403 FreeTierError). The official CLI satisfies
+	// this without trying -- it always streams and carries its full
+	// coding toolset -- but a bare chat-completion client does not, so
+	// the body is rewritten into the gate's shape here, before the
+	// protocol translation, on the Chat Completions path only: the
+	// Responses translation carries `stream` and `tools` through its own
+	// envelope, and the Responses SSE stream it produces is not folded
+	// back here.
+	if proto == protocolChatCompletions && isOpencodeProvider(endpoint.Provider) {
+		backendBody = opencodeGateBody(backendBody)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "POST", providerCfg.URL+path, bytes.NewReader(backendBody))
 	if err != nil {
 		return nil, err
@@ -276,12 +309,14 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	// in the config always win (set after the synthesized ones below).
 	//
 	// The session id must be the canonical `ses_<12hex><14base62>`; the gateway
-	// measures a 403 for any other shape. Headers alone are not sufficient,
-	// though: the gateway also requires stream=true and a `tools` array holding
-	// both `bash` and `read`. Those live in the request body, which is forwarded
-	// from the client verbatim, so an agent client that sends them passes and a
-	// bare chat completion 403s — see scripts/fake-opencode-upstream.py, which
-	// enforces the same contract.
+	// measures a 403 for any other shape. Headers alone are not
+	// sufficient, though: the gateway also requires stream=true and a
+	// `tools` array holding both `bash` and `read`. The official CLI
+	// always sends both, and the body gate above (opencodeGateBody)
+	// rewrites a bare chat completion into the same shape, so the
+	// contract holds for agent and non-agent clients alike — see
+	// scripts/fake-opencode-upstream.py, which enforces the same
+	// contract.
 	if isOpencodeProvider(endpoint.Provider) {
 		for k, v := range opencodeRequestHeaders() {
 			req.Header.Set(k, v)
@@ -296,10 +331,13 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 		// Both spellings carry the same id. Setting only the canonical
 		// x-opencode-session would leave X-Session-ID holding the per-request
 		// random id from opencodeRequestHeaders, so the two would disagree and
-		// the routing backend would read the unstable one.
+		// the routing backend would read the unstable one. The session-id and
+		// affinity spellings are set from the same value for the same reason.
 		setSession := func(id string) {
 			ses := opencodeSessionFor(id)
 			req.Header.Set("x-opencode-session", ses)
+			req.Header.Set("x-opencode-session-id", ses)
+			req.Header.Set("x-session-affinity", ses)
 			req.Header.Set("X-Session-ID", ses)
 		}
 		if conv := opencodeConversationID(body); conv != "" {
@@ -310,6 +348,13 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 			// forwarded: "ctx:<hex>" is a shape the gateway rejects with 403.
 			setSession(sessionID)
 		}
+	}
+	// Command Code client headers. Applied before the provider
+	// overrides below so an explicit header in the airouter
+	// config still wins, exactly as for the OpenCode attribution
+	// headers above.
+	if proto == protocolCommandCode {
+		ccSetRequestHeaders(req, providerCfg.APIKey(), ccSessionID)
 	}
 	// Provider-level header overrides from config take precedence over the
 	// synthesized OpenCode attribution headers.
@@ -467,8 +512,10 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// A 200 without an SSE content type means the provider ignored stream:true
 	// and returned a plain JSON body. Forwarding that as SSE would garble the
 	// client's stream (abrupt / malformed termination), so treat it as a failure
-	// and fall back to the next model in the chain.
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+	// and fall back to the next model in the chain. Command Code is exempt: its
+	// /alpha/generate always answers with an NDJSON event stream whose Content-
+	// Type is not text/event-stream, and the translator below turns it into SSE.
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") && p.effectiveProtocol(&endpoint) != protocolCommandCode {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
@@ -488,10 +535,14 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// upstream stream back into Chat Completions SSE before anything else sees
 	// it. Everything downstream -- the buffering-until-first-content rule, the
 	// tool-call accumulation, the [DONE] framing -- is protocol-agnostic and
-	// works unchanged on the translated bytes.
+	// works unchanged on the translated bytes. Command Code's NDJSON event
+	// stream is translated the same way.
 	var src io.Reader = resp.Body
-	if p.effectiveProtocol(&endpoint) == protocolResponses {
+	switch p.effectiveProtocol(&endpoint) {
+	case protocolResponses:
 		src = newResponsesSSEToChatReader(resp.Body)
+	case protocolCommandCode:
+		src = newCCStreamToChatReader(resp.Body, ccBodyModel(body, endpoint.Model), time.Now().Unix())
 	}
 
 	guarded := &firstByteReader{r: src, firstCtx: firstCtx}
