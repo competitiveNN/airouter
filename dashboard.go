@@ -105,18 +105,18 @@ async function req(path, opts={}) {
   if(!res.ok){ const t=await res.text(); throw new Error(t); }
   return res.headers.get('content-type')?.includes('application/json')? res.json(): res.text();
 }
-let window='1d';
+let activeWindow='1d';
 function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e; }
 function renderWindowSel(){
   const s=document.getElementById('wsel');
   s.innerHTML='';
   for(const w of ['1d','7d','30d']){
-    const b=el('button', 'wsel'+(w===window?' on':''), w);
-    b.onclick=()=>{ window=w; refresh(); };
+    const b=el('button', 'wsel'+(w===activeWindow?' on':''), w);
+    b.onclick=()=>{ activeWindow=w; refresh(); };
     s.appendChild(b);
   }
 }
-function renderChains(chains){
+function renderChains(chains, breaker){
   const c=document.getElementById('chains');
   c.innerHTML='';
   if(!chains || !chains.length){ c.textContent='No chains configured.'; return; }
@@ -125,7 +125,10 @@ function renderChains(chains){
   // circuit column means anything, and a field they cannot see is a field
   // that gets forgotten. When the breaker is off every endpoint renders ""
   // or "closed", and without this label the column looks like decoration.
-  const breaker = d.circuit_breaker;
+  // The flag arrives as an argument: reading it off the payload's
+  // top-level object here would be a ReferenceError, because that
+  // object lives in refresh()'s scope, and an exception here
+  // would blank the whole page.
   for(const ch of chains){
     const row=el('div','chain');
     row.appendChild(el('b',null,ch.model));
@@ -200,7 +203,7 @@ function renderBoard(id, rows, cols){
 }
 async function refresh(){
   try{
-    const d=await req('/admin/dashboard/data?window='+window);
+    const d=await req('/admin/dashboard/data?window='+activeWindow);
     // Anchor the countdown to the gateway's clock. The browser's clock is
     // not trustworthy here: a laptop five minutes ahead renders every
     // cooldown as already expired, and one behind makes a cooldown that has
@@ -209,7 +212,7 @@ async function refresh(){
     // reference the countdown advances from.
     if(d.now) serverNow = new Date(d.now).getTime();
     renderWindowSel();
-    renderChains(d.chains||[]);
+    renderChains(d.chains||[], d.circuit_breaker);
     renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.latency_percentiles?r.latency_percentiles.p50_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p95_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p99_ms:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
     renderBoard('volume', d.volume||[], [[r=>r.rate,v=>v.toFixed(3)],[r=>r.attempts,v=>v]]);
     renderBoard('failures', d.failures||[], [[r=>r.rate,v=>(v*100).toFixed(1)+'%'],[r=>r.failures,v=>v]]);

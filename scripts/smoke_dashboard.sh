@@ -711,6 +711,112 @@ else:
     sys.exit(1)
 PY
 
+# --- execute the page's JavaScript, the way a browser does ---------------
+# Every assertion above greps the HTML or the payload. Neither can
+# catch a runtime error in the page's own script: a ReferenceError
+# inside refresh() leaves every table empty while the HTML, the
+# payload and every grep stay green. That is exactly how the
+# dashboard went empty while the data endpoint was fully populated.
+# So the last stage runs the page's script in node against a mocked
+# DOM whose fetch returns the payload the daemon really served, and
+# asserts the render functions populated the document.
+if command -v node >/dev/null 2>&1; then
+  PAGE_HTML="$(curl -s -H "$AUTH" "$BASE/admin/dashboard")"
+  printf '%s' "$PAGE_HTML" > "$WORK/page.html"
+  printf '%s' "$RECOVER" > "$WORK/payload.json"
+  cat > "$WORK/page_harness.js" <<'NODE'
+// Execute the dashboard page's script the way a browser does: a
+// mocked DOM, a fetch that returns the payload the gateway really
+// served, and the page's own script. Exits non-zero when the
+// script throws or when the render leaves a panel empty -- the
+// failure mode no grep can see.
+//
+// The script runs in the GLOBAL scope (vm.runInThisContext), not
+// eval's scope, against a non-configurable `window` property: a
+// browser's window is exactly that, and a top-level `let window`
+// in the page is a SyntaxError there ("redeclaration of
+// non-configurable global property window") that eval would
+// silently accept. The harness must see what the browser sees.
+const fs = require('fs');
+const vm = require('vm');
+const [pagePath, payloadPath] = process.argv.slice(2);
+const html = fs.readFileSync(pagePath, 'utf8');
+const m = html.match(/<script>([\s\S]*)<\/script>/);
+if (!m) { console.error('no <script> in page'); process.exit(1); }
+const script = m[1];
+const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
+
+const store = {};
+function mkEl() {
+  return { innerHTML: '', textContent: '', className: '', style: {}, dataset: {}, children: [],
+    appendChild(c) { this.children.push(c); } };
+}
+global.document = {
+  getElementById(id) { if (!store[id]) store[id] = mkEl(); return store[id]; },
+  createElement() { return mkEl(); },
+  querySelectorAll() { return []; },
+};
+global.URLSearchParams = class {
+  constructor(s) { this.s = s || ''; }
+  get(k) { const mm = new RegExp('[?&]' + k + '=([^&]*)').exec(this.s); return mm ? decodeURIComponent(mm[1]) : null; }
+};
+global.location = { search: '?api_key=smoke-dashboard-key' };
+global.setInterval = () => 0;
+global.prompt = () => '';
+// The browser's window is a non-configurable property of the
+// global object. Define it the same way so a top-level
+// `let window` in the page throws here as it does there.
+Object.defineProperty(globalThis, 'window', { value: {}, configurable: false, writable: false });
+const resp = {
+  ok: true,
+  headers: { get(h) { return h === 'content-type' ? 'application/json' : null; } },
+  json: async () => payload,
+  text: async () => JSON.stringify(payload),
+};
+global.fetch = async () => resp;
+
+(async () => {
+  try {
+    vm.runInThisContext(script);
+    await new Promise(r => setTimeout(r, 500));
+  } catch (e) {
+    console.error('script threw: ' + (e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e));
+    process.exit(1);
+  }
+  const status = store['status'] ? store['status'].textContent : '';
+  if (!status.startsWith('Updated')) {
+    console.error('status = ' + JSON.stringify(status) + ', want a render that completed');
+    process.exit(1);
+  }
+  for (const id of ['chains', 'speed', 'volume', 'failures']) {
+    const el = store[id];
+    if (!el || el.children.length === 0) {
+      console.error(id + ' panel is empty');
+      process.exit(1);
+    }
+  }
+  const cells = store['speed'].children[0].children.map(c => c.textContent);
+  if (cells.length < 5) {
+    console.error('speed row has ' + cells.length + ' cells, want >= 5');
+    process.exit(1);
+  }
+  console.log('status=' + JSON.stringify(status)
+    + ' chains=' + store['chains'].children.length
+    + ' speed=' + store['speed'].children.length
+    + ' volume=' + store['volume'].children.length
+    + ' failures=' + store['failures'].children.length);
+  process.exit(0);
+})();
+NODE
+  if node "$WORK/page_harness.js" "$WORK/page.html" "$WORK/payload.json" > "$WORK/page_harness.out" 2>&1; then
+    note "page script rendered: $(tr '\n' ' ' < "$WORK/page_harness.out")"
+  else
+    bad "page script did not render: $(tr '\n' ' ' < "$WORK/page_harness.out")"
+  fi
+else
+  note "node not found; skipping page-script execution check"
+fi
+
 # --- report -----------------------------------------------------------------
 if [ "$fail" -eq 0 ]; then
   note "smoke_dashboard: ALL PASS"
