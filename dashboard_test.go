@@ -867,6 +867,69 @@ func TestDashboardPageRendersPercentiles(t *testing.T) {
 	}
 }
 
+// TestDashboardPageReadsTheFieldsThePayloadEmits pins the page to
+// the payload's JSON contract. The latency percentile columns are the
+// one place the frontend and the payload can disagree about field
+// names, and when they do the failure is silent: the page loads, the
+// table fills, and the p50/p95/p99 columns render as dashes while
+// every neighbouring column is fine. This fetches both the page and
+// the payload from the same gateway and asserts the page reads the
+// tags the payload actually carries.
+func TestDashboardPageReadsTheFieldsThePayloadEmits(t *testing.T) {
+	cfg := &Config{Models: map[string]ModelConfig{}}
+	g := dashboardTestGateway(t, cfg)
+
+	// One attempt with a latency gives the speed row a histogram,
+	// so the percentiles are computed rather than suppressed by the
+	// payload's omitempty.
+	g.metrics.Attempt("p:m", 300*time.Millisecond, true)
+	g.metrics.RecordDashboardTokens("p:m", 10)
+
+	dataReq := httptest.NewRequest(http.MethodGet, "/admin/dashboard/data?window=1d", nil)
+	dataReq.Header.Set("Authorization", "Bearer secret")
+	dataW := httptest.NewRecorder()
+	g.HandleAdminDashboardData(dataW, dataReq)
+	if dataW.Code != http.StatusOK {
+		t.Fatalf("data: status = %d, want 200", dataW.Code)
+	}
+	var payload struct {
+		Speed []struct {
+			Endpoint           string `json:"endpoint"`
+			LatencyPercentiles *struct {
+				P50 float64 `json:"p50_ms"`
+				P95 float64 `json:"p95_ms"`
+				P99 float64 `json:"p99_ms"`
+			} `json:"latency_percentiles"`
+		} `json:"speed"`
+	}
+	if err := json.Unmarshal(dataW.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("data payload is not JSON: %v", err)
+	}
+	if len(payload.Speed) != 1 {
+		t.Fatalf("speed rows = %d, want 1", len(payload.Speed))
+	}
+	if payload.Speed[0].LatencyPercentiles == nil {
+		t.Fatal("speed row carries no latency_percentiles; the percentile columns would render as dashes")
+	}
+
+	pageReq := httptest.NewRequest(http.MethodGet, "/admin/dashboard", nil)
+	pageReq.Header.Set("Authorization", "Bearer secret")
+	pageW := httptest.NewRecorder()
+	g.HandleAdminDashboard(pageW, pageReq)
+	if pageW.Code != http.StatusOK {
+		t.Fatalf("page: status = %d, want 200", pageW.Code)
+	}
+	html := pageW.Body.String()
+	for _, want := range []string{"latency_percentiles", "p50_ms", "p95_ms", "p99_ms"} {
+		if !contains(html, want) {
+			t.Errorf("dashboard page does not read %q — the latency percentile columns render empty", want)
+		}
+	}
+	if contains(html, "r.percentiles") {
+		t.Error("dashboard page still reads the stale r.percentiles accessor; the payload emits latency_percentiles")
+	}
+}
+
 // TestDashboardRingLenCovers30d is the memory-bound guarantee for the
 // extended ring: it must hold 43201 slots (30d + 1 spare), not the old
 // 10081 (7d + 1). A ring shorter than its longest window would silently
