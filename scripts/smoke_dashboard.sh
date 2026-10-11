@@ -527,8 +527,9 @@ if not rows:
 " "$DATA" || fail=1
 done
 
-# Both windows serve, and the 7d window is not an alias that fell through to
-# the 1d code path (it has its own tick arithmetic: 10080 ticks vs 1440).
+# All three windows serve, and neither the 7d nor the 30d window is an alias
+# that fell through to the 1d code path (they have their own tick arithmetic:
+# 10080 ticks vs 1440 vs 43200).
 W7="$(curl -s -H "$AUTH" "$BASE/admin/dashboard/data?window=7d")"
 grep -q "fake-model" <<<"$W7" || bad "7d window returned no data for the traffic"
 python3 - "$W7" <<'PY' || fail=1
@@ -538,6 +539,44 @@ if d.get("window") != "7d":
     print(f"  FAIL 7d payload reports window={d.get('window')!r}", file=sys.stderr)
     sys.exit(1)
 print("  ok 7d window serves with window=7d")
+PY
+W30="$(curl -s -H "$AUTH" "$BASE/admin/dashboard/data?window=30d")"
+grep -q "fake-model" <<<"$W30" || bad "30d window returned no data for the traffic"
+python3 - "$W30" <<'PY' || fail=1
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get("window") != "30d":
+    print(f"  FAIL 30d payload reports window={d.get('window')!r}", file=sys.stderr)
+    sys.exit(1)
+print("  ok 30d window serves with window=30d")
+PY
+
+# The speed leaderboard carries p50/p95/p99 latencies for every endpoint it
+# lists. The upstream answers in milliseconds against a 300s fake latency
+# budget, so all three must be present, positive, and ordered — a p99 lower
+# than p50 is a distribution that does not exist, and a missing field is a
+# handler that silently dropped the histogram rather than a quiet
+# substitution of zeros.
+python3 - "$DATA" <<'PY' || fail=1
+import json, sys
+d = json.loads(sys.argv[1])
+for e in d.get("speed", []):
+    p = e.get("latency_percentiles")
+    if not p:
+        print(f"  FAIL {e['endpoint']} carries no latency_percentiles; the "
+              f"histogram is not reaching the leaderboard", file=sys.stderr)
+        sys.exit(1)
+    try:
+        p50, p95, p99 = p["p50_ms"], p["p95_ms"], p["p99_ms"]
+    except KeyError as k:
+        print(f"  FAIL {e['endpoint']} latency_percentiles missing {k}",
+              file=sys.stderr)
+        sys.exit(1)
+    if not (0 < p50 <= p95 <= p99):
+        print(f"  FAIL {e['endpoint']} percentiles are not ordered: "
+              f"p50={p50} p95={p95} p99={p99}", file=sys.stderr)
+        sys.exit(1)
+print("  ok every speed row carries ordered p50<=p95<=p99 latencies")
 PY
 
 # The cumulative /metrics series must agree with the ring about what happened,

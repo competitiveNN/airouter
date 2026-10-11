@@ -2,24 +2,51 @@ package main
 
 import "time"
 
+// latencyPercentiles holds the p50, p95, and p99 attempt latencies for one
+// endpoint over a dashboard window. They are computed from the cumulative
+// attempt latency histogram (the same buckets the Prometheus endpoint
+// exports) by linear interpolation between bucket boundaries.
+//
+// Why these three and not more? p50 is what most requests experience — the
+// "typical" answer. p95 is what the slow 5% look like, which is where a
+// chain starts to feel slow to a user. p99 is the tail, where a timeout or
+// a retry shows up. Together they let an operator tell "the endpoint is
+// consistently slow" (high p50) from "it's usually fine but occasionally
+// hiccups" (low p50, high p99) — the two diagnoses call for different
+// fixes, and a single average latency cannot distinguish them.
+type latencyPercentiles struct {
+	P50 float64 `json:"p50_ms"`
+	P95 float64 `json:"p95_ms"`
+	P99 float64 `json:"p99_ms"`
+}
+
 // dashboardEndpointAgg is the summed telemetry for one endpoint over a time
 // window, as computed by DashboardQuery. It is what the dashboard renders:
 // the raw endpoint string, its attempt count, failure count, total latency,
-// total completion tokens, the ticks in which it was active, and the window
-// it was summed over.
+// total completion tokens, the ticks in which it was active, the latency
+// histogram buckets, and the window it was summed over.
 //
 // ActiveTicks is the denominator the speed leaderboard divides by, and it is
 // not the window: see attemptTick.activeTicks for why. It is carried on the
 // aggregate rather than recomputed by the handler so the three leaderboards
 // cannot disagree about how long each endpoint was busy.
+//
+// LatencyHist is the cumulative histogram for this endpoint over the window.
+// It is carried on the aggregate (rather than recomputed by the handler from
+// LatencyNS) because the histogram is what the percentile computation needs:
+// the sum alone cannot tell p50 from p99, and the two must be derived from
+// the same buckets the Prometheus endpoint exports so the dashboard and
+// /metrics always agree.
 type dashboardEndpointAgg struct {
-	Endpoint    string `json:"endpoint"`
-	Attempts    int64  `json:"attempts"`
-	Failures    int64  `json:"failures"`
-	LatencyNS   int64  `json:"latency_ns"`
-	Tokens      int64  `json:"tokens"`
-	ActiveTicks int64  `json:"active_ticks"`
-	Window      string `json:"window"`
+	Endpoint    string             `json:"endpoint"`
+	Attempts    int64              `json:"attempts"`
+	Failures    int64              `json:"failures"`
+	LatencyNS   int64              `json:"latency_ns"`
+	Tokens      int64              `json:"tokens"`
+	ActiveTicks int64              `json:"active_ticks"`
+	LatencyHist []int64            `json:"-"`
+	Window      string             `json:"window"`
+	Percentiles latencyPercentiles `json:"latency_percentiles,omitempty"`
 }
 
 // dashboardLeaderboardEntry is one row of a leaderboard, carrying the
@@ -28,12 +55,13 @@ type dashboardEndpointAgg struct {
 // rather than by the renderer, so the number is consistent across the three
 // leaderboards and cannot be recomputed differently by the UI.
 type dashboardLeaderboardEntry struct {
-	Endpoint  string  `json:"endpoint"`
-	Attempts  int64   `json:"attempts"`
-	Failures  int64   `json:"failures"`
-	LatencyNS int64   `json:"latency_ns"`
-	Tokens    int64   `json:"tokens"`
-	Rate      float64 `json:"rate"`
+	Endpoint    string             `json:"endpoint"`
+	Attempts    int64              `json:"attempts"`
+	Failures    int64              `json:"failures"`
+	LatencyNS   int64              `json:"latency_ns"`
+	Tokens      int64              `json:"tokens"`
+	Rate        float64            `json:"rate"`
+	Percentiles latencyPercentiles `json:"latency_percentiles,omitempty"`
 }
 
 // dashboardChainStatus is one logical model's chain as seen by the dashboard:
@@ -91,7 +119,7 @@ type dashboardResponse struct {
 }
 
 // dashboardWindowSeconds maps a dashboard window name onto the number of
-// ticks it covers. Unknown windows map to 0, which the handler treats as a
+// seconds it covers. Unknown windows map to 0, which the handler treats as a
 // 400 rather than silently defaulting — a window the dashboard does not
 // advertise is a client error, not a quiet substitution.
 func dashboardWindowSeconds(w dashboardWindow) int {
@@ -100,6 +128,8 @@ func dashboardWindowSeconds(w dashboardWindow) int {
 		return 24 * 60 * 60
 	case dashboardWindow7d:
 		return 7 * 24 * 60 * 60
+	case dashboardWindow30d:
+		return 30 * 24 * 60 * 60
 	default:
 		return 0
 	}
@@ -109,7 +139,7 @@ func dashboardWindowSeconds(w dashboardWindow) int {
 // rejecting anything the dashboard does not advertise.
 func dashboardWindowFor(raw string) (dashboardWindow, bool) {
 	switch dashboardWindow(raw) {
-	case dashboardWindow1d, dashboardWindow7d:
+	case dashboardWindow1d, dashboardWindow7d, dashboardWindow30d:
 		return dashboardWindow(raw), true
 	default:
 		return "", false

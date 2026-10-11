@@ -287,19 +287,22 @@ func TestDashboardSpeedDividesByBusyTime(t *testing.T) {
 // the rejection of everything else, which is what keeps the handler from
 // silently answering a question the dashboard never asked.
 func TestDashboardWindowForRejectsUnknown(t *testing.T) {
-	for _, ok := range []dashboardWindow{dashboardWindow1d, dashboardWindow7d} {
+	for _, ok := range []dashboardWindow{dashboardWindow1d, dashboardWindow7d, dashboardWindow30d} {
 		got, valid := dashboardWindowFor(string(ok))
 		if !valid || got != ok {
 			t.Fatalf("dashboardWindowFor(%q) = %q,%v; want accepted", ok, got, valid)
 		}
 	}
-	for _, bad := range []string{"", "1h", "30d", "1D", "d1"} {
+	for _, bad := range []string{"", "1h", "30", "1D", "d1"} {
 		if _, valid := dashboardWindowFor(bad); valid {
 			t.Fatalf("dashboardWindowFor(%q) must be rejected", bad)
 		}
 	}
 	if dashboardWindowSeconds(dashboardWindow7d) != 7*24*60*60 {
 		t.Fatalf("7d window = %d s", dashboardWindowSeconds(dashboardWindow7d))
+	}
+	if dashboardWindowSeconds(dashboardWindow30d) != 30*24*60*60 {
+		t.Fatalf("30d window = %d s", dashboardWindowSeconds(dashboardWindow30d))
 	}
 }
 
@@ -717,5 +720,159 @@ func TestDashboardApiKeyQueryAuth(t *testing.T) {
 				t.Fatalf("status = %d, want %d", w.Code, c.want)
 			}
 		})
+	}
+}
+
+// TestPercentileFromHistogram checks the interpolation math on a synthetic
+// histogram whose observations all land in one bucket. It is the unit test
+// for percentileFromHistogram: the dashboard latency columns are only as
+// right as this function, and a regression here silently mis-ranks every
+// "fastest" endpoint on the page.
+func TestPercentileFromHistogram(t *testing.T) {
+	bounds := []float64{0.25, 0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45}
+	// 100 observations in bucket 0 (≤0.25s): the cumulative distribution
+	// is {100, 100, ..., 100}.
+	hist := []int64{100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	p := percentileFromHistogram(hist, bounds)
+	// p50: rank 50, bucket 0, frac = 50/100 = 0.5 → 0.25*0.5 = 0.125s = 125ms.
+	if p.P50 != 125 {
+		t.Fatalf("p50 = %v, want 125ms", p.P50)
+	}
+	// p95: rank 95, bucket 0, frac = 0.95 → 0.25*0.95 = 0.2375s = 237.5ms.
+	if p.P95 != 237.5 {
+		t.Fatalf("p95 = %v, want 237.5ms", p.P95)
+	}
+	// p99: rank 99, bucket 0, frac = 0.99 → 0.25*0.99 = 0.2475s = 247.5ms.
+	if p.P99 != 247.5 {
+		t.Fatalf("p99 = %v, want 247.5ms", p.P99)
+	}
+}
+
+// TestPercentileFromHistogramEmpty returns zero values for an empty
+// histogram. The dashboard suppresses these with omitempty rather than
+// rendering "0ms" for an endpoint that never answered.
+func TestPercentileFromHistogramEmpty(t *testing.T) {
+	bounds := []float64{0.25, 0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45}
+	if p := percentileFromHistogram(nil, bounds); p.P50 != 0 || p.P95 != 0 || p.P99 != 0 {
+		t.Fatalf("nil histogram = %+v, want all zero", p)
+	}
+	allZero := []int64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if p := percentileFromHistogram(allZero, bounds); p.P50 != 0 || p.P95 != 0 || p.P99 != 0 {
+		t.Fatalf("zeroed histogram = %+v, want all zero", p)
+	}
+}
+
+// TestPercentileFromHistogramMismatchedLength returns zero values when the
+// histogram and boundary arrays disagree: the caller built the histogram
+// wrong, and guessing produces a nonsense number.
+func TestPercentileFromHistogramMismatchedLength(t *testing.T) {
+	bounds := []float64{0.25, 0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45}
+	// One bucket but twelve boundaries would be needed for +Inf: the
+	// function requires len(hist) == len(boundaries)+1.
+	if p := percentileFromHistogram([]int64{100}, bounds); p.P50 != 0 || p.P95 != 0 || p.P99 != 0 {
+		t.Fatalf("mismatched length = %+v, want all zero", p)
+	}
+}
+
+// TestDashboardQueryIncludesPercentiles checks that DashboardQuery computes
+// latency percentiles from the histogram it sums across ticks. An endpoint
+// whose attempts all land in the same bucket should report that bucket's
+// boundary for every percentile.
+func TestDashboardQueryIncludesPercentiles(t *testing.T) {
+	m := NewMetrics()
+	stop := m.StartDashboardTelemetry()
+	defer stop()
+
+	// 100 attempts at 0.3s: 0.3 > 0.25 so it misses bucket 0 and lands in
+	// bucket 1 (≤0.5s). The cumulative histogram is {0, 100, 0, ...}, which
+	// is the interesting shape — every percentile falls between the two
+	// finite boundaries 0.25 and 0.5, so the assertion exercises the
+	// between-buckets interpolation rather than the trivial bucket-0 case
+	// (all samples at or below the first boundary) that a 0.1s latency
+	// would produce.
+	for i := 0; i < 100; i++ {
+		m.Attempt("prov:pct", 300*time.Millisecond, true)
+	}
+
+	rows := m.DashboardQuery(dashboardWindow1d)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	a := rows[0]
+	if a.Attempts != 100 {
+		t.Fatalf("attempts = %d, want 100", a.Attempts)
+	}
+	// p50: rank 50, bucket 1. cum[0]=0, cum[1]=100. frac = 50/100 = 0.5.
+	// result = 0.25 + (0.5-0.25)*0.5 = 0.375s = 375ms.
+	if a.Percentiles.P50 != 375 {
+		t.Fatalf("p50 = %v, want 375ms (0.375s)", a.Percentiles.P50)
+	}
+	// p95: rank 95, bucket 1. frac = 95/100 = 0.95. result = 0.4875s.
+	if a.Percentiles.P95 != 487.5 {
+		t.Fatalf("p95 = %v, want 487.5ms (0.4875s)", a.Percentiles.P95)
+	}
+	// p99: rank 99, bucket 1. frac = 0.99. result = 0.4975s.
+	if a.Percentiles.P99 != 497.5 {
+		t.Fatalf("p99 = %v, want 497.5ms (0.4975s)", a.Percentiles.P99)
+	}
+}
+
+// TestDashboard30dWindow checks the 30d window is accepted and that the
+// ring's extended length covers it. The old ring held 10081 slots for a 7d
+// window; the 30d window needs 43200 ticks plus one spare.
+func TestDashboard30dWindow(t *testing.T) {
+	m := NewMetrics()
+	stop := m.StartDashboardTelemetry()
+	defer stop()
+
+	m.Attempt("prov:model-a", time.Second, true)
+
+	// A fresh observation must appear in the 30d window.
+	if rows := m.DashboardQuery(dashboardWindow30d); len(rows) != 1 {
+		t.Fatalf("30d window should include a fresh observation, got %d rows", len(rows))
+	}
+	// Advance past 30d and confirm it ages out.
+	for i := 0; i < 30*24*60; i++ {
+		m.advanceRingTickLocked()
+	}
+	if rows := m.DashboardQuery(dashboardWindow30d); len(rows) != 0 {
+		t.Fatalf("observation older than 30d must be excluded, got %d rows", len(rows))
+	}
+	// It must not reappear in a shorter window either.
+	if rows := m.DashboardQuery(dashboardWindow7d); len(rows) != 0 {
+		t.Fatalf("30d-old observation must not appear in 7d, got %d rows", len(rows))
+	}
+}
+
+// TestDashboardPageRendersPercentiles pins the latency percentile columns
+// and the 30d window selector in the dashboard HTML. Without this a
+// regression that drops the percentile computation would still render a
+// working page — the speed leaderboard would just show fewer columns and
+// nothing would notice.
+func TestDashboardPageRendersPercentiles(t *testing.T) {
+	cfg := &Config{Models: map[string]ModelConfig{}}
+	g := dashboardTestGateway(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/admin/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	w := httptest.NewRecorder()
+	g.HandleAdminDashboard(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"p50", "p95", "p99", "30d"} {
+		if !contains(body, want) {
+			t.Errorf("dashboard page missing %q — the latency percentile columns or the 30d window selector is gone", want)
+		}
+	}
+}
+
+// TestDashboardRingLenCovers30d is the memory-bound guarantee for the
+// extended ring: it must hold 43201 slots (30d + 1 spare), not the old
+// 10081 (7d + 1). A ring shorter than its longest window would silently
+// double-count the newest tick in every 30d query.
+func TestDashboardRingLenCovers30d(t *testing.T) {
+	if dashboardRingLen != 30*24*60+1 {
+		t.Fatalf("dashboardRingLen = %d, want %d (30d + 1 spare)", dashboardRingLen, 30*24*60+1)
 	}
 }

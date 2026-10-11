@@ -19,23 +19,24 @@ import (
 type dashboardWindow string
 
 const (
-	dashboardWindow1d dashboardWindow = "1d"
-	dashboardWindow7d dashboardWindow = "7d"
+	dashboardWindow1d  dashboardWindow = "1d"
+	dashboardWindow7d  dashboardWindow = "7d"
+	dashboardWindow30d dashboardWindow = "30d"
 )
 
 // dashboardTickSeconds is the granularity of the attempt ring. One minute is
 // coarse enough that a tick never spans a request boundary in a way that
 // matters for a leaderboard (a model measured over 60s vs 59s is noise, not
-// signal) and fine enough that the 1d window is 24 samples and 7d is 168 —
-// both cheap to sum at scrape time.
+// signal) and fine enough that the 1d window is 1440 samples, 7d is 10080,
+// and 30d is 43200 — all cheap to sum at scrape time.
 const dashboardTickSeconds = 60
 
 // dashboardRingLen is the number of ticks held, which must cover the longest
-// window (7d = 10080 minutes) plus one to keep the current tick distinct from
+// window (30d = 43200 minutes) plus one to keep the current tick distinct from
 // the oldest. It is a fixed allocation: memory is bounded by
 // dashboardRingLen * labelsCap regardless of how long the process lives, which
 // is the property the label cap exists to guarantee for the other maps.
-const dashboardRingLen = 10080 + 1
+const dashboardRingLen = 43200 + 1
 
 // Metrics collects Prometheus-style metrics for operational visibility.
 // All counters are atomic for thread-safe updates without locks.
@@ -482,10 +483,18 @@ func (m *Metrics) Attempt(endpoint string, d time.Duration, ok bool) {
 	// boundedAttemptKeyLocked: the key is resolved here and passed to the ring,
 	// which never calls boundedAttemptKeyLocked itself and so cannot disagree
 	// about which bucket an observation landed in.
-	m.recordRingAttemptLocked(key, endpoint, ns, ok)
-	m.mu.Unlock()
-
+	m.recordRingAttemptLocked(key, endpoint, ns, ok, idx)
+	// The histogram bucket is incremented under the same lock as the rest of
+	// the observation. The original code incremented it after m.mu.Unlock(),
+	// which was a real race: the histogram slice is created under the lock
+	// but mutated outside it, so a concurrent ServeHTTP read could observe a
+	// bucket that had just been created but not yet incremented, and the
+	// Prometheus exposition would under-report the distribution until the
+	// next scrape. Moving it inside the critical section costs nothing —
+	// h[idx].Add(1) is a single atomic increment — and makes the histogram
+	// and the cumulative maps consistent at all times.
 	h[idx].Add(1)
+	m.mu.Unlock()
 }
 
 // boundedAttemptKey admits one new attempt label and returns the key it was

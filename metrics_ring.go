@@ -19,12 +19,20 @@ import "time"
 // near zero and bury the genuinely fast ones, which is the opposite of what
 // a "fastest" leaderboard should do. The denominator is the time the endpoint
 // was actually busy, which is what the operator wants to compare.
+//
+// hist holds the per-endpoint attempt latency histogram for this tick. It is
+// the ring's local copy of the cumulative attemptHistByEnd buckets, kept
+// separately so the dashboard can answer "what was the p95 latency of this
+// endpoint over the last N hours" without reading the cumulative maps (which
+// are keyed by labelKey and would require a reverse lookup to render).
+// The bucket boundaries are attemptLatencyBounds; the last slot is +Inf.
 type attemptTick struct {
 	attempts    map[labelKey]int64
 	failures    map[labelKey]int64
 	latencyNS   map[labelKey]int64
 	tokens      map[labelKey]int64
 	activeTicks map[labelKey]int64
+	hist        map[labelKey][]int64
 	// endpoints maps a key to the raw endpoint string (e.g. "provider:model")
 	// the dashboard renders. The cumulative maps store the endpoint under the
 	// endpoint= label; the ring keeps the raw string alongside so the
@@ -48,6 +56,7 @@ func newAttemptTick() *attemptTick {
 		latencyNS:   make(map[labelKey]int64),
 		tokens:      make(map[labelKey]int64),
 		activeTicks: make(map[labelKey]int64),
+		hist:        make(map[labelKey][]int64),
 		endpoints:   make(map[labelKey]string),
 	}
 }
@@ -76,7 +85,14 @@ func (m *Metrics) attemptTickForLocked() *attemptTick {
 // maps are keyed on the raw endpoint string (the same value the cumulative
 // maps store under the endpoint= label), which is what the dashboard renders.
 // They are identical here by construction — see boundedAttemptKeyLocked.
-func (m *Metrics) recordRingAttemptLocked(key labelKey, endpoint string, ns int64, ok bool) {
+//
+// The histogram bucket index is passed in because Attempt computes it before
+// taking the lock (the boundary loop is cheap and lock-free) and the ring
+// must record the observation in the same bucket the cumulative histogram
+// will. Passing the index rather than re-deriving it keeps the two in sync
+// by construction: if the boundary array ever changes, both sites break
+// together rather than disagreeing silently.
+func (m *Metrics) recordRingAttemptLocked(key labelKey, endpoint string, ns int64, ok bool, histIdx int) {
 	t := m.attemptTickForLocked()
 	t.attempts[key] = t.attempts[key] + 1
 	t.activeTicks[key] = t.activeTicks[key] + 1
@@ -89,6 +105,19 @@ func (m *Metrics) recordRingAttemptLocked(key labelKey, endpoint string, ns int6
 	if _, exists := t.endpoints[key]; !exists {
 		t.endpoints[key] = endpoint
 	}
+	// The histogram is recorded in the same tick so the dashboard can
+	// answer "what was the p95 latency over the last N hours" by summing
+	// this slice across ticks and computing the percentile from the
+	// cumulative distribution. The slice is created on first write, with
+	// one slot per boundary plus the +Inf bucket — the same shape as the
+	// cumulative attemptHistByEnd, so the two always agree about how many
+	// buckets exist.
+	h := t.hist[key]
+	if h == nil {
+		h = make([]int64, len(m.attemptLatencyBounds)+1)
+		t.hist[key] = h
+	}
+	h[histIdx]++
 }
 
 // advanceRingTickLocked moves the ring forward by one minute, resetting the
