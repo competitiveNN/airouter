@@ -159,6 +159,8 @@ What `origin/master` is missing, oldest first:
 - `87dc7bf` dashboard: surface the reason an endpoint is down, and rate speed by busy time
 - `0279d6f` dashboard: anchor the cooldown countdown to the gateway's clock, and exercise the circuit column against real traffic
 - `4a6dd83` dashboard: surface the breaker state and prove circuit recovery against real traffic
+- `367e478` commandcode: proxy the /alpha/generate protocol and bypass the opencode free-tier gate
+- `fef8dc3` dashboard: per-endpoint latency percentiles and a 30d window
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
