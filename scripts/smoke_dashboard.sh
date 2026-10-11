@@ -795,6 +795,29 @@ global.fetch = async () => resp;
       process.exit(1);
     }
   }
+  // The chains card is a header line over a grid of pills, not a
+  // wall of text. Assert the structure the layout depends on: each
+  // .chain carries a .chainhead and an .eps, every pill lives
+  // inside an .eps, and endpoints that need an operator's eye
+  // (cooldown, circuit, down) sort ahead of eligible ones -- a
+  // revert to the old paragraph layout fails here, not in a grep.
+  const rankOf = p => /^pill /.test(p.className) && !p.className.includes('ok') ? 0 : 1;
+  for (const chain of store['chains'].children) {
+    const names = chain.children.map(c => c.className);
+    if (!names.includes('chainhead') || !names.includes('eps')) {
+      console.error('chain child classes ' + JSON.stringify(names));
+      process.exit(1);
+    }
+    const eps = chain.children.find(c => c.className === 'eps');
+    if (!eps.children.length) { console.error('.eps is empty'); process.exit(1); }
+    const ranks = eps.children.map(rankOf);
+    const ordered = ranks.every((r, i) => i === 0 || ranks[i - 1] <= r);
+    if (!ordered) {
+      console.error('pills not sorted by operator attention: '
+        + JSON.stringify(eps.children.map(c => c.className)));
+      process.exit(1);
+    }
+  }
   const cells = store['speed'].children[0].children.map(c => c.textContent);
   if (cells.length < 5) {
     console.error('speed row has ' + cells.length + ' cells, want >= 5');

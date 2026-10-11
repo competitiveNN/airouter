@@ -29,7 +29,7 @@ header{background:#0f172a;color:#fff;padding:1rem 2rem;display:flex;justify-cont
 main{padding:2rem;max-width:1200px;margin:0 auto}
 .card{background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.1);padding:1.5rem;margin-bottom:1.5rem}
 h2{margin-top:0}
-textarea{background:#0f172a;color:#e2e8f0;padding:1rem;border-radius:8px;overflow:auto;font-family:ui-monospace,monospace}
+textarea{background:#0f172a;color:#e2e8f0;padding:1rem;border-radius:8px;overflow:auto;font-family:ui-monospace,monospace;width:100%;box-sizing:border-box;min-height:16rem;resize:vertical}
 button{background:#2563eb;color:#fff;border:none;padding:.6rem 1rem;border-radius:8px;cursor:pointer;margin-right:.5rem}
 button:disabled{opacity:.5}
 button.wsel{background:transparent;color:#64748b;border:1px solid #cbd5e1;padding:.4rem .8rem}
@@ -38,9 +38,16 @@ table{border-collapse:collapse;width:100%;font-size:.9rem}
 th,td{text-align:left;padding:.5rem .75rem;border-bottom:1px solid #e2e8f0}
 th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem;letter-spacing:.05em}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
-.chain{display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem;flex-wrap:wrap}
-.chain b{min-width:5rem}
-.pill{padding:.15rem .5rem;border-radius:999px;font-size:.75rem;font-family:ui-monospace,monospace}
+/* One chain is a header line (model plus the counts that answer the
+   operator's question at a glance) over a grid of endpoint pills. A long
+   fallback chain is not a paragraph: the grid keeps the pills in aligned
+   columns however many there are, and renderChains sorts the endpoints
+   that need an operator's eye first. */
+.chain{margin-bottom:1.25rem}
+.chainhead{display:flex;gap:.5rem;align-items:baseline;margin-bottom:.4rem}
+.chainhead b{min-width:5rem}
+.eps{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));gap:.35rem .6rem}
+.pill{padding:.15rem .5rem;border-radius:999px;font-size:.75rem;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pill.ok{background:#dcfce7;color:#166534}
 .pill.no{background:#fee2e2;color:#991b1b}
 /* A down endpoint can be down for two different reasons, and they need
@@ -85,7 +92,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 <p>Load and edit config (JSON). Save writes back to config.yaml and reloads.</p>
 <button id="load">Load Config</button>
 <button id="save" disabled>Save Config</button>
-<textarea id="editor" rows="20" style="width:100%;"></textarea>
+<textarea id="editor" rows="16"></textarea>
 </div>
 </div>
 </div>
@@ -131,13 +138,30 @@ function renderChains(chains, breaker){
   // would blank the whole page.
   for(const ch of chains){
     const row=el('div','chain');
-    row.appendChild(el('b',null,ch.model));
+    const head=el('div','chainhead');
+    head.appendChild(el('b',null,ch.model));
     const sum=el('span','sum',ch.operational+'/'+ch.total+' eligible');
     if(!breaker) sum.title='circuit breaker is disabled; the circuit column is inactive';
-    row.appendChild(sum);
-    const eps=el('div');
-    eps.style.marginLeft='5rem';
-    for(const ep of ch.endpoints){
+    head.appendChild(sum);
+    row.appendChild(head);
+    const eps=el('div','eps');
+    // The fallback order matters only for endpoints that
+    // are actually serving. Anything that needs an
+    // operator's eye jumps the queue: an open circuit
+    // (deliberate, not incidental) outranks a plain down,
+    // which outranks a cooldown (a planned, often
+    // transient wait); eligible endpoints keep their
+    // configured order at the end. The rank mirrors the
+    // if-chain below so a pill's position always matches
+    // the class it renders with.
+    const rank=ep=>{
+      if(ep.eligible) return 3;
+      if(ep.cooldown) return 2;
+      if(ep.circuit&&ep.circuit!=='closed') return 0;
+      return 1;
+    };
+    const ordered=[...ch.endpoints].sort((a,b)=>rank(a)-rank(b));
+    for(const ep of ordered){
       let why, cls;
       if(ep.eligible){
         // An eligible endpoint with no circuit record is still "closed" —
@@ -159,10 +183,10 @@ function renderChains(chains, breaker){
       else { why='down'; cls='no'; }
       const p=el('span','pill '+cls, ep.endpoint+' '+why);
       if(ep.cooldown) p.dataset.until=ep.cooldown_until;
-      p.style.marginRight='6px';
       eps.appendChild(p);
     }
-    c.appendChild(eps);
+    row.appendChild(eps);
+    c.appendChild(row);
   }
 }
 // The countdown is anchored to the gateway's clock, not the browser's: the
