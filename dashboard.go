@@ -67,7 +67,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 <div class="grid">
 <div>
 <h3>Fastest (tokens/s)</h3>
-<table><thead><tr><th>Endpoint</th><th>Tok/s</th><th>Tokens</th></tr></thead>
+<table><thead><tr><th>Endpoint</th><th>Tok/s</th><th>Tokens</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>
 <tbody id="speed"></tbody></table>
 </div>
 <div>
@@ -110,7 +110,7 @@ function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.class
 function renderWindowSel(){
   const s=document.getElementById('wsel');
   s.innerHTML='';
-  for(const w of ['1d','7d']){
+  for(const w of ['1d','7d','30d']){
     const b=el('button', 'wsel'+(w===window?' on':''), w);
     b.onclick=()=>{ window=w; refresh(); };
     s.appendChild(b);
@@ -192,8 +192,8 @@ function renderBoard(id, rows, cols){
   for(const r of top){
     const tr=document.createElement('tr');
     tr.appendChild(el('td',null,r.endpoint));
-    for(const [key,fmt] of cols){
-      tr.appendChild(el('td','num',fmt(r[key])));
+    for(const [acc,fmt] of cols){
+      tr.appendChild(el('td','num',fmt(acc(r))));
     }
     tb.appendChild(tr);
   }
@@ -210,9 +210,9 @@ async function refresh(){
     if(d.now) serverNow = new Date(d.now).getTime();
     renderWindowSel();
     renderChains(d.chains||[]);
-    renderBoard('speed', d.speed||[], [['rate',v=>v.toFixed(1)],['tokens',v=>v]]);
-    renderBoard('volume', d.volume||[], [['rate',v=>v.toFixed(3)],['attempts',v=>v]]);
-    renderBoard('failures', d.failures||[], [['rate',v=>(v*100).toFixed(1)+'%'],['failures',v=>v]]);
+    renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.percentiles?r.percentiles.p50:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.percentiles?r.percentiles.p95:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.percentiles?r.percentiles.p99:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
+    renderBoard('volume', d.volume||[], [[r=>r.rate,v=>v.toFixed(3)],[r=>r.attempts,v=>v]]);
+    renderBoard('failures', d.failures||[], [[r=>r.rate,v=>(v*100).toFixed(1)+'%'],[r=>r.failures,v=>v]]);
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
 }

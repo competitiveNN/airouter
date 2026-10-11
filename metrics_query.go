@@ -17,7 +17,14 @@ import "time"
 // the current tick is nil but the previous one has not been cleared, or
 // vice versa, and the sums would be off by one tick's worth of data. The
 // cost is a brief write-lock hold on every dashboard scrape, which is
-// negligible — a scrape is a few map reads over at most 168 ticks.
+// negligible — a scrape is a few map reads over at most 43200 ticks.
+//
+// The latency histogram is summed across ticks alongside the counters, and
+// the p50/p95/p99 percentiles are computed from the cumulative distribution
+// by percentileFromHistogram. They are carried on the aggregate so the
+// dashboard can render "typical latency" and "tail latency" without the
+// handler having to re-derive them, and so the three leaderboards cannot
+// disagree about what a percentile means.
 func (m *Metrics) DashboardQuery(w dashboardWindow) []dashboardEndpointAgg {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -86,6 +93,19 @@ func (m *Metrics) DashboardQuery(w dashboardWindow) []dashboardEndpointAgg {
 			}
 			a.ActiveTicks += v
 		}
+		for k, v := range t.hist {
+			a := agg[k]
+			if a == nil {
+				a = &dashboardEndpointAgg{}
+				agg[k] = a
+			}
+			if a.LatencyHist == nil {
+				a.LatencyHist = make([]int64, len(v))
+			}
+			for i := range v {
+				a.LatencyHist[i] += v[i]
+			}
+		}
 		for k, ep := range t.endpoints {
 			if _, exists := endpoints[k]; !exists {
 				endpoints[k] = ep
@@ -100,6 +120,14 @@ func (m *Metrics) DashboardQuery(w dashboardWindow) []dashboardEndpointAgg {
 			a.Endpoint = string(k)
 		}
 		a.Window = string(w)
+		// Compute percentiles from the cumulative histogram. If the slice is
+		// nil (no observations in the window) the function returns zero
+		// values, and the omitempty tag suppresses them in the JSON — which
+		// is the right answer: an endpoint with no attempts has no latency
+		// distribution to show.
+		if len(a.LatencyHist) > 0 {
+			a.Percentiles = percentileFromHistogram(a.LatencyHist, m.attemptLatencyBounds)
+		}
 		out = append(out, *a)
 	}
 	return out

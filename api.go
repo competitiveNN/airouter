@@ -1809,11 +1809,12 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 
 	for _, a := range aggs {
 		entry := dashboardLeaderboardEntry{
-			Endpoint:  a.Endpoint,
-			Attempts:  a.Attempts,
-			Failures:  a.Failures,
-			LatencyNS: a.LatencyNS,
-			Tokens:    a.Tokens,
+			Endpoint:    a.Endpoint,
+			Attempts:    a.Attempts,
+			Failures:    a.Failures,
+			LatencyNS:   a.LatencyNS,
+			Tokens:      a.Tokens,
+			Percentiles: a.Percentiles,
 		}
 		// Speed is tokens per SECOND OF BUSY TIME, not per second of window.
 		// An endpoint that served 500 tokens in one minute of a 7d window and
