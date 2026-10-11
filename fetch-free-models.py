@@ -1142,12 +1142,15 @@ def probe_auto_fallbacks(
 #
 # The version is not cosmetic. OpenCode asks third-party gateways to send "the
 # correct, official User-Agent string (matching opencode/<version>)", and the
-# fix it documents for its own frontends is "update past <version>" — so a UA
-# that trails the published release is not the official string. Bump it from
+# fix it documents for its own frontends is "update past <version>" -- so a UA
+# that trails the published release is not the official string. The official
+# string is exactly `opencode/<version>`: the shipped CLI builds it that way
+# (verified in the opencode-linux-x64 packages for 1.18.34 and 1.19.0, where
+# the template is `opencode/${version}` with no suffix). Bump the version from
 # https://registry.npmjs.org/opencode-ai/latest, and keep it equal to the
 # User-Agent in config.go: test_opencode_ua_matches_the_gateway asserts the two
 # agree, because nothing else stops them drifting apart.
-OPENCODE_UA = "opencode/1.18.34/cli"
+OPENCODE_UA = "opencode/1.19.0"
 
 # Where the published version is read from. The dist-tags endpoint, NOT the
 # package document: https://registry.npmjs.org/opencode-ai is ~5MB of every
@@ -1160,13 +1163,14 @@ OPENCODE_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/opencode-ai/dist-
 
 
 def opencode_ua_version(ua: str = OPENCODE_UA) -> str:
-    """The `opencode/<version>/cli` version out of a User-Agent string.
+    """The `opencode/<version>` version out of a User-Agent string.
 
-    Tolerates the surrounding shape rather than assuming it: if the string is
-    ever edited into something this cannot parse, the caller reports "unknown"
+    Tolerates the surrounding shape rather than assuming it: a legacy
+    `opencode/<version>/cli` spelling still parses, and a string that is
+    ever edited into something this cannot parse reports "unknown"
     instead of claiming a version that was never there.
     """
-    m = re.match(r"^opencode/([^/]+)/", ua or "")
+    m = re.match(r"^opencode/([^/]+)", ua or "")
     return m.group(1) if m else ""
 
 
@@ -1199,7 +1203,7 @@ def check_opencode_ua_version() -> str | None:
     if not have:
         print(
             f"OpenCode UA check: cannot parse a version out of {OPENCODE_UA!r}; "
-            "expected opencode/<version>/cli",
+            "expected opencode/<version>",
             file=sys.stderr,
         )
         return None
@@ -1227,9 +1231,9 @@ def check_opencode_ua_version() -> str | None:
     print("  User-Agent string (matching opencode/<version>)\".", file=sys.stderr)
     print("", file=sys.stderr)
     print("  Bump BOTH of these, then re-run scripts/check-rules.py:", file=sys.stderr)
-    print(f"    fetch-free-models.py  OPENCODE_UA = \"opencode/{latest}/cli\"",
+    print(f"    fetch-free-models.py  OPENCODE_UA = \"opencode/{latest}\"",
           file=sys.stderr)
-    print(f"    config.go             \"User-Agent\": \"opencode/{latest}/cli\"",
+    print(f"    config.go             \"User-Agent\": \"opencode/{latest}\"",
           file=sys.stderr)
     print("", file=sys.stderr)
     print("  test_opencode_ua_matches_the_gateway will fail if only one is bumped.",

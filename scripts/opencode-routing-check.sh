@@ -192,12 +192,13 @@ upstream_status() {
     "${url}chat/completions" \
     -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
     -H 'Content-Type: application/json' \
-    -H 'User-Agent: opencode/1.18.34/cli' \
+    -H 'User-Agent: opencode/1.19.0' \
     -H 'x-opencode-client: cli' \
     -H 'x-opencode-project: default' \
     -H "x-opencode-session: $session" \
     -H "X-Session-ID: $session" \
     -H "x-opencode-request: msg_$(printf '%032x' $RANDOM$RANDOM$RANDOM)" \
+    -H 'x-opencode-preflight: liveness' \
     -d "$PREFLIGHT_BODY" 2>/dev/null) || true
   local status="${raw##*$'\n'}"
   [[ "$status" =~ ^[0-9]+$ ]] || status=000

@@ -39,6 +39,13 @@ const (
 	protocolChatCompletions protocol = "chat"
 	// protocolResponses is POST <url>/responses with a Responses-shaped body.
 	protocolResponses protocol = "responses"
+	// protocolCommandCode addresses a provider that speaks Command Code's
+	// internal /alpha/generate protocol (api.commandcode.ai). The gateway
+	// translates an OpenAI Chat Completions request into the CC envelope --
+	// including the per-key device-fingerprint and lifecycle pre-requests the
+	// CLI performs -- and translates the CC NDJSON event stream back into Chat
+	// Completions SSE. See commandcode.go.
+	protocolCommandCode protocol = "commandcode"
 )
 
 // protocolFor normalizes the configured value. An absent or unknown value is
@@ -48,6 +55,8 @@ func protocolFor(s string) protocol {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "responses", "response", "openai-responses":
 		return protocolResponses
+	case "commandcode", "command-code", "cc":
+		return protocolCommandCode
 	default:
 		return protocolChatCompletions
 	}
@@ -56,10 +65,14 @@ func protocolFor(s string) protocol {
 // upstreamPath is the URL path a protocol resolves to, relative to the
 // provider's base URL.
 func (p protocol) upstreamPath() string {
-	if p == protocolResponses {
+	switch p {
+	case protocolResponses:
 		return "/responses"
+	case protocolCommandCode:
+		return "/alpha/generate"
+	default:
+		return "/chat/completions"
 	}
-	return "/chat/completions"
 }
 
 // chatRequestBody is the subset of a Chat Completions request this translator

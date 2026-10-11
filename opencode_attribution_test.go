@@ -36,6 +36,12 @@ import (
 // them. Compared as a set (not a count) so a header being added or dropped is
 // named in the failure.
 //
+// The session id travels under four spellings -- x-opencode-session (the
+// canonical free-tier form), x-opencode-session-id and x-session-affinity
+// (the session and cache-affinity identities the current CLI sends,
+// model-request.ts), and X-Session-ID (the plain routing-backend name) --
+// all from one value, set in buildRequest so they cannot drift apart.
+//
 // These names are all lower case and compared case-insensitively (see
 // assertOpencodeHeaderMap), because net/http canonicalizes header names on the
 // way onto the wire: "x-opencode-client" is stored as "X-Opencode-Client". A
@@ -47,6 +53,8 @@ var opencodeHeaderKeys = []string{
 	"x-opencode-project",
 	"x-opencode-request",
 	"x-opencode-session",
+	"x-opencode-session-id",
+	"x-session-affinity",
 	"x-session-id",
 }
 
@@ -146,12 +154,20 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 	if got, want := h["x-opencode-project"], "default"; got != want {
 		t.Errorf("%s: x-opencode-project = %q, want %q", where, got, want)
 	}
+	// The official string is exactly `opencode/<version>`: the
+	// CLI's own LLM request path builds it that way
+	// (packages/opencode/src/session/llm/request.ts:
+	// `const USER_AGENT = \`opencode/${InstallationVersion}\``),
+	// and the shipped opencode-linux-x64 binaries for 1.18.34
+	// and 1.19.0 carry no suffix. (Installation.USER_AGENT, the
+	// `opencode/<channel>/<version>/<client>` form, is the
+	// webfetch/models.ts spelling, not the one the gateway sees.)
 	if got := h["user-agent"]; got == "" {
 		t.Errorf("%s: User-Agent is empty; the free tier rejects anonymous clients", where)
 	} else if !strings.HasPrefix(got, "opencode/") {
 		t.Errorf("%s: User-Agent = %q, want an opencode/... CLI identity", where, got)
-	} else if !strings.HasSuffix(got, "/cli") {
-		t.Errorf("%s: User-Agent = %q, want a .../cli suffix", where, got)
+	} else if strings.Contains(strings.TrimPrefix(got, "opencode/"), "/") {
+		t.Errorf("%s: User-Agent = %q, want the official opencode/<version> shape with no suffix", where, got)
 	}
 
 	// The two generated ids must be well-formed AND distinct from each other.
@@ -177,10 +193,14 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 	// X-Session-ID is the routing backend's name for the same conversation.
 	// It must equal the canonical session id: if the two disagree, the backend
 	// reads the other one and loses the affinity the id exists to buy.
-	if got, canonical := h["x-session-id"], h["x-opencode-session"]; got != canonical {
-		t.Errorf("%s: X-Session-ID = %q, want the same id as x-opencode-session = %q "+
-			"(the backend reads both; a disagreement forfeits routing affinity)",
-			where, got, canonical)
+	// The session-id and affinity spellings are the CLI's own names for the
+	// same value; all four must agree or the backend reads a stale one.
+	for _, alias := range []string{"x-session-id", "x-opencode-session-id", "x-session-affinity"} {
+		if got, canonical := h[alias], h["x-opencode-session"]; got != canonical {
+			t.Errorf("%s: %s = %q, want the same id as x-opencode-session = %q "+
+				"(the backend reads every spelling; a disagreement forfeits routing affinity)",
+				where, alias, got, canonical)
+		}
 	}
 }
 

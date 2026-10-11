@@ -37,10 +37,11 @@ type ChatCompletionRequest struct {
 }
 
 type ChatCompletionMessage struct {
-	Role      string                   `json:"role"`
-	Content   string                   `json:"content"`
-	Name      string                   `json:"name,omitempty"`
-	ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+	Role             string                   `json:"role"`
+	Content          string                   `json:"content"`
+	ReasoningContent string                   `json:"reasoning_content,omitempty"`
+	Name             string                   `json:"name,omitempty"`
+	ToolCalls        []ChatCompletionToolCall `json:"tool_calls,omitempty"`
 
 	// ImageURLs holds image references for a multimodal message. When it is
 	// non-empty MarshalJSON emits content as the array form
@@ -68,15 +69,16 @@ type ChatCompletionToolCall struct {
 // raw JSON blob would massively over-count tokens).
 func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 	var a struct {
-		Role      string                   `json:"role"`
-		Content   json.RawMessage          `json:"content"`
-		Name      string                   `json:"name,omitempty"`
-		ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+		Role             string                   `json:"role"`
+		Content          json.RawMessage          `json:"content"`
+		ReasoningContent string                   `json:"reasoning_content,omitempty"`
+		Name             string                   `json:"name,omitempty"`
+		ToolCalls        []ChatCompletionToolCall `json:"tool_calls,omitempty"`
 	}
 	if err := json.Unmarshal(data, &a); err != nil {
 		return err
 	}
-	m.Role, m.Name = a.Role, a.Name
+	m.Role, m.Name, m.ReasoningContent = a.Role, a.Name, a.ReasoningContent
 	// ToolCalls must be carried through: a custom UnmarshalJSON that ignores
 	// them silently drops every tool call in a decoded response, which breaks
 	// tool-result round trips on both the chat and Responses surfaces.
@@ -119,11 +121,12 @@ type StreamOptions struct {
 func (m ChatCompletionMessage) MarshalJSON() ([]byte, error) {
 	if len(m.ImageURLs) == 0 {
 		return json.Marshal(struct {
-			Role      string                   `json:"role"`
-			Content   string                   `json:"content"`
-			Name      string                   `json:"name,omitempty"`
-			ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
-		}{m.Role, m.Content, m.Name, m.ToolCalls})
+			Role             string                   `json:"role"`
+			Content          string                   `json:"content"`
+			ReasoningContent string                   `json:"reasoning_content,omitempty"`
+			Name             string                   `json:"name,omitempty"`
+			ToolCalls        []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+		}{m.Role, m.Content, m.ReasoningContent, m.Name, m.ToolCalls})
 	}
 	parts := make([]map[string]any, 0, len(m.ImageURLs)+1)
 	if m.Content != "" {
@@ -136,11 +139,12 @@ func (m ChatCompletionMessage) MarshalJSON() ([]byte, error) {
 		})
 	}
 	return json.Marshal(struct {
-		Role      string                   `json:"role"`
-		Content   []map[string]any         `json:"content"`
-		Name      string                   `json:"name,omitempty"`
-		ToolCalls []ChatCompletionToolCall `json:"tool_calls,omitempty"`
-	}{m.Role, parts, m.Name, m.ToolCalls})
+		Role             string                   `json:"role"`
+		Content          []map[string]any         `json:"content"`
+		ReasoningContent string                   `json:"reasoning_content,omitempty"`
+		Name             string                   `json:"name,omitempty"`
+		ToolCalls        []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+	}{m.Role, parts, m.ReasoningContent, m.Name, m.ToolCalls})
 }
 
 type ChatCompletionResponse struct {
@@ -1075,6 +1079,19 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			resp.Body.Close()
 			cancel()
 
+			// Command Code error statuses are remapped to the
+			// OpenAI-equivalent the client and the cooldown
+			// classifier expect: 402 payment-required is a rate
+			// limit, 5xx is a retryable upstream error, and an
+			// unlisted status becomes a 502 rather than a generic
+			// failure.
+			if ep.UpstreamProtocol() == protocolCommandCode {
+				if mapped := ccMapError(resp.StatusCode, respBody); mapped != nil {
+					resp.StatusCode = mapped.StatusCode
+					respBody = mapped.Body
+				}
+			}
+
 			// "This model does not support this protocol" is a statement about
 			// the PROTOCOL, not about the endpoint's health: the same catalog
 			// holds chat-only and responses-only models side by side. Measured
@@ -1123,6 +1140,35 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		resp.Body.Close()
 		cancel()
 
+		// OpenCode free-tier gate: the body gate in buildRequest forced
+		// `stream:true` upstream even for this non-streaming client, so
+		// an opencode endpoint answers an SSE stream where a single JSON
+		// object was expected. Fold the stream back into the Chat
+		// Completions shape here, so everything after this point -- TPS
+		// accounting, the headers copied to the client, the body written
+		// out -- sees the shape it expects.
+		//
+		// Only the Chat Completions protocol carries the gate: a
+		// Responses-protocol endpoint keeps its own envelope, and its
+		// translation below handles that shape. A truncation or
+		// zero-output failure is treated as a failed attempt rather than
+		// forwarded: emitting a half-folded completion would be a silent
+		// corruption, while falling back gets a real answer from the next
+		// endpoint.
+		if isOpencodeProvider(ep.Provider) && g.proxy.effectiveProtocol(ep) == protocolChatCompletions {
+			if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/event-stream") {
+				converted, cerr := opencodeAggregateStream(respBody, req.Model, time.Now().Unix())
+				if cerr != nil {
+					log.Printf("[debug] session=%s model=%s -> opencode SSE aggregation failed: %v", sessionID, req.Model, cerr)
+					tried[ep.Key()] = true
+					g.router.ApplyCooldownForSession(ep, 502, cerr.Error(), sessionID, 0)
+					g.recordCooldown()
+					continue
+				}
+				respBody = converted
+			}
+		}
+
 		// An endpoint addressed with the Responses API answers with a Responses
 		// envelope; the client asked for Chat Completions. Translate here so
 		// everything after this point -- TPS accounting, the headers copied to
@@ -1138,6 +1184,24 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				log.Printf("[debug] session=%s model=%s -> responses->chat translation failed: %v", sessionID, req.Model, cerr)
 				tried[ep.Key()] = true
 				g.router.ApplyCooldownForSession(ep, 502, cerr.Error(), sessionID, 0)
+				g.recordCooldown()
+				continue
+			}
+			respBody = converted
+		}
+
+		// Command Code answers with an NDJSON event stream even for
+		// a non-streaming client request (the envelope always sets
+		// stream:true). Fold the events into a Chat Completions
+		// object here. A truncated stream (no finish event) or an
+		// empty one (zero output tokens) is a failed attempt: falling
+		// back gets a real answer from the next endpoint.
+		if ep.UpstreamProtocol() == protocolCommandCode {
+			converted, cerr := ccAggregateStream(respBody, req.Model, time.Now().Unix())
+			if cerr != nil {
+				log.Printf("[debug] session=%s model=%s -> commandcode aggregation failed: %v", sessionID, req.Model, cerr)
+				tried[ep.Key()] = true
+				g.router.ApplyCooldownFromErrorForSession(ep, cerr, sessionID)
 				g.recordCooldown()
 				continue
 			}
@@ -1161,6 +1225,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				continue
 			}
 			w.Header()[k] = v
+		}
+		// Command Code's NDJSON stream is folded into a plain JSON
+		// object above; the upstream's stream content type must not
+		// reach the client.
+		if ep.UpstreamProtocol() == protocolCommandCode {
+			w.Header().Set("Content-Type", "application/json")
 		}
 		w.WriteHeader(200)
 		if _, writeErr := w.Write(respBody); writeErr != nil {
