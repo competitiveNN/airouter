@@ -19,7 +19,20 @@ func main() {
 	allowNoAuth := flag.Bool("allow-no-auth", false, "Allow running without an API key (INSECURE: all endpoints including admin become unauthenticated)")
 	warmup := flag.Bool("warmup", false, "Warm up model profiles on startup (fires test requests to each provider)")
 	toolCalls := flag.Bool("tool-calls", false, "Enable synthesized tool-call events in streaming responses (disabled by default for compatibility)")
+	pruneStats := flag.String("prune-stats", "", "Prune the dashboard stats journal at PATH to the 30-day retention window, then exit")
 	flag.Parse()
+
+	// The prune mode is a maintenance operation, not a gateway: it
+	// rewrites one file and exits before anything else starts, so the
+	// systemd timer that runs it needs no API key and no config.
+	if *pruneStats != "" {
+		kept, err := pruneDashboardJournal(*pruneStats)
+		if err != nil {
+			log.Fatalf("Failed to prune stats journal %s: %v", *pruneStats, err)
+		}
+		log.Printf("Pruned stats journal %s: %d ticks kept", *pruneStats, kept)
+		return
+	}
 
 	if *gatewayAPIKey == "" {
 		*gatewayAPIKey = os.Getenv("GATEWAY_API_KEY")
@@ -35,6 +48,11 @@ func main() {
 	}
 
 	cooldownPath := filepath.Join(filepath.Dir(*configPath), "cooldowns.json")
+	// The dashboard journal lives beside the config for the same
+	// reason cooldowns.json does: it is state the gateway owns, and
+	// the config's directory is the one place the operator already
+	// associates with the gateway's data.
+	journalPath := filepath.Join(filepath.Dir(*configPath), "metrics-ring.jsonl")
 	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
 	proxy.SetProtocolResolver(router.ProtocolFor)
@@ -116,7 +134,7 @@ func main() {
 
 	// Start the dashboard attempt ring so the 1d/7d leaderboards are live
 	// from startup rather than only after the first dashboard scrape.
-	stopDashboard := gateway.metrics.StartDashboardTelemetry()
+	stopDashboard := gateway.metrics.StartDashboardTelemetry(journalPath)
 	defer stopDashboard()
 	for name, p := range cfg.Providers {
 		keyStatus := "no key"

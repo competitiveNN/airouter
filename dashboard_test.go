@@ -23,7 +23,7 @@ func TestDashboardQuerySumsOnlyTheWindow(t *testing.T) {
 	// Bring the ticker up so attemptRingStarted is set, then advance the ring
 	// by hand. Attempts recorded via Attempt always land in the CURRENT tick,
 	// so to place observations in specific ticks we drive the ring directly.
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 
 	// A 1d window covers 1440 ticks. Record into tick 0 (current), advance
@@ -54,7 +54,7 @@ func TestDashboardQuerySumsOnlyTheWindow(t *testing.T) {
 // when the numbers matter.
 func TestDashboardQueryIncludesCurrentTick(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 	for i := 0; i < 5; i++ {
 		m.Attempt("prov:model-a", 100*time.Millisecond, true)
@@ -76,7 +76,7 @@ func TestDashboardQueryIncludesCurrentTick(t *testing.T) {
 // the endpoint string survives the aggregation.
 func TestDashboardQueryAggregatesAcrossTicks(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 
 	m.Attempt("prov:a", 100*time.Millisecond, true)
@@ -124,7 +124,7 @@ func TestDashboardQueryUnknownWindowIsEmpty(t *testing.T) {
 // leaderboard.
 func TestRecordDashboardTokensRejectsNonPositive(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 	m.Attempt("prov:a", time.Millisecond, true)
 	m.RecordDashboardTokens("prov:a", 0)
@@ -249,7 +249,7 @@ func TestDashboardChainStatusDistinguishesCooldownFromCircuit(t *testing.T) {
 // and checks the rate reflects the minute, not the week.
 func TestDashboardSpeedDividesByBusyTime(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 
 	m.Attempt("prov:a", 100*time.Millisecond, true)
@@ -346,7 +346,7 @@ func TestHandleAdminDashboardDataServesPayload(t *testing.T) {
 		}},
 	}}
 	g := dashboardTestGateway(t, cfg)
-	stop := g.metrics.StartDashboardTelemetry()
+	stop := g.metrics.StartDashboardTelemetry("")
 	defer stop()
 	g.metrics.Attempt("p1:m1", 100*time.Millisecond, true)
 	g.metrics.Attempt("p2:m2", 100*time.Millisecond, false)
@@ -431,7 +431,7 @@ func TestHandleAdminDashboardDataRequiresAuth(t *testing.T) {
 // more steps than its length wraps rather than growing or panicking.
 func TestDashboardRingIsBounded(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 	before := len(m.attemptRing)
 	for i := 0; i < dashboardRingLen+10; i++ {
@@ -450,8 +450,8 @@ func TestDashboardRingIsBounded(t *testing.T) {
 // twice as fast and silently halve every reported window.
 func TestStartDashboardTelemetryIsIdempotent(t *testing.T) {
 	m := NewMetrics()
-	stop1 := m.StartDashboardTelemetry()
-	stop2 := m.StartDashboardTelemetry()
+	stop1 := m.StartDashboardTelemetry("")
+	stop2 := m.StartDashboardTelemetry("")
 	defer stop1()
 	defer stop2()
 	if !m.attemptRingStarted {
@@ -534,7 +534,7 @@ func contains(s, sub string) bool {
 // cannot tell an inclusive upper bound from one that is off by two.
 func TestDashboardWindowBoundaryIsExact(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 	m.Attempt("prov:model-a", time.Second, true)
 
@@ -570,7 +570,7 @@ func TestDashboardWindowBoundaryIsExact(t *testing.T) {
 // would drift high forever and nothing in the running daemon would notice.
 func TestDashboardRingRolloverExcludesExactlyOneTick(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 	// Raise the label cap above the ring length: this test writes one distinct
 	// endpoint per tick on purpose, and the default cap of 512 would roll them
@@ -615,7 +615,7 @@ func TestDashboardRingRolloverExcludesExactlyOneTick(t *testing.T) {
 // is mid-advance is neither dropped nor counted twice.
 func TestDashboardAttemptConcurrentWithTicker(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 
 	// The ticker advances the ring under the write lock (see
@@ -810,7 +810,7 @@ func TestPercentileFromHistogramOverflowBucket(t *testing.T) {
 // whole dashboard payload — instead of reporting the boundary.
 func TestDashboardQueryOverflowBucketDoesNotPanic(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 	// 100 attempts at 60s: every one lands in the +Inf bucket, so
 	// all three percentile ranks fall there.
@@ -841,7 +841,7 @@ func TestDashboardQueryOverflowBucketDoesNotPanic(t *testing.T) {
 // boundary for every percentile.
 func TestDashboardQueryIncludesPercentiles(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 
 	// 100 attempts at 0.3s: 0.3 > 0.25 so it misses bucket 0 and lands in
@@ -883,7 +883,7 @@ func TestDashboardQueryIncludesPercentiles(t *testing.T) {
 // window; the 30d window needs 43200 ticks plus one spare.
 func TestDashboard30dWindow(t *testing.T) {
 	m := NewMetrics()
-	stop := m.StartDashboardTelemetry()
+	stop := m.StartDashboardTelemetry("")
 	defer stop()
 
 	m.Attempt("prov:model-a", time.Second, true)

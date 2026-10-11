@@ -18,6 +18,10 @@ opencode-probe-cache.json
 # Runtime state (regenerated on startup)
 cooldowns.json
 cooldowns.priority.json
+# The dashboard stats journal is append-only runtime state:
+# it grows every minute the gateway serves traffic, so it
+# must stay out of the tree fingerprint (and out of git).
+metrics-ring.jsonl
 
 # Tooling metadata
 .maki/
