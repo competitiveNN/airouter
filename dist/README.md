@@ -151,17 +151,13 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `0f5f499` dashboard: web UI for chain status and time-windowed leaderboards
-- `16d26b1` sync: refresh intelligence scores and record chain protocols
-- `9a8a680` config tests: make protocol injection structural, and prove it has teeth
-- `09b7eee` admin: accept ?api_key= so the dashboard opens in a browser
-- `f0e8c94` gofmt: dashboard_test.go
-- `87dc7bf` dashboard: surface the reason an endpoint is down, and rate speed by busy time
-- `0279d6f` dashboard: anchor the cooldown countdown to the gateway's clock, and exercise the circuit column against real traffic
-- `4a6dd83` dashboard: surface the breaker state and prove circuit recovery against real traffic
-- `367e478` commandcode: proxy the /alpha/generate protocol and bypass the opencode free-tier gate
-- `fef8dc3` dashboard: per-endpoint latency percentiles and a 30d window
 - `fed9d59` dashboard: read the percentile fields the payload emits
+
+`origin/master` advanced underneath an earlier version of
+this list (it carried the dashboard web UI, the breaker
+state, the commandcode protocol and the percentile work —
+all pushed since), which is the moving-target property the
+note at the top describes: the list is checked, not trusted.
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
