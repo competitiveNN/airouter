@@ -152,6 +152,7 @@ git push origin master
 What `origin/master` is missing, oldest first:
 
 - `fed9d59` dashboard: read the percentile fields the payload emits
+- `9868d30` dashboard: answer the finite boundary when a percentile rank lands in +Inf
 
 `origin/master` advanced underneath an earlier version of
 this list (it carried the dashboard web UI, the breaker
