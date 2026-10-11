@@ -69,6 +69,16 @@ func percentileFromHistogram(hist []int64, boundaries []float64) latencyPercenti
 					// Interpolate between 0 and boundaries[0].
 					return boundaries[0] * (rank / float64(cum[i]))
 				}
+				// The last slot is the +Inf bucket: it has no upper
+				// boundary to interpolate toward. The observation
+				// exceeded the largest finite boundary and the
+				// histogram does not say by how much, so that
+				// boundary is the honest answer. Indexing
+				// boundaries[i] here would run one past the end of
+				// the boundary array.
+				if i == len(cum)-1 {
+					return boundaries[len(boundaries)-1]
+				}
 				// Interpolate between boundaries[i-1] and boundaries[i].
 				// The fraction is how far into this bucket the rank
 				// falls, as a share of the bucket's own count.

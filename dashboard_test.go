@@ -774,6 +774,67 @@ func TestPercentileFromHistogramMismatchedLength(t *testing.T) {
 	}
 }
 
+// TestPercentileFromHistogramOverflowBucket pins the +Inf case: a
+// rank that lands in the last bucket must answer the largest finite
+// boundary, not panic. The live gateway hit this whenever an
+// endpoint served enough attempts slower than the largest boundary
+// (45s): the p99 rank fell into +Inf, the interpolation indexed
+// one past the boundary array, and the panic took the entire
+// dashboard payload down with it.
+func TestPercentileFromHistogramOverflowBucket(t *testing.T) {
+	bounds := []float64{0.25, 0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45}
+	// 50 observations at ≤0.25s and 50 above 45s: cum[0]=50, so
+	// the p50 rank (50) lands exactly at the top of bucket 0,
+	// while the p95 and p99 ranks (95, 99) exceed every finite
+	// cumulative count and fall into the +Inf bucket.
+	hist := []int64{50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50}
+	p := percentileFromHistogram(hist, bounds)
+	// p50: rank 50, bucket 0, frac = 50/50 = 1 → 0.25s = 250ms.
+	if p.P50 != 250 {
+		t.Fatalf("p50 = %v, want 250ms", p.P50)
+	}
+	// p95 and p99 land in +Inf: the honest answer is the largest
+	// finite boundary, 45s = 45000ms.
+	if p.P95 != 45000 {
+		t.Fatalf("p95 = %v, want 45000ms (largest finite boundary)", p.P95)
+	}
+	if p.P99 != 45000 {
+		t.Fatalf("p99 = %v, want 45000ms (largest finite boundary)", p.P99)
+	}
+}
+
+// TestDashboardQueryOverflowBucketDoesNotPanic is the end-to-end
+// regression for the live outage: attempts slower than the largest
+// histogram boundary land in the +Inf bucket, and a percentile rank
+// that falls there used to panic the query — and therefore the
+// whole dashboard payload — instead of reporting the boundary.
+func TestDashboardQueryOverflowBucketDoesNotPanic(t *testing.T) {
+	m := NewMetrics()
+	stop := m.StartDashboardTelemetry()
+	defer stop()
+	// 100 attempts at 60s: every one lands in the +Inf bucket, so
+	// all three percentile ranks fall there.
+	for i := 0; i < 100; i++ {
+		m.Attempt("prov:slow", 60*time.Second, true)
+	}
+	rows := m.DashboardQuery(dashboardWindow1d)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	for _, pct := range []struct {
+		name string
+		got  float64
+	}{
+		{"p50", rows[0].Percentiles.P50},
+		{"p95", rows[0].Percentiles.P95},
+		{"p99", rows[0].Percentiles.P99},
+	} {
+		if pct.got != 45000 {
+			t.Fatalf("%s = %v, want 45000ms (largest finite boundary)", pct.name, pct.got)
+		}
+	}
+}
+
 // TestDashboardQueryIncludesPercentiles checks that DashboardQuery computes
 // latency percentiles from the histogram it sums across ticks. An endpoint
 // whose attempts all land in the same bucket should report that bucket's
