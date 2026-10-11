@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune airouter dashboard stats journal to the 30-day window
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/airouter
+# The prune rewrites one local file and exits before any
+# server starts, so it needs neither provider credentials
+# nor the gateway API key — unlike the sync units it does
+# not source .envrc.
+ExecStart=%h/dev/airouter/airouter -prune-stats %h/dev/airouter/metrics-ring.jsonl
+TimeoutStartSec=10min

@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 // attemptTick is one minute's worth of per-endpoint attempt telemetry. It is
 // the unit the attempt ring stores; the dashboard sums a range of ticks to
@@ -71,6 +74,11 @@ func (m *Metrics) attemptTickForLocked() *attemptTick {
 	t := m.attemptRing[m.attemptRingNow]
 	if t == nil {
 		t = newAttemptTick()
+		// The tick belongs to the minute it was created in, aligned to
+		// the minute boundary the ticker advances on: the journal slots
+		// a tick by its minute, so a lazily created tick must carry the
+		// boundary, not the instant of its first write.
+		t.start = time.Now().Truncate(time.Minute)
 		m.attemptRing[m.attemptRingNow] = t
 	}
 	return t
@@ -139,21 +147,67 @@ func (m *Metrics) advanceRingTickLocked() {
 	m.attemptRingStarted = true
 }
 
-// StartDashboardTelemetry starts the background goroutine that advances the
-// attempt ring once a minute. It is idempotent: calling it twice does not
-// start a second ticker. The returned function stops it.
+// restoreDashboardJournalLocked replays the journal into the ring.
+// Caller must hold m.mu.
+//
+// Each tick is placed in the slot its minute maps to, so the ring's
+// geometry after a restart is exactly what it would have been had the
+// process never stopped: DashboardQuery walks back from
+// attemptRingNow, and every restored tick sits at the position its
+// minute occupies, so a 1d window still covers the last 1440 minutes
+// rather than the last 1440 ticks this process happened to record.
+func (m *Metrics) restoreDashboardJournalLocked(path string) (int, error) {
+	nowMinute := journalMinute(time.Now())
+	lines, err := replayDashboardJournal(path, nowMinute)
+	if err != nil {
+		return 0, err
+	}
+	for minute, line := range lines {
+		slot := journalSlot(minute)
+		if slot < 0 || slot >= dashboardRingLen {
+			continue
+		}
+		m.attemptRing[slot] = line.attemptTick()
+	}
+	m.attemptRingNow = journalSlot(nowMinute)
+	return len(lines), nil
+}
+
+// StartDashboardTelemetry starts the background goroutine that advances
+// the attempt ring once a minute and appends each completed tick to
+// the dashboard journal at journalPath (empty disables persistence).
+// It is idempotent: calling it twice does not start a second ticker.
+// The returned function stops it.
 //
 // It is wired from main.go alongside the config watcher, so the dashboard is
 // live from startup rather than only after the first dashboard scrape. Without
 // this the first 1d/7d leaderboard would report "no data" for up to a minute
 // even though the gateway had been serving requests the whole time.
-func (m *Metrics) StartDashboardTelemetry() func() {
+//
+// On start it also restores the journal into the ring and prunes the
+// journal back to the retention window. The prune is best-effort and
+// its failure is logged, not fatal: the timer prunes daily, but a
+// missed timer (machine off at 06:30) must not let the journal grow
+// without bound, so every boot prunes too.
+func (m *Metrics) StartDashboardTelemetry(journalPath string) func() {
 	m.mu.Lock()
 	if m.attemptRingStarted {
 		m.mu.Unlock()
 		return func() {}
 	}
 	m.attemptRingStarted = true
+	if journalPath != "" {
+		if restored, err := m.restoreDashboardJournalLocked(journalPath); err != nil {
+			log.Printf("[dashboard] journal restore failed: %v", err)
+		} else if restored > 0 {
+			log.Printf("[dashboard] journal restored %d ticks from %s", restored, journalPath)
+		}
+		if kept, err := pruneDashboardJournal(journalPath); err != nil {
+			log.Printf("[dashboard] journal prune failed: %v", err)
+		} else if kept == 0 {
+			log.Printf("[dashboard] journal %s holds nothing within the retention window", journalPath)
+		}
+	}
 	m.mu.Unlock()
 
 	stop := make(chan struct{})
@@ -176,8 +230,19 @@ func (m *Metrics) StartDashboardTelemetry() func() {
 				return
 			case <-ticker.C:
 				m.mu.Lock()
+				// The tick being left behind is complete: Attempt holds the
+				// same lock for the whole of an observation, so nothing can
+				// land in it after the advance. It is journaled outside the
+				// lock — the append is a file write, and the request path
+				// must not wait on disk.
+				completed := m.attemptRing[m.attemptRingNow]
 				m.advanceRingTickLocked()
 				m.mu.Unlock()
+				if completed != nil && journalPath != "" {
+					if err := appendDashboardJournal(journalPath, completed); err != nil {
+						log.Printf("[dashboard] journal append: %v", err)
+					}
+				}
 			}
 		}
 	}()

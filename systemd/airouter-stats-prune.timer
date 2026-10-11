@@ -1,0 +1,13 @@
+[Unit]
+Description=Prune airouter dashboard stats journal daily
+
+[Timer]
+# Half past the model sync's hour so the two daily jobs never
+# contend; the randomized delay desynchronizes further if
+# several machines share a provider.
+OnCalendar=*-*-* 06:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
