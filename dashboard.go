@@ -210,7 +210,7 @@ async function refresh(){
     if(d.now) serverNow = new Date(d.now).getTime();
     renderWindowSel();
     renderChains(d.chains||[]);
-    renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.percentiles?r.percentiles.p50:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.percentiles?r.percentiles.p95:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.percentiles?r.percentiles.p99:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
+    renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.latency_percentiles?r.latency_percentiles.p50_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p95_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p99_ms:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
     renderBoard('volume', d.volume||[], [[r=>r.rate,v=>v.toFixed(3)],[r=>r.attempts,v=>v]]);
     renderBoard('failures', d.failures||[], [[r=>r.rate,v=>(v*100).toFixed(1)+'%'],[r=>r.failures,v=>v]]);
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
