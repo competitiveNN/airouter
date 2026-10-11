@@ -161,6 +161,7 @@ What `origin/master` is missing, oldest first:
 - `4a6dd83` dashboard: surface the breaker state and prove circuit recovery against real traffic
 - `367e478` commandcode: proxy the /alpha/generate protocol and bypass the opencode free-tier gate
 - `fef8dc3` dashboard: per-endpoint latency percentiles and a 30d window
+- `fed9d59` dashboard: read the percentile fields the payload emits
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
