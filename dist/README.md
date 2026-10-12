@@ -151,11 +151,9 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `fed9d59` dashboard: read the percentile fields the payload emits
-- `9868d30` dashboard: answer the finite boundary when a percentile rank lands in +Inf
-- `34b40a8` dashboard: fix the blank page and render the page's script in the gate
-- `80001f1` dashboard: lay chains out as a header over a pill grid, size the editor
-- `2244b15` dashboard: persist the attempt ring to a journal, prune daily
+- `1ad8d5f` chat: add a built-in web chat UI (open-webui substitute)
+- `7d904ff` chat: fix 7 UI bugs and round-trip reasoning items for prefix caching
+- `ca64e49` chat: test prefix-cache passthrough, reasoning round-trip, audit #3 fixes
 
 `origin/master` advanced underneath an earlier version of
 this list (it carried the dashboard web UI, the breaker
