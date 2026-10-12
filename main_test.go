@@ -2239,7 +2239,7 @@ func TestStreamSSE_CoalescesToolCallDeltas(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	acc, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	acc, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2313,7 +2313,7 @@ func TestStreamSSE_IncompleteToolCallDropped(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2346,7 +2346,7 @@ func TestStreamSSE_EmptyArgsToolCallEmitted(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2391,7 +2391,7 @@ func TestStreamSSE_MultipleToolCalls(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2447,7 +2447,7 @@ func TestStreamSSE_ToolCallWithContent(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2512,7 +2512,7 @@ func TestStreamSSE_NameArrivesLate(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2570,7 +2570,7 @@ func TestStreamSSE_PartialArgumentsAcrossChunks(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2622,7 +2622,7 @@ func TestStreamSSE_SameIndexOverwrite(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body)
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2999,7 +2999,7 @@ func TestStreamSSE_FinalEventNoTrailingBlankLine(t *testing.T) {
 	flusher := &testFlusher{buf}
 	p := &Proxy{}
 
-	_, _, _, err := p.streamSSE(flusher, flusher, body)
+	_, _, _, err := p.streamSSE(flusher, flusher, body, "")
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}

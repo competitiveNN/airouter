@@ -1208,6 +1208,15 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			respBody = converted
 		}
 
+		// Model patches rewrite provider-specific output
+		// artifacts (e.g. tool calls a model traps inside its
+		// thinking block) after the protocol translations
+		// above, so every upstream shape is normalized before
+		// the patch runs.
+		if patch := modelPatchFor(ep.Model); patch != nil {
+			respBody = patch.TransformCompletion(respBody)
+		}
+
 		g.router.RecordSuccess(ep)
 		attemptDur := time.Since(attemptStart)
 		g.recordAttempt(ep, attemptDur, true)

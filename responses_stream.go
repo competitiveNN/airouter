@@ -281,11 +281,20 @@ func (s *responsesStreamWriter) fail(code, message, errType string) {
 // caller buffers each attempt in order to decide whether to replay it. The
 // lifecycle events (response.created / response.in_progress) have already been
 // written by newResponsesStreamWriter before this is called.
-func translateChatSSE(r io.Reader, sw *responsesStreamWriter) (string, []streamToolCall, error) {
+func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel string) (string, []streamToolCall, error) {
 	var buffered bytes.Buffer
 	released := false
 	var acc strings.Builder
 	tcs := []streamToolCall{}
+
+	// A model patch rescues tool calls a model traps inside its
+	// thinking block. The thinking itself is not surfaced on the
+	// Responses surface, so only the extracted calls matter here.
+	patch := modelPatchFor(upstreamModel)
+	var patchState PatchStreamState
+	if patch != nil {
+		patchState = patch.BeginStream()
+	}
 
 	release := func() {
 		if released {
@@ -313,6 +322,10 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter) (string, []streamT
 			continue
 		}
 		if bytes.Equal(raw, []byte("[DONE]")) {
+			if patch != nil {
+				_, extracted := patch.FlushStream(patchState)
+				registerPatchCalls(&tcs, extracted)
+			}
 			release()
 			finish := lastFinishReason(tcs)
 			sw.finish(finish, tcs)
@@ -329,6 +342,17 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter) (string, []streamT
 				StatusCode: statusForStreamError(code),
 				Body:       []byte(msg),
 			}
+		}
+
+		// Run the model patch over the chunk: any tool call whose
+		// closing tag arrived here is accumulated like an upstream
+		// tool call delta. The cleaned payload differs from raw only
+		// in the thinking fields, which this surface does not
+		// forward, so the cleaned form is safe to decode.
+		if patch != nil {
+			cleaned, extracted := patch.TransformStreamChunk(patchState, raw)
+			registerPatchCalls(&tcs, extracted)
+			raw = cleaned
 		}
 
 		// ChatCompletionStreamDelta has no ToolCalls field (the chat path
@@ -377,6 +401,10 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter) (string, []streamT
 	}
 	if err := scanner.Err(); err != nil {
 		return acc.String(), tcs, err
+	}
+	if patch != nil {
+		_, extracted := patch.FlushStream(patchState)
+		registerPatchCalls(&tcs, extracted)
 	}
 	release()
 	sw.finish(lastFinishReason(tcs), tcs)
@@ -442,6 +470,29 @@ func lastFinishReason(tcs []streamToolCall) string {
 		return "tool_calls"
 	}
 	return "stop"
+}
+
+// registerPatchCalls folds tool calls extracted by a model patch into
+// the running accumulator, assigning each the smallest index not yet
+// used so a patch call never collides with an upstream tool call.
+func registerPatchCalls(tcs *[]streamToolCall, calls []PatchToolCall) {
+	for _, c := range calls {
+		idx := 0
+		for {
+			used := false
+			for _, existing := range *tcs {
+				if existing.Index == idx {
+					used = true
+					break
+				}
+			}
+			if !used {
+				break
+			}
+			idx++
+		}
+		accumulateResponsesToolCall(tcs, idx, c.ID, "function", c.Name, c.Arguments)
+	}
 }
 
 // accumulateResponsesToolCall folds one Chat Completions tool_call delta into
