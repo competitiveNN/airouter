@@ -675,6 +675,7 @@ select, input[type=text] { background: #1b1e24; color: #e6e6e6; border: 1px soli
 .msg-col { max-width: 75%; display: flex; flex-direction: column; }
 .msg.user .msg-col { align-items: flex-end; }
 .stats { font-size: 11px; color: #8b93a1; margin-top: 4px; }
+.stream-error { color: #e08080; margin-top: 4px; }
 .thinking { margin: 0 0 6px; }
 .thinking summary { cursor: pointer; font-size: 12px; color: #8b93a1; user-select: none; }
 .thinking-body { margin-top: 4px; padding: 6px 8px; border-left: 2px solid #333842; color: #a8b2c0; font-size: 13px; }
@@ -790,9 +791,14 @@ function renderMarkdown(src) {
   s = s.replace(/\x60{3}[ \t]*(\w*)[ \t]*\r?\n([\s\S]*?)\x60{3}/g, function (m, lang, code) {
     return keep('<pre class="code-block"><code>' + esc(code.replace(/^\r?\n/, '').replace(/\r?\n[ \t]*$/, '')) + '</code></pre>');
   });
+  // Inline code spans are stashed like fenced blocks, before
+  // escaping: their content must survive the markdown passes
+  // below (a ** or $$ inside a code span is neither
+  // emphasis nor math).
+  s = s.replace(/\x60([^\x60\n]+)\x60/g, function (m, code) {
+    return keep('<code>' + esc(code) + '</code>');
+  });
   s = esc(s);
-  // Inline code
-  s = s.replace(/\x60([^\x60\n]+)\x60/g, '<code>$1</code>');
   // LaTeX: display math $$...$$ and inline $...$
   s = s.replace(/\$\$([\s\S]*?)\$\$/g, function (m, tex) {
     return keep('<span class="math math-display">' + esc(tex.replace(/\s+/g, ' ').trim()) + '</span>');
@@ -823,22 +829,33 @@ function renderMarkdown(src) {
     }
     return '<p>' + p.replace(/\n/g, '<br>') + '</p>';
   }).join('');
-  // A NUL marker with no stashed block (message text that
-  // itself contains NUL bytes) is left as-is, never replaced
-  // by "undefined".
-  return s.replace(/\u0000(\d+)\u0000/g, function (m, i) {
-  	var v = stash[+i];
-  	return v === undefined ? m : v;
-  });
+  // Restoring can expose markers nested inside a restored
+  // block (math that contains a code span), so repeat until
+  // no marker is left. A pass only resolves markers, it never
+  // creates them, so this terminates. A marker with no
+  // stashed block (message text that itself contains NUL
+  // bytes) is left as-is, never replaced by "undefined".
+  var prev;
+  do {
+  	prev = s;
+  	s = s.replace(/\u0000(\d+)\u0000/g, function (m, i) {
+  	  var v = stash[+i];
+  	  return v === undefined ? m : v;
+  	});
+  } while (s !== prev);
+  return s;
 }
 
 // renderThinking renders the model's reasoning as a collapsible
-// block above the answer. It is open while the answer is still
-// streaming and collapsed afterwards, so a long reasoning chain
-// never buries the answer it produced.
-function renderThinking(text) {
+// block above the answer. The open argument says whether the
+// block starts expanded: true only while the reasoning is
+// still streaming. A complete or historical message is always
+// collapsed, whatever else is happening on the page —
+// switching chats mid-stream must not pop old thinking
+// blocks open.
+function renderThinking(text, open) {
   if (!text) return '';
-  return '<details class="thinking"' + (generating ? ' open' : '') + '><summary>Thinking…</summary><div class="thinking-body">' + renderMarkdown(text) + '</div></details>';
+  return '<details class="thinking"' + (open ? ' open' : '') + '><summary>Thinking…</summary><div class="thinking-body">' + renderMarkdown(text) + '</div></details>';
 }
 
 function defaultEndpoint() {
@@ -1003,6 +1020,10 @@ function renderSettings() {
       });
     };
     row.querySelector('.ep-del').onclick = function () {
+      if (ep.id === 'self') {
+        alert('The gateway endpoint cannot be deleted.');
+        return;
+      }
       if (!confirm('Delete endpoint ' + (ep.name || ep.url) + '?')) return;
       endpoints = endpoints.filter(function (x) { return x.id !== ep.id; });
       save(LS_ENDPOINTS, endpoints);
@@ -1057,7 +1078,7 @@ function appendMessage(role, content, stats, thinking) {
   col.className = 'msg-col';
   var bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.innerHTML = renderThinking(thinking) + renderMarkdown(content);
+  bubble.innerHTML = renderThinking(thinking, false) + renderMarkdown(content);
   col.appendChild(bubble);
   if (stats) {
     var st = document.createElement('div');
@@ -1100,14 +1121,32 @@ function fmtInt(n) {
 
 // ---------- sending ----------
 
+// toResponsesItems builds the Responses API "input" from the
+// stored history. A reasoning model's reasoning items are passed
+// back ahead of the answer they produced: the API expects them
+// there (the model keeps its reasoning chain), and sending the
+// same items every turn keeps the request prefix identical to
+// the one the provider cached server-side — dropping them would
+// silently turn every later turn's cache into a miss.
 function toResponsesItems(messages) {
-  return messages.map(function (m) {
-    return {
+  var items = [];
+  messages.forEach(function (m) {
+    if (m.role === 'assistant') {
+      var reasoning = m.reasoning || [];
+      for (var i = 0; i < reasoning.length; i++) {
+        items.push(reasoning[i]);
+      }
+      if (!reasoning.length && m.thinking) {
+        items.push({ type: 'reasoning', summary: [{ type: 'summary_text', text: m.thinking }] });
+      }
+    }
+    items.push({
       type: 'message',
       role: m.role,
       content: [{ type: m.role === 'user' ? 'input_text' : 'output_text', text: m.content }]
-    };
+    });
   });
+  return items;
 }
 
 // updateComposer toggles the Send and Stop buttons so an
@@ -1158,27 +1197,29 @@ function send() {
   updateComposer();
   var full = '';
   var thinking = '';
+  var reasoningItems = null;
   var stats = null;
 
   doSend(payload, protocol,
     function (chunk, isThinking) {
       if (isThinking) thinking += chunk; else full += chunk;
-      bubble.innerHTML = renderThinking(thinking) + renderMarkdown(full);
+      bubble.innerHTML = renderThinking(thinking, true) + renderMarkdown(full);
       $('messages').scrollTop = $('messages').scrollHeight;
     },
-    function (s) { stats = s; statsEl.textContent = statsText(s); }
+    function (s) { stats = s; statsEl.textContent = statsText(s); },
+    function (items) { reasoningItems = items; }
   ).then(function () {
     generating = false;
     abortCtrl = null;
     updateComposer();
     if (full || thinking) {
-      chat.messages.push({ role: 'assistant', content: full, thinking: thinking, stats: stats });
+      chat.messages.push({ role: 'assistant', content: full, thinking: thinking, reasoning: reasoningItems, stats: stats });
       chat.updated = Date.now();
       save(LS_CHATS, chats);
       renderChats();
       // Re-render now that the stream is over so the
       // thinking block collapses.
-      bubble.innerHTML = renderThinking(thinking) + renderMarkdown(full);
+      bubble.innerHTML = renderThinking(thinking, false) + renderMarkdown(full);
     } else {
       bubble.textContent = '(empty response)';
     }
@@ -1191,8 +1232,8 @@ function send() {
       // Stopped mid-stream: keep the partial reasoning and
       // answer exactly as the model produced them so far.
       if (full || thinking) {
-        bubble.innerHTML = renderThinking(thinking) + renderMarkdown(full);
-        chat.messages.push({ role: 'assistant', content: full, thinking: thinking, stats: stats });
+        bubble.innerHTML = renderThinking(thinking, false) + renderMarkdown(full);
+        chat.messages.push({ role: 'assistant', content: full, thinking: thinking, reasoning: reasoningItems, stats: stats });
         chat.updated = Date.now();
         save(LS_CHATS, chats);
         renderChats();
@@ -1201,11 +1242,23 @@ function send() {
       }
       return;
     }
-    bubble.textContent = 'Error: ' + err;
+    // The stream failed (an error event mid-stream, a
+    // network error, ...). Whatever the model produced
+    // before the failure is kept and saved, with the
+    // error appended — its work so far is not thrown away.
+    if (full || thinking) {
+      bubble.innerHTML = renderThinking(thinking, false) + renderMarkdown(full) + '<p class="stream-error">Error: ' + esc(err) + '</p>';
+      chat.messages.push({ role: 'assistant', content: full, thinking: thinking, reasoning: reasoningItems, stats: stats });
+      chat.updated = Date.now();
+      save(LS_CHATS, chats);
+      renderChats();
+    } else {
+      bubble.textContent = 'Error: ' + err;
+    }
   });
 }
 
-function doSend(payload, protocol, onText, onStats) {
+function doSend(payload, protocol, onText, onStats, onItems) {
   return fetch(apiUrl('/chat/' + protocol), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1214,23 +1267,37 @@ function doSend(payload, protocol, onText, onStats) {
   }).then(function (resp) {
     if (!resp.ok) {
       return resp.text().then(function (t) {
-        throw new Error('HTTP ' + resp.status + ' ' + (t || '').slice(0, 300));
+        // An error status can carry an SSE stream whose
+        // data lines hold the real error JSON; show that
+        // instead of the raw stream text.
+        var msg = t || '';
+        var m = msg.match(/data:[ \t]*(\{[\s\S]*\})/);
+        if (m) {
+          try {
+            var obj = JSON.parse(m[1]);
+            if (obj && obj.error) {
+              msg = obj.error.message || JSON.stringify(obj.error);
+            }
+          } catch (e) {}
+        }
+        throw new Error('HTTP ' + resp.status + ' ' + String(msg).slice(0, 300));
       });
     }
     var ct = resp.headers.get('content-type') || '';
     if (ct.indexOf('text/event-stream') >= 0) {
-      return readStream(resp, onText, onStats);
+      return readStream(resp, onText, onStats, onItems);
     }
     return resp.json().then(function (obj) {
       var parts = extractParts(obj, protocol);
       if (parts.thinking) onText(parts.thinking, true);
       if (parts.text) onText(parts.text, false);
+      if (parts.reasoning && parts.reasoning.length) onItems(parts.reasoning);
       onStats(statsFromHeaders(resp));
     });
   });
 }
 
-function readStream(resp, onText, onStats) {
+function readStream(resp, onText, onStats, onItems) {
   var reader = resp.body.getReader();
   var decoder = new TextDecoder();
   var buf = '';
@@ -1240,7 +1307,7 @@ function readStream(resp, onText, onStats) {
         // Flush the decoder so a multi-byte character split
         // across the final chunks is not dropped.
         buf += decoder.decode();
-        if (buf.trim()) handleSSE(buf, onText, onStats);
+        if (buf.trim()) handleSSE(buf, onText, onStats, onItems);
         return;
       }
       buf += decoder.decode(result.value, { stream: true });
@@ -1248,7 +1315,7 @@ function readStream(resp, onText, onStats) {
       while ((idx = buf.indexOf('\n\n')) >= 0) {
         var ev = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
-        handleSSE(ev, onText, onStats);
+        handleSSE(ev, onText, onStats, onItems);
       }
       return pump();
     });
@@ -1256,7 +1323,7 @@ function readStream(resp, onText, onStats) {
   return pump();
 }
 
-function handleSSE(rawEvent, onText, onStats) {
+function handleSSE(rawEvent, onText, onStats, onItems) {
   var lines = rawEvent.split('\n');
   var eventName = '';
   var dataLines = [];
@@ -1283,6 +1350,20 @@ function handleSSE(rawEvent, onText, onStats) {
   if (obj.error) {
     throw new Error((obj.error && obj.error.message) || JSON.stringify(obj.error));
   }
+  // response.completed carries the whole output, reasoning
+  // items included (with the ids the provider gave them).
+  // Keeping them lets the next turn send them back, which is
+  // what the Responses API expects of a reasoning model and
+  // what keeps the provider's server-side prefix cache hit.
+  if (obj.type === 'response.completed' && obj.response && obj.response.output && onItems) {
+    var reasoning = [];
+    for (var i = 0; i < obj.response.output.length; i++) {
+      if (obj.response.output[i] && obj.response.output[i].type === 'reasoning') {
+        reasoning.push(obj.response.output[i]);
+      }
+    }
+    if (reasoning.length) onItems(reasoning);
+  }
   var text = '';
   var isThinking = false;
   if (obj.type === 'response.output_text.delta') {
@@ -1304,10 +1385,11 @@ function handleSSE(rawEvent, onText, onStats) {
   if (text) onText(text, isThinking);
 }
 
-// extractParts pulls the answer text and the reasoning text out
-// of a complete (non-streaming) response of either API shape.
+// extractParts pulls the answer text, the reasoning text
+// and the raw reasoning items out of a complete
+// (non-streaming) response of either API shape.
 function extractParts(obj, protocol) {
-  var parts = { text: '', thinking: '' };
+  var parts = { text: '', thinking: '', reasoning: [] };
   if (!obj) return parts;
   if (protocol === 'responses') {
     if (obj.output) {
@@ -1320,6 +1402,7 @@ function extractParts(obj, protocol) {
             }
           }
         } else if (item.type === 'reasoning') {
+          parts.reasoning.push(item);
           var added = false;
           var summary = item.summary || [];
           for (var k = 0; k < summary.length; k++) {
