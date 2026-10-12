@@ -39,6 +39,9 @@ client, so:
 | `GET /v1/models` | The four logical models; `max_context_tokens` advertises the **smallest** context window in the chain, so a client never plans for more input than every backend the profile might fall back to can accept |
 | `GET /health`, `GET /metrics` | Liveness; Prometheus metrics (authenticated) |
 | `GET /v1/airouter/state` | Unauthenticated snapshot of every endpoint's circuit state and remaining cooldown |
+| `GET /chat` | Web chat UI (open-webui substitute), authenticated like `/admin` |
+| `POST /chat/completions`, `POST /chat/responses` | The chat UI's proxy: forwards to any remote OpenAI-compatible endpoint named in the request's `endpoint` object, and reports context tokens, TTFT, prefill t/s and decode t/s (as `X-Chat-*` headers, or an `airouter.stats` SSE event when streaming) |
+| `POST /chat/models` | The chat UI's roster fetch: proxies `GET <endpoint.url>/models` so the model dropdown is populated from what the endpoint actually serves |
 | `/admin/*` | Authenticated: config (GET/POST), sessions, cooldowns, providers, and an HTML dashboard at `/admin/` |
 
 ### Protocol-aware routing
@@ -61,6 +64,22 @@ model's capabilities. Image requests are routed only to vision-capable
 endpoints, and an endpoint that rejects an image at runtime is learned
 as text-only for subsequent vision requests (runtime-only, not
 persisted).
+
+## Web chat
+
+`GET /chat` (authenticated like `/admin`, so open it as
+`/chat?api_key=...`) is a built-in chat UI — a substitute for
+open-webui. It speaks both the Chat Completions and Responses APIs
+(selectable per chat), defaults to the gateway itself (smart / work /
+fast / large), and shows per-response stats: context size,
+time-to-first-token, prefill t/s and decode t/s, measured by the
+proxy from the upstream stream. Any number of remote OpenAI-compatible
+endpoints can be added in the "API endpoints" panel (base URL + key);
+each endpoint's model list is fetched live from its `/models` path
+(a "Fetch models" button in the panel re-reads it), so it is never
+configured by hand. Chats, endpoints and UI state persist in the
+browser's localStorage, and the sidebar's "Delete all" button wipes
+every past chat.
 
 ## Running it
 

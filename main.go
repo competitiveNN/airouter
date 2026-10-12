@@ -68,6 +68,10 @@ func main() {
 	go watchConfig(ctx, *configPath, gateway)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/chat", gateway.HandleChatPage)
+	mux.HandleFunc("/chat/completions", gateway.HandleWebChatCompletions)
+	mux.HandleFunc("/chat/responses", gateway.HandleWebChatResponses)
+	mux.HandleFunc("/chat/models", gateway.HandleWebChatModels)
 	mux.HandleFunc("/v1/models", gateway.HandleModels)
 	mux.HandleFunc("/v1/chat/completions", gateway.HandleChatCompletions)
 	mux.HandleFunc("/v1/responses", gateway.HandleResponses)
