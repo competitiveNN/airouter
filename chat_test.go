@@ -458,6 +458,66 @@ func TestChatProxyInjectsStreamOptions(t *testing.T) {
 	}
 }
 
+// TestChatProxyPreservesMessagesBytes pins the prefix-cache
+// property of the proxy: the conversation history is forwarded
+// byte-for-byte. chatSplitEndpoint keeps every field as a
+// json.RawMessage, so the messages array (and the Responses
+// input array) reach the upstream with their original key
+// order and spacing intact — never re-serialized. A
+// re-serializing proxy would normalize the history, changing
+// the request prefix and turning the provider's server-side
+// prefix cache into a miss on every turn.
+func TestChatProxyPreservesMessagesBytes(t *testing.T) {
+	var gotBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	g := newChatTestGateway(t)
+	// The message uses a non-standard key order (content
+	// before role) on purpose: a proxy that re-marshals the
+	// history would sort the keys and change the prefix.
+	messages := `{"content":"hi","role":"user"}`
+	payload := `{"endpoint":{"url":"` + upstream.URL + `/v1"},"model":"smart","messages":[` + messages + `]}`
+
+	// The same request twice must produce the same upstream
+	// bytes: a stable prefix is what the provider caches.
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		g.HandleWebChatCompletions(rec, chatTestRequest(t, http.MethodPost, "/chat/completions", payload))
+		if rec.Code != 200 {
+			t.Fatalf("request %d: expected 200, got %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if len(gotBodies) != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", len(gotBodies))
+	}
+	if gotBodies[0] != gotBodies[1] {
+		t.Errorf("identical requests must forward identical bytes:\n  %s\n  %s", gotBodies[0], gotBodies[1])
+	}
+	if !strings.Contains(gotBodies[0], `"content":"hi","role":"user"`) {
+		t.Errorf("expected the messages bytes preserved verbatim, got: %s", gotBodies[0])
+	}
+
+	// The Responses API carries the history in "input"; its
+	// bytes are preserved the same way.
+	input := `[{"type":"message","content":[{"type":"input_text","text":"hi"}],"role":"user"}]`
+	respPayload := `{"endpoint":{"url":"` + upstream.URL + `/v1"},"model":"smart","input":` + input + `}`
+	rec := httptest.NewRecorder()
+	g.HandleWebChatResponses(rec, chatTestRequest(t, http.MethodPost, "/chat/responses", respPayload))
+	if rec.Code != 200 {
+		t.Fatalf("responses: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	last := gotBodies[len(gotBodies)-1]
+	if !strings.Contains(last, input) {
+		t.Errorf("expected the input bytes preserved verbatim, got: %s", last)
+	}
+}
+
 // TestChatProxyUpstreamErrorPassthrough covers a failing
 // upstream: the status and error body reach the client and no
 // stats are fabricated.
@@ -735,7 +795,7 @@ func TestChatPageComposerControls(t *testing.T) {
 		`signal: abortCtrl ? abortCtrl.signal : null`,
 		"err.name === 'AbortError'",
 		"function renderMarkdown",
-		"bubble.innerHTML = renderThinking(thinking) + renderMarkdown(full)",
+		"bubble.innerHTML = renderThinking(thinking, true) + renderMarkdown(full)",
 		"function fetchModels",
 		"function refreshModels",
 		"apiUrl('/chat/models')",
@@ -764,8 +824,8 @@ func TestChatPageThinkingUI(t *testing.T) {
 		"function extractParts",
 		"item.type === 'reasoning'",
 		"msg.reasoning_content || msg.reasoning || msg.reasoning_text",
-		"bubble.innerHTML = renderThinking(thinking) + renderMarkdown(full)",
-		"content: full, thinking: thinking, stats: stats",
+		"bubble.innerHTML = renderThinking(thinking, true) + renderMarkdown(full)",
+		"content: full, thinking: thinking, reasoning: reasoningItems, stats: stats",
 		"appendMessage(m.role, m.content, m.stats, m.thinking)",
 		"if (text) onText(text, isThinking);",
 		"onText(parts.thinking, true);",
@@ -802,5 +862,71 @@ func TestChatPageStreamRobustness(t *testing.T) {
 	// while a stream is in flight.
 	if got := strings.Count(chatHTML, "if (generating) return;"); got != 3 {
 		t.Errorf("expected send/new-chat/delete-all all blocked mid-stream, found %d guards", got)
+	}
+}
+
+// TestChatPageReasoningRoundTrip pins the prefix-cache
+// behavior of the Responses API client: a reasoning model's
+// reasoning items are captured from the completed response,
+// stored with the message, and passed back ahead of the
+// answer on the next turn. The Responses API expects them
+// there (the model keeps its reasoning chain) and resending
+// the same items every turn keeps the request prefix
+// identical to the one the provider cached server-side —
+// dropping them would silently turn every later turn's cache
+// into a miss.
+func TestChatPageReasoningRoundTrip(t *testing.T) {
+	for _, want := range []string{
+		// Capture the reasoning items from a completed response
+		// (they carry the ids the provider assigned).
+		"obj.response.output[i].type === 'reasoning'",
+		// A non-streaming response carries them in output[].
+		"parts.reasoning.push(item)",
+		// The items are stored with the message and read back
+		// out of the history.
+		"reasoning: reasoningItems",
+		"m.reasoning",
+		// And rebuilt into the request input ahead of the
+		// assistant message.
+		"items.push(reasoning[i])",
+	} {
+		if !strings.Contains(chatHTML, want) {
+			t.Errorf("chatHTML missing %q", want)
+		}
+	}
+}
+
+// TestChatPageAudit3Fixes pins the client-side robustness
+// fixes: a mid-stream error keeps the answer produced so far
+// (with the error appended) instead of wiping it, the
+// thinking block is collapsed for any finished or historical
+// message (not keyed off the global streaming flag), the
+// gateway endpoint cannot be deleted, inline code spans are
+// stashed before escaping (so ** and $$ inside code are not
+// reformatted), marker restore loops to a fixpoint (so a
+// marker nested inside a restored block recovers), and an
+// error status carrying an SSE stream shows the stream's
+// error message rather than the raw event text.
+func TestChatPageAudit3Fixes(t *testing.T) {
+	for _, want := range []string{
+		// Mid-stream error: partials kept, error appended,
+		// message saved.
+		`<p class="stream-error">Error: ' + esc(err) + '</p>`,
+		// The thinking block is explicitly collapsed for
+		// finished and historical messages.
+		"renderThinking(thinking, false)",
+		// The gateway endpoint is not deletable.
+		"ep.id === 'self'",
+		// Inline code spans are stashed before escaping.
+		"keep('<code>' + esc(code)",
+		// Marker restore repeats until no marker is left.
+		"} while (s !== prev);",
+		// An error status can carry an SSE stream; the real
+		// error message is extracted from its data line.
+		"var m = msg.match(/data:[ \\t]*(\\{[\\s\\S]*\\})/);",
+	} {
+		if !strings.Contains(chatHTML, want) {
+			t.Errorf("chatHTML missing %q", want)
+		}
 	}
 }
