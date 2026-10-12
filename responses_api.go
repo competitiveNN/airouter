@@ -197,6 +197,14 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			continue
 		}
 
+		// Model patches rewrite provider-specific output artifacts
+		// (e.g. tool calls a model traps inside its thinking
+		// block) before the body is parsed, so the parsed
+		// completion carries the rescued tool calls.
+		if patch := modelPatchFor(ep.Model); patch != nil {
+			respBody = patch.TransformCompletion(respBody)
+		}
+
 		chat, err := parseChatResponse(respBody)
 		if err != nil {
 			// A 200 that isn't a usable completion is a provider fault, not a
@@ -393,7 +401,7 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 		resp.Body.Close()
 		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
-	return translateChatSSE(resp.Body, sw)
+	return translateChatSSE(resp.Body, sw, ep.Model)
 }
 
 // nopFlusher satisfies flushWriter while we buffer. The real flush happens
