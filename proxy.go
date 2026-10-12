@@ -549,7 +549,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	idle := newIdleTimeoutReader(guarded, p.streamIdleTimeout)
 	defer idle.Close()
 
-	return p.streamSSE(w, flusher, idle)
+	return p.streamSSE(w, flusher, idle, endpoint.Model)
 }
 
 // firstByteReader applies firstCtx (the size-based timeout) to only the first
@@ -748,7 +748,7 @@ func (i *idleTimeoutReader) Close() error {
 	return nil
 }
 
-func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (string, []streamToolCall, int, error) {
+func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, upstreamModel string) (string, []streamToolCall, int, error) {
 	var eventBuf bytes.Buffer
 	scanner := bufio.NewScanner(body)
 	buf := make([]byte, 0, 64*1024)
@@ -779,6 +779,16 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	// coalescing. This preserves compatibility with clients that handle raw
 	// tool-call deltas themselves.
 	toolCalls := p.toolCalls.Load()
+
+	// A model patch rewrites one upstream model's output (e.g. tool
+	// calls a model traps inside its thinking block). It is nil for
+	// every model without a registered patch, in which case the
+	// stream is untouched.
+	patch := modelPatchFor(upstreamModel)
+	var patchState PatchStreamState
+	if patch != nil {
+		patchState = patch.BeginStream()
+	}
 
 	// Capture the model name from the stream so synthesized tool call events
 	// can mirror it back to the client.
@@ -851,6 +861,38 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 	// blank line). It extracts errors, decides whether the stream is now
 	// "released" (safe to flush), and either flushes or buffers the event.
 	processEvent := func(raw []byte) error {
+		// A model patch rewrites the event before anything else
+		// sees it: tags are stripped from the thinking fields and
+		// any tool call the event completes is registered like an
+		// upstream tool call, so it is synthesized at [DONE] time
+		// (see the post-loop code below).
+		if patch != nil {
+			payload := sseDataPayload(raw)
+			cleaned, extracted := patch.TransformStreamChunk(patchState, payload)
+			for _, c := range extracted {
+				idx := takePendingToolCallIndex(pendingToolCalls)
+				pendingToolCalls[idx] = &pendingTC{
+					id:           c.ID,
+					name:         c.Name,
+					args:         c.Arguments,
+					argsReceived: true,
+					complete:     true,
+				}
+				// Also accumulate for the fallback replay: a
+				// mid-stream failure must replay an already-
+				// extracted call via appendAssistantMessage.
+				tcs = append(tcs, streamToolCall{
+					Index:     idx,
+					ID:        c.ID,
+					Type:      "function",
+					Name:      c.Name,
+					Arguments: c.Arguments,
+				})
+			}
+			if !bytes.Equal(cleaned, payload) {
+				raw = rewriteSSEEventData(raw, cleaned)
+			}
+		}
 		if err := ExtractSSEError(raw); err != nil {
 			// Early upstream error: discard buffered output so far and signal the
 			// caller to fall back.
@@ -1030,11 +1072,47 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader) (st
 		return acc.String(), tcs, completionTokens, err
 	}
 
+	// Close the model patch's stream: text it still holds back (a `<`
+	// that never resolved, or a block whose closer never arrived) is
+	// emitted as one final event so no thinking text is lost, and any
+	// call completed by the flush is registered like the ones below.
+	if patch != nil {
+		final, extracted := patch.FlushStream(patchState)
+		for _, c := range extracted {
+			idx := takePendingToolCallIndex(pendingToolCalls)
+			pendingToolCalls[idx] = &pendingTC{
+				id:           c.ID,
+				name:         c.Name,
+				args:         c.Arguments,
+				argsReceived: true,
+				complete:     true,
+			}
+			tcs = append(tcs, streamToolCall{
+				Index:     idx,
+				ID:        c.ID,
+				Type:      "function",
+				Name:      c.Name,
+				Arguments: c.Arguments,
+			})
+		}
+		if final != nil {
+			if _, err := w.Write([]byte("data: " + string(final) + "\n\n")); err != nil {
+				return acc.String(), tcs, completionTokens, err
+			}
+			flusher.Flush()
+		}
+	}
+
 	// Emit synthesized tool calls BEFORE [DONE] so the client parser still
 	// processes them as part of the stream. Arriving after [DONE] they would
 	// be silently dropped. Iterate in deterministic index order so the
 	// client receives tool calls in the same order the upstream intended.
-	if toolCalls {
+	//
+	// This also runs with toolCalls disabled when a model patch
+	// extracted calls: the patch's calls are complete by construction,
+	// and the client must receive them even when raw upstream tool
+	// deltas are forwarded verbatim.
+	if toolCalls || len(pendingToolCalls) > 0 {
 		var indices []int
 		for idx := range pendingToolCalls {
 			indices = append(indices, idx)
