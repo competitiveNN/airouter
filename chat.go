@@ -189,6 +189,7 @@ func (g *GatewayContext) HandleChatPage(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
 	w.Write([]byte(chatHTML))
@@ -458,7 +459,14 @@ type chatScanResult struct {
 func chatPumpStream(w http.ResponseWriter, flusher http.Flusher, body io.Reader) chatScanResult {
 	var res chatScanResult
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	// A single SSE line can be huge: the Responses
+	// API's response.completed event carries the
+	// whole output in one line, and providers
+	// embed multi-MB base64 parts in a single
+	// delta. The cap matches the non-streaming
+	// read cap; a smaller one would truncate such
+	// a stream mid-line.
+	scanner.Buffer(make([]byte, 64*1024), 64<<20)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		payload := sseDataPayload(line)
@@ -799,9 +807,12 @@ function renderMarkdown(src) {
     return keep('<code>' + esc(code) + '</code>');
   });
   s = esc(s);
-  // LaTeX: display math $$...$$ and inline $...$
+  // LaTeX: display math $$...$$ and inline $...$.
+  // The text is escaped already at this point, so
+  // it is inserted as-is: escaping it a second
+  // time would render the entities literally.
   s = s.replace(/\$\$([\s\S]*?)\$\$/g, function (m, tex) {
-    return keep('<span class="math math-display">' + esc(tex.replace(/\s+/g, ' ').trim()) + '</span>');
+    return keep('<span class="math math-display">' + tex.replace(/\s+/g, ' ').trim() + '</span>');
   });
   s = s.replace(/\$([^$\n]+)\$/g, '<span class="math math-inline">$1</span>');
   // Headings and rules
@@ -1320,7 +1331,14 @@ function readStream(resp, onText, onStats, onItems) {
       return pump();
     });
   }
-  return pump();
+  // A failed stream (an error event throws out of
+  // handleSSE, the request was aborted) releases
+  // the response body instead of leaving it open
+  // until GC.
+  return pump().catch(function (err) {
+    reader.cancel();
+    throw err;
+  });
 }
 
 function handleSSE(rawEvent, onText, onStats, onItems) {
@@ -1461,7 +1479,15 @@ function init() {
   }
   save(LS_ENDPOINTS, endpoints);
 
-  chats.forEach(function (c) { if (!c.id) c.id = newId('c'); });
+  // A chat whose id was lost (a hand-edited
+  // store) is repaired in place, and the repair
+  // is persisted so the next load does not mint
+  // a fresh id for it.
+  var chatIdsRepaired = false;
+  chats.forEach(function (c) {
+    if (!c.id) { c.id = newId('c'); chatIdsRepaired = true; }
+  });
+  if (chatIdsRepaired) save(LS_CHATS, chats);
 
   renderEndpoints();
   if (ui.protocol) $('protocol-select').value = ui.protocol;
