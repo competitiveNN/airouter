@@ -50,6 +50,9 @@ func TestChatPageServedBehindAuth(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("expected text/html, got %s", ct)
 	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("expected Cache-Control no-cache like every other HTML surface, got %q", cc)
+	}
 	if body := rec.Body.String(); !strings.Contains(body, "airouter chat") {
 		t.Errorf("expected the chat UI in the response body")
 	}
@@ -928,5 +931,75 @@ func TestChatPageAudit3Fixes(t *testing.T) {
 		if !strings.Contains(chatHTML, want) {
 			t.Errorf("chatHTML missing %q", want)
 		}
+	}
+}
+
+// TestChatProxyStreamLongLines pins the stream
+// scanner's line cap: a single SSE line larger
+// than a megabyte (the Responses API's
+// response.completed event carries a whole
+// output in one line, and providers embed
+// multi-MB base64 parts in a single delta) is
+// forwarded whole, and the final usage chunk
+// after it is still captured for the stats
+// event. A smaller cap would truncate the
+// stream mid-line and lose the usage.
+func TestChatProxyStreamLongLines(t *testing.T) {
+	big := strings.Repeat("x", 2<<20)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"%s\"}}]}\n\n", big)
+		fmt.Fprintf(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	g := newChatTestGateway(t)
+	body := `{"endpoint":{"url":"` + upstream.URL + `"},"model":"smart","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	g.HandleWebChatCompletions(rec, chatTestRequest(t, http.MethodPost, "/chat/completions", body))
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, big) {
+		t.Errorf("the 2 MiB SSE line was not forwarded whole")
+	}
+	if !strings.Contains(out, "event: airouter.stats") {
+		t.Fatalf("no stats event appended; stream tail: %.200s", out[len(out)-200:])
+	}
+	if !strings.Contains(out, "\"context_tokens\":7") {
+		t.Errorf("usage was not captured from the chunk after the long line")
+	}
+}
+
+// TestChatPageAudit4Fixes pins the audit #4
+// client fixes: display math is not escaped a
+// second time (the text is escaped before the
+// math pass, so escaping again would render
+// the entities literally), the response body
+// reader is released when a stream fails (an
+// error event throws out of handleSSE), and a
+// chat id repaired at load is persisted.
+func TestChatPageAudit4Fixes(t *testing.T) {
+	for _, want := range []string{
+		// Display math: the already-escaped text
+		// is inserted as-is.
+		"' + tex.replace(/\\s+/g, ' ').trim() + '</span>'",
+		// The reader is cancelled when the stream
+		// fails.
+		"reader.cancel();",
+		// A repaired chat id is persisted.
+		"if (chatIdsRepaired) save(LS_CHATS, chats);",
+	} {
+		if !strings.Contains(chatHTML, want) {
+			t.Errorf("chatHTML missing %q", want)
+		}
+	}
+	// The display-math pass must not escape a
+	// second time.
+	if strings.Contains(chatHTML, "esc(tex.replace") {
+		t.Errorf("display math is escaped twice: entities would render literally")
 	}
 }
