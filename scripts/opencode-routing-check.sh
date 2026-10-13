@@ -179,10 +179,21 @@ upstream_status() {
   # -- drives the same preflight instead of silently hitting opencode.ai.
   local url="$PROVIDER_URL"
   if [[ "$url" != */ ]]; then url="$url/"; fi
-  # The same session shape the gateway mints (config.go opencodeSessionID):
-  # ses_ + 12 hex + 14 base62. The fake enforces the shape, not a value.
-  local session
-  session="ses_$(printf '%012x' $RANDOM$RANDOM)$(python3 -c "print(''.join(__import__('random').choices(__import__('string').digits + __import__('string').ascii_letters, k=14)))")"
+  # The same shape the gateway mints (config.go opencodeSessionID):
+  # ses_ + 12 hex + 14 base62, where the 12 hex are a descending
+  # KSUID prefix. The gateway decodes that prefix and refuses ids
+  # whose embedded counter is not one a real client could have minted
+  # in a millisecond (measured 2026-10-13: counters 0-60 pass, 70+
+  # answer 403 FreeTierError), so the ids below are real KSUIDs, not
+  # random hex. The fake enforces the shape, not a value.
+  local session request_id
+  read -r session request_id < <(python3 -c "
+import itertools, random, string, time
+mask = (1 << 48) - 1
+val = (int(time.time() * 1000) * 0x1000 + 1) & mask
+b62 = lambda: ''.join(random.choices(string.digits + string.ascii_letters, k=14))
+print('ses_%012x%s' % (~val & mask, b62()), 'msg_%012x%s' % (val, b62()))
+")
   local raw
   # The code is isolated by writing it on its own line, because a failed
   # connection still prints "000" for %{http_code} and an `|| echo 000` would
@@ -197,7 +208,7 @@ upstream_status() {
     -H 'x-opencode-project: default' \
     -H "x-opencode-session: $session" \
     -H "X-Session-ID: $session" \
-    -H "x-opencode-request: msg_$(printf '%032x' $RANDOM$RANDOM$RANDOM)" \
+    -H "x-opencode-request: $request_id" \
     -H 'x-opencode-preflight: liveness' \
     -d "$PREFLIGHT_BODY" 2>/dev/null) || true
   local status="${raw##*$'\n'}"
