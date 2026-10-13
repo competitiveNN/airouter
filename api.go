@@ -1017,7 +1017,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 		walk.next()
 
-		ep, _ := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -1037,12 +1037,29 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					return
 				}
 			}
-			// All endpoints in the chain are on cooldown (or otherwise
-			// ineligible). The configured cooldowns are long (30m for auth
-			// errors, up to 24h for hardened rate limits), so waiting for them
-			// to expire here would only delay this request while its result is
-			// guaranteed to fail again. Fail fast: the cooldown has already
-			// been applied and protects the upstream from retry storms.
+			// Every endpoint in the chain is on cooldown (or otherwise
+			// ineligible). Wait out the SHORTEST remaining cooldown and
+			// cycle back: SelectEndpoint restarts its walk at the head of
+			// the chain, so the last model in the chain leads back to the
+			// first, and a model that recovers mid-request gives this
+			// request another chance instead of a guaranteed 503. The
+			// wait is capped at 30s, and the loop stays bounded by the
+			// wall-clock budget and the attempts counter above, so this
+			// cannot spin forever. A zero wait means no cooldown is
+			// pending anywhere in the chain; there is nothing to wait
+			// for, so fail fast.
+			if wait > 0 {
+				timer := time.NewTimer(minDuration(wait, 30*time.Second))
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
+					g.recordRequest(req.Model, 503, time.Since(start))
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
@@ -1358,7 +1375,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		}
 		walk.next()
 
-		ep, _ := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -1377,12 +1394,31 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 					return
 				}
 			}
-			// All endpoints in the chain are on cooldown (or otherwise
-			// ineligible). The configured cooldowns are long (30m for auth
-			// errors, up to 24h for hardened rate limits), so waiting for them
-			// to expire here would only delay this request while its result is
-			// guaranteed to fail again. Fail fast: the cooldown has already
-			// been applied and protects the upstream from retry storms.
+			// Every endpoint in the chain is on cooldown (or otherwise
+			// ineligible). Wait out the SHORTEST remaining cooldown and
+			// cycle back: SelectEndpoint restarts its walk at the head of
+			// the chain, so the last model in the chain leads back to the
+			// first, and a model that recovers mid-request gives this
+			// request another chance instead of a terminated stream. The
+			// reconnecting comment keeps the SSE connection alive during
+			// the wait. The wait is capped at 30s, and the loop stays
+			// bounded by the wall-clock budget and the attempts counter
+			// above, so this cannot spin forever. A zero wait means no
+			// cooldown is pending anywhere in the chain; there is nothing
+			// to wait for, so fail fast.
+			if wait > 0 {
+				fmt.Fprintf(w, ": reconnecting in %v\n\n", wait.Round(time.Second))
+				flusher.Flush()
+				timer := time.NewTimer(minDuration(wait, 30*time.Second))
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					g.recordRequest(req.Model, 499, time.Since(start))
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return

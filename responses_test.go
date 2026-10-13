@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -721,4 +722,61 @@ func TestResponsesNonStreaming_FallbackRespectsWallClockBudget(t *testing.T) {
 			elapsed.Round(time.Millisecond))
 	}
 	t.Logf("exhausted the chain in %v", elapsed.Round(time.Millisecond))
+}
+
+// TestResponsesNonStreaming_CycleBackRecoversMidRequest pins the
+// chain cycle-back on the Responses completion path, the twin of
+// TestHandleChatCompletions_CycleBackRecoversMidRequest: when every
+// endpoint has failed and is on cooldown, the loop waits out the
+// shortest remaining cooldown instead of failing fast, the walk
+// restarts at the head of the chain (the last model leads back to
+// the first), and a recovered endpoint serves the request.
+//
+// The backend 429s the first two hits (one per chain endpoint, in
+// either order) and answers the third with a real Responses payload.
+func TestResponsesNonStreaming_CycleBackRecoversMidRequest(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	srv := responsesGatewayWith(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		if n <= 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(429)
+			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"cb","object":"response","status":"completed","choices":[{"message":{"role":"assistant","content":"recovered"}}]}`)
+	}, func(g *GatewayContext) { g.SetTestCooldown(200 * time.Millisecond) },
+		ModelEndpoint{Provider: "openai", Model: "m1"},
+		ModelEndpoint{Provider: "openai", Model: "m2"},
+	)
+
+	began := time.Now()
+	resp := postResponses(t, srv, `{"model":"smart","input":"hi"}`)
+	defer resp.Body.Close()
+	body := readAllString(t, resp)
+	elapsed := time.Since(began)
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected the cycle-back to recover the request (200), got %d after %v (body: %s)",
+			resp.StatusCode, elapsed.Round(time.Millisecond), body)
+	}
+	if !strings.Contains(body, "recovered") {
+		t.Errorf("expected the recovered content in the response, got: %s", body)
+	}
+	mu.Lock()
+	n := hits
+	mu.Unlock()
+	if n != 3 {
+		t.Errorf("expected 3 backend hits (2 failed + 1 cycle-back), got %d", n)
+	}
+	// The cycle-back only fires after the shortest cooldown has been
+	// waited out, so a recovered request takes at least that long.
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("expected the handler to wait out the cooldown (>=100ms), it finished in %v -- the cycle-back wait is missing", elapsed)
+	}
 }

@@ -24,10 +24,15 @@ client, so:
   (`chainLen*3 + 1`) *and* a wall-clock budget (12s for small requests,
   20s mid-size, more for large) bounds elapsed time, because a hanging
   attempt costs far more than a fast 429.
-- **When every endpoint is on cooldown, the gateway fails fast.** The
-  configured cooldowns run 30m for auth errors and up to 24h for
-  hardened rate limits, so a request that waits them out is guaranteed
-  to fail again — it returns `503 all_models_unavailable` immediately.
+- **When every endpoint is on cooldown, the gateway cycles back.**
+  The request waits out the *shortest* remaining cooldown (capped
+  at 30s) and the walk restarts at the head of the chain — the
+  last model leads back to the first — so a model that recovers
+  mid-request still serves the request instead of a guaranteed
+  503. Only when no cooldown is pending anywhere does it return
+  `503 all_models_unavailable` immediately. The wait is bounded by
+  the same wall-clock budget and attempt cap as every other step,
+  so it can never spin forever.
 
 ## API surface
 
