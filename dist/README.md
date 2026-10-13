@@ -156,6 +156,9 @@ What `origin/master` is missing, oldest first:
 - `ca64e49` chat: test prefix-cache passthrough, reasoning round-trip, audit #3 fixes
 - `2a50e9a` chat: fix 5 audit #4 bugs
 - `3dfd4da` chat: test audit #4 fixes
+- `afcb6f5` router: treat credit/quota refusals as transient, fix half-open probe livelock
+- `1a935dc` router: test the chain cycle-back and rotation-window fall-through
+- `045ce9c` config: regenerate free-model chains from the 2026-10-13 fetch
 
 `origin/master` advanced underneath an earlier version of
 this list (it carried the dashboard web UI, the breaker
