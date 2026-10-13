@@ -3730,6 +3730,183 @@ func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 	}
 }
 
+// TestHandleChatCompletions_CycleBackRecoversMidRequest pins the
+// chain cycle-back at the handler level: when every endpoint in the
+// chain has failed and is on cooldown, the request does not fail
+// outright -- it waits out the SHORTEST remaining cooldown, the walk
+// restarts at the head of the chain (the last model leads back to
+// the first), and a model that recovers mid-request serves the
+// request.
+//
+// The backend 429s the first two hits (one per chain endpoint, in
+// either order -- the rotation hash may start the session at either
+// depth) and answers the third with a real completion. With the
+// cycle-back in place the third hit is the head endpoint answering
+// again; with the old fail-fast behaviour the handler would have
+// returned 503 after two attempts in ~milliseconds.
+func TestHandleChatCompletions_CycleBackRecoversMidRequest(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		if n <= 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(429)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{"message": "rate limited"},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID:      "cycle-back",
+			Object:  "chat.completion",
+			Created: 1234567890,
+			Model:   "m1",
+			Choices: []ChatCompletionChoice{
+				{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "recovered"}},
+			},
+		})
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"b": {URL: backend.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "b", Model: "m1"},
+				{Provider: "b", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	// Short cooldowns so the cycle-back wait is a fraction of a
+	// second rather than the production 30s+.
+	gateway.SetTestCooldown(200 * time.Millisecond)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	started := time.Now()
+	gateway.HandleChatCompletions(rec, req)
+	elapsed := time.Since(started)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected the cycle-back to recover the request (200), got %d after %v; body: %s",
+			rec.Code, elapsed.Round(time.Millisecond), rec.Body.String())
+	}
+	// The cycle-back restarts the walk at the head, so the model that
+	// finally answers must be the FIRST one in the chain.
+	var result ChatCompletionResponse
+	json.NewDecoder(rec.Body).Decode(&result)
+	if result.Model != "m1" {
+		t.Errorf("expected the cycle-back to reach the head model m1, got %s", result.Model)
+	}
+	mu.Lock()
+	n := hits
+	mu.Unlock()
+	if n != 3 {
+		t.Errorf("expected 3 backend hits (2 failed + 1 cycle-back), got %d", n)
+	}
+	// The handler must have waited out the cooldown rather than
+	// failing fast: the cycle-back only fires after the shortest
+	// cooldown (200ms) has been waited out.
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("expected the handler to wait out the cooldown (>=100ms), it finished in %v -- the cycle-back wait is missing", elapsed)
+	}
+}
+
+// TestHandleChatCompletionsStreaming_CycleBackRecoversMidRequest is
+// the streaming twin: while the chain is on cooldown the stream stays
+// alive with a `: reconnecting` comment, the request waits out the
+// shortest cooldown, and the resumed attempt -- the head of the chain
+// again -- delivers the content.
+func TestHandleChatCompletionsStreaming_CycleBackRecoversMidRequest(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		if n <= 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(429)
+			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		events := []string{
+			`data: {"id":"cb","object":"chat.completion.chunk","created":123,"model":"m1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}`,
+			`data: {"id":"cb","object":"chat.completion.chunk","created":123,"model":"m1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+		}
+		for _, e := range events {
+			fmt.Fprint(w, e+"\n\n")
+			flusher.Flush()
+		}
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"b": {URL: backend.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "b", Model: "m1"},
+				{Provider: "b", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	gateway.SetTestCooldown(200 * time.Millisecond)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	started := time.Now()
+	gateway.HandleChatCompletions(rec, req)
+	elapsed := time.Since(started)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected the cycle-back to recover the stream (200), got %d after %v; body: %s",
+			rec.Code, elapsed.Round(time.Millisecond), rec.Body.String())
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "Hello") {
+		t.Errorf("expected the resumed stream to carry content, got:\n%s", out)
+	}
+	// The wait must be visible to the streaming client as a comment
+	// that keeps the connection alive.
+	if !strings.Contains(out, ": reconnecting in") {
+		t.Errorf("expected a ': reconnecting' SSE comment during the cooldown wait, got:\n%s", out)
+	}
+	assertSSEWellFormed(t, out)
+	mu.Lock()
+	n := hits
+	mu.Unlock()
+	if n != 3 {
+		t.Errorf("expected 3 backend hits (2 failed + 1 cycle-back), got %d", n)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("expected the handler to wait out the cooldown (>=100ms), it finished in %v -- the cycle-back wait is missing", elapsed)
+	}
+}
+
 // TestConcurrentStreamingSameSession verifies that multiple concurrent streaming
 // requests with the SAME session ID (same model + same messages hash) don't
 // interfere with each other's endpoint selection. Before the fix, the shared
