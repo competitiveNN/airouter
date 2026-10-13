@@ -1636,7 +1636,7 @@ func ccAggregateStream(body []byte, model string, created int64) ([]byte, error)
 // is a rate limit, 5xx is a retryable upstream error, and an
 // unlisted status becomes a 502 rather than a generic failure).
 func ccMapError(status int, body []byte) *ProviderError {
-	mappedStatus, errType := ccStatusMap(status)
+	mappedStatus, errType := ccStatusMap(status, body)
 	message := fmt.Sprintf("CC API error (%d)", status)
 	code := ""
 	var parsed struct {
@@ -1680,9 +1680,25 @@ func ccMapError(status int, body []byte) *ProviderError {
 // ccStatusMap is the proxy's CC_STATUS_MAP: an upstream status
 // to the (gateway status, error type) pair the client should
 // see. Unlisted statuses become a retryable 502 upstream_error.
-func ccStatusMap(status int) (int, string) {
+//
+// The one refinement on the raw table: a 400 whose body is a
+// quota/credit exhaustion refusal ("insufficient credits ...
+// purchase more credits") is not a malformed request. It is the
+// provider saying the account's balance is gone -- the same
+// event as a 402 payment-required, which the table already maps
+// to a 429 rate limit. Measured live 2026-10-12: commandcode's
+// free-tier accounts answer every request with exactly that 400,
+// and classifying it as a client error left the endpoint in
+// rotation with a zero-second cooldown -- 708 failed round trips
+// in 90 minutes, 100% failure. Mapping it onto the 429 family
+// gives it the transient cooldown curve and lets the circuit
+// breaker count it.
+func ccStatusMap(status int, body []byte) (int, string) {
 	switch status {
 	case 400:
+		if isQuotaRefusal(400, string(body)) {
+			return 429, "rate_limit_error"
+		}
 		return 400, "invalid_request_error"
 	case 401:
 		return 401, "authentication_error"

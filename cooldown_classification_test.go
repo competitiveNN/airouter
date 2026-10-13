@@ -529,3 +529,109 @@ func TestCooldownNeverShrinksAsErrorsAccumulate(t *testing.T) {
 			"that failed once: got %v", got)
 	}
 }
+
+// The Command Code free-tier refusal, measured live 2026-10-12:
+//
+//	cooldown commandcode/stealth/glyph-cluster:free status=400
+//	  errors=100 for 0s: {"error":{"message":"You have insufficient
+//	  credits to make this request. Please purchase more credits ..."}}
+//
+// A 400 wearing those words is not a malformed request -- it is the
+// provider saying the account's balance is exhausted, an event in the
+// same family as a 402 payment-required. Before the fix it was
+// classified as a client request error: zero cooldown, the endpoint
+// never left rotation, every request paid a full round trip to a model
+// that cannot answer, and the already-expired entry was filtered out of
+// saveCooldowns so the failure never even reached cooldowns.json.
+func TestAQuotaRefusalGetsATransientCooldown(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	ep := &ModelEndpoint{Provider: "commandcode", Model: "stealth/glyph-cluster:free"}
+	const refusal = `{"error":{"message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","code":"BAD_REQUEST"}}`
+
+	// The first refusal must cool the endpoint, and for the 429
+	// base (30s), not zero.
+	got := r.ApplyCooldownForSession(ep, 400, refusal, "", 0)
+	if got != 30*time.Second {
+		t.Fatalf("a credits refusal produced a %v cooldown, want 30s", got)
+	}
+	// The endpoint is held out of rotation while it lasts.
+	if wait := r.minCooldownWait([]ModelEndpoint{*ep}, false); wait <= 0 {
+		t.Error("endpoint is still selectable after a credits refusal")
+	}
+	// Consecutive refusals escalate like any transient error.
+	prev := got
+	for i := 0; i < 5; i++ {
+		got = r.ApplyCooldownForSession(ep, 400, refusal, "", 0)
+		if got <= prev {
+			t.Fatalf("credits refusal %d gave %v, not above the previous %v",
+				i+2, got, prev)
+		}
+		prev = got
+	}
+	// And it is capped with the rest of the transient curve.
+	if got := r.ApplyCooldownForSession(ep, 400, refusal, "", 0); got > maxCooldown {
+		t.Errorf("credits refusal escalated past the transient ceiling: %v", got)
+	}
+}
+
+// The same refusal must advance the circuit breaker, so five
+// consecutive refusals hard-block the endpoint instead of merely
+// spacing its probes out. On the chat path the classifier sees the
+// remapped 429; on the streaming and /v1/responses paths it sees the
+// raw 400, so the breaker has to recognise the refusal itself.
+func TestAQuotaRefusalTripsTheCircuitBreaker(t *testing.T) {
+	cfg := &Config{
+		Preferences: &Preferences{CircuitBreakerThreshold: intPtr(3)},
+	}
+	r := NewRouter(cfg, "")
+	ep := &ModelEndpoint{Provider: "commandcode", Model: "stealth/glyph-cluster:free"}
+	const refusal = `{"error":{"message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service."}}`
+
+	for i := 0; i < 3; i++ {
+		r.ApplyCooldownForSession(ep, 400, refusal, "", 0)
+	}
+	if cb := r.GetCircuitState(ep); cb != CircuitOpen {
+		t.Fatalf("three credits refusals left the circuit %v, want Open", cb)
+	}
+	if r.IsAvailable(ep) {
+		t.Error("endpoint is selectable with an open circuit and an active cooldown")
+	}
+}
+
+// A quota refusal is a narrow exception to "a 400 is a client error".
+// An ordinary 400 must keep its no-cooldown treatment, or a healthy
+// endpoint gets parked over a bad request.
+func TestAQuotaRefusalIsNarrow(t *testing.T) {
+	if !isQuotaRefusal(400, `{"error":{"message":"You have insufficient credits to make this request."}}`) {
+		t.Error("the canonical credits refusal was not recognised")
+	}
+	if !isQuotaRefusal(400, `{"error":{"message":"quota exceeded"}})`) {
+		t.Error("a quota-exceeded refusal was not recognised")
+	}
+	// Statuses other than 400 are never a "refusal wearing a 400".
+	if isQuotaRefusal(429, "insufficient credits") {
+		t.Error("a 429 is already transient; the predicate must not fire")
+	}
+	if isQuotaRefusal(404, "insufficient credits") {
+		t.Error("a 404 is a permanent endpoint error, not a quota refusal")
+	}
+	for _, other := range []string{
+		`{"error":{"type":"invalid_request_error","message":"invalid request"}}`,
+		`{"error":{"message":"max_tokens is not supported"}}`,
+		`{"error":{"message":"rate limited"}}`,
+		`garbage`,
+		``,
+	} {
+		if isQuotaRefusal(400, other) {
+			t.Errorf("an ordinary 400 body was read as a quota refusal: %q", other)
+		}
+		r := NewRouter(&Config{}, "")
+		ep := &ModelEndpoint{Provider: "p", Model: "m"}
+		if d := r.ApplyCooldownForSession(ep, 400, other, "s", 0); d != 0 {
+			t.Errorf("ordinary 400 %q produced a %v cooldown, want 0", other, d)
+		}
+		if cb := r.GetCircuitState(ep); cb != CircuitClosed {
+			t.Errorf("ordinary 400 %q tripped the circuit breaker", other)
+		}
+	}
+}
