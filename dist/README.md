@@ -151,16 +151,17 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `b63a0c5` api: cycle back to the chain head after the shortest cooldown
+- `ed31280` dashboard: list the sessions each model is serving right now
 
 `origin/master` advanced underneath earlier versions of
-this list (the previous eight entries — the web chat UI, the
+this list (the entries before this one — the web chat UI, the
 audit #4 work, the credit/quota handling, the cycle-back
-tests and the config regeneration — were all pushed since),
-which is the moving-target property the note at the top
-describes: the list is checked, not trusted.
+tests, the config regeneration and the last list refresh —
+were all pushed since), which is the moving-target property
+the note at the top describes: the list is checked, not
+trusted.
 
-That empty list is the check working, not a corrupted handoff. `origin/master`
+An empty list would be the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
 `scripts/audit-attribution-check.py` then reports every entry as "not an unpushed
 commit (it may have been pushed or rewritten)". `gate.sh` runs that check, so a
