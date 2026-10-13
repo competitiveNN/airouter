@@ -154,6 +154,8 @@ What `origin/master` is missing, oldest first:
 - `1ad8d5f` chat: add a built-in web chat UI (open-webui substitute)
 - `7d904ff` chat: fix 7 UI bugs and round-trip reasoning items for prefix caching
 - `ca64e49` chat: test prefix-cache passthrough, reasoning round-trip, audit #3 fixes
+- `2a50e9a` chat: fix 5 audit #4 bugs
+- `3dfd4da` chat: test audit #4 fixes
 
 `origin/master` advanced underneath an earlier version of
 this list (it carried the dashboard web UI, the breaker
