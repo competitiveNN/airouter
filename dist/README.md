@@ -151,15 +151,15 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `ed31280` dashboard: list the sessions each model is serving right now
+- `2bcece4` opencode: mint real KSUID session/request ids for the free-tier gate
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
 audit #4 work, the credit/quota handling, the cycle-back
-tests, the config regeneration and the last list refresh —
-were all pushed since), which is the moving-target property
-the note at the top describes: the list is checked, not
-trusted.
+tests, the config regeneration, the last list refresh and the
+dashboard session listing — were all pushed since), which is
+the moving-target property the note at the top describes: the
+list is checked, not trusted.
 
 An empty list would be the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
