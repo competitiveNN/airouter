@@ -716,6 +716,26 @@ func (r *Router) isAvailableLocked(ep *ModelEndpoint) bool {
 		if max <= 0 {
 			max = defaultCircuitBreakerHalfOpenProbes
 		}
+		// A half-open circuit whose budget is spent and that has
+		// been sitting there longer than the longest transient
+		// cooldown has lost its probe's outcome: a failed probe
+		// reopens the circuit and sets a fresh cooldown (so the
+		// state would be Open, not HalfOpen), and a successful one
+		// closes the circuit. The one way to reach this state is an
+		// outcome that was never recorded -- the daemon restarted
+		// mid-probe, or the failure pre-dates the
+		// reopen-on-any-probe-failure fix. Without this reset the
+		// endpoint is dark forever: nothing but a probe's own
+		// outcome can change a half-open state, and no further
+		// probe is ever admitted. Re-arm the budget so the endpoint
+		// is re-probed instead of staying dark until an operator
+		// clears it by hand.
+		if cb.ProbesSent >= max && time.Since(cb.OpenedAt) > maxCooldown {
+			log.Printf("[debug] circuit %s: half-open probe outcome lost, re-arming probe budget", key)
+			cb.ProbesSent = 0
+			cb.OpenedAt = time.Now()
+			r.circuits[key] = cb
+		}
 		if cb.ProbesSent < max {
 			cb.ProbesSent++
 			r.circuits[key] = cb
@@ -1098,6 +1118,23 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 	if isProtocolUnsupported(statusCode, errMsg) {
 		duration = protocolUnsupportedCooldown
 	}
+	// A quota/credit refusal outranks the generic 400 classification for the
+	// same reason, measured live 2026-10-12: commandcode's free-tier
+	// accounts answer every request with HTTP 400 "You have insufficient
+	// credits to make this request. Please purchase more credits ...", which
+	// isClientRequestError reads as "the request is unacceptable" -> 0s
+	// cooldown -> the endpoint never leaves rotation. Every request paid a
+	// full round trip to a model that cannot answer (708 requests in 90
+	// minutes, 100% failure), and because a 0s cooldown is already expired
+	// when saveCooldowns runs, the entry never reached cooldowns.json at all.
+	// The refusal is a statement about the ENDPOINT's balance, not the
+	// request: the identical request succeeds the moment the balance is
+	// topped up or the quota window resets. It belongs on the transient
+	// curve with a 429 -- bounded escalation, and the circuit breaker
+	// counts it (see recordCircuitFailureLocked).
+	if isQuotaRefusal(statusCode, errMsg) {
+		duration = escalateCooldown(baseCooldownForError(429), cd.ErrorCount)
+	}
 	// A TIMEOUT is the one statusless failure that gets a steeper ramp than its
 	// neighbours, because it is the only one that has already cost the caller
 	// real time. Gated on statusCode == 0 so a provider that answers "timeout"
@@ -1232,19 +1269,27 @@ func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 // consecutive-failure counter so the circuit breaker and cooldown escalation
 // share one source of truth.
 //
-// Only transient errors (429/5xx) advance the circuit: 404/401/403 are
-// permanent and are handled purely by cooldowns (opening a circuit on auth
-// errors would just delay a retry that still won't succeed until creds
-// rotate).
+// Only transient errors (429/5xx/status 0) advance the circuit from
+// Closed: 404/401/403 are permanent and are handled purely by cooldowns
+// (opening a circuit on auth errors would just delay a retry that still
+// won't succeed until creds rotate). A quota/credit refusal is the
+// exception: it wears a 400 but describes the endpoint's balance, which
+// can be topped up at any time, so it belongs on the same curve as a 429.
+//
+// A failed HALF-OPEN probe reopens the circuit regardless of the status
+// class. In half-open the only requests admitted are probes, so any
+// failure recorded here IS a probe outcome, and a probe that failed with
+// a "permanent" status (a 404, a 400 quota refusal) has still proved the
+// endpoint is not serving. Returning early here instead left the circuit
+// half-open with its probe budget spent -- a state nothing else can exit,
+// because isAvailableLocked admits no further probes once the budget is
+// gone and only a probe's own outcome can change the state. The endpoint
+// then goes dark until an operator clears it, and a restart does not help
+// because the state is persisted (measured live 2026-10-12:
+// commandcode2:stealth/glyph-cluster:free, half-open with probes_sent=1
+// since 2026-10-08).
 func (r *Router) recordCircuitFailureLocked(ep *ModelEndpoint, statusCode int, cd *CooldownEntry) {
 	if r.circuitBreakerThreshold <= 0 {
-		return
-	}
-	// Only transient errors trip the circuit. Status 0 (connection error,
-	// timeout, DNS failure) is treated as transient because the endpoint is
-	// reachable in principle — the failure is in the network path, not the
-	// model itself. 404/401/403 are permanent and handled purely by cooldowns.
-	if statusCode != 429 && statusCode != 0 && (statusCode < 500 || statusCode > 599) {
 		return
 	}
 	key := ep.Key()
@@ -1253,11 +1298,24 @@ func (r *Router) recordCircuitFailureLocked(ep *ModelEndpoint, statusCode int, c
 		cb = &CircuitBreaker{State: CircuitClosed}
 		r.circuits[key] = cb
 	}
-	// ProbesSent is the single source of truth for consecutive failures,
-	// shared by both the cooldown escalation path (ApplyCooldown*) and the
-	// standalone RecordFailure API. Using cd.ErrorCount here instead would
-	// create a second independent counter and trip the circuit at half the
-	// configured threshold.
+	if cb.State == CircuitHalfOpen {
+		// Failed probe → reopen with a fresh open window.
+		cb.ProbesSent++
+		r.emitCircuitTransition(CircuitHalfOpen, CircuitOpen, key)
+		cb.State = CircuitOpen
+		cb.OpenedAt = time.Now()
+		log.Printf("[debug] circuit %s: half-open probe failed -> open", key)
+		return
+	}
+	transient := statusCode == 429 || statusCode == 0 || (statusCode >= 500 && statusCode <= 599)
+	// cd carries the recorded error message (set by the caller before
+	// this runs), which is where a quota refusal is recognisable.
+	if !transient && cd != nil && isQuotaRefusal(statusCode, cd.LastError) {
+		transient = true
+	}
+	if !transient {
+		return
+	}
 	switch cb.State {
 	case CircuitClosed:
 		cb.ProbesSent++
@@ -1267,13 +1325,6 @@ func (r *Router) recordCircuitFailureLocked(ep *ModelEndpoint, statusCode int, c
 			cb.OpenedAt = time.Now()
 			log.Printf("[debug] circuit %s: closed -> open (failures=%d, status=%d)", key, cb.ProbesSent, statusCode)
 		}
-	case CircuitHalfOpen:
-		// Failed probe → reopen with a fresh open window.
-		cb.ProbesSent++
-		r.emitCircuitTransition(CircuitHalfOpen, CircuitOpen, key)
-		cb.State = CircuitOpen
-		cb.OpenedAt = time.Now()
-		log.Printf("[debug] circuit %s: half-open probe failed -> open", key)
 	case CircuitOpen:
 		// Already open; a failure extends the open window.
 		cb.ProbesSent++
@@ -1547,6 +1598,46 @@ func isProtocolUnsupported(statusCode int, body string) bool {
 	lower := strings.ToLower(body)
 	return strings.Contains(lower, "modelprotocolunsupported") ||
 		strings.Contains(lower, "model does not support this protocol")
+}
+
+// isQuotaRefusal reports whether a 400 body is a quota or credit
+// exhaustion refusal -- "insufficient credits", "purchase more
+// credits", "quota exceeded" -- rather than a malformed request.
+//
+// It needs its own predicate because it arrives as HTTP 400, and 400
+// is otherwise classified as a client request error: no cooldown,
+// ever. That is correct for a genuinely bad request, where a
+// byte-identical retry is rejected identically. It is exactly wrong
+// here, because this 400 is not about the request. It is the provider
+// saying the ENDPOINT's balance is exhausted -- a property of the
+// account, identical in kind to a 402 payment-required (which the
+// cooldown classifier already treats as a rate limit).
+//
+// The live symptom this fixes, from the daemon on 2026-10-12:
+//
+//	cooldown commandcode/stealth/glyph-cluster:free status=400
+//	  errors=100 for 0s: {"error":{"message":"You have insufficient
+//	  credits to make this request. Please purchase more credits ..."}}
+//
+// Zero-second cooldown, so the endpoint stayed in rotation on every
+// request: 708 failed round trips in 90 minutes, each burning 1-6s
+// of the caller's latency budget before the chain walked on, and the
+// 0s entry was already expired by the time saveCooldowns ran, so the
+// failure was invisible in cooldowns.json. The message list is
+// deliberately narrow: an ordinary 400 (a validation error, a
+// token minimum, an unsupported parameter) must keep its no-cooldown
+// treatment, or a healthy endpoint gets parked over a bad request.
+func isQuotaRefusal(statusCode int, msg string) bool {
+	if statusCode != 400 {
+		return false
+	}
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "insufficient credits") ||
+		strings.Contains(lower, "out of credits") ||
+		strings.Contains(lower, "not enough credits") ||
+		strings.Contains(lower, "purchase more credits") ||
+		strings.Contains(lower, "insufficient quota") ||
+		strings.Contains(lower, "quota exceeded")
 }
 
 // protocolUnsupportedCooldown is how long an endpoint that refused the

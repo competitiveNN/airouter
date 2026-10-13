@@ -409,6 +409,32 @@ func TestCCMapError(t *testing.T) {
 	}
 }
 
+// TestCCMapErrorQuotaRefusal pins the one refinement on the raw
+// CC_STATUS_MAP: a 400 whose body is a credit/quota exhaustion
+// refusal is the same event as a 402 payment-required (already
+// mapped to a 429 rate limit), not a malformed request. Measured
+// live 2026-10-12: commandcode's free-tier accounts answer every
+// request with HTTP 400 "You have insufficient credits ...", and
+// classifying it as invalid_request_error left the endpoint in
+// rotation with a zero-second cooldown -- 708 failed round trips in
+// 90 minutes, 100% failure, never once appearing in cooldowns.json.
+func TestCCMapErrorQuotaRefusal(t *testing.T) {
+	const refusal = `{"error":{"message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","code":"BAD_REQUEST"}}`
+	pe := ccMapError(400, []byte(refusal))
+	if pe.StatusCode != 429 {
+		t.Fatalf("a credits refusal mapped to %d, want 429", pe.StatusCode)
+	}
+	// The provider's own message survives into the client-visible error.
+	if !strings.Contains(string(pe.Body), "insufficient credits") {
+		t.Errorf("the refusal message was dropped from the mapped body: %s", pe.Body)
+	}
+	// An ordinary 400 keeps the raw mapping.
+	pe = ccMapError(400, []byte(`{"error":{"message":"max_tokens is not supported","code":"BAD_REQUEST"}}`))
+	if pe.StatusCode != 400 {
+		t.Fatalf("an ordinary 400 mapped to %d, want 400", pe.StatusCode)
+	}
+}
+
 func TestCCSlugifyProjectPath(t *testing.T) {
 	if got := ccSlugifyProjectPath(`C:\Users\dev\projects\app`); got != "c-users-dev-projects-app" {
 		t.Fatalf("slugify = %q", got)

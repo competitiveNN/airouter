@@ -5333,6 +5333,91 @@ func TestCircuitBreakerHalfOpenProbeSuccess(t *testing.T) {
 	}
 }
 
+// TestHalfOpenProbeFailureReopensCircuit pins the half-open
+// livelock fix. In half-open the only admitted requests are probes,
+// so a failure recorded in that state IS a probe outcome -- even one
+// carrying a "permanent" status like a 400. Before the fix,
+// recordCircuitFailureLocked returned early on non-transient
+// statuses, leaving the circuit half-open with its probe budget
+// spent: a state nothing else can exit, because isAvailableLocked
+// admits no further probes and only a probe's own outcome can
+// change the state. The endpoint went dark until an operator cleared
+// it, and a restart did not help because the state is persisted
+// (measured live 2026-10-12: commandcode2:stealth/glyph-cluster:free,
+// half-open with probes_sent=1 since 2026-10-08).
+func TestHalfOpenProbeFailureReopensCircuit(t *testing.T) {
+	cfg := &Config{
+		Preferences: &Preferences{CircuitBreakerThreshold: intPtr(2)},
+	}
+	router := NewRouter(cfg, "")
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	// Trip the circuit, then let the cooldown expire so the next
+	// request is admitted as a half-open probe.
+	router.ApplyCooldown(ep, 500, "server error")
+	router.ApplyCooldown(ep, 500, "server error")
+	router.ApplyCooldownWithDuration(ep, 0, "force expiry", "", 50*time.Millisecond)
+	time.Sleep(80 * time.Millisecond)
+
+	// The probe is admitted and the circuit is half-open.
+	if !router.IsAvailable(ep) {
+		t.Fatal("expected the half-open probe to be admitted")
+	}
+	if cb := router.GetCircuitState(ep); cb != CircuitHalfOpen {
+		t.Fatalf("expected circuit HalfOpen after probe admission, got %v", cb)
+	}
+
+	// The probe fails with a NON-transient status. The circuit must
+	// reopen -- not stay half-open with a spent budget.
+	router.ApplyCooldown(ep, 400, "not found")
+	if cb := router.GetCircuitState(ep); cb != CircuitOpen {
+		t.Fatalf("a failed probe with a permanent status left the circuit %v, want Open", cb)
+	}
+}
+
+// TestStuckHalfOpenCircuitIsReProbed covers the recovery for a
+// circuit that is ALREADY stuck: half-open, probe budget spent, and
+// no cooldown pending -- the probe's outcome was lost (the daemon
+// restarted mid-probe, or the failure pre-dates the
+// reopen-on-any-probe-failure fix). Such a circuit must re-arm its
+// probe budget once it has sat half-open longer than the longest
+// transient cooldown, instead of darkening the endpoint until an
+// operator clears it by hand.
+func TestStuckHalfOpenCircuitIsReProbed(t *testing.T) {
+	cfg := &Config{
+		Preferences: &Preferences{CircuitBreakerThreshold: intPtr(2)},
+	}
+	router := NewRouter(cfg, "")
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
+
+	// A half-open circuit whose probe was sent long enough ago that
+	// its outcome can never arrive.
+	router.mu.Lock()
+	router.circuits[ep.Key()] = &CircuitBreaker{
+		State:      CircuitHalfOpen,
+		OpenedAt:   time.Now().Add(-(maxCooldown + time.Hour)),
+		ProbesSent: 1,
+	}
+	router.mu.Unlock()
+
+	// The spent budget is re-armed and a fresh probe is admitted.
+	if !router.IsAvailable(ep) {
+		t.Fatal("a half-open circuit with a lost probe outcome must re-admit a probe")
+	}
+	// And a probe still in its window is NOT re-armed: only one probe
+	// runs at a time.
+	router.mu.Lock()
+	router.circuits[ep.Key()] = &CircuitBreaker{
+		State:      CircuitHalfOpen,
+		OpenedAt:   time.Now(),
+		ProbesSent: 1,
+	}
+	router.mu.Unlock()
+	if router.IsAvailable(ep) {
+		t.Error("a fresh half-open probe must not be re-armed while its outcome is pending")
+	}
+}
+
 // TestCircuitBreakerDisableViaZeroThreshold verifies that setting the
 // threshold to 0 disables the circuit breaker entirely (ad-hoc cooldown
 // escalation handles failures instead).
