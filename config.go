@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -45,35 +47,82 @@ func isOpencodeProvider(provider string) bool {
 // opencodeBase62 is the alphabet OpenCode mints session ids from.
 const opencodeBase62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// opencodeSessionID mints a session id in the canonical OpenCode shape
-// `ses_<12 hex><14 base62>`.
+// opencodeKSUIDMask is the width of the id prefix the free-tier gate
+// inspects: 6 bytes, hex-encoded, holding a KSUID-shaped
+// `timestamp_ms * 4096 + counter` value.
+const opencodeKSUIDMask = (1 << 48) - 1
+
+// opencodeIDCounter sequences the ids minted within one millisecond.
 //
-// The shape is enforced by the gateway. Bisected live against
-// opencode.ai/zen/v1 on 2026-10-01: a session id that is absent, or is any
-// other shape — including the `ses_`+32hex this function used to emit — gets
-// `403 FreeTierError`, even when every other free-tier condition is met. So the
-// old id was not cosmetic; it was a 403 on every proxied free-model request.
-func opencodeSessionID() string {
-	b := make([]byte, 20)
+// The gateway's free-tier gate decodes the counter out of the session
+// id prefix and refuses ids whose counter looks larger than a real
+// client could mint in a millisecond. Measured live against
+// opencode.ai/zen/v1 on 2026-10-13: counters 0-60 are admitted,
+// 70 and up answer `403 FreeTierError`. The counter is therefore kept
+// well below that bound; the timestamp part of the prefix carries the
+// id's uniqueness, the counter only the per-millisecond ordering.
+var opencodeIDCounter atomic.Uint32
+
+// opencodeKSUUIDPrefix renders the 12-hex-character KSUID prefix the
+// OpenCode free-tier gate validates.
+//
+// The gate decodes the prefix as `~(timestamp_ms * 4096 + counter)`
+// (mod 2^48) for a SESSION id -- OpenCode mints session ids in
+// descending KSUID order, newest first -- and as the plain
+// `timestamp_ms * 4096 + counter` for a message id. Either way the
+// decoded counter must be small. A prefix of plain random bytes, which
+// is what this code emitted until 2026-10-13, decodes to an arbitrary
+// counter and is refused with `403 FreeTierError` on ~every request:
+// the gate only admits the ~64 counter values a real client can mint
+// in a millisecond, so a random 48-bit prefix passes with probability
+// ~64/4096. That is the regression that made every proxied free-model
+// request fail even though the header names and shapes were right.
+func opencodeKSUUIDPrefix(descending bool) string {
+	c := opencodeIDCounter.Add(1) % 32
+	val := (uint64(time.Now().UnixMilli())*0x1000 + uint64(c)) & opencodeKSUIDMask
+	if descending {
+		val = ^val & opencodeKSUIDMask
+	}
+	return fmt.Sprintf("%012x", val)
+}
+
+// opencodeRandomBase62 mints n characters from the OpenCode base62
+// alphabet, crypto-random. The RNG failure path fills deterministically
+// so an id is always produced; the gateway checks the KSUID prefix, not
+// this tail.
+func opencodeRandomBase62(n int) string {
+	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		// Never block a request on RNG failure. Fill deterministically: the id
-		// stays well-formed, which is what the gateway checks.
 		for i := range b {
 			b[i] = byte(i)
 		}
 	}
 	var sb strings.Builder
-	sb.Grow(4 + 12 + 14)
-	sb.WriteString("ses_")
-	sb.WriteString(hex.EncodeToString(b[:6]))
-	for _, c := range b[6:20] {
+	sb.Grow(n)
+	for _, c := range b {
 		sb.WriteByte(opencodeBase62[int(c)%len(opencodeBase62)])
 	}
 	return sb.String()
 }
 
-// opencodeSessionFor maps an airouter session id onto the canonical OpenCode
-// shape, deterministically.
+// opencodeSessionID mints a session id in the canonical OpenCode shape
+// `ses_<12 hex><14 base62>`, where the 12 hex characters are the
+// descending-KSUID prefix the free-tier gate validates (see
+// opencodeKSUUIDPrefix). Fresh per call, exactly like the official
+// CLI mints one per session.
+func opencodeSessionID() string {
+	return "ses_" + opencodeKSUUIDPrefix(true) + opencodeRandomBase62(14)
+}
+
+// opencodeRequestID mints the per-request id carried under
+// x-opencode-request, in the ascending-KSUID shape the official CLI
+// mints for message ids (`msg_<12 hex><14 base62>`).
+func opencodeRequestID() string {
+	return "msg_" + opencodeKSUUIDPrefix(false) + opencodeRandomBase62(14)
+}
+
+// opencodeSessionFor maps an airouter session id onto the canonical
+// OpenCode shape, deterministically.
 //
 // airouter identifies a session as "ctx:<32 hex>" (api.go, bodySessionID). The
 // gateway rejects that shape with 403 FreeTierError even when every other
@@ -83,16 +132,30 @@ func opencodeSessionID() string {
 // session upstream is what buys prompt-cache affinity, and that only works if the
 // same airouter session presents the same ses_ id on every request of the
 // conversation.
+//
+// The hash also has to produce a prefix the free-tier gate admits: the decoded
+// counter is pinned to 1 (always inside the gate's accepted range, see
+// opencodeKSUUIDPrefix), the hash owns the timestamp bits and the base62 tail.
+// A deterministic mapping cannot consult the clock -- the same airouter session
+// must present the same id weeks later -- so the timestamp bits are derived
+// from the hash too; the gate checks the counter, not the timestamp's age
+// (measured 2026-10-13: a prefix decoding to the Unix epoch is admitted).
 func opencodeSessionFor(sessionID string) string {
 	sum := sha256.Sum256([]byte("airouter\x00opencode\x00" + sessionID))
-	var sb strings.Builder
-	sb.Grow(4 + 12 + 14)
-	sb.WriteString("ses_")
-	sb.WriteString(hex.EncodeToString(sum[:6]))
-	for _, c := range sum[6:20] {
-		sb.WriteByte(opencodeBase62[int(c)%len(opencodeBase62)])
-	}
-	return sb.String()
+	val := uint64(sum[0])<<40 | uint64(sum[1])<<32 | uint64(sum[2])<<24 |
+		uint64(sum[3])<<16 | uint64(sum[4])<<8 | uint64(sum[5])
+	val &^= 0xFFF
+	val |= 1
+	descending := ^val & opencodeKSUIDMask
+	return "ses_" + fmt.Sprintf("%012x", descending) +
+		func() string {
+			var sb strings.Builder
+			sb.Grow(14)
+			for _, c := range sum[6:20] {
+				sb.WriteByte(opencodeBase62[int(c)%len(opencodeBase62)])
+			}
+			return sb.String()
+		}()
 }
 
 // opencodeConversationID derives the identity of the *conversation* a request
@@ -207,7 +270,7 @@ func opencodeRequestHeaders() map[string]string {
 		"x-opencode-session-id": sess,
 		"x-session-affinity":    sess,
 		"X-Session-ID":          sess,
-		"x-opencode-request":    "msg_" + randomHex(16),
+		"x-opencode-request":    opencodeRequestID(),
 		"x-opencode-project":    "default",
 	}
 }

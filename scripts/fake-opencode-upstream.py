@@ -41,7 +41,7 @@ REQUIRED_HEADERS = {
 }
 # Generated per request by airouter, so only the shape is checked, not a value.
 REQUIRED_PATTERNS = {
-    "x-opencode-request": re.compile(r"^msg_[0-9a-f]{32}$"),
+    "x-opencode-request": re.compile(r"^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$"),
 }
 # The canonical OpenCode session shape, `ses_<12 hex><14 base62>`.
 #
@@ -50,6 +50,36 @@ REQUIRED_PATTERNS = {
 # -- is answered with `403 FreeTierError` even when every other free-tier
 # condition is satisfied. So the format is load-bearing, not cosmetic.
 SESSION_PATTERN = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+# ... and since 2026-10-13 the shape alone is not enough. The gateway decodes
+# the 12 hex characters as a KSUID value -- bit-inverted for a session id,
+# plain for a message id -- and refuses an id whose decoded counter (the low
+# 12 bits) is larger than a real client could mint in one millisecond.
+# Measured live 2026-10-13: counters 0-60 are admitted, 70 and up answer
+# `403 FreeTierError`. Random hex decodes to an arbitrary counter and so fails
+# on ~every request, which is the regression that made every proxied
+# free-model request fail until the ids became real KSUIDs.
+KSUID_WIDTH = (1 << 48) - 1
+KSUID_COUNTER_MAX = 64
+
+
+def opencode_id_problem(kind: str, value: str) -> str | None:
+    """Return why this id would be refused by the free-tier gate, or None.
+
+    `kind` is "session" (descending KSUID) or "request" (ascending KSUID).
+    """
+    if kind == "session":
+        if not SESSION_PATTERN.match(value):
+            return f"{value!r} is not ses_<12hex><14base62>"
+    elif not REQUIRED_PATTERNS["x-opencode-request"].match(value):
+        return f"{value!r} is not msg_<12hex><14base62>"
+    val = int(value[4:16], 16)
+    if kind == "session":
+        val = ~val & KSUID_WIDTH
+    counter = val & 0xFFF
+    if counter >= KSUID_COUNTER_MAX:
+        return (f"{value!r} decodes to KSUID counter {counter}; the gate "
+                f"refuses counters >= {KSUID_COUNTER_MAX}")
+    return None
 
 # The gate also inspects the body: `stream` must be true and `tools` must carry
 # BOTH of these names. Measured: `bash`+`read` -> 200, while a single `bash`,
@@ -149,8 +179,9 @@ class Handler(BaseHTTPRequestHandler):
             if not pattern.match(got):
                 return f"{name}={got!r} does not match {pattern.pattern}"
         session = self.headers.get("x-opencode-session", "")
-        if not SESSION_PATTERN.match(session):
-            return f"x-opencode-session={session!r} is not ses_<12hex><14base62>"
+        problem = opencode_id_problem("session", session)
+        if problem:
+            return f"x-opencode-session: {problem}"
         # The routing backend validates a session id under this second name as
         # well, and reads it alongside x-opencode-session. A gateway that sets
         # only the first is treated as having no session at all: routing and
@@ -159,11 +190,16 @@ class Handler(BaseHTTPRequestHandler):
         routing_session = self.headers.get("X-Session-ID", "")
         if not routing_session:
             return "X-Session-ID is absent; the routing backend sees no session"
-        if not SESSION_PATTERN.match(routing_session):
-            return f"X-Session-ID={routing_session!r} is not ses_<12hex><14base62>"
+        problem = opencode_id_problem("session", routing_session)
+        if problem:
+            return f"X-Session-ID: {problem}"
         if routing_session != session:
             return (f"X-Session-ID={routing_session!r} disagrees with "
                     f"x-opencode-session={session!r}")
+        request_id = self.headers.get("x-opencode-request", "")
+        problem = opencode_id_problem("request", request_id)
+        if problem:
+            return f"x-opencode-request: {problem}"
         return None
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API

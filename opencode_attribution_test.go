@@ -25,8 +25,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -87,9 +89,42 @@ var (
 	// airouter uses internally -- is answered with `403 FreeTierError` even when
 	// every other free-tier condition holds. A green test against the old
 	// pattern meant the request would have been rejected in production.
+	//
+	// Since 2026-10-13 the shape is necessary but not sufficient: the gateway
+	// decodes the 12 hex characters as a KSUID value and refuses an id whose
+	// embedded counter no real client could mint in a millisecond (see
+	// opencodeKSUIDCounter). opencodeKSUIDProblem is the hermetic check for
+	// that second half of the contract.
 	sesIDPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
-	msgIDPattern = regexp.MustCompile(`^msg_[0-9a-f]{32}$`)
+	msgIDPattern = regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 )
+
+// opencodeKSUIDWidth and opencodeKSUIDCounterMax mirror the constants in
+// config.go and scripts/fake-opencode-upstream.py: the 48-bit KSUID value the
+// id prefix encodes, and the largest counter the free-tier gate admits
+// (measured live 2026-10-13: 0-60 pass, 70+ answer 403 FreeTierError).
+const (
+	opencodeKSUIDWidth      = (1 << 48) - 1
+	opencodeKSUIDCounterMax = 64
+)
+
+// opencodeKSUIDProblem returns why this id would be refused by the free-tier
+// gate's KSUID check, or "" when it is admitted. `descending` selects the
+// form the id carries: session ids are minted descending (newest first),
+// message ids ascending.
+func opencodeKSUIDProblem(descending bool, id string) string {
+	val, err := strconv.ParseUint(id[4:16], 16, 64)
+	if err != nil {
+		return fmt.Sprintf("prefix %q is not 12 hex characters", id[4:16])
+	}
+	if descending {
+		val = ^val & opencodeKSUIDWidth
+	}
+	if counter := val & 0xFFF; counter >= opencodeKSUIDCounterMax {
+		return fmt.Sprintf("decodes to KSUID counter %d, which the gate refuses", counter)
+	}
+	return ""
+}
 
 // lowerKeys canonicalizes a header map's keys to lower case so a map authored
 // with "x-opencode-client" can be compared against a map net/http stored as
@@ -180,6 +215,8 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 	if got := h["x-opencode-session"]; got != "" {
 		if !sesIDPattern.MatchString(got) {
 			t.Errorf("%s: x-opencode-session = %q, want ses_<12hex><14base62>", where, got)
+		} else if problem := opencodeKSUIDProblem(true, got); problem != "" {
+			t.Errorf("%s: x-opencode-session = %q: %s", where, got, problem)
 		}
 		if h["x-opencode-session"] == h["x-opencode-request"] {
 			t.Errorf("%s: session and request ids are identical (%q); they must be independent",
@@ -187,7 +224,9 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 		}
 	}
 	if got := h["x-opencode-request"]; !msgIDPattern.MatchString(got) {
-		t.Errorf("%s: x-opencode-request = %q, want msg_ + 32 hex chars", where, got)
+		t.Errorf("%s: x-opencode-request = %q, want msg_<12hex><14base62>", where, got)
+	} else if problem := opencodeKSUIDProblem(false, got); problem != "" {
+		t.Errorf("%s: x-opencode-request = %q: %s", where, got, problem)
 	}
 
 	// X-Session-ID is the routing backend's name for the same conversation.
@@ -441,7 +480,7 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 				h["x-opencode-session"])
 		}
 		if got := h["x-opencode-request"]; !msgIDPattern.MatchString(got) {
-			t.Errorf("x-opencode-request = %q, want msg_ + 32 hex chars", got)
+			t.Errorf("x-opencode-request = %q, want msg_<12hex><14base62>", got)
 		}
 		assertAttributionPresent(t, "no-anchor fallback", h)
 	})
@@ -475,22 +514,32 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 }
 
 // TestOpencodeSessionIDShape pins the generated and derived session ids to the
-// one shape the gateway accepts.
+// one shape the gateway accepts, and to the KSUID content the gateway's
+// free-tier gate decodes out of that shape.
 //
-// This is the single highest-impact assertion in the file. Measured live
-// against opencode.ai/zen/v1 on 2026-10-01: a session id in any other shape is
-// answered `403 FreeTierError` even when every other free-tier condition is met.
-// The two shapes this code previously emitted -- `ses_`+32hex from
-// opencodeRequestHeaders, and the raw `ctx:<hex>` that buildRequest forwarded --
-// were both measured 403, so both were production outages that the old
-// `^ses_[0-9a-f]{32}$` pattern happily passed.
+// Measured live against opencode.ai/zen/v1 on 2026-10-01: a session id in any
+// other shape is answered `403 FreeTierError` even when every other free-tier
+// condition is met. The two shapes this code previously emitted -- `ses_`+32hex
+// from opencodeRequestHeaders, and the raw `ctx:<hex>` that buildRequest
+// forwarded -- were both measured 403, so both were production outages that the
+// old `^ses_[0-9a-f]{32}$` pattern happily passed.
+//
+// A second, narrower outage shipped later and is pinned here too: on 2026-10-13
+// the gateway began decoding the 12 hex characters as a KSUID value and
+// refusing an id whose embedded counter is >= 64 (measured: 0-60 admitted,
+// 70+ refused). A prefix of plain random bytes decodes to an arbitrary counter
+// and so fails on ~98% of requests -- a partial outage that a shape-only test
+// cannot see, because the shape was still `ses_<12hex><14base62>`.
 func TestOpencodeSessionIDShape(t *testing.T) {
-	t.Run("generated ids are canonical and unique", func(t *testing.T) {
+	t.Run("generated ids are canonical, unique and gate-admitted", func(t *testing.T) {
 		seen := make(map[string]bool, 64)
 		for i := 0; i < 64; i++ {
 			id := opencodeSessionID()
 			if !sesIDPattern.MatchString(id) {
 				t.Fatalf("opencodeSessionID() = %q, want ses_<12hex><14base62>", id)
+			}
+			if problem := opencodeKSUIDProblem(true, id); problem != "" {
+				t.Fatalf("opencodeSessionID() = %q: %s", id, problem)
 			}
 			if seen[id] {
 				t.Fatalf("opencodeSessionID() repeated %q", id)
@@ -499,7 +548,7 @@ func TestOpencodeSessionIDShape(t *testing.T) {
 		}
 	})
 
-	t.Run("derived ids are canonical, deterministic and collision-free", func(t *testing.T) {
+	t.Run("derived ids are canonical, deterministic, collision-free and gate-admitted", func(t *testing.T) {
 		for _, sid := range []string{
 			"ctx:abcdef0123456789",
 			"ctx:",
@@ -509,6 +558,9 @@ func TestOpencodeSessionIDShape(t *testing.T) {
 			got := opencodeSessionFor(sid)
 			if !sesIDPattern.MatchString(got) {
 				t.Errorf("opencodeSessionFor(%q) = %q, want ses_<12hex><14base62>", sid, got)
+			}
+			if problem := opencodeKSUIDProblem(true, got); problem != "" {
+				t.Errorf("opencodeSessionFor(%q) = %q: %s", sid, got, problem)
 			}
 			if again := opencodeSessionFor(sid); again != got {
 				t.Errorf("opencodeSessionFor(%q) is not deterministic: %q then %q", sid, got, again)
@@ -521,6 +573,96 @@ func TestOpencodeSessionIDShape(t *testing.T) {
 		}
 		if a, b := opencodeSessionFor("ctx:a"), opencodeSessionFor("ctx:b"); a == b {
 			t.Errorf("distinct gateway sessions collided on %q", a)
+		}
+	})
+}
+
+// TestOpencodeKSUIDContract pins the second half of the free-tier
+// gate's session-id check: the 12 hex characters are a KSUID value,
+// and the decoded counter must be one a real client could mint in a
+// millisecond.
+//
+// Measured live against opencode.ai/zen/v1 on 2026-10-13: a session
+// id whose prefix decodes to counter 0-60 is admitted (the request
+// reaches the model and streams), while counter 70+ answers
+// `403 FreeTierError` with every other condition satisfied. The
+// timestamp bits are NOT checked for age -- a prefix decoding to the
+// Unix epoch is admitted -- so only the counter is asserted here.
+//
+// The negative controls are the point: a validator that accepted any
+// 12 hex characters would have let the 2026-10-13 regression
+// (random-byte prefixes, ~98% refusal rate) ship green.
+func TestOpencodeKSUIDContract(t *testing.T) {
+	t.Run("minted session ids decode to admitted counters", func(t *testing.T) {
+		for i := 0; i < 200; i++ {
+			if problem := opencodeKSUIDProblem(true, opencodeSessionID()); problem != "" {
+				t.Fatalf("opencodeSessionID(): %s", problem)
+			}
+		}
+	})
+
+	t.Run("minted request ids decode to admitted counters", func(t *testing.T) {
+		for i := 0; i < 200; i++ {
+			if problem := opencodeKSUIDProblem(false, opencodeRequestID()); problem != "" {
+				t.Fatalf("opencodeRequestID(): %s", problem)
+			}
+		}
+	})
+
+	t.Run("derived ids decode to the pinned counter", func(t *testing.T) {
+		// opencodeSessionFor pins the counter to 1, so every derived id
+		// decodes to the same admitted value no matter what the hash
+		// produced.
+		for _, sid := range []string{"ctx:a", "ctx:b", "conv:x", ""} {
+			id := opencodeSessionFor(sid)
+			val, err := strconv.ParseUint(id[4:16], 16, 64)
+			if err != nil {
+				t.Fatalf("opencodeSessionFor(%q) = %q: prefix is not hex", sid, id)
+			}
+			if got := (^val & opencodeKSUIDWidth) & 0xFFF; got != 1 {
+				t.Errorf("opencodeSessionFor(%q) = %q decodes to counter %d, want the pinned 1",
+					sid, id, got)
+			}
+		}
+	})
+
+	t.Run("a large counter is refused", func(t *testing.T) {
+		// Construct ids the way the gate sees them: the session carries
+		// the inverted value, so an id whose DECODED counter is 100 is
+		// the inversion of (0x1000 * 1 | 100).
+		for _, tc := range []struct {
+			descending bool
+			counter    uint64
+		}{{true, 100}, {true, 4095}, {false, 100}, {false, 4095}} {
+			val := (uint64(1) << 12) | tc.counter
+			prefix := val
+			if tc.descending {
+				prefix = ^val & opencodeKSUIDWidth
+			}
+			id := fmt.Sprintf("ses_%012x%s", prefix, "abcdefghijklmnop")
+			if tc.descending {
+				id = fmt.Sprintf("ses_%012x%s", prefix, "abcdefghijklmnop")
+			} else {
+				id = fmt.Sprintf("msg_%012x%s", prefix, "abcdefghijklmnop")
+			}
+			if problem := opencodeKSUIDProblem(tc.descending, id); problem == "" {
+				t.Errorf("counter %d (descending=%v) was admitted; the gate refuses it",
+					tc.counter, tc.descending)
+			}
+		}
+	})
+
+	t.Run("a small counter is admitted", func(t *testing.T) {
+		for _, counter := range []uint64{0, 1, 10, 60} {
+			val := (uint64(1) << 12) | counter
+			descending := fmt.Sprintf("ses_%012x%s", ^val&opencodeKSUIDWidth, "abcdefghijklmnop")
+			ascending := fmt.Sprintf("msg_%012x%s", val, "abcdefghijklmnop")
+			if problem := opencodeKSUIDProblem(true, descending); problem != "" {
+				t.Errorf("session counter %d refused: %s", counter, problem)
+			}
+			if problem := opencodeKSUIDProblem(false, ascending); problem != "" {
+				t.Errorf("request counter %d refused: %s", counter, problem)
+			}
 		}
 	})
 }

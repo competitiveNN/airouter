@@ -20,6 +20,7 @@ Anything else returned by ollama.com/v1/models is treated as metered.
 
 import argparse
 import csv
+import itertools
 import json
 import os
 import re
@@ -1247,6 +1248,12 @@ def check_opencode_ua_version() -> str | None:
 # names (`foo`,`bar`) were each measured as 403.
 OPENCODE_CORE_TOOLS = ("bash", "read")
 _BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+# Sequences the KSUID prefixes minted within one millisecond. The
+# gateway's free-tier gate decodes the counter out of the prefix and
+# refuses values that look like more than a few dozen ids per
+# millisecond, so the counter is kept far below that bound (see
+# opencode_ksuid_prefix).
+_OPENCODE_ID_COUNTER = itertools.count()
 # 429 is a rate limit on a working key, never a verdict about the model.
 #
 # It is also a property of the CREDENTIAL, not of the model being probed: once
@@ -1377,16 +1384,48 @@ def protocol_for_probe_detail(detail: str) -> str | None:
     return None
 
 
-def opencode_session_id() -> str:
-    """Mint a canonical `ses_<12 hex><14 base62>` id.
+def opencode_ksuid_prefix(descending: bool = False) -> str:
+    """Render the 12-hex KSUID prefix the OpenCode free-tier gate validates.
 
-    The gateway rejects a session id in any other shape — including the
-    `ses_` + 32 hex that config.go used to send, which was a 403 on every
-    proxied request. 6 random bytes give the hex part; the other 14 bytes are
-    folded through base62 one char each.
+    The gateway decodes the prefix as `timestamp_ms * 4096 + counter`
+    (mod 2**48) -- bit-inverted for a session id, plain for a message
+    id -- and refuses ids whose decoded counter is larger than a real
+    client could mint in a millisecond. Measured live against
+    opencode.ai/zen/v1 on 2026-10-13: counters 0-60 are admitted,
+    70+ answer `403 FreeTierError`. A prefix of plain random bytes
+    decodes to an arbitrary counter and is refused on ~every request
+    (pass probability ~64/4096), which is what broke every proxied
+    free-model request until the ids became real KSUIDs.
     """
-    raw = os.urandom(20)
-    return "ses_" + raw[:6].hex() + "".join(_BASE62[b % 62] for b in raw[6:20])
+    counter = next(_OPENCODE_ID_COUNTER) % 32
+    val = (int(time.time() * 1000) * 0x1000 + counter) & ((1 << 48) - 1)
+    if descending:
+        val = ~val & ((1 << 48) - 1)
+    return f"{val:012x}"
+
+
+def opencode_session_id() -> str:
+    """Mint a canonical `ses_<12 hex><14 base62>` session id.
+
+    The 12 hex characters are a descending-KSUID prefix (see
+    opencode_ksuid_prefix): the free-tier gate decodes them and
+    refuses any other content, not just any other shape. The 14 base62
+    characters are crypto-random, folded one char per byte.
+    """
+    return (
+        "ses_"
+        + opencode_ksuid_prefix(descending=True)
+        + "".join(_BASE62[b % 62] for b in os.urandom(14))
+    )
+
+
+def opencode_request_id() -> str:
+    """Mint the `msg_<12 hex><14 base62>` per-request id, ascending KSUID."""
+    return (
+        "msg_"
+        + opencode_ksuid_prefix()
+        + "".join(_BASE62[b % 62] for b in os.urandom(14))
+    )
 
 
 def opencode_gate_tools(protocol: str) -> list[dict[str, Any]]:
@@ -1452,7 +1491,7 @@ def opencode_headers(api_key: str, session: str | None = None) -> dict[str, str]
         "User-Agent": OPENCODE_UA,
         "x-opencode-session": session or opencode_session_id(),
         "x-opencode-client": "cli",
-        "x-opencode-request": "msg_" + os.urandom(16).hex(),
+        "x-opencode-request": opencode_request_id(),
         "x-opencode-project": "default",
     }
 
