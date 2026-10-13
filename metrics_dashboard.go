@@ -89,9 +89,32 @@ type dashboardEndpointInfo struct {
 	Circuit       string     `json:"circuit"`
 }
 
+// dashboardInflightEndpoint is one upstream endpoint within an
+// inflight model, with the number of sessions it is generating
+// tokens for right now.
+type dashboardInflightEndpoint struct {
+	Endpoint string `json:"endpoint"`
+	Sessions int    `json:"sessions"`
+}
+
+// dashboardInflightModel is a logical model with sessions
+// currently being served: how many sessions, which endpoints
+// are serving them, and when the oldest of those sessions
+// started. It is live state read straight from the request
+// path, not from the ring: the ring records history in
+// one-minute ticks, and a panel answering "what is happening
+// now" from minute-old ticks is a panel that lies by up to
+// a minute.
+type dashboardInflightModel struct {
+	Model     string                      `json:"model"`
+	Sessions  int                         `json:"sessions"`
+	Endpoints []dashboardInflightEndpoint `json:"endpoints"`
+	Since     time.Time                   `json:"since"`
+}
+
 // dashboardResponse is the complete dashboard payload, returned by
-// /admin/dashboard/data. It bundles the four sections the dashboard renders
-// (chains, speed, volume, failures) so a single request populates the page.
+// /admin/dashboard/data. It bundles the five sections the dashboard renders
+// (chains, inflight, speed, volume, failures) so a single request populates the page.
 //
 // Now carries the gateway's wall clock for the same reason the cooldown
 // pills carry an expiry rather than a duration: the browser renders the
@@ -103,13 +126,17 @@ type dashboardEndpointInfo struct {
 // not the client's, because the gateway is the authority on whether the
 // endpoint is still cooling down.
 type dashboardResponse struct {
-	Chains    []dashboardChainStatus      `json:"chains"`
-	Speed     []dashboardLeaderboardEntry `json:"speed"`
-	Volume    []dashboardLeaderboardEntry `json:"volume"`
-	Failures  []dashboardLeaderboardEntry `json:"failures"`
-	Window    string                      `json:"window"`
-	Now       time.Time                   `json:"now"`
-	Generated time.Time                   `json:"generated"`
+	Chains   []dashboardChainStatus      `json:"chains"`
+	Speed    []dashboardLeaderboardEntry `json:"speed"`
+	Volume   []dashboardLeaderboardEntry `json:"volume"`
+	Failures []dashboardLeaderboardEntry `json:"failures"`
+	// Inflight is the live set: models with sessions being
+	// served right now, and how many sessions each is
+	// generating tokens for.
+	Inflight  []dashboardInflightModel `json:"inflight"`
+	Window    string                   `json:"window"`
+	Now       time.Time                `json:"now"`
+	Generated time.Time                `json:"generated"`
 	// CircuitBreaker is whether the router's breaker is on at all. It is
 	// surfaced rather than left implicit because the column it governs looks
 	// identical either way when the breaker is off: every endpoint renders

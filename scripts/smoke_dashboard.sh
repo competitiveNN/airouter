@@ -23,6 +23,16 @@
 # contract the gateway promises the client: the client sees 200, and the
 # telemetry records the failure the client did not see.
 #
+# WHY THE FIXTURE HAS A DELIBERATELY SLOW ENDPOINT
+#
+# The inflight panel is live state: it lists the sessions being served at
+# the instant the payload is generated. Every other request in this check
+# completes before its payload is captured, so a panel fed only by
+# completed traffic would always be empty -- and a check that only ever
+# saw the empty state could not tell a working panel from a broken one.
+# The slow-model endpoint answers after 4 seconds, so a request to the
+# `large` chain is still in flight when the inflight payload is taken.
+#
 # Usage:
 #   scripts/smoke_dashboard.sh
 #   VERBOSE=1 scripts/smoke_dashboard.sh     # print the JSON payload
@@ -132,6 +142,7 @@ fi
 cat > "$WORK/upstream.py" <<'PY'
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
@@ -186,6 +197,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
             # Recovered: answer like the healthy model, streaming or not.
+            model = "fake-model"
+
+        if model == "slow-model":
+            # A model that takes its time to answer: a request
+            # to it stays in flight for the sleep, which is the
+            # state the inflight panel reports. The delay is
+            # long enough that the payload captured below is
+            # guaranteed to be taken while the request is still
+            # being served, and short enough that the run does
+            # not wait long on it.
+            time.sleep(4)
+            # Answer like the healthy model afterwards.
             model = "fake-model"
 
         if not streaming:
@@ -275,6 +298,10 @@ models:
         model: broken-model
       - provider: fake
         model: fake-model
+  large:
+    chain:
+      - provider: fake
+        model: slow-model
 YAML
 
 SMOKE_FAKE_KEY=dummy GATEWAY_API_KEY="$APIKEY" \
@@ -298,7 +325,7 @@ note "asserting the dashboard surface"
 # revert to the old config-editor HTML fails here rather than at the browser.
 HTML="$(curl -s -H "$AUTH" "$BASE/admin/dashboard")"
 grep -q "AI Router Dashboard" <<<"$HTML" || bad "dashboard HTML did not render"
-for label in Chains Fastest "Most requests" "failure rate"; do
+for label in Chains Inflight Fastest "Most requests" "failure rate"; do
   grep -q "$label" <<<"$HTML" || bad "dashboard HTML is missing the '$label' section"
 done
 
@@ -648,6 +675,69 @@ for c in d.get("chains", []):
 print("  ok every down endpoint carries a future cooldown_until")
 PY
 
+# --- the inflight panel: a session being served RIGHT NOW -------------
+# The inflight section is live state, not history: it lists the models
+# with sessions in flight at the instant the payload is generated. Every
+# request above completed before this point, so a panel fed only by
+# completed traffic can never show anything -- which is exactly why this
+# check drives one that is still running. The slow-model endpoint
+# answers after 4s, so a request to `large` is still being served when
+# the payload below is taken. Fire it in the background and capture
+# the payload while it runs.
+curl -s -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"model":"large","messages":[{"role":"user","content":"slow"}],"stream":true}' \
+  "$BASE/v1/chat/completions" >"$WORK/large.out" &
+LARGE_PID=$!
+sleep 1.5
+
+INFLIGHT="$(curl -s -H "$AUTH" "$BASE/admin/dashboard/data?window=1d")"
+python3 - "$INFLIGHT" <<'PY' || fail=1
+import json, sys
+d = json.loads(sys.argv[1])
+rows = {m["model"]: m for m in d.get("inflight", [])}
+large = rows.get("large")
+if large is None:
+    print("  FAIL the inflight panel has no 'large' row while a "
+          "large session is being served", file=sys.stderr)
+    sys.exit(1)
+if large["sessions"] != 1:
+    print(f"  FAIL large reports {large['sessions']} sessions, want 1",
+          file=sys.stderr)
+    sys.exit(1)
+eps = large.get("endpoints") or []
+if len(eps) != 1 or eps[0]["endpoint"] != "fake:slow-model" or eps[0]["sessions"] != 1:
+    print(f"  FAIL large should be served by fake:slow-model with 1 "
+          f"session, got {eps}", file=sys.stderr)
+    sys.exit(1)
+# The earlier traffic completed, so its sessions must have left the
+# inflight set: a panel that never forgets a finished session is a
+# leak, and the count above would be right only by accident.
+for done in ("smart", "work"):
+    if done in rows:
+        print(f"  FAIL the completed {done} session is still inflight",
+              file=sys.stderr)
+        sys.exit(1)
+print("  ok inflight panel lists large: 1 session on fake:slow-model")
+PY
+
+wait "$LARGE_PID" || bad "large (slow) stream request failed"
+grep -q "PING" "$WORK/large.out" || bad "slow stream produced no content"
+grep -q "data: \[DONE\]" "$WORK/large.out" || bad "slow stream did not terminate with [DONE]"
+
+# The session left the inflight set once its stream completed: the
+# deferred untrack fires on the success path too, or the panel would
+# list a model that stopped serving minutes ago.
+AFTER="$(curl -s -H "$AUTH" "$BASE/admin/dashboard/data?window=1d")"
+python3 - "$AFTER" <<'PY' || fail=1
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get("inflight"):
+    print(f"  FAIL the inflight panel is not empty after every stream "
+          f"completed: {d['inflight']}", file=sys.stderr)
+    sys.exit(1)
+print("  ok inflight panel empties when the session completes")
+PY
+
 # The RECOVERY half of the circuit breaker, asserted against a fresh payload
 # taken after the recovery request below. The fake upstream flips
 # broken-model to answering 200 on its second call, so that request finds
@@ -723,7 +813,7 @@ PY
 if command -v node >/dev/null 2>&1; then
   PAGE_HTML="$(curl -s -H "$AUTH" "$BASE/admin/dashboard")"
   printf '%s' "$PAGE_HTML" > "$WORK/page.html"
-  printf '%s' "$RECOVER" > "$WORK/payload.json"
+  printf '%s' "$INFLIGHT" > "$WORK/payload.json"
   cat > "$WORK/page_harness.js" <<'NODE'
 // Execute the dashboard page's script the way a browser does: a
 // mocked DOM, a fetch that returns the payload the gateway really
@@ -788,7 +878,7 @@ global.fetch = async () => resp;
     console.error('status = ' + JSON.stringify(status) + ', want a render that completed');
     process.exit(1);
   }
-  for (const id of ['chains', 'speed', 'volume', 'failures']) {
+  for (const id of ['chains', 'speed', 'volume', 'failures', 'inflight']) {
     const el = store[id];
     if (!el || el.children.length === 0) {
       console.error(id + ' panel is empty');
@@ -818,6 +908,38 @@ global.fetch = async () => resp;
       process.exit(1);
     }
   }
+  // The inflight card answers the chains card's question at a single
+  // instant, so it reuses the same layout: a header line (model plus
+  // the session count) over a grid of endpoint pills. A revert to a
+  // bare list, or a pill that names neither its endpoint nor its
+  // count, fails here rather than at a browser.
+  const inflightRows = store['inflight'].children;
+  for (const row of inflightRows) {
+    const names = row.children.map(c => c.className);
+    if (!names.includes('chainhead') || !names.includes('eps')) {
+      console.error('inflight row child classes ' + JSON.stringify(names));
+      process.exit(1);
+    }
+    const ieps = row.children.find(c => c.className === 'eps');
+    for (const p of ieps.children) {
+      if (!/^pill /.test(p.className) || !p.textContent.includes('fake:')) {
+        console.error('inflight pill ' + JSON.stringify(p.textContent)
+          + ' does not name an endpoint');
+        process.exit(1);
+      }
+    }
+  }
+  // The payload the harness runs against carries one inflight model
+  // (large) with one session on fake:slow-model: assert the header
+  // names both the model and the count it is serving.
+  const ihead = store['inflight'].children[0].children
+    .find(c => c.className === 'chainhead');
+  const iheadText = ihead.children.map(c => c.textContent).join(' ');
+  if (!iheadText.includes('large') || !iheadText.includes('1 session')) {
+    console.error('inflight header ' + JSON.stringify(iheadText)
+      + ' does not name large with 1 session');
+    process.exit(1);
+  }
   const cells = store['speed'].children[0].children.map(c => c.textContent);
   if (cells.length < 5) {
     console.error('speed row has ' + cells.length + ' cells, want >= 5');
@@ -825,6 +947,7 @@ global.fetch = async () => resp;
   }
   console.log('status=' + JSON.stringify(status)
     + ' chains=' + store['chains'].children.length
+    + ' inflight=' + store['inflight'].children.length
     + ' speed=' + store['speed'].children.length
     + ' volume=' + store['volume'].children.length
     + ' failures=' + store['failures'].children.length);
