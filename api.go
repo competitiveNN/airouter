@@ -230,6 +230,7 @@ type GatewayContext struct {
 	allowNoAuth   bool          // explicit opt-in to unauthenticated mode (-allow-no-auth)
 	testCooldown  time.Duration // override for tests: forces all cooldowns to this duration
 	metrics       *Metrics      // Prometheus-style metrics; nil in tests that don't need it
+	inflight      *inflightTracker
 }
 
 func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string, allowNoAuth ...bool) *GatewayContext {
@@ -239,6 +240,7 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 		configPath:    configPath,
 		gatewayAPIKey: gatewayAPIKey,
 		metrics:       NewMetrics(),
+		inflight:      newInflightTracker(),
 	}
 	if len(allowNoAuth) > 0 {
 		g.allowNoAuth = allowNoAuth[0]
@@ -978,6 +980,17 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	// between them forever inside the fallback budget.
 	protocolFlips := map[string]bool{}
 
+	// The session is inflight for the lifetime of the request:
+	// the dashboard counts the sessions each model is serving
+	// right now, and a request walking its fallback chain is
+	// still being served by its model. The deferred untrack
+	// covers every exit path below — success, upstream error,
+	// client disconnect, budget exhaustion — so a session can
+	// never linger in the inflight set after its request is
+	// done.
+	g.inflight.Track(sessionID, req.Model, "")
+	defer g.inflight.Untrack(sessionID)
+
 	for {
 		if ctx.Err() != nil {
 			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
@@ -1064,6 +1077,13 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
+
+		// Which upstream endpoint is generating for this
+		// session right now. A mid-request fallback moves the
+		// session to the next endpoint in the chain, and the
+		// dashboard should show where it is being served now,
+		// not where it started.
+		g.inflight.UpdateEndpoint(sessionID, ep.Key())
 
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
@@ -1321,6 +1341,14 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	// accumulatedTCs tracks tool call state across fallbacks so that
 	// partially-received tool calls persist across model switches.
 	var accumulatedTCs []streamToolCall
+
+	// The session is inflight for the lifetime of the request;
+	// see the matching comment in handleCompletion. The deferred
+	// untrack covers every exit path, including the mid-stream
+	// failure path that replays partial output and falls back.
+	g.inflight.Track(sessionID, req.Model, "")
+	defer g.inflight.Untrack(sessionID)
+
 	sendDone := func() {
 		if doneSent {
 			return
@@ -1423,6 +1451,11 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
+
+		// See the matching comment in handleCompletion: refresh
+		// which endpoint is generating for this session before
+		// the upstream call that may fall back mid-stream.
+		g.inflight.UpdateEndpoint(sessionID, ep.Key())
 
 		// StreamToClient buffers the start of the stream and only flushes to the
 		// client once the first content token (or tool call) arrives, so an early
@@ -1900,6 +1933,7 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		Speed:          speed,
 		Volume:         volume,
 		Failures:       failures,
+		Inflight:       g.inflight.Snapshot(),
 		Window:         string(win),
 		Now:            time.Now(),
 		Generated:      time.Now(),

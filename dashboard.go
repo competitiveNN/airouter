@@ -2,11 +2,13 @@ package main
 
 // dashboard.go adds a web dashboard to the airouter gateway.
 //
-// The dashboard is served at /admin/dashboard and renders four sections from
+// The dashboard is served at /admin/dashboard and renders five sections from
 // a single JSON payload fetched at /admin/dashboard/data:
 //
-//   - chains: each logical model's configured endpoints, with how many are
-//     currently eligible (not on cooldown, circuit not open).
+//   - chains: each logical model's configured endpoints, with how many
+//     are currently eligible (not on cooldown, circuit not open).
+//   - inflight: the models with sessions being served right now, and
+//     how many sessions each is generating tokens for.
 //   - speed: leaderboard of fastest endpoints by tokens/s.
 //   - volume: leaderboard of endpoints serving the most requests.
 //   - failures: leaderboard of endpoints failing the most requests.
@@ -68,6 +70,11 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 <h2>Chains</h2>
 <p>How many endpoints in each logical model's fallback chain are currently eligible.</p>
 <div id="chains"></div>
+</div>
+<div class="card">
+<h2>Inflight</h2>
+<p>Models currently serving sessions, and how many sessions each is generating tokens for right now.</p>
+<div id="inflight"></div>
 </div>
 <div class="card">
 <h2>Leaderboards <span id="wsel"></span></h2>
@@ -212,6 +219,37 @@ setInterval(()=>{
     if(Number.isFinite(t)) p.textContent=p.textContent.replace(/cooldown \S+$/, 'cooldown '+cooldownLabel(t, serverNow));
   });
 }, 1000);
+// renderInflight draws the live panel: one row per model that
+// has sessions being served right now, with the endpoints
+// generating tokens for them. It reuses the chains card's
+// header-over-pills layout, because the question it answers is
+// the chains card's question at a single instant: not "how many
+// endpoints are eligible" but "what is being served NOW". An
+// empty panel says so in words, the same way the chains card
+// does, so an operator can tell "nothing in flight" from "the
+// panel failed to render".
+function renderInflight(rows){
+  const c=document.getElementById('inflight');
+  c.innerHTML='';
+  if(!rows || !rows.length){ c.textContent='No sessions in flight.'; return; }
+  for(const m of rows){
+    const row=el('div','chain');
+    const head=el('div','chainhead');
+    head.appendChild(el('b',null,m.model));
+    const n=m.sessions;
+    const sum=el('span','sum', n+(n===1?' session':' sessions')+' in flight');
+    if(m.since) sum.title='oldest session since '+m.since;
+    head.appendChild(sum);
+    row.appendChild(head);
+    const eps=el('div','eps');
+    for(const e of m.endpoints||[]){
+      const s=e.sessions;
+      eps.appendChild(el('span','pill ok', e.endpoint+' '+(s===1?'1 session':s+' sessions')));
+    }
+    row.appendChild(eps);
+    c.appendChild(row);
+  }
+}
 function renderBoard(id, rows, cols){
   const tb=document.getElementById(id);
   tb.innerHTML='';
@@ -237,6 +275,7 @@ async function refresh(){
     if(d.now) serverNow = new Date(d.now).getTime();
     renderWindowSel();
     renderChains(d.chains||[], d.circuit_breaker);
+    renderInflight(d.inflight||[]);
     renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.latency_percentiles?r.latency_percentiles.p50_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p95_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p99_ms:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
     renderBoard('volume', d.volume||[], [[r=>r.rate,v=>v.toFixed(3)],[r=>r.attempts,v=>v]]);
     renderBoard('failures', d.failures||[], [[r=>r.rate,v=>(v*100).toFixed(1)+'%'],[r=>r.failures,v=>v]]);
