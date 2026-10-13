@@ -151,20 +151,14 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `1ad8d5f` chat: add a built-in web chat UI (open-webui substitute)
-- `7d904ff` chat: fix 7 UI bugs and round-trip reasoning items for prefix caching
-- `ca64e49` chat: test prefix-cache passthrough, reasoning round-trip, audit #3 fixes
-- `2a50e9a` chat: fix 5 audit #4 bugs
-- `3dfd4da` chat: test audit #4 fixes
-- `afcb6f5` router: treat credit/quota refusals as transient, fix half-open probe livelock
-- `1a935dc` router: test the chain cycle-back and rotation-window fall-through
-- `045ce9c` config: regenerate free-model chains from the 2026-10-13 fetch
+- `b63a0c5` api: cycle back to the chain head after the shortest cooldown
 
-`origin/master` advanced underneath an earlier version of
-this list (it carried the dashboard web UI, the breaker
-state, the commandcode protocol and the percentile work —
-all pushed since), which is the moving-target property the
-note at the top describes: the list is checked, not trusted.
+`origin/master` advanced underneath earlier versions of
+this list (the previous eight entries — the web chat UI, the
+audit #4 work, the credit/quota handling, the cycle-back
+tests and the config regeneration — were all pushed since),
+which is the moving-target property the note at the top
+describes: the list is checked, not trusted.
 
 That empty list is the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
