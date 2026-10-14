@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,15 @@ type Proxy struct {
 	// header-timeout budget clones it (Clone shares the connection pool), so
 	// per-attempt timeouts do not cost pooling.
 	baseTransport *http.Transport
+
+	// ccTransport/ccClient route Command Code upstream traffic through
+	// the HTTP CONNECT proxy named by CC_UPSTREAM_PROXY
+	// (commandcode-proxy issue #18). Both are nil -- and every accessor
+	// below falls back to the direct client/transport -- when the env
+	// var is unset or unparsable, so the default path is byte-for-byte
+	// the direct one.
+	ccTransport *http.Transport
+	ccClient    *http.Client
 
 	// protocolFor resolves an endpoint's effective protocol, consulting the
 	// router's learned map. Injected after construction for the same reason
@@ -64,6 +74,35 @@ func (p *Proxy) effectiveProtocol(ep *ModelEndpoint) protocol {
 		return ep.UpstreamProtocol()
 	}
 	return fn(ep)
+}
+
+// commandCodeClient returns the HTTP client Command Code upstreams
+// are dialed through: the proxy-routed one when CC_UPSTREAM_PROXY is
+// configured, the shared client otherwise.
+func (p *Proxy) commandCodeClient() *http.Client {
+	if p.ccClient != nil {
+		return p.ccClient
+	}
+	return p.client
+}
+
+// commandCodeTransport returns the transport Command Code upstreams are
+// dialed through, for the per-attempt clone in StreamToClient.
+func (p *Proxy) commandCodeTransport() *http.Transport {
+	if p.ccTransport != nil {
+		return p.ccTransport
+	}
+	return p.baseTransport
+}
+
+// redactProxyURL renders a proxy URL without its credentials: the
+// URL may carry user:pass and must never reach a log line whole.
+func redactProxyURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "(invalid proxy url)"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 func (p *Proxy) SetMetrics(m *Metrics) {
@@ -109,6 +148,25 @@ func NewProxy(cfg *Config) *Proxy {
 		streamIdleTimeout: 60 * time.Second,
 	}
 	p.baseTransport = p.client.Transport.(*http.Transport)
+
+	// Command Code upstream proxy. http.Transport.Proxy issues CONNECT
+	// for https targets on its own, so the tunnel carries end-to-end
+	// TLS to the Command Code API and only the Command Code upstream
+	// is affected -- every other provider keeps the direct transport.
+	// A malformed URL is logged and ignored rather than fatal: the
+	// gateway serves many providers and one bad env var must not take
+	// the daemon down (the direct path keeps working).
+	if raw := ccUpstreamProxyURL(); raw != "" {
+		if pu, err := url.Parse(raw); err == nil && pu.Scheme != "" && pu.Host != "" {
+			tr := p.baseTransport.Clone()
+			tr.Proxy = http.ProxyURL(pu)
+			p.ccTransport = tr
+			p.ccClient = &http.Client{Transport: tr}
+			log.Printf("[commandcode] upstream requests routed through proxy %s", redactProxyURL(raw))
+		} else {
+			log.Printf("[commandcode] invalid CC_UPSTREAM_PROXY %q, using direct connection", raw)
+		}
+	}
 	p.config = &atomic.Pointer[Config]{}
 	p.config.Store(cfg)
 	return p
@@ -267,7 +325,7 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 		}
 		backendBody = envelope
 		ccSessionID = sid
-		ccEnsureInitialized(ctx, p.client, providerCfg.URL, apiKey)
+		ccEnsureInitialized(ctx, p.commandCodeClient(), providerCfg.URL, apiKey)
 	}
 
 	// OpenCode free-tier gate. The gateway admits a request only when
@@ -376,7 +434,13 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 		return nil, err
 	}
 
-	resp, err := p.client.Do(req)
+	// Command Code upstreams may be routed through an HTTP CONNECT
+	// proxy (CC_UPSTREAM_PROXY); every other provider is direct.
+	client := p.client
+	if p.effectiveProtocol(&endpoint) == protocolCommandCode {
+		client = p.commandCodeClient()
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, &ProviderError{Err: err}
 	}
@@ -492,8 +556,16 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// deliberately left unbounded: this deadline governs headers only, and a
 	// long generation must still be allowed to run to completion.
 	client := p.client
-	if p.baseTransport != nil {
-		tr := p.baseTransport.Clone()
+	transport := p.baseTransport
+	if p.effectiveProtocol(&endpoint) == protocolCommandCode {
+		// The per-attempt clone must start from the transport the
+		// protocol is actually dialed through, so a configured
+		// upstream proxy survives the ResponseHeaderTimeout override.
+		client = p.commandCodeClient()
+		transport = p.commandCodeTransport()
+	}
+	if transport != nil {
+		tr := transport.Clone()
 		tr.ResponseHeaderTimeout = timeout
 		client = &http.Client{Transport: tr}
 	}

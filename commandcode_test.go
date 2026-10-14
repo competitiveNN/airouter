@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -441,5 +445,150 @@ func TestCCSlugifyProjectPath(t *testing.T) {
 	}
 	if got := ccSlugifyProjectPath(""); got != "root" {
 		t.Fatalf("slugify empty = %q", got)
+	}
+}
+
+// TestCCStreamToolCallIndexCountsCalls pins the tool-call delta
+// index: it counts tool calls, not chunks. A call issued after
+// text deltas must still start at 0 -- OpenAI clients group
+// tool-call deltas by this index, so a mis-indexed first call
+// (the old behavior reused the chunk counter and emitted index 2
+// for the stream below) is mis-grouped or dropped client-side.
+func TestCCStreamToolCallIndexCountsCalls(t *testing.T) {
+	ndjson := strings.Join([]string{
+		`{"type":"text-delta","text":"Let me check"}`,
+		`{"type":"text-delta","text":" that."}`,
+		`{"type":"tool-call","toolCallId":"call_1","toolName":"f","input":{"a":1}}`,
+		`{"type":"tool-call","toolCallId":"call_2","toolName":"g","input":{"b":2}}`,
+		`{"type":"finish","finishReason":"tool-calls","totalUsage":{"inputTokens":10,"outputTokens":5}}`,
+		``,
+	}, "\n")
+	r := newCCStreamToChatReader(strings.NewReader(ndjson), "m", 1)
+	var out bytes.Buffer
+	io.Copy(&out, r)
+	s := out.String()
+	if !strings.Contains(s, `"id":"call_1","index":0`) {
+		t.Fatalf("first tool call not indexed 0:\n%s", s)
+	}
+	if !strings.Contains(s, `"id":"call_2","index":1`) {
+		t.Fatalf("second tool call not indexed 1:\n%s", s)
+	}
+}
+
+// TestCCStreamZeroOutputGuard pins the streaming zero-output
+// guard: a finish that reports zero output tokens with no
+// content is an empty response, which the upstream treats as a
+// rate-limit-family failure (the same rule ccAggregateStream
+// enforces on the non-streaming path and the reference proxy
+// enforces on its stream). The translator must surface an error
+// event -- never a clean [DONE] -- so the fallback walk can
+// retry the next endpoint.
+func TestCCStreamZeroOutputGuard(t *testing.T) {
+	ndjson := `{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":5,"outputTokens":0}}` + "\n"
+	r := newCCStreamToChatReader(strings.NewReader(ndjson), "m", 1)
+	var out bytes.Buffer
+	io.Copy(&out, r)
+	s := out.String()
+	if !strings.Contains(s, `"error"`) {
+		t.Fatalf("zero-output stream produced no error event:\n%s", s)
+	}
+	if !strings.Contains(s, "zero output tokens") {
+		t.Fatalf("wrong error message:\n%s", s)
+	}
+	if strings.Contains(s, "data: [DONE]") {
+		t.Fatalf("zero-output stream must not terminate cleanly:\n%s", s)
+	}
+
+	// The guard must NOT fire once content has been emitted: an
+	// error event after delivered text would truncate a good
+	// response. A stream with text and a zero-token finish
+	// (a broken-usage upstream) still ends in [DONE].
+	withText := strings.Join([]string{
+		`{"type":"text-delta","text":"answer"}`,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":5,"outputTokens":0}}`,
+		``,
+	}, "\n")
+	r = newCCStreamToChatReader(strings.NewReader(withText), "m", 1)
+	out.Reset()
+	io.Copy(&out, r)
+	if !strings.Contains(out.String(), "data: [DONE]") {
+		t.Fatalf("stream with delivered text must still terminate:\n%s", out.String())
+	}
+}
+
+// TestCCUpstreamProxyRouting pins CC_UPSTREAM_PROXY: when set,
+// every Command Code upstream request dials the proxy with
+// CONNECT instead of going direct, and the proxy-routed client is
+// the one the request path uses (Forward, StreamToClient and the
+// fingerprint/lifecycle pre-requests all share it).
+func TestCCUpstreamProxyRouting(t *testing.T) {
+	// Without the env var the commandcode accessors fall back to
+	// the direct client/transport.
+	direct := NewProxy(&Config{})
+	if direct.ccClient != nil || direct.ccTransport != nil {
+		t.Fatal("no proxy configured, yet a proxied client was built")
+	}
+	if direct.commandCodeClient() != direct.client {
+		t.Fatal("commandCodeClient() must fall back to the shared client")
+	}
+	if direct.commandCodeTransport() != direct.baseTransport {
+		t.Fatal("commandCodeTransport() must fall back to the shared transport")
+	}
+
+	// With the env var set, the generation request must arrive at
+	// the proxy as a CONNECT for the Command Code API host. The
+	// fake proxy cannot complete the TLS handshake that follows
+	// its 200, so Forward returns an error -- the CONNECT itself
+	// is the assertion.
+	var mu sync.Mutex
+	var connects []string
+	fakeProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		connects = append(connects, r.Method+" "+r.Host)
+		mu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer fakeProxy.Close()
+
+	t.Setenv("CC_UPSTREAM_PROXY", fakeProxy.URL)
+	cfg := &Config{Providers: map[string]ProviderConfig{
+		"commandcode": {URL: "https://api.commandcode.ai"},
+	}}
+	p := NewProxy(cfg)
+	if p.ccClient == nil || p.ccTransport == nil {
+		t.Fatal("CC_UPSTREAM_PROXY did not build the proxied client/transport")
+	}
+	if p.commandCodeClient() == p.client {
+		t.Fatal("commandCodeClient() must return the proxied client")
+	}
+
+	_, err := p.Forward(context.Background(),
+		[]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`),
+		ModelEndpoint{Provider: "commandcode", Model: "m", Protocol: "commandcode"}, "s")
+	if err == nil {
+		t.Log("note: Forward unexpectedly succeeded through the fake proxy")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, c := range connects {
+		if c == "CONNECT api.commandcode.ai:443" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no CONNECT to api.commandcode.ai:443 reached the proxy; saw %v", connects)
+	}
+}
+
+// TestRedactProxyURL pins the log redaction: a proxy URL may
+// carry user:pass and must never reach a log line whole.
+func TestRedactProxyURL(t *testing.T) {
+	if got := redactProxyURL("http://user:secret@proxy.example:8080"); got != "http://proxy.example:8080" {
+		t.Fatalf("redactProxyURL = %q", got)
+	}
+	if got := redactProxyURL(""); got != "(invalid proxy url)" {
+		t.Fatalf("redactProxyURL(\"\") = %q", got)
 	}
 }
