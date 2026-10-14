@@ -152,6 +152,7 @@ git push origin master
 What `origin/master` is missing, oldest first:
 
 - `7d252d6` dashboard: keep the pill count visible past a long slug
+- `5f326ce` chat: benchmark prefill and decode at 512/4k/16k/64k tokens
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
