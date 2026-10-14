@@ -222,6 +222,69 @@ func TestChatProxyCompletionsStreamingMetrics(t *testing.T) {
 	}
 }
 
+// TestChatProxyTimesFromRequestStart pins when the
+// stats clock starts: before the upstream request is
+// sent, not when its response headers arrive. An
+// upstream that walks a fallback chain (the gateway
+// itself does, between its providers) sends nothing
+// — headers included — until it has a first chunk,
+// so a clock that starts at the headers would report
+// a near-zero TTFT for a request the user waited
+// seconds for. Here the upstream delays its headers
+// by 40ms and its first content token by another
+// 30ms; TTFT must cover both waits.
+func TestChatProxyTimesFromRequestStart(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(40 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		time.Sleep(30 * time.Millisecond)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	g := newChatTestGateway(t)
+	payload := `{"endpoint":{"url":"` + upstream.URL + `/v1"},"model":"smart","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	g.HandleWebChatCompletions(rec, chatTestRequest(t, http.MethodPost, "/chat/completions", payload))
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	idx := strings.Index(rec.Body.String(), "event: "+chatStatsEvent)
+	if idx < 0 {
+		t.Fatalf("expected an %s event, got: %s", chatStatsEvent, rec.Body.String())
+	}
+	dataIdx := strings.Index(rec.Body.String()[idx:], "data: ")
+	dataLine := rec.Body.String()[idx+dataIdx+len("data: "):]
+	if nl := strings.Index(dataLine, "\n"); nl >= 0 {
+		dataLine = dataLine[:nl]
+	}
+	var stats chatStats
+	if err := json.Unmarshal([]byte(dataLine), &stats); err != nil {
+		t.Fatalf("stats event is not valid JSON (%v): %s", err, dataLine)
+	}
+	// Both sleeps (40ms before headers, 30ms before
+	// the first token) plus scheduling slack. A clock
+	// started at the response headers would report
+	// only the 30ms.
+	if stats.TTFTMs < 60 {
+		t.Errorf("expected TTFT >= 60ms (40ms header wait + 30ms token wait), got %dms", stats.TTFTMs)
+	}
+	if stats.ElapsedMs < stats.TTFTMs {
+		t.Errorf("elapsed (%dms) must not precede TTFT (%dms)", stats.ElapsedMs, stats.TTFTMs)
+	}
+	if stats.PrefillTPS <= 0 {
+		t.Errorf("expected a positive prefill t/s, got %f", stats.PrefillTPS)
+	}
+}
+
 // TestChatProxyResponsesStreamingMetrics covers the Responses
 // API grammar: text deltas in response.output_text.delta events
 // and usage nested inside response.completed.
