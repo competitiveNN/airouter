@@ -838,8 +838,28 @@ const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
 
 const store = {};
 function mkEl() {
-  return { innerHTML: '', textContent: '', className: '', style: {}, dataset: {}, children: [],
+  const e = { innerHTML: '', className: '', style: {}, dataset: {}, children: [],
     appendChild(c) { this.children.push(c); } };
+  // A browser computes textContent from the element's descendants,
+  // and setting it drops the children. A plain property would leave
+  // every element built from child spans -- the pills, which carry
+  // the slug and the count as separate spans -- reading as empty,
+  // which no real browser would do.
+  let own = '';
+  Object.defineProperty(e, 'textContent', {
+    get() { return own + this.children.map(c => c.textContent).join(''); },
+    set(v) { own = v; this.children = []; },
+  });
+  // Setting innerHTML replaces the children. Every render function
+  // clears its panel with innerHTML='' before appending rows; a plain
+  // property would leave the previous render's rows in place and the
+  // panel would grow a duplicate row per refresh.
+  let html = '';
+  Object.defineProperty(e, 'innerHTML', {
+    get() { return html; },
+    set(v) { html = v; if (v === '') e.children = []; },
+  });
+  return e;
 }
 global.document = {
   getElementById(id) { if (!store[id]) store[id] = mkEl(); return store[id]; },
@@ -938,6 +958,28 @@ global.fetch = async () => resp;
   if (!iheadText.includes('large') || !iheadText.includes('1 session')) {
     console.error('inflight header ' + JSON.stringify(iheadText)
       + ' does not name large with 1 session');
+    process.exit(1);
+  }
+  // A long endpoint slug must not hide the count it annotates:
+  // slug and count render as separate spans and only the slug
+  // ellipsizes. Render a synthetic row whose slug is longer
+  // than any pill column and assert the count survives in its
+  // own .pct child -- the exact failure when slug and count
+  // shared one ellipsizing text node.
+  renderInflight([{model: 'large', sessions: 2,
+    endpoints: [{endpoint: 'commandcode2:meituan/longcat-2.5-preview-free', sessions: 2}]}]);
+  const longPill = store['inflight'].children[0].children
+    .find(c => c.className === 'eps').children[0];
+  const pnm = longPill.children.find(c => c.className === 'pnm');
+  const pct = longPill.children.find(c => c.className === 'pct');
+  if (!pnm || !pnm.textContent.includes('commandcode2:meituan/longcat-2.5-preview-free')) {
+    console.error('long-slug pill lost its endpoint name: '
+      + JSON.stringify(longPill.textContent));
+    process.exit(1);
+  }
+  if (!pct || !pct.textContent.includes('2 sessions')) {
+    console.error('long-slug pill lost its session count: '
+      + JSON.stringify(longPill.textContent));
     process.exit(1);
   }
   const cells = store['speed'].children[0].children.map(c => c.textContent);

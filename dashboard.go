@@ -49,7 +49,14 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .chainhead{display:flex;gap:.5rem;align-items:baseline;margin-bottom:.4rem}
 .chainhead b{min-width:5rem}
 .eps{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));gap:.35rem .6rem}
-.pill{padding:.15rem .5rem;border-radius:999px;font-size:.75rem;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pill{display:flex;align-items:baseline;gap:.4rem;padding:.15rem .5rem;border-radius:999px;font-size:.75rem;font-family:ui-monospace,monospace}
+/* The slug is the only part that may clip: the count or status
+   beside it is the reason the pill exists, so it lives in its
+   own span that the ellipsis can never reach. min-width:0 lets
+   the slug shrink below its content size, which is what makes
+   the ellipsis engage inside a flex container. */
+.pill .pnm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill .pct{white-space:nowrap}
 .pill.ok{background:#dcfce7;color:#166534}
 .pill.no{background:#fee2e2;color:#991b1b}
 /* A down endpoint can be down for two different reasons, and they need
@@ -188,7 +195,12 @@ function renderChains(chains, breaker){
         why='cooldown '+cooldownLabel(t);
       } else if(ep.circuit&&ep.circuit!=='closed'){ why=ep.circuit; cls='circuit'; }
       else { why='down'; cls='no'; }
-      const p=el('span','pill '+cls, ep.endpoint+' '+why);
+      // Slug and status are separate spans: the pill ellipsizes
+      // only the slug, so a long endpoint name can never hide
+      // the up/down/cooldown verdict it annotates.
+      const p=el('span','pill '+cls);
+      p.appendChild(el('span','pnm',ep.endpoint));
+      p.appendChild(el('span','pct',why));
       if(ep.cooldown) p.dataset.until=ep.cooldown_until;
       eps.appendChild(p);
     }
@@ -216,7 +228,12 @@ setInterval(()=>{
   serverNow += 1000;
   document.querySelectorAll('.pill.cooldown[data-until]').forEach(p=>{
     const t=Number(p.dataset.until);
-    if(Number.isFinite(t)) p.textContent=p.textContent.replace(/cooldown \S+$/, 'cooldown '+cooldownLabel(t, serverNow));
+    // The countdown lives in the pill's .pct span, so the rewrite
+    // targets it directly: setting the pill's textContent would
+    // replace the slug span with a bare text node and un-do the
+    // two-part layout on every tick.
+    const ct=p.querySelector('.pct');
+    if(Number.isFinite(t)&&ct) ct.textContent='cooldown '+cooldownLabel(t, serverNow);
   });
 }, 1000);
 // renderInflight draws the live panel: one row per model that
@@ -244,7 +261,13 @@ function renderInflight(rows){
     const eps=el('div','eps');
     for(const e of m.endpoints||[]){
       const s=e.sessions;
-      eps.appendChild(el('span','pill ok', e.endpoint+' '+(s===1?'1 session':s+' sessions')));
+      // Slug and count are separate spans: the pill ellipsizes
+      // only the slug, so a long endpoint name can never hide
+      // the session count it annotates.
+      const p=el('span','pill ok');
+      p.appendChild(el('span','pnm',e.endpoint));
+      p.appendChild(el('span','pct', s===1?'1 session':s+' sessions'));
+      eps.appendChild(p);
     }
     row.appendChild(eps);
     c.appendChild(row);
