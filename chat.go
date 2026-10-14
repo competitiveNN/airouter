@@ -330,6 +330,14 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 		upstream.Header.Set("Authorization", "Bearer "+ep.APIKey)
 	}
 
+	// Timing starts before the request is sent, not when
+	// its response headers arrive: an upstream that walks
+	// a fallback chain (the gateway itself does, between
+	// its providers) sends nothing — headers included —
+	// until it has a first chunk, and the wait for that
+	// first token is exactly what the stats (and the
+	// benchmark) mean to measure.
+	t0 := time.Now()
 	resp, err := chatHTTPClient.Do(upstream)
 	if err != nil {
 		writeAPIError(w, 502, "Upstream request failed: "+err.Error(), "server_error", "upstream_error")
@@ -347,7 +355,6 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	t0 := time.Now()
 	// The Content-Type value is case-insensitive (RFC 9110);
 	// a provider that spells it "Text/Event-Stream" must still
 	// take the streaming path rather than be read as a whole
