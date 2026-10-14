@@ -154,6 +154,7 @@ What `origin/master` is missing, oldest first:
 - `7d252d6` dashboard: keep the pill count visible past a long slug
 - `5f326ce` chat: benchmark prefill and decode at 512/4k/16k/64k tokens
 - `65ed0a2` chat: time stats from request start, not response headers
+- `91cc3a5` commandcode: align the /alpha/generate proxy with the reference
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
