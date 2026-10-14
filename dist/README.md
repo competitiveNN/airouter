@@ -151,7 +151,7 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `2bcece4` opencode: mint real KSUID session/request ids for the free-tier gate
+- `7d252d6` dashboard: keep the pill count visible past a long slug
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
