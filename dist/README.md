@@ -151,18 +151,16 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `7d252d6` dashboard: keep the pill count visible past a long slug
-- `5f326ce` chat: benchmark prefill and decode at 512/4k/16k/64k tokens
-- `65ed0a2` chat: time stats from request start, not response headers
 - `91cc3a5` commandcode: align the /alpha/generate proxy with the reference
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
 audit #4 work, the credit/quota handling, the cycle-back
-tests, the config regeneration, the last list refresh and the
-dashboard session listing — were all pushed since), which is
-the moving-target property the note at the top describes: the
-list is checked, not trusted.
+tests, the config regeneration, the last list refresh, the
+dashboard session listing, the pill-count fix, the prefill/
+decode benchmark and the chat stats timing — were all pushed
+since), which is the moving-target property the note at the
+top describes: the list is checked, not trusted.
 
 An empty list would be the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
