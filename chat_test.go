@@ -795,7 +795,7 @@ func TestChatPageComposerControls(t *testing.T) {
 	for _, want := range []string{
 		`id="stop"`,
 		"abortCtrl = new AbortController()",
-		`signal: abortCtrl ? abortCtrl.signal : null`,
+		`signal: signal || (abortCtrl ? abortCtrl.signal : null)`,
 		"err.name === 'AbortError'",
 		"function renderMarkdown",
 		"bubble.innerHTML = renderThinking(thinking, true) + renderMarkdown(full)",
@@ -862,8 +862,9 @@ func TestChatPageStreamRobustness(t *testing.T) {
 		}
 	}
 	// send(), new-chat and delete-all are all blocked
-	// while a stream is in flight.
-	if got := strings.Count(chatHTML, "if (generating) return;"); got != 3 {
+	// while a stream is in flight (or a benchmark is
+	// running).
+	if got := strings.Count(chatHTML, "if (generating || benchRunning) return;"); got != 3 {
 		t.Errorf("expected send/new-chat/delete-all all blocked mid-stream, found %d guards", got)
 	}
 }
@@ -1001,5 +1002,47 @@ func TestChatPageAudit4Fixes(t *testing.T) {
 	// second time.
 	if strings.Contains(chatHTML, "esc(tex.replace") {
 		t.Errorf("display math is escaped twice: entities would render literally")
+	}
+}
+
+// TestChatPageBenchmarkUI pins the in-chat
+// benchmark: it measures the selected model at
+// the four context depths through the same
+// chat proxy (so the gateway's own
+// measurements are the numbers shown), caps
+// the completion so decode speed is
+// comparable across depths, runs the depths
+// sequentially under their own abort
+// controller, and a failing depth shows its
+// error and lets the run continue.
+func TestChatPageBenchmarkUI(t *testing.T) {
+	for _, want := range []string{
+		`id="benchmark"`,
+		"var BENCH_DEPTHS = [512, 4096, 16384, 65536];",
+		"var BENCH_MAX_TOKENS = 256;",
+		"function benchPrompt",
+		"function runBenchmark",
+		"payload.max_tokens = BENCH_MAX_TOKENS;",
+		"payload.max_output_tokens = BENCH_MAX_TOKENS;",
+		"benchAbortCtrl = new AbortController();",
+		"signal: signal || (abortCtrl ? abortCtrl.signal : null)",
+		"className = 'bench-table';",
+		"$('benchmark').onclick = runBenchmark;",
+		"if (generating || benchRunning) return;",
+		"while (row.cells.length > 1) row.deleteCell(1);",
+		"bad.colSpan = 4;",
+	} {
+		if !strings.Contains(chatHTML, want) {
+			t.Errorf("chatHTML missing %q", want)
+		}
+	}
+	// The benchmark must measure both directions:
+	// a depth row records the real context size
+	// plus ttft, prefill and decode.
+	if strings.Contains(chatHTML, "function runBenchmark") && !strings.Contains(chatHTML, "s.prefill_tokens_per_sec") {
+		t.Errorf("benchmark rows do not record prefill speed")
+	}
+	if strings.Contains(chatHTML, "function runBenchmark") && !strings.Contains(chatHTML, "s.decode_tokens_per_sec") {
+		t.Errorf("benchmark rows do not record decode speed")
 	}
 }

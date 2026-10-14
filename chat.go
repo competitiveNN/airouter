@@ -697,6 +697,11 @@ select, input[type=text] { background: #1b1e24; color: #e6e6e6; border: 1px soli
 .ep-row input { width: 100%; background: #1b1e24; color: #e6e6e6; border: 1px solid #333842; border-radius: 6px; padding: 6px; font: inherit; }
 .ep-actions { display: flex; gap: 8px; margin-top: 8px; }
 .hint { font-size: 12px; color: #8b93a1; margin: 8px 0; }
+.bench-table { border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+.bench-table th, .bench-table td { border: 1px solid #2a2e36; padding: 3px 8px; text-align: right; white-space: nowrap; }
+.bench-table th { color: #8b93a1; font-weight: normal; }
+.bench-table th:first-child, .bench-table td:first-child { text-align: left; }
+.bench-error { color: #e08080; }
 </style>
 </head>
 <body>
@@ -720,6 +725,7 @@ select, input[type=text] { background: #1b1e24; color: #e6e6e6; border: 1px soli
       </select>
       <select id="model-select" title="Model"></select>
       <input type="text" id="model-input" placeholder="model name" spellcheck="false" style="display:none">
+      <button id="benchmark" title="Measure prefill and decode speed at several context depths">Benchmark</button>
     </div>
     <div id="messages"></div>
     <div id="composer">
@@ -1168,7 +1174,7 @@ function updateComposer() {
 }
 
 function send() {
-  if (generating) return;
+  if (generating || benchRunning) return;
   var text = $('prompt').value.trim();
   if (!text) return;
   var ep = currentEndpoint();
@@ -1269,12 +1275,12 @@ function send() {
   });
 }
 
-function doSend(payload, protocol, onText, onStats, onItems) {
+function doSend(payload, protocol, onText, onStats, onItems, signal) {
   return fetch(apiUrl('/chat/' + protocol), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-    signal: abortCtrl ? abortCtrl.signal : null
+    signal: signal || (abortCtrl ? abortCtrl.signal : null)
   }).then(function (resp) {
     if (!resp.ok) {
       return resp.text().then(function (t) {
@@ -1455,6 +1461,161 @@ function statsFromHeaders(resp) {
   };
 }
 
+// ---------- benchmark ----------
+
+// BENCH_DEPTHS are the context sizes, in tokens, the
+// benchmark measures: 512 for the small-prompt floor,
+// then the depths where prefill starts to dominate the
+// first-token latency.
+var BENCH_DEPTHS = [512, 4096, 16384, 65536];
+
+// BENCH_MAX_TOKENS caps the completion so decode speed
+// is comparable across depths: every depth produces
+// (up to) the same number of output tokens, timed
+// from the first one.
+var BENCH_MAX_TOKENS = 256;
+
+var benchRunning = false;
+var benchStopping = false;
+var benchAbortCtrl = null;
+
+function benchLabel(depth) {
+  return depth >= 1024 ? (depth / 1024) + 'k' : String(depth);
+}
+
+// benchPrompt builds a prompt of roughly "tokens"
+// tokens: the gateway's own fallback estimate for
+// plain prose is about 4 characters per token, so
+// the target length is 4x the depth. The table
+// shows the real context size the upstream reports,
+// not this estimate.
+function benchPrompt(tokens) {
+  var target = Math.max(16, Math.round(tokens * 4));
+  var sentence = 'The quick brown fox jumps over the lazy dog. ';
+  var s = '';
+  var n = 0;
+  while (s.length < target) {
+    s += n + ' ' + sentence;
+    n++;
+  }
+  return s;
+}
+
+// runBenchmark sends one request per depth to the
+// selected endpoint and model and records the
+// proxy's own measurements (first-token latency,
+// prefill and decode tokens per second) in a table
+// in the chat. Depths run sequentially so each
+// measurement is taken with the endpoint otherwise
+// idle. The button turns into Stop for the duration;
+// stopping aborts the in-flight depth and ends the
+// run. A depth that fails (a 64k prompt exceeds the
+// model's context, say) shows its error in the
+// table and the run continues.
+function runBenchmark() {
+  if (benchRunning) {
+    benchStopping = true;
+    if (benchAbortCtrl) benchAbortCtrl.abort();
+    return;
+  }
+  if (generating) {
+    alert('Stop the current response before running a benchmark.');
+    return;
+  }
+  var ep = currentEndpoint();
+  if (!ep || !ep.url) { alert('Add an API endpoint first (button at the bottom left).'); return; }
+  var model = currentModel();
+  var protocol = $('protocol-select').value;
+
+  var col = appendMessage('assistant', '', null, null);
+  var bubble = col.querySelector('.bubble');
+  var labels = BENCH_DEPTHS.map(benchLabel);
+  bubble.innerHTML = '<p>Benchmarking <b>' + esc(model) + '</b> at ' + labels.join(' / ') + ' tokens…</p>';
+  var table = document.createElement('table');
+  table.className = 'bench-table';
+  var head = table.insertRow(-1);
+  var names = ['depth', 'context', 'ttft', 'prefill', 'decode'];
+  for (var i = 0; i < names.length; i++) {
+    var th = document.createElement('th');
+    th.textContent = names[i];
+    head.appendChild(th);
+  }
+  bubble.appendChild(table);
+
+  benchRunning = true;
+  $('benchmark').textContent = 'Stop';
+
+  function finish(stopped) {
+    benchRunning = false;
+    benchStopping = false;
+    benchAbortCtrl = null;
+    $('benchmark').textContent = 'Benchmark';
+    var note = document.createElement('p');
+    note.className = 'stats';
+    note.textContent = stopped ? 'benchmark stopped' : 'benchmark complete';
+    bubble.appendChild(note);
+  }
+
+  var idx = 0;
+  function next() {
+    if (benchStopping) { finish(true); return; }
+    if (!benchRunning) return;
+    if (idx >= BENCH_DEPTHS.length) { finish(false); return; }
+    var depth = BENCH_DEPTHS[idx++];
+    var row = table.insertRow(-1);
+    var cells = [];
+    for (var i = 0; i < names.length; i++) cells.push(row.insertCell(-1));
+    cells[0].textContent = benchLabel(depth);
+    for (var j = 1; j < names.length; j++) cells[j].textContent = '…';
+
+    var prompt = benchPrompt(depth);
+    var payload = {
+      endpoint: { url: ep.url, api_key: ep.api_key },
+      model: model,
+      stream: true
+    };
+    if (protocol === 'responses') {
+      payload.input = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] }];
+      payload.max_output_tokens = BENCH_MAX_TOKENS;
+    } else {
+      payload.messages = [{ role: 'user', content: prompt }];
+      payload.max_tokens = BENCH_MAX_TOKENS;
+    }
+
+    benchAbortCtrl = new AbortController();
+    doSend(payload, protocol,
+      function () {},
+      function (s) {
+        if (!s) return;
+        cells[1].textContent = fmtInt(s.context_tokens);
+        cells[2].textContent = s.ttft_ms ? fmtInt(s.ttft_ms) + ' ms' : '—';
+        cells[3].textContent = s.prefill_tokens_per_sec ? Math.round(s.prefill_tokens_per_sec) + ' t/s' : '—';
+        cells[4].textContent = s.decode_tokens_per_sec ? Math.round(s.decode_tokens_per_sec) + ' t/s' : '—';
+      },
+      function () {},
+      benchAbortCtrl.signal
+    ).then(function () {
+      next();
+    }).catch(function (err) {
+      if (err && err.name === 'AbortError') {
+        cells[1].textContent = 'stopped';
+        finish(true);
+        return;
+      }
+      // A failed depth does not end the run: the
+      // error replaces the pending cells and the
+      // next depth still runs.
+      while (row.cells.length > 1) row.deleteCell(1);
+      var bad = row.insertCell(-1);
+      bad.className = 'bench-error';
+      bad.colSpan = 4;
+      bad.textContent = 'Error: ' + (err && err.message ? err.message : err);
+      next();
+    });
+  }
+  next();
+}
+
 // ---------- wiring ----------
 
 function init() {
@@ -1518,6 +1679,7 @@ function init() {
   };
   $('model-input').onchange = persistUI;
   $('send').onclick = send;
+  $('benchmark').onclick = runBenchmark;
   $('stop').onclick = function () {
     if (abortCtrl) abortCtrl.abort();
   };
@@ -1528,7 +1690,7 @@ function init() {
     }
   });
   $('new-chat').onclick = function () {
-    if (generating) return;
+    if (generating || benchRunning) return;
     var chat = { id: newId('c'), title: '', messages: [], created: Date.now(), updated: Date.now() };
     chats.push(chat);
     currentChatId = chat.id;
@@ -1538,7 +1700,7 @@ function init() {
     $('prompt').focus();
   };
   $('delete-all').onclick = function () {
-    if (generating) return;
+    if (generating || benchRunning) return;
     if (!chats.length) return;
     if (!confirm('Delete all ' + chats.length + ' past chats? This cannot be undone.')) return;
     chats = [];
