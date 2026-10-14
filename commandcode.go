@@ -95,6 +95,17 @@ func ccCliMode() string        { return ccStrEnv("CC_CLI_MODE", "agent") }
 func ccCliSessionMode() string { return ccStrEnv("CC_CLI_SESSION_MODE", "interactive") }
 func ccZDR() bool              { return ccBoolEnv("CMD_ZDR", false) }
 
+// ccUpstreamProxyURL names the HTTP CONNECT proxy every Command Code
+// upstream request (generation, fingerprint record, lifecycle event)
+// is routed through. Empty means a direct connection. It is the
+// gateway equivalent of commandcode-proxy's CC_UPSTREAM_PROXY
+// (issue #18): the Node proxy implements the CONNECT tunnel by hand
+// because Node's fetch ignores proxy env vars; Go's net/http issues
+// CONNECT for https targets through http.Transport.Proxy natively.
+func ccUpstreamProxyURL() string {
+	return os.Getenv("CC_UPSTREAM_PROXY")
+}
+
 // ccEmptySystemPlaceholder sends a single space when there is no system
 // prompt, so the upstream does not inject its ~7.5K-token default
 // prompt (commandcode-proxy issue #17).
@@ -1247,10 +1258,15 @@ type ccStreamToChatReader struct {
 	done      bool
 	firstDone bool
 
-	chunkIndex   int
-	sawFinish    bool
-	finishReason string
-	usage        *ccUsage
+	chunkIndex    int
+	toolCallIndex int
+	sawFinish     bool
+	finishReason  string
+	usage         *ccUsage
+	// outputTokens is the output-token count the upstream last
+	// reported (finish-step / finish usage). It feeds the
+	// zero-output guard below.
+	outputTokens int
 }
 
 func newCCStreamToChatReader(src io.Reader, model string, created int64) *ccStreamToChatReader {
@@ -1316,6 +1332,18 @@ func (r *ccStreamToChatReader) pump() error {
 			r.pend = append(r.pend, r.errorChunk("Upstream stream ended without a completion finish (no finish event) — response was truncated")...)
 			return nil
 		}
+		// Zero-output guard: a finish that reports no output tokens is
+		// an empty response, which the upstream treats as a
+		// rate-limit-family failure -- the same guard the reference
+		// proxy applies and the non-streaming aggregator
+		// (ccAggregateStream) enforces. It only fires before any chunk
+		// was emitted: once text or a tool call has gone out, the
+		// stream is committed to the client and an error event would
+		// truncate a delivered response.
+		if r.chunkIndex == 0 && r.toolCallIndex == 0 && r.outputTokens == 0 {
+			r.pend = append(r.pend, r.errorChunk("Empty response from upstream (zero output tokens)")...)
+			return nil
+		}
 		if !r.firstDone {
 			r.firstDone = true
 			r.pend = append(r.pend, []byte("data: [DONE]\n\n")...)
@@ -1370,10 +1398,16 @@ func (r *ccStreamToChatReader) translateLine(line []byte) []byte {
 	case "tool-call":
 		id := ev.ToolCallID
 		if id == "" {
-			id = "call_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(r.chunkIndex)
+			id = "call_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(r.toolCallIndex)
 		}
+		// The index counts tool calls, not chunks: OpenAI clients
+		// group deltas by it, so a call issued after text deltas
+		// must still start at 0. The reference proxy keeps a
+		// dedicated toolCallIndex counter for exactly this reason;
+		// reusing the chunk counter would mis-index every call
+		// that follows content.
 		tc := map[string]any{
-			"index": r.chunkIndex,
+			"index": r.toolCallIndex,
 			"id":    id,
 			"type":  "function",
 			"function": map[string]any{
@@ -1387,6 +1421,7 @@ func (r *ccStreamToChatReader) translateLine(line []byte) []byte {
 			delta["content"] = nil
 		}
 		r.chunkIndex++
+		r.toolCallIndex++
 		return r.chunk(delta, nil, nil)
 
 	case "finish-step":
@@ -1396,6 +1431,7 @@ func (r *ccStreamToChatReader) translateLine(line []byte) []byte {
 		}
 		if ev.Usage != nil {
 			r.usage = ev.Usage
+			r.outputTokens = ev.Usage.OutputTokens
 		}
 		return nil
 
@@ -1405,6 +1441,9 @@ func (r *ccStreamToChatReader) translateLine(line []byte) []byte {
 		u := ev.TotalUsage
 		if u == nil {
 			u = r.usage
+		}
+		if u != nil {
+			r.outputTokens = u.OutputTokens
 		}
 		ccNormalizeUsage(u)
 		var usage any
