@@ -1279,36 +1279,39 @@ OPENCODE_PROBE_TIMEOUT = 20
 
 # ── OpenCode probe cache ──────────────────────────────────────────────────────
 #
-# The gate probe answers "does this key still reach this model", which changes
-# on the provider's schedule, not ours. Re-asking on every sync is pure cost:
-# 12 candidates x up to 2 protocols is the slowest phase of the fetcher, and it
-# is also the phase that makes the sync fragile, since a slow upstream turns
-# into an over-budget run that leaves models unverified.
+# The gate probe answers "does this key still reach this model". Re-asking
+# on every sync is pure cost: 12 candidates x up to 2 protocols is the
+# slowest phase of the fetcher, it is the phase that makes the sync
+# fragile (a slow upstream turns into an over-budget run that leaves
+# models unverified), and it spends the very free-tier rate limit a
+# sweep must stay inside — the first exhausted 429 aborts the whole
+# sweep and leaves the rest UNVERIFIED.
 #
-# Verdicts are cached PER MODEL and expire independently, because the two
-# directions have very different costs of being wrong:
-#   - `ok` cached long: a model that answered keeps answering. Stale-true costs
-#     a chain entry that might 403 for a few days, and the gateway's cooldown
-#     handles that at request time.
-#   - a negative verdict cached SHORT: entitlements change, and models do come
-#     back. Caching "freetier" for a week would keep a working model out of the
-#     chains for a week -- the exact regression this probe was rebuilt to undo.
+# So a model is live-probed ONCE, EVER. The verdict lands in
+# OPENCODE_PROBE_CACHE_FILE and never expires, in either direction:
+#   - a stale `ok` costs one 403 round trip, and the daemon's cooldown
+#     (cooldowns.json, recorded from real client traffic) backs the
+#     endpoint off at request time — sync-time re-probing is not what
+#     recovers a refused endpoint;
+#   - a stale negative keeps a model out of the chains, but re-probing
+#     it on every sync is exactly the per-model live cost this cache
+#     exists to remove. REFRESH_OPENCODE_PROBE=1 is the deliberate
+#     override.
+#
+# The cache is keyed by model id alone, so a model that vanishes from
+# the listing and returns later still owns its old verdict and is not
+# re-probed.
 OPENCODE_PROBE_CACHE_FILE = Path(__file__).resolve().parent / "opencode-probe-cache.json"
-OPENCODE_PROBE_OK_TTL_HOURS = int(os.environ.get("OPENCODE_PROBE_OK_TTL_HOURS", "168"))
-OPENCODE_PROBE_NEG_TTL_HOURS = int(os.environ.get("OPENCODE_PROBE_NEG_TTL_HOURS", "24"))
-
-
-def opencode_probe_cache_ttl_hours(verdict: str) -> int:
-    """How long a cached verdict of this kind stays trustworthy."""
-    return OPENCODE_PROBE_OK_TTL_HOURS if verdict == "ok" else OPENCODE_PROBE_NEG_TTL_HOURS
 
 
 def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
-    """Read the probe cache, dropping expired and malformed entries.
+    """Read the probe cache, dropping malformed entries.
 
-    Never raises: a corrupt cache must cost one live probe round, not the model
-    list. Anything unusable is discarded rather than repaired, because the whole
-    point is that a cache miss is always safe.
+    Nothing expires: a model is probed once, ever, so every well-formed
+    entry in the file is a permanent fact about that model, however old.
+    Never raises: a corrupt cache must cost one live probe round, not the
+    model list. Anything unusable is discarded rather than repaired,
+    because the whole point is that a cache miss is always safe.
     """
     if not OPENCODE_PROBE_CACHE_FILE.exists():
         return {}
@@ -1320,7 +1323,6 @@ def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
     except (json.JSONDecodeError, OSError):
         return {}
     live: dict[str, dict[str, Any]] = {}
-    now = datetime.now(UTC)
     for model_id, entry in probes.items():
         if not isinstance(entry, dict):
             continue
@@ -1328,10 +1330,11 @@ def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
         if verdict not in ("ok", "freetier", "error"):
             continue
         try:
-            checked = datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
+            # Parsed as validation only: an entry with no usable
+            # timestamp is malformed, not old. Age is deliberately not
+            # consulted — the verdict is permanent (see the notes above).
+            datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
         except ValueError:
-            continue
-        if (now - checked).total_seconds() > opencode_probe_cache_ttl_hours(verdict) * 3600:
             continue
         live[model_id] = entry
     return live
@@ -1598,10 +1601,11 @@ def fetch_opencode() -> list[dict[str, Any]]:
     chains (7 in smart, 8 in work, 2 in fast, 1 in large) that 403 on every
     call, costing a guaranteed round trip per request that reached them.
 
-    Verdicts are cached per model in OPENCODE_PROBE_CACHE_FILE and expire
-    independently by direction, so a steady-state sync spends one listing call
-    and no probe calls at all. Set REFRESH_OPENCODE_PROBE=1 to force a live
-    re-probe of every candidate and rewrite the cache.
+    Verdicts are cached per model in OPENCODE_PROBE_CACHE_FILE and never
+    expire: each model is live-probed once, ever, so a steady-state sync
+    spends one listing call and no probe calls at all. Set
+    REFRESH_OPENCODE_PROBE=1 to force a live re-probe of every candidate
+    and rewrite the cache.
 
     Set SKIP_OPENCODE_PROBE=1 to skip verification and keep the old
     listing-only behaviour. That reintroduces the dead-endpoint problem, so
@@ -1701,12 +1705,13 @@ def fetch_opencode() -> list[dict[str, Any]]:
         if entry is None and index + 1 < len(candidates):
             time.sleep(OPENCODE_CANDIDATE_PAUSE)
 
-    # Only persist what this sweep actually produced a verdict for, so a run that
-    # stopped early cannot promote a half-finished pass into a week of cache.
-    probed = {m.get("id", "") for m in candidates} - {m.get("id", "") for m in untried}
-    save_opencode_probe_cache(
-        {k: v for k, v in cache.items() if k in probed and k}
-    )
+    # Every verdict in `cache` is a permanent per-model fact: the ones
+    # this sweep produced plus, when the cache was loaded rather than
+    # reset, every verdict earlier sweeps recorded. Dropping any of them
+    # would mean live-probing that model again — the one thing this
+    # cache exists to prevent — so a sweep that stops early persists
+    # exactly what it knows.
+    save_opencode_probe_cache(cache)
 
     if untried:
         # normalize_opencode never sets `protocol`, so an unprobed record cannot
@@ -1726,9 +1731,8 @@ def fetch_opencode() -> list[dict[str, Any]]:
     if cached_used:
         print(
             f"OpenCode: {cached_used}/{len(candidates)} verdicts served from "
-            f"{OPENCODE_PROBE_CACHE_FILE.name} (negative verdicts expire after "
-            f"{OPENCODE_PROBE_NEG_TTL_HOURS}h, positive after "
-            f"{OPENCODE_PROBE_OK_TTL_HOURS}h)",
+            f"{OPENCODE_PROBE_CACHE_FILE.name} (verdicts never expire: a model "
+            f"is live-probed once, ever)",
             file=sys.stderr,
         )
     print(f"OpenCode: {len(free_models)}/{len(candidates)} candidates verified usable", file=sys.stderr)

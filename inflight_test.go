@@ -226,3 +226,47 @@ func TestDashboardPageReadsTheInflightFieldsThePayloadEmits(t *testing.T) {
 		}
 	}
 }
+
+// TestDashboardPageReadsTheCooldownFieldsThePayloadEmits is the cooldowns
+// analogue of the inflight test: the Cooldowns card's checkbox list and clear
+// button must read the same fields the payload emits. A rename on either side
+// would leave the card rendering nothing and the clear button inert.
+func TestDashboardPageReadsTheCooldownFieldsThePayloadEmits(t *testing.T) {
+	cfg := &Config{Models: map[string]ModelConfig{}}
+	g := dashboardTestGateway(t, cfg)
+
+	dataReq := httptest.NewRequest(http.MethodGet, "/admin/dashboard/data?window=1d", nil)
+	dataReq.Header.Set("Authorization", "Bearer secret")
+	dataW := httptest.NewRecorder()
+	g.HandleAdminDashboardData(dataW, dataReq)
+	var payload struct {
+		Cooldowns map[string]struct {
+			Expiry     time.Time `json:"expiry"`
+			StatusCode int       `json:"status_code"`
+			ErrorCount int       `json:"error_count"`
+			LastError  string    `json:"last_error"`
+		} `json:"cooldowns"`
+		Circuits map[string]struct {
+			State      string    `json:"state"`
+			OpenedAt   time.Time `json:"opened_at"`
+			ProbesSent int       `json:"probes_sent"`
+		} `json:"circuits"`
+	}
+	if err := json.Unmarshal(dataW.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("data payload is not JSON: %v", err)
+	}
+
+	pageReq := httptest.NewRequest(http.MethodGet, "/admin/dashboard", nil)
+	pageReq.Header.Set("Authorization", "Bearer secret")
+	pageW := httptest.NewRecorder()
+	g.HandleAdminDashboard(pageW, pageReq)
+	if pageW.Code != http.StatusOK {
+		t.Fatalf("page: status = %d, want 200", pageW.Code)
+	}
+	html := pageW.Body.String()
+	for _, want := range []string{"cooldowns", "renderCooldowns", "cooldownSelection", "clearSelectedCooldowns", "model_key", "status_code", "error_count", "last_error", "/admin/cooldowns", "selectAll", "toggleSelectAll"} {
+		if !contains(html, want) {
+			t.Errorf("dashboard page does not read %q — the cooldowns card renders empty", want)
+		}
+	}
+}

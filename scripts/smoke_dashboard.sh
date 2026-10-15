@@ -837,9 +837,22 @@ const script = m[1];
 const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
 
 const store = {};
-function mkEl() {
-  const e = { innerHTML: '', className: '', style: {}, dataset: {}, children: [],
-    appendChild(c) { this.children.push(c); } };
+function mkEl(tag) {
+  const e = { tagName: (tag || '').toUpperCase(), innerHTML: '', className: '', style: {}, dataset: {}, children: [],
+    appendChild(c) { this.children.push(c); },
+    querySelector(sel) {
+      // A browser's querySelector walks the subtree. The harness's
+      // elements are shallow trees (a table's tbody is a direct child),
+      // so a linear walk over children is enough to match what the
+      // page does -- the cooldowns card calls table.querySelector('tbody')
+      // to find the body it just created with innerHTML.
+      const want = sel.toLowerCase();
+      for (const c of this.children) {
+        if ((c.tagName || '').toLowerCase() === want) return c;
+        if (c.querySelector) { const r = c.querySelector(sel); if (r) return r; }
+      }
+      return null;
+    } };
   // A browser computes textContent from the element's descendants,
   // and setting it drops the children. A plain property would leave
   // every element built from child spans -- the pills, which carry
@@ -863,7 +876,7 @@ function mkEl() {
 }
 global.document = {
   getElementById(id) { if (!store[id]) store[id] = mkEl(); return store[id]; },
-  createElement() { return mkEl(); },
+  createElement(tag) { return mkEl(tag); },
   querySelectorAll() { return []; },
 };
 global.URLSearchParams = class {
@@ -898,7 +911,7 @@ global.fetch = async () => resp;
     console.error('status = ' + JSON.stringify(status) + ', want a render that completed');
     process.exit(1);
   }
-  for (const id of ['chains', 'speed', 'volume', 'failures', 'inflight']) {
+  for (const id of ['chains', 'speed', 'volume', 'failures', 'inflight', 'cooldowns']) {
     const el = store[id];
     if (!el || el.children.length === 0) {
       console.error(id + ' panel is empty');
@@ -987,12 +1000,36 @@ global.fetch = async () => resp;
     console.error('speed row has ' + cells.length + ' cells, want >= 5');
     process.exit(1);
   }
+  // The cooldowns card is a checkbox list over a table: each row carries a
+  // checkbox and the model key, and the actions bar is visible only when
+  // there is something to clear. A card that rendered nothing or whose
+  // checkbox list was inert would fail here rather than at a browser.
+  const cdRows = store['cooldowns'].children;
+  if (cdRows.length === 0) {
+    console.error('cooldowns panel is empty');
+    process.exit(1);
+  }
+  const cdTable = cdRows[0];
+  const cdBoxes = cdTable.querySelectorAll ? cdTable.querySelectorAll('input[type=checkbox]') : [];
+  for (const row of cdRows) {
+    const boxes = row.querySelectorAll ? row.querySelectorAll('input[type=checkbox]') : [];
+    const key = row.children.map(c => c.textContent).join(' ');
+    if (!key.includes(':')) {
+      console.error('cooldowns row ' + JSON.stringify(key) + ' does not name a model');
+      process.exit(1);
+    }
+  }
+  if (!store['cooldownActions'] || store['cooldownActions'].style.display === 'none') {
+    console.error('cooldown actions bar is hidden when cooldowns are present');
+    process.exit(1);
+  }
   console.log('status=' + JSON.stringify(status)
     + ' chains=' + store['chains'].children.length
     + ' inflight=' + store['inflight'].children.length
     + ' speed=' + store['speed'].children.length
     + ' volume=' + store['volume'].children.length
-    + ' failures=' + store['failures'].children.length);
+    + ' failures=' + store['failures'].children.length
+    + ' cooldowns=' + cdRows.length);
   process.exit(0);
 })();
 NODE

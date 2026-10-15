@@ -500,14 +500,14 @@ func TestProbeAvailabilityIsReadOnly(t *testing.T) {
 	// rather than "closed" because there is no breaker record for this
 	// endpoint yet — the dashboard renders "" as "up", which is the same
 	// conclusion the string would carry.
-	if ok, cd, circ := router.ProbeAvailability(ep); !ok || cd || circ != "" {
+	if ok, cd, circ, _ := router.ProbeAvailability(ep); !ok || cd || circ != "" {
 		t.Fatalf("initial probe = (%v,%v,%q), want (true,false,\"\")", ok, cd, circ)
 	}
 
 	// An active cooldown makes it down, and the reason is the cooldown.
 	router.ApplyCooldown(ep, 429, "rate limited")
-	if ok, cd, circ := router.ProbeAvailability(ep); ok || !cd {
-		t.Fatalf("probed during cooldown = (%v,%v,%q), want (false,true,\"closed\")", ok, cd, circ)
+	if ok, cd, circ, until := router.ProbeAvailability(ep); ok || !cd || until.IsZero() {
+		t.Fatalf("probed during cooldown = (%v,%v,%q,%v), want (false,true,\"closed\",non-zero)", ok, cd, circ, until)
 	}
 
 	// Drive the circuit open with repeated failures so we can probe the
@@ -522,7 +522,7 @@ func TestProbeAvailabilityIsReadOnly(t *testing.T) {
 
 	// The circuit is open, so the probe says down — and crucially, unlike
 	// IsAvailable, it must NOT have transitioned it to half-open.
-	if ok, _, circ := router.ProbeAvailability(ep); ok || circ != "open" {
+	if ok, _, circ, _ := router.ProbeAvailability(ep); ok || circ != "open" {
 		t.Fatalf("probed an open circuit = (%v,%q), want (false,\"open\") — the probe must not advance the breaker", ok, circ)
 	}
 	if cb := router.GetAllCircuitsState(); cb[0].CircuitState != "open" {

@@ -365,13 +365,21 @@ func opencodeGateToolName(tool map[string]json.RawMessage) string {
 	return ""
 }
 
-// opencodeGateTool builds the canonical gate tool. The gateway checks
-// the tool NAME only (measured: any description and an empty parameter
-// schema pass), so the injected tool carries a minimal but honest
-// schema rather than the CLI's full one.
+// opencodeGateTool builds the canonical gate tool. The gateway inspects
+// the tool's parameter SCHEMA, not just its name: measured live against
+// opencode.ai/inference/openai/v1 on 2026-10-15, a `read` tool whose
+// parameters is `{"type":"object","properties":{}}` is refused with 403
+// FreeTierError, while one carrying any property -- even
+// `{"type":"object","properties":{"x":{}}}` -- passes. The `read` tool is
+// required at all (removing it 403s), and so is every other tool present:
+// a `bash` with an empty schema also 403s. Names, descriptions, `required`
+// and `additionalProperties` are irrelevant once `properties` is
+// non-empty. The injected tool therefore carries a real property; this
+// used to be `{"type":"object","properties":{}}` and is exactly what made
+// every free-tier request 403.
 func opencodeGateTool(name string) map[string]json.RawMessage {
 	description := "opencode gate tool"
-	parameters := json.RawMessage(`{"type":"object","properties":{}}`)
+	parameters := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)
 	fn, _ := json.Marshal(struct {
 		Name        string          `json:"name"`
 		Description string          `json:"description"`

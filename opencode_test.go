@@ -31,8 +31,14 @@ func TestOpencodeGateBody(t *testing.T) {
 	}
 
 	// A client that already streams with both tools keeps its own
-	// tools (the gate must not duplicate them).
-	satisfied := `{"model":"m","stream":true,"tools":[{"type":"function","function":{"name":"bash"}},{"type":"function","function":{"name":"read"}},{"type":"function","function":{"name":"edit"}}]}`
+	// tools (the gate must not duplicate them). Both tools carry a
+	// parameters schema with at least one property: measured live
+	// against opencode.ai/inference/openai/v1 on 2026-10-15, a `read`
+	// tool with `{"type":"object","properties":{}}` -- or no parameters
+	// key at all -- is refused with 403 FreeTierError, so a body the
+	// gate accepts must declare a property. The assertion is about
+	// non-duplication, not about whether the client's schema is empty.
+	satisfied := `{"model":"m","stream":true,"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}},{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},{"type":"function","function":{"name":"edit","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}]}`
 	out = opencodeGateBody([]byte(satisfied))
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("gate output is not JSON: %v", err)
@@ -71,6 +77,30 @@ func TestOpencodeGateBody(t *testing.T) {
 	// Fail-open: an unparseable body is forwarded verbatim.
 	if out := opencodeGateBody([]byte("not json")); string(out) != "not json" {
 		t.Errorf("unparseable body was rewritten: %s", out)
+	}
+
+	// The injected gate tools must carry a parameters schema with at least
+	// one property. Measured live against opencode.ai/inference/openai/v1
+	// on 2026-10-15: a `read` tool whose parameters is
+	// `{"type":"object","properties":{}}` is refused with 403 FreeTierError,
+	// while one carrying any property passes. An empty schema used to be
+	// emitted here and is exactly what made every free-tier request 403.
+	for _, tool := range []map[string]json.RawMessage{opencodeGateTool("bash"), opencodeGateTool("read")} {
+		var fn struct {
+			Parameters json.RawMessage `json:"parameters"`
+		}
+		if err := json.Unmarshal(tool["function"], &fn); err != nil {
+			t.Fatalf("injected gate tool is malformed: %v", err)
+		}
+		var params struct {
+			Properties json.RawMessage `json:"properties"`
+		}
+		if err := json.Unmarshal(fn.Parameters, &params); err != nil {
+			t.Fatalf("injected gate tool parameters is not an object: %s", fn.Parameters)
+		}
+		if len(params.Properties) == 0 || string(params.Properties) == "{}" {
+			t.Errorf("injected gate tool parameters has no properties: %s", fn.Parameters)
+		}
 	}
 }
 

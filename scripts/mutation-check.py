@@ -273,6 +273,18 @@ MUTATIONS: list[Mutation] = [
         "An ssl.SSLError or RemoteDisconnected would abort the nightly sync "
         "and lose the whole model list.",
     ),
+    Mutation(
+        "once-ever verdict expires",
+        "fetch-free-models.py",
+        "        live[model_id] = entry\n    return live",
+        "        checked = datetime.fromisoformat(str(entry.get(\"checked_at\", \"\")).replace(\"Z\", \"+00:00\"))\n"
+        "        if (datetime.now(UTC) - checked).total_seconds() > 24 * 3600:\n"
+        "            continue\n"
+        "        live[model_id] = entry\n    return live",
+        "A verdict older than a day is dropped from the cache, so the next "
+        "sync pays the per-model live probe cost again — the exact cost the "
+        "once-ever cache exists to remove.",
+    ),
     # The `protocol:` field. Each mutation removes one of the three ways the
     # field can silently stop being written, and none of them crashes: the
     # config still loads and still routes, it just addresses every endpoint in

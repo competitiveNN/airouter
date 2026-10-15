@@ -972,31 +972,30 @@ def test_probe_cache_round_trips(tmp_path, monkeypatch):
     assert all(m.get("verified") is True for m in second), second
 
 
-def test_probe_cache_expires_negatives_far_faster_than_positives(tmp_path, monkeypatch):
-    """Asymmetric TTL is the safety property, not an optimisation.
+def test_probe_verdicts_are_cached_once_ever(tmp_path, monkeypatch):
+    """The live probe is a per-model cost paid once, ever.
 
-    A cached `ok` going stale costs a chain entry that may 403 briefly. A cached
-    `freetier` going stale for a week would keep a working model OUT of the
-    chains for a week -- exactly the regression this probe was rebuilt to undo.
+    Both directions are permanent, and age is not consulted at all:
+    a stale `ok` costs one 403 that the daemon's cooldown absorbs at
+    request time, while a stale negative stays negative because
+    re-probing on every sync is exactly the per-model live cost this
+    cache exists to remove. REFRESH_OPENCODE_PROBE=1 is the deliberate
+    override (tested above).
     """
-    monkeypatch.setattr(ff, "OPENCODE_PROBE_OK_TTL_HOURS", 168)
-    monkeypatch.setattr(ff, "OPENCODE_PROBE_NEG_TTL_HOURS", 24)
-    assert ff.opencode_probe_cache_ttl_hours("ok") == 168
-    assert ff.opencode_probe_cache_ttl_hours("freetier") == 24
-    assert ff.opencode_probe_cache_ttl_hours("error") == 24
-
-    old = datetime.now(UTC) - timedelta(hours=30)
-    stamp = old.isoformat().replace("+00:00", "Z")
+    ancient = datetime.now(UTC) - timedelta(days=3650)
+    stamp = ancient.isoformat().replace("+00:00", "Z")
     cache_file = tmp_path / "c.json"
     cache_file.write_text(json.dumps({"probes": {
         "good-free": {"verdict": "ok", "checked_at": stamp},
         "gone-free": {"verdict": "freetier", "checked_at": stamp},
+        "broken-free": {"verdict": "error", "checked_at": stamp},
     }}))
     monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", cache_file)
 
     live = ff.load_opencode_probe_cache()
-    assert "good-free" in live, "a 30h-old positive verdict must survive"
-    assert "gone-free" not in live, "a 30h-old negative verdict must be re-probed"
+    assert set(live) == {"good-free", "gone-free", "broken-free"}, \
+        "a ten-year-old verdict of either kind must still be served: " \
+        "a model is live-probed once, ever"
 
 
 def test_probe_cache_ignores_garbage_and_never_raises(tmp_path, monkeypatch):
@@ -1032,9 +1031,19 @@ def test_refresh_env_forces_a_live_probe(tmp_path, monkeypatch):
     assert probed == ["m1-free"], "REFRESH_OPENCODE_PROBE=1 must ignore the cache"
 
 
-def test_rate_limited_run_does_not_persist_a_half_finished_pass(tmp_path, monkeypatch):
-    """A sweep that stopped early must not become a week of cached verdicts."""
+def test_rate_limited_run_keeps_every_verdict_it_knows(tmp_path, monkeypatch):
+    """An interrupted sweep persists exactly what it knows, no more.
+
+    Verdicts are permanent, so a sweep that stops early must keep the
+    verdicts earlier sweeps recorded too — dropping one would mean
+    live-probing that model again, the one thing the cache prevents.
+    It must not, however, invent verdicts for models it never reached.
+    """
     cache_file = tmp_path / "c.json"
+    cache_file.write_text(json.dumps({"probes": {
+        "m0-free": {"verdict": "ok", "checked_at":
+                    ff.datetime.now(ff.UTC).isoformat().replace("+00:00", "Z")},
+    }}))
     monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", cache_file)
     monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {
         "data": [{"id": "m1-free"}, {"id": "m2-free"}, {"id": "m3-free"}],
@@ -1051,7 +1060,7 @@ def test_rate_limited_run_does_not_persist_a_half_finished_pass(tmp_path, monkey
     out = ff.fetch_opencode()
     assert len(out) == 3, [m["id"] for m in out]
     saved = json.loads(cache_file.read_text())["probes"]
-    assert set(saved) == {"m1-free"}, saved
+    assert set(saved) == {"m0-free", "m1-free"}, saved
 
 
 # ── Which wire shape a model speaks ───────────────────────────────────────────

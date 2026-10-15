@@ -101,7 +101,18 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 <table><thead><tr><th>Endpoint</th><th>Fail %</th><th>Failures</th></tr></thead>
 <tbody id="failures"></tbody></table>
 </div>
-<div>
+</div>
+</div>
+<div class="card">
+<h2>Cooldowns</h2>
+<p>Endpoints currently on cooldown or with open circuits. Check entries to clear.</p>
+<div id="cooldowns"></div>
+<div id="cooldownActions" style="margin-top:.75rem;display:none">
+<button id="clearSelected" class="wsel" disabled>Clear selected</button>
+<button id="selectAll" class="wsel" onclick="toggleSelectAll()">Select all</button>
+</div>
+</div>
+<div class="card">
 <h2>Config Editor</h2>
 <p>Load and edit config (JSON). Save writes back to config.yaml and reloads.</p>
 <button id="load">Load Config</button>
@@ -286,6 +297,67 @@ function renderBoard(id, rows, cols){
     tb.appendChild(tr);
   }
 }
+let cooldownSelection = new Set();
+function renderCooldowns(data){
+  const c=document.getElementById('cooldowns');
+  c.innerHTML='';
+  const cdRows=Object.entries(data.cooldowns||{}).map(([k,v])=>({model_key:k, expiry:v.expiry||null, status_code:v.status_code||0, error_count:v.error_count||0, last_error:v.last_error||'', state:''}));
+  const circRows=Object.entries(data.circuits||{}).map(([k,v])=>({model_key:k, expiry:null, status_code:-1, error_count:v.probes_sent||0, last_error:'', state:'circuit '+v.state}));
+  const rows=[...cdRows, ...circRows];
+  if(!rows.length){
+    c.textContent='No cooldowns or circuits active.';
+    document.getElementById('cooldownActions').style.display='none';
+    return;
+  }
+  document.getElementById('cooldownActions').style.display='block';
+  const table=document.createElement('table');
+  const thead=document.createElement('thead');
+  const thr=document.createElement('tr');
+  for(const h of ['','Model','Expiry','Status','Errors','Last error']){
+    const th=document.createElement('th'); th.textContent=h; thr.appendChild(th);
+  }
+  thead.appendChild(thr);
+  table.appendChild(thead);
+  const tbody=document.createElement('tbody');
+  for(const r of rows){
+    const tr=document.createElement('tr');
+    const cb=document.createElement('input'); cb.type='checkbox'; cb.value=r.model_key;
+    if(cooldownSelection.has(r.model_key)) cb.checked=true;
+    cb.onchange=e=>{ if(e.target.checked) cooldownSelection.add(r.model_key); else cooldownSelection.delete(r.model_key); updateClearButton(); };
+    const td0=document.createElement('td'); td0.appendChild(cb); tr.appendChild(td0);
+    const td1=document.createElement('td'); td1.textContent=r.model_key; tr.appendChild(td1);
+    const td2=document.createElement('td'); td2.textContent=r.expiry?new Date(r.expiry).toLocaleString():'—'; tr.appendChild(td2);
+    const td3=document.createElement('td'); td3.textContent=(r.state||r.status_code); tr.appendChild(td3);
+    const td4=document.createElement('td'); td4.className='num'; td4.textContent=r.error_count||0; tr.appendChild(td4);
+    const td5=document.createElement('td'); td5.textContent=(r.last_error||'').slice(0,120); tr.appendChild(td5);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  c.appendChild(table);
+  updateClearButton();
+}
+function updateClearButton(){
+  const btn=document.getElementById('clearSelected');
+  btn.disabled=cooldownSelection.size===0;
+}
+function toggleSelectAll(){
+  const boxes=document.querySelectorAll('#cooldowns input[type=checkbox]');
+  const allSelected=Array.from(boxes).every(b=>b.checked);
+  boxes.forEach(b=>{ b.checked=!allSelected; if(b.checked) cooldownSelection.add(b.value); else cooldownSelection.delete(b.value); });
+  updateClearButton();
+}
+async function clearSelectedCooldowns(){
+  if(!cooldownSelection.size) return;
+  const models=Array.from(cooldownSelection);
+  try{
+    const url=new URL('/admin/cooldowns', location.origin);
+    models.forEach(m=>url.searchParams.append('model',m));
+    await req(url.pathname+url.search,{method:'DELETE'});
+    cooldownSelection.clear();
+    refresh();
+    document.getElementById('status').textContent='Cooldowns cleared for '+models.length+' model(s)';
+  }catch(e){ alert('Clear failed: '+e); }
+}
 async function refresh(){
   try{
     const d=await req('/admin/dashboard/data?window='+activeWindow);
@@ -302,6 +374,7 @@ async function refresh(){
     renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.latency_percentiles?r.latency_percentiles.p50_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p95_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p99_ms:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
     renderBoard('volume', d.volume||[], [[r=>r.rate,v=>v.toFixed(3)],[r=>r.attempts,v=>v]]);
     renderBoard('failures', d.failures||[], [[r=>r.rate,v=>(v*100).toFixed(1)+'%'],[r=>r.failures,v=>v]]);
+    if(d.cooldowns||d.circuits) renderCooldowns(d);
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
 }
@@ -322,6 +395,7 @@ document.getElementById('save').onclick=async()=>{
     document.getElementById('status').textContent='Saved';
   }catch(e){ alert('Save failed: '+e); }
 };
+document.getElementById('clearSelected').onclick=clearSelectedCooldowns;
 refresh();
 setInterval(refresh, 30000);
 </script>
