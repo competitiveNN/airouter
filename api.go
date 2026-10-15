@@ -1663,17 +1663,34 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 	// Targets come from the query string so a mistaken bulk clear is at least
 	// explicit:   DELETE /admin/cooldowns?model=<provider:model>
 	//              DELETE /admin/cooldowns            (clears everything)
+	//              DELETE /admin/cooldowns?model=a&model=b  (clears multiple)
 	if r.Method == http.MethodDelete {
-		modelKey := r.URL.Query().Get("model")
-		removed := g.router.ClearCooldowns(modelKey)
-		if modelKey != "" && removed == 0 {
-			writeAPIError(w, 404, "No cooldown for model "+modelKey, "not_found", "cooldown_not_found")
+		modelKeys := r.URL.Query()["model"]
+		if len(modelKeys) == 0 {
+			removed := g.router.ClearCooldowns("")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"cleared": removed,
+				"models":  []string{},
+			})
 			return
+		}
+		removed := 0
+		var modelsRemoved []string
+		for _, k := range modelKeys {
+			n := g.router.ClearCooldowns(k)
+			if n > 0 {
+				removed += n
+				modelsRemoved = append(modelsRemoved, k)
+			} else if k != "" {
+				writeAPIError(w, 404, "No cooldown for model "+k, "not_found", "cooldown_not_found")
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"cleared": removed,
-			"model":   modelKey,
+			"models":  modelsRemoved,
 		})
 		return
 	}
@@ -1863,12 +1880,7 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 	// scrapes every 30s, so asking it here would race the request path over
 	// breakers that are mid-recovery.
 	eligible := func(ep ModelEndpoint) (bool, bool, string, time.Time) {
-		ok, cd, circ := g.router.ProbeAvailability(&ep)
-		var until time.Time
-		if cd {
-			until, _ = g.router.CooldownExpiry(&ep)
-		}
-		return ok, cd, circ, until
+		return g.router.ProbeAvailability(&ep)
 	}
 
 	chains := DashboardChainStatus(cfg, eligible)
@@ -1938,6 +1950,8 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		Now:            time.Now(),
 		Generated:      time.Now(),
 		CircuitBreaker: g.router.CircuitBreakerEnabled(),
+		Cooldowns:      g.router.GetAllCooldowns(),
+		Circuits:       g.router.GetAllCircuits(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

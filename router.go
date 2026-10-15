@@ -794,14 +794,16 @@ func (r *Router) IsAvailable(ep *ModelEndpoint) bool {
 //
 // The three return values (eligible, on cooldown, circuit state) are the same
 // shape the dashboard renders, so the page can show "down — cooldown until
-// 14:22" instead of just "down".
-func (r *Router) ProbeAvailability(ep *ModelEndpoint) (bool, bool, string) {
+// 14:22" instead of just "down". The fourth value is the cooldown's expiry,
+// carried only when the endpoint is actually cooling down: it is what lets
+// the pill render a countdown rather than a bare "cooldown" with no time.
+func (r *Router) ProbeAvailability(ep *ModelEndpoint) (bool, bool, string, time.Time) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.probeAvailabilityLocked(ep)
 }
 
-func (r *Router) probeAvailabilityLocked(ep *ModelEndpoint) (bool, bool, string) {
+func (r *Router) probeAvailabilityLocked(ep *ModelEndpoint) (bool, bool, string, time.Time) {
 	key := ep.Key()
 	cd, hasCooldown := r.cooldowns[key]
 	cb := r.circuits[key]
@@ -818,24 +820,26 @@ func (r *Router) probeAvailabilityLocked(ep *ModelEndpoint) (bool, bool, string)
 			max = defaultCircuitBreakerHalfOpenProbes
 		}
 		if cb.ProbesSent < max {
-			return true, false, circuit
+			return true, false, circuit, time.Time{}
 		}
-		return false, false, circuit
+		return false, false, circuit, time.Time{}
 	}
 
-	// Active cooldown → down, and the reason is the cooldown.
+	// Active cooldown → down, and the reason is the cooldown. The expiry is
+	// the instant the countdown counts down TO, so the dashboard can show
+	// "cooldown until 14:22" instead of a bare "cooldown".
 	if hasCooldown && time.Now().Before(cd.Expiry) {
-		return false, true, circuit
+		return false, true, circuit, cd.Expiry
 	}
 
 	// Circuit open → down, and the reason is the breaker. isAvailableLocked
 	// would transition this to half-open and admit a probe; this probe
 	// refuses, because doing so on a scrape would race the request path.
 	if cb != nil && cb.State == CircuitOpen {
-		return false, false, circuit
+		return false, false, circuit, time.Time{}
 	}
 
-	return true, false, circuit
+	return true, false, circuit, time.Time{}
 }
 
 func minDuration(a, b time.Duration) time.Duration {

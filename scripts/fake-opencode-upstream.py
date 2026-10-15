@@ -100,17 +100,36 @@ def _gate_body_problem(req: dict) -> str | None:
     if not isinstance(tools, list):
         return "body has no tools array"
     names = set()
+    schemas = {}
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         # chat-completions nests the name under `function`; responses puts it flat
         fn = tool.get("function")
         name = fn.get("name") if isinstance(fn, dict) else tool.get("name")
+        params = fn.get("parameters") if isinstance(fn, dict) else tool.get("parameters")
         if isinstance(name, str):
             names.add(name)
+            if isinstance(params, dict):
+                schemas.setdefault(name, params)
     missing = [n for n in GATE_TOOLS if n not in names]
     if missing:
         return f"tools is missing {','.join(missing)} (has {sorted(names)})"
+    # The gate inspects the parameter SCHEMA, not just the name: measured
+    # live against opencode.ai/inference/openai/v1 on 2026-10-15, a `read`
+    # tool whose parameters is `{"type":"object","properties":{}}` is refused
+    # with 403 FreeTierError, while one carrying any property passes. An
+    # empty schema is exactly what airouter used to emit, so the fake has to
+    # reject it too or the routing check would go green against a weaker
+    # contract than production enforces.
+    for name in GATE_TOOLS:
+        params = schemas.get(name)
+        if not isinstance(params, dict):
+            return f"tool {name!r} has no parameters schema"
+        props = params.get("properties")
+        if not isinstance(props, dict) or not props:
+            return (f"tool {name!r} parameters has no properties "
+                    f"({json.dumps(params)})")
     return None
 
 CHUNKS = ("PING", " OK")

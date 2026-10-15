@@ -143,6 +143,15 @@ type dashboardResponse struct {
 	// "" or "closed", and an operator cannot tell from the page alone whether
 	// the circuit column means anything. The field says so.
 	CircuitBreaker bool `json:"circuit_breaker"`
+	// Cooldowns is the raw cooldown map keyed by <provider>:<model>, and
+	// Circuits the same for open breakers. They are the raw state, not the
+	// rendered chain view: the dashboard's Cooldowns card is the operator
+	// surface for clearing it, and a card that could clear state would have
+	// to import the whole payload anyway. Without them the operator has no
+	// way to see the backoff the chains card only summarises, and no way to
+	// clear it without restarting the daemon.
+	Cooldowns map[string]CooldownEntry   `json:"cooldowns"`
+	Circuits  map[string]*CircuitBreaker `json:"circuits"`
 }
 
 // dashboardWindowSeconds maps a dashboard window name onto the number of

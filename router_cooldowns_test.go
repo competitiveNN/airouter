@@ -161,8 +161,9 @@ func TestAdminCooldownsDeleteOne(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var resp struct {
-		Cleared int    `json:"cleared"`
-		Model   string `json:"model"`
+		Cleared int      `json:"cleared"`
+		Model   string   `json:"model"`
+		Models  []string `json:"models"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -170,8 +171,11 @@ func TestAdminCooldownsDeleteOne(t *testing.T) {
 	if resp.Cleared == 0 {
 		t.Error("expected cleared > 0")
 	}
-	if resp.Model != bad.Key() {
-		t.Errorf("model: got %q, want %q", resp.Model, bad.Key())
+	if resp.Model != "" {
+		t.Errorf("model: got %q, want \"\" (single-model clears now report under models)", resp.Model)
+	}
+	if len(resp.Models) != 1 || resp.Models[0] != bad.Key() {
+		t.Errorf("models: got %v, want [%q]", resp.Models, bad.Key())
 	}
 
 	// The named endpoint is gone; the untouched one must survive.
@@ -181,6 +185,67 @@ func TestAdminCooldownsDeleteOne(t *testing.T) {
 	}
 	if _, ok := got[good.Key()]; !ok {
 		t.Error("clearing one model also cleared an unrelated one")
+	}
+}
+
+// TestAdminCooldownsDeleteMultiple verifies the operator can clear several
+// endpoints in one request, which is the shape the dashboard's Cooldowns card
+// uses: a checkbox list whose "Clear selected" button builds ?model=a&model=b.
+// The response reports the models that were actually cleared, not the ones
+// asked for, so a request that names a non-existent model still succeeds.
+func TestAdminCooldownsDeleteMultiple(t *testing.T) {
+	cfg := loadTestConfig(t)
+	cfg.Preferences = &Preferences{
+		InitialRotationWindow:   &noRotation,
+		CircuitBreakerThreshold: intPtr(2),
+	}
+	router := NewRouter(cfg, "")
+	gateway := NewGatewayContext(router, NewProxy(cfg), cfg, "", "secret-key")
+
+	for _, m := range []string{"gpt-4", "gpt-4o", "o3"} {
+		ep := &ModelEndpoint{Provider: "openai", Model: m}
+		router.ApplyCooldown(ep, 500, "server error")
+	}
+
+	// Clear two of the three; the third survives.
+	req := httptest.NewRequest(http.MethodDelete, "/admin/cooldowns?model=openai:gpt-4&model=openai:o3", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	rec := httptest.NewRecorder()
+	gateway.HandleAdminCooldowns(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Cleared int      `json:"cleared"`
+		Models  []string `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Cleared != 4 {
+		t.Errorf("cleared: got %d, want 4 (each model clears both its cooldown and its circuit)", resp.Cleared)
+	}
+	if len(resp.Models) != 2 {
+		t.Fatalf("models: got %v, want 2 entries", resp.Models)
+	}
+	if resp.Models[0] != "openai:gpt-4" || resp.Models[1] != "openai:o3" {
+		t.Errorf("models: got %v, want [openai:gpt-4 openai:o3]", resp.Models)
+	}
+
+	// The untouched one must survive, and the cleared ones must be gone.
+	got := router.GetAllCooldowns()
+	if len(got) != 1 {
+		t.Fatalf("cooldowns after clear: got %d, want 1", len(got))
+	}
+	if _, ok := got["openai:gpt-4o"]; !ok {
+		t.Error("the model that was NOT asked for was cleared")
+	}
+	if _, ok := got["openai:gpt-4"]; ok {
+		t.Error("openai:gpt-4 was not cleared")
+	}
+	if _, ok := got["openai:o3"]; ok {
+		t.Error("openai:o3 was not cleared")
 	}
 }
 

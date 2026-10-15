@@ -1,6 +1,7 @@
 {
-  "fetched_at": "2026-10-13T04:02:57.371219Z",
+  "fetched_at": "2026-10-15T04:14:58.712797Z",
   "first_seen": {
+    "cat-jam-free": "2026-10-14",
     "deepseek-ai/deepseek-coder-6.7b-instruct": "2026-09-26",
     "dots-studio/dots-3-note-preview:free": "2026-09-26",
     "exo-free": "2026-10-08",
@@ -29,13 +30,11 @@
   "missing_since": {
     "exo-free": "2026-10-12",
     "fledge-alpha-free": "2026-10-08",
+    "inclusionai/ling-3.1-flash": "2026-10-14",
+    "inclusionai/ling-3.1-flash:free": "2026-10-15",
     "jev-1.13-free": "2026-10-13",
-    "ling-3.1-flash-free": "2026-10-13",
-    "longcat-2.5-preview-free": "2026-10-13",
+    "ling-3.1-flash-free": "2026-10-15",
     "mimo-v2.5-free": "2026-10-08",
-    "mimo-v2.6-flash-free": "2026-10-13",
-    "space-bunny-free": "2026-10-13",
-    "stealth/space-bunny-alpha": "2026-10-08",
-    "step-5-preview-free": "2026-10-13"
+    "stealth/space-bunny-alpha": "2026-10-08"
   }
 }
