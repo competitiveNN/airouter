@@ -203,14 +203,15 @@ function renderChains(chains, breaker){
         // and keep it live so a page left open shows the remaining time
         // ticking down rather than a stale timestamp.
         const t=new Date(ep.cooldown_until).getTime();
-        why='cooldown '+cooldownLabel(t);
+        why='cooldown '+cooldownLabel(t, serverNow);
       } else if(ep.circuit&&ep.circuit!=='closed'){ why=ep.circuit; cls='circuit'; }
       else { why='down'; cls='no'; }
       // Slug and status are separate spans: the pill ellipsizes
       // only the slug, so a long endpoint name can never hide
       // the up/down/cooldown verdict it annotates.
       const p=el('span','pill '+cls);
-      p.appendChild(el('span','pnm',ep.endpoint));
+      const slug=el('span','pnm',ep.endpoint); slug.title=ep.endpoint;
+      p.appendChild(slug);
       p.appendChild(el('span','pct',why));
       if(ep.cooldown) p.dataset.until=ep.cooldown_until;
       eps.appendChild(p);
@@ -276,7 +277,8 @@ function renderInflight(rows){
       // only the slug, so a long endpoint name can never hide
       // the session count it annotates.
       const p=el('span','pill ok');
-      p.appendChild(el('span','pnm',e.endpoint));
+      const slug=el('span','pnm',e.endpoint); slug.title=e.endpoint;
+      p.appendChild(slug);
       p.appendChild(el('span','pct', s===1?'1 session':s+' sessions'));
       eps.appendChild(p);
     }

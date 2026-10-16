@@ -186,6 +186,12 @@ func TestDashboardChainStatusCountsEligible(t *testing.T) {
 	if c.Endpoints[2].Eligible || c.Endpoints[2].Cooldown || c.Endpoints[2].Circuit != "open" || c.Endpoints[2].CooldownUntil != nil {
 		t.Fatalf("endpoints[2] = %+v, want p3:m3 ineligible, circuit open, no cooldown", c.Endpoints[2])
 	}
+	// The cooldown pill must carry a future expiry, not nil: cooldownLabel
+	// renders "cooldown NaN:NaN" when cooldown_until is missing, so every
+	// down-on-cooldown endpoint must have a non-nil CooldownUntil.
+	if c.Endpoints[1].CooldownUntil == nil || c.Endpoints[1].CooldownUntil.IsZero() {
+		t.Fatalf("endpoints[1] = %+v, want non-nil non-zero CooldownUntil", c.Endpoints[1])
+	}
 
 	nilChains := DashboardChainStatus(cfg, nil)
 	if len(nilChains) != 1 || nilChains[0].Operational != 0 {
