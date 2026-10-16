@@ -1,0 +1,132 @@
+# Airouter AI Gateway Configuration
+#
+# Providers: OpenAI-compatible backend endpoints
+# Each provider has:
+#   url: The base URL for the OpenAI-compatible API
+#   api_key_env: Environment variable name containing the API key
+#
+# Models: Logical model names (smart, work, fast, large) mapped to fallback chains
+# Each chain is a list of endpoints, each specifying:
+#   provider: Provider name (key in providers)
+#   model: Actual model name on that provider
+#
+# Distribution rules (see AGENTS.md and scripts/sync-instruction.txt, which
+# scripts/check-rules.py enforces against the fetched model list):
+#   - Each chain is ordered best-first by model quality (intelligence benchmark),
+#     descending; the strongest model for the profile sits at the top. `large`
+#     is the exception: it sorts by context window descending, then intelligence.
+#   - Profile membership, so a model lands where it is meant to be used:
+#       smart  intelligence >= 25, any context window
+#       work   the smart pool extended down to intelligence >= 15
+#       fast   intelligence < 25 or an id containing flash-lite / lightning /
+#              nano / gemma / lfm / laguna-xs, capped at 10 distinct models
+#       large  context_length >= 200000 only
+#   - Every NVIDIA NIM model is emitted as a consecutive nvidia / nvidia2 / nvidia3
+#     trio (same model id, three API keys) so a 429 on one key falls through to the
+#     next key on the same model instead of failing the request.
+#   - The LAST entry of every chain is that profile's "auto" fallback.
+#
+# Copy this file to config.yaml and fill in your API keys and model choices before
+# starting the gateway. The nightly model sync (scripts/sync-models.sh) regenerates
+# the `models:` section from the live free-model list; `providers:` and
+# `preferences:` are yours to edit and are preserved across syncs.
+
+providers:
+  # Example: NVIDIA NIM (three keys so a 429 falls through to the next key)
+  nvidia:
+    url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY        # set this in .envrc
+  nvidia2:
+    url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY_2      # set this in .envrc
+  nvidia3:
+    url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY_3      # set this in .envrc
+
+  # Example: Ollama Cloud
+  ollama:
+    url: https://ollama.com/v1
+    api_key_env: OLLAMA_API_KEY        # set this in .envrc
+
+  # Example: OpenCode gateway
+  opencode:
+    url: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY      # set this in .envrc
+
+  # Example: KiloCode gateway
+  kilocode:
+    url: https://api.kilo.ai/api/gateway/v1
+    api_key_env: KILOCODE_API_KEY      # set this in .envrc
+
+  # Example: Google AI Studio (Gemini) - four keys for key rotation
+  gemini:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY        # set this in .envrc
+  gemini2:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_2      # set this in .envrc
+  gemini3:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_3      # set this in .envrc
+  gemini4:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_4      # set this in .envrc
+  gemini5:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_5      # set this in .envrc
+
+  # Example: CommandCode local proxy (two keys for key rotation)
+  commandcode:
+    url: http://127.0.0.1:3050/v1
+    api_key_env: COMMANDCODE_API_KEY   # set this in .envrc
+  commandcode2:
+    url: http://127.0.0.1:3050/v1
+    api_key_env: COMMANDCODE_API_KEY_2 # set this in .envrc
+
+preferences:
+  newest_first_on_tie: true
+  initial_rotation_window: 8
+  cooldown_jitter: 0.25
+  circuit_breaker_threshold: 5
+  circuit_half_open_probes: 1
+  # default_max_tokens: 0   # uncomment + set to override the auto behavior
+  # max_label_cardinality: 512   # uncomment to override the default
+
+models:
+  smart:
+    chain:
+      # - provider: nvidia
+      #   model: your-best-smart-model  # placeholder
+      #   vision: false
+      #   intelligence: 50.0
+      # - provider: kilocode
+      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   vision: true
+  work:
+    chain:
+      # - provider: nvidia
+      #   model: your-best-work-model  # placeholder
+      #   vision: false
+      #   intelligence: 45.0
+      # - provider: kilocode
+      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   vision: true
+  fast:
+    chain:
+      # - provider: kilocode
+      #   model: your-fast-model  # placeholder
+      #   vision: false
+      #   intelligence: 22.0
+      # - provider: kilocode
+      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   vision: true
+  large:
+    chain:
+      # - provider: nvidia
+      #   model: your-large-context-model  # placeholder
+      #   vision: false
+      #   intelligence: 20.0
+      #   context_length: 1000000
+      # - provider: kilocode
+      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   vision: true
