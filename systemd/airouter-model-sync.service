@@ -1,5 +1,5 @@
 [Unit]
-Description=Airouter model sync (refresh the free-model list, veto what the gateway is refused on, rebuild config.yaml)
+Description=Airouter model sync (refresh the free-model list, veto what the gateway is refused on, rebuild config.yaml, commit and push the first-seen cache)
 Documentation=file:%h/dev/airouter/scripts/sync-instruction.txt
 After=network.target
 

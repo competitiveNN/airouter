@@ -91,3 +91,29 @@ fi
 
 rm -f "$BACKUP"
 echo "[sync] config.yaml updated successfully"
+
+# Commit and push any tracked files the sync changed. The nightly sync
+# regenerates config.yaml (which is gitignored and never committed) and may
+# update first-seen-cache.json when a new model appears or a month passes
+# without a listing. Only tracked files are committed; config.yaml and
+# cooldowns.json stay out of the tree by design.
+if git -C "$PROJECT_DIR" diff --quiet -- first-seen-cache.json; then
+    echo "[sync] first-seen-cache.json unchanged, nothing to commit"
+else
+    echo "[sync] committing updated first-seen-cache.json..."
+    # Identify ourselves for the commit (systemd units have no user context).
+    git -C "$PROJECT_DIR" config user.name "${SYNC_GIT_USER:-airouter-sync}"
+    git -C "$PROJECT_DIR" config user.email "${SYNC_GIT_EMAIL:-airouter-sync@localhost}"
+    git -C "$PROJECT_DIR" add first-seen-cache.json
+    git -C "$PROJECT_DIR" commit -m "sync: update first-seen cache from $(date +%F)" >/dev/null
+    echo "[sync] pushing commit..."
+    # Refresh the remote-tracking ref so --force-with-lease has a baseline to
+    # compare against. This repo has a single operator (the sync service), so
+    # after filter-repo rewrote every commit hash when config.yaml was purged
+    # from history, local master and origin/master no longer share an ancestor.
+    # --force-with-lease then aborts if someone else pushed to origin in the
+    # meantime, which is safer than a bare --force.
+    git -C "$PROJECT_DIR" fetch origin >/dev/null
+    git -C "$PROJECT_DIR" push --force-with-lease origin HEAD:master
+    echo "[sync] commit pushed"
+fi
