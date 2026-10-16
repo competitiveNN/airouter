@@ -56,12 +56,25 @@ func main() {
 	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
 	proxy.SetProtocolResolver(router.ProtocolFor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Proxy service: fetches proxy lists from proxy_sources.txt every 15 min,
+	// geolocates each proxy, and maintains a priority-sorted pool (EU/NA
+	// preferred, all others as backup). It only runs when at least one
+	// endpoint has proxying enabled; otherwise the periodic fetching is
+	// unnecessary overhead.
+	proxySvc := NewProxyService("proxy_sources.txt", 15*time.Minute)
+	if proxyEnabled(cfg) {
+		go proxySvc.Start(ctx)
+		proxy.SetProxyService(proxySvc)
+		log.Println("Proxy service enabled (pool refresh every 15 min)")
+	}
+
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
 	router.SetMetrics(gateway.metrics)
 	proxy.SetMetrics(gateway.metrics)
 	proxy.SetToolCalls(*toolCalls)
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	// Hot-reload the config when the file changes on disk so fallback chains
 	// and providers can be updated without restarting the server.

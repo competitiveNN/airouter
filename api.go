@@ -21,6 +21,10 @@ import (
 
 const maxRequestBytes = 32 << 20 // 32 MiB
 
+// proxyCooldown is how long a proxy is cooled down after a transport-layer
+// failure. The endpoint is not penalized for proxy errors -- only the proxy is.
+const proxyCooldown = 30 * time.Second
+
 type ChatCompletionRequest struct {
 	Model            string                  `json:"model"`
 	Messages         []ChatCompletionMessage `json:"messages"`
@@ -1094,21 +1098,56 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// time.Since(start) below into a per-attempt measurement, which is how
 		// the request-level latency metric would stop meaning request latency.
 		attemptStart := time.Now()
-		resp, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
-		if err != nil {
+		// For proxied endpoints, retry with different proxies before giving up
+		// on the endpoint. A proxy transport/dial failure is a proxy problem,
+		// not an endpoint problem, so the endpoint must not be cooled down;
+		// only the proxy is. ep.Proxy is the maximum number of different
+		// proxies to try (0 = direct connection, no proxy). Even a direct
+		// connection gets one attempt.
+		var lastErr error
+		var resp *http.Response
+		gotResp := false
+		maxProxyTries := ep.Proxy
+		if maxProxyTries == 0 {
+			maxProxyTries = 1
+		}
+		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+			r, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
+			if err != nil {
+				var pErr *ProxyError
+				if errors.As(err, &pErr) {
+					// Proxy failure: mark the proxy down and try again with a
+					// different proxy on the same endpoint.
+					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					lastErr = err
+					continue
+				}
+				// Non-proxy error: endpoint failure.
+				lastErr = err
+				break
+			}
+			resp = r
+			gotResp = true
+			break
+		}
+		if !gotResp {
 			cancel()
 			g.recordAttempt(ep, time.Since(attemptStart), false)
-			if isClientDisconnect(err) {
+			if isClientDisconnect(lastErr) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
-			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			var pErr *ProxyError
+			if !errors.As(lastErr, &pErr) {
+				// Only cool down the endpoint for non-proxy errors.
+				g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
+			}
 			g.recordCooldown()
 			if g.testCooldown > 0 {
-				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+				g.router.ApplyCooldownWithDuration(ep, 0, lastErr.Error(), sessionID, g.testCooldown)
 			}
 			continue
 		}
@@ -1470,7 +1509,38 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// report only the final attempt.
 		attemptStart := time.Now()
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
-		partial, toolCalls, completionTokens, err := g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout, sessionID)
+		// For proxied endpoints, retry with different proxies before giving up
+		// on the endpoint. A proxy transport/dial failure is a proxy problem,
+		// not an endpoint problem, so the endpoint must not be cooled down;
+		// only the proxy is. Non-proxy errors (direct connection or endpoint
+		// HTTP errors) cool down the endpoint as before. A proxy failure at
+		// client.Do happens before any content is sent, so it is safe to retry
+		// on the same endpoint. ep.Proxy is the maximum number of different
+		// proxies to try (0 = direct connection, no proxy). Even a direct
+		// connection gets one attempt.
+		var partial string
+		var toolCalls []streamToolCall
+		var completionTokens int
+		var err error
+		maxProxyTries := ep.Proxy
+		if maxProxyTries == 0 {
+			maxProxyTries = 1
+		}
+		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout, sessionID)
+			if err != nil {
+				var pErr *ProxyError
+				if errors.As(err, &pErr) {
+					// Proxy failure: mark the proxy down and try again with a
+					// different proxy on the same endpoint.
+					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					continue
+				}
+				// Non-proxy error: endpoint failure.
+				break
+			}
+			break
+		}
 		if err == nil {
 			g.router.RecordSuccess(ep)
 			attemptDur := time.Since(attemptStart)

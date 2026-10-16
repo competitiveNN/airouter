@@ -84,6 +84,8 @@ models:
       #   model: your-best-smart-model  # placeholder
       #   vision: false
       #   intelligence: 50.0
+      #   proxy: 0   # route via proxy pool (HTTPS/SOCKS5). 0 = disabled; N = max
+      #     proxies to try on this endpoint before chain fallback
       # - provider: kilocode
       #   model: kilo-auto/free  # last: auto fallback (placeholder)
       #   vision: true

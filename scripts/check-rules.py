@@ -297,6 +297,7 @@ def check(
 
         scores: list[float] = []
         contexts: list[int] = []
+        ctx_mismatches: list[tuple[str, int, int]] = []
         lines = comment_lines(config_text, profile)
         model_line_re = re.compile(r"^        model: (?P<id>\S+)\s+# (?P<score>\d+\.\d)")
 
@@ -401,9 +402,7 @@ def check(
                     f"rule11: {tag} intelligence {score} != model list {src.score}"
                 )
             if src.context_length != ctx:
-                problems.append(
-                    f"rule11: {tag} context_length {ctx} != model list {src.context_length}"
-                )
+                ctx_mismatches.append((tag, ctx, src.context_length))
 
         # rule 4: best-first by intelligence (large is ctx-first by rule 5).
         if profile == "large":
@@ -414,6 +413,11 @@ def check(
                 problems.append(f"rule5: large has an entry below context_length {rules['min_context']}")
         elif scores and scores != sorted(scores, reverse=True):
             problems.append(f"rule4: {profile} is not ordered by intelligence descending: {scores}")
+
+        for tag, ctx, src_ctx in ctx_mismatches:
+            problems.append(
+                f"rule11: {tag} context_length {ctx} != model list {src_ctx}"
+            )
 
         floor = rules.get("min_intelligence")
         if floor is not None and any(s < floor for s in scores):
