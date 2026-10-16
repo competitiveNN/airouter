@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,6 +51,11 @@ type Proxy struct {
 	// while streamSSE reads it from request goroutines.
 	metricsMu sync.RWMutex
 	metrics   *Metrics
+
+	// proxySvc routes proxied endpoints through the proxy pool. Nil when no
+	// endpoint has proxying enabled.
+	proxyMu  sync.RWMutex
+	proxySvc *ProxyService
 }
 
 // SetMetrics attaches the shared metrics collector to the proxy so stream-level
@@ -74,6 +80,27 @@ func (p *Proxy) effectiveProtocol(ep *ModelEndpoint) protocol {
 		return ep.UpstreamProtocol()
 	}
 	return fn(ep)
+}
+
+// SetProxyService wires the proxy pool into the Proxy. Endpoints with
+// Proxy: true route upstream traffic through a proxy from the pool. Nil
+// disables proxying (direct connections only).
+func (p *Proxy) SetProxyService(svc *ProxyService) {
+	p.proxyMu.Lock()
+	p.proxySvc = svc
+	p.proxyMu.Unlock()
+}
+
+// MarkProxyDown puts a proxy into cooldown so it is skipped by pick() until
+// the cooldown expires. Used when a proxied request fails at the transport
+// layer so the proxy (not the endpoint) takes the penalty.
+func (p *Proxy) MarkProxyDown(proxyURL string, d time.Duration) {
+	p.proxyMu.RLock()
+	svc := p.proxySvc
+	p.proxyMu.RUnlock()
+	if svc != nil {
+		svc.MarkDown(proxyURL, d)
+	}
 }
 
 // commandCodeClient returns the HTTP client Command Code upstreams
@@ -423,6 +450,53 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	return req, nil
 }
 
+// ProxyError is returned when a request routed through a proxy fails at the
+// transport/dial layer (the proxy itself is unreachable or misbehaving), as
+// distinct from the endpoint returning an HTTP error. The endpoint is not at
+// fault, so it must not be cooled down; the proxy is.
+type ProxyError struct {
+	Proxy *ProxyInfo
+	Err   error
+}
+
+func (e *ProxyError) Error() string {
+	return fmt.Sprintf("proxy %s: %v", redactProxyURL(e.Proxy.URL), e.Err)
+}
+
+func (e *ProxyError) Unwrap() error {
+	return e.Err
+}
+
+// isProxyConnectError reports whether err is a transport-level failure that is
+// unambiguously the proxy's fault: a dial failure to the proxy, or a proxy CONNECT
+// rejection. TLS handshake failures through an established tunnel, or endpoint
+// HTTP errors, are not proxy errors and are reported as ProviderError so the
+// endpoint (not the proxy) is cooled down.
+func isProxyConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// http.Transport wraps proxy CONNECT failures as url.Error with Op
+	// containing "proxyconnect".
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if strings.Contains(urlErr.Op, "proxyconnect") {
+			return true
+		}
+		// Dial failure to the proxy: url.Error wrapping net.OpError{Op: "dial"}.
+		var netErr *net.OpError
+		if errors.As(urlErr.Err, &netErr) && netErr.Op == "dial" {
+			return true
+		}
+	}
+	// SOCKS5 dialer path returns net.OpError{Op: "dial"} directly.
+	var netErr *net.OpError
+	if errors.As(err, &netErr) && netErr.Op == "dial" {
+		return true
+	}
+	return false
+}
+
 func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, error) {
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
@@ -434,14 +508,45 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 		return nil, err
 	}
 
-	// Command Code upstreams may be routed through an HTTP CONNECT
-	// proxy (CC_UPSTREAM_PROXY); every other provider is direct.
+	// Select the client: Command Code upstreams use the command-code client,
+	// proxied endpoints use a transport routed through the proxy pool, and
+	// everything else uses the shared direct client.
 	client := p.client
 	if p.effectiveProtocol(&endpoint) == protocolCommandCode {
 		client = p.commandCodeClient()
 	}
+
+	// The proxy selected for this attempt, if any. Used to wrap dial failures
+	// as ProxyError so the router can cool down the proxy instead of the
+	// endpoint and retry with a different proxy.
+	var usedProxy *ProxyInfo
+	if endpoint.Proxy > 0 {
+		p.proxyMu.RLock()
+		svc := p.proxySvc
+		p.proxyMu.RUnlock()
+		if svc != nil {
+			proxy := svc.pick()
+			if proxy != nil {
+				base := p.baseTransport
+				if p.effectiveProtocol(&endpoint) == protocolCommandCode {
+					base = p.commandCodeTransport()
+				}
+				tr := svc.TransportFor(base, proxy)
+				client = &http.Client{Transport: tr}
+				usedProxy = proxy
+			}
+		}
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
+		// Only unambiguous proxy connection errors (dial failures, CONNECT
+		// rejections) cool down the proxy and trigger a proxy retry. TLS
+		// handshake failures through an established tunnel, EOFs, timeouts on
+		// body read, etc. are endpoint errors and cool down the endpoint.
+		if usedProxy != nil && isProxyConnectError(err) {
+			return nil, &ProxyError{Proxy: usedProxy, Err: err}
+		}
 		return nil, &ProviderError{Err: err}
 	}
 	return resp, nil
@@ -555,16 +660,39 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// shares the connection pool, so this costs no pooling. The body phase is
 	// deliberately left unbounded: this deadline governs headers only, and a
 	// long generation must still be allowed to run to completion.
+	// Select the transport and client for this attempt. Proxied endpoints
+	// route through a proxy from the pool (HTTPS via Transport.Proxy, SOCKS5
+	// via a custom DialContext); everything else uses the shared direct
+	// transport.
 	client := p.client
 	transport := p.baseTransport
 	if p.effectiveProtocol(&endpoint) == protocolCommandCode {
-		// The per-attempt clone must start from the transport the
-		// protocol is actually dialed through, so a configured
-		// upstream proxy survives the ResponseHeaderTimeout override.
 		client = p.commandCodeClient()
 		transport = p.commandCodeTransport()
 	}
-	if transport != nil {
+
+	proxied := false
+	var usedProxy *ProxyInfo
+	if endpoint.Proxy > 0 {
+		p.proxyMu.RLock()
+		svc := p.proxySvc
+		p.proxyMu.RUnlock()
+		if svc != nil {
+			if proxy := svc.pick(); proxy != nil {
+				tr := svc.TransportFor(transport, proxy)
+				tr.ResponseHeaderTimeout = timeout
+				client = &http.Client{Transport: tr}
+				transport = tr
+				usedProxy = proxy
+				proxied = true
+			}
+		}
+	}
+
+	// Apply the per-attempt header timeout to whatever transport is in use.
+	// For proxied endpoints where a proxy was selected, the timeout was already
+	// set above; otherwise clone the transport to set the per-attempt budget.
+	if transport != nil && !proxied {
 		tr := transport.Clone()
 		tr.ResponseHeaderTimeout = timeout
 		client = &http.Client{Transport: tr}
@@ -572,6 +700,13 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 
 	resp, err := client.Do(req)
 	if err != nil {
+		// Only unambiguous proxy connection errors (dial failures, CONNECT
+		// rejections) cool down the proxy and trigger a proxy retry. TLS
+		// handshake failures through an established tunnel, EOFs, timeouts on
+		// body read, etc. are endpoint errors and cool down the endpoint.
+		if usedProxy != nil && isProxyConnectError(err) {
+			return "", nil, 0, &ProxyError{Proxy: usedProxy, Err: err}
+		}
 		return "", nil, 0, &ProviderError{Err: err}
 	}
 	defer resp.Body.Close()

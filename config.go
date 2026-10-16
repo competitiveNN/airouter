@@ -586,6 +586,15 @@ type ModelEndpoint struct {
 	// a typo must not take a working endpoint out of rotation, and
 	// chat/completions is the shape every provider understands.
 	Protocol string `yaml:"protocol,omitempty"`
+
+	// Proxy routes this endpoint's upstream traffic through a proxy from the
+	// proxy pool (see proxy service). Defaults to 0: direct connection.
+	// When greater than 0, the gateway picks a proxy from the prioritized pool
+	// (European and North American proxies first, all others as backup) and
+	// dials the upstream through it (HTTPS or SOCKS5). The value is the
+	// maximum number of different proxies to try on this endpoint before
+	// falling back to the next model in the chain.
+	Proxy int `yaml:"proxy,omitempty"`
 }
 
 // UpstreamProtocol resolves the configured Protocol, defaulting to chat.
@@ -1025,4 +1034,17 @@ func ExtractSSEError(data []byte) error {
 	}
 
 	return nil
+}
+
+// proxyEnabled reports whether any endpoint in any model chain has proxying
+// enabled. When false, the proxy service does not need to run.
+func proxyEnabled(cfg *Config) bool {
+	for _, model := range cfg.Models {
+		for _, ep := range model.Chain {
+			if ep.Proxy > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
