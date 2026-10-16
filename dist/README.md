@@ -151,7 +151,7 @@ git push origin master
 
 What `origin/master` is missing, oldest first:
 
-- `91cc3a5` commandcode: align the /alpha/generate proxy with the reference
+- `43bf86f` dashboard: fix the cooldown NaN:NaN pills
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
