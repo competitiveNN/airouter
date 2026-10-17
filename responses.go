@@ -67,6 +67,7 @@ type responsesRequest struct {
 	Metadata           json.RawMessage `json:"metadata,omitempty"`
 	Reasoning          json.RawMessage `json:"reasoning,omitempty"`
 	Text               json.RawMessage `json:"text,omitempty"`
+	ReasoningEffort    *string         `json:"reasoning_effort,omitempty"`
 }
 
 // item is one entry of the Responses `input` / `output` array. The Responses

@@ -281,8 +281,8 @@ def fuzzy_match_slug(model_id: str, aa_slugs: dict[str, Any]) -> str | None:
     if hit:
         return hit
 
-    # Guards shared by the approximate tiers
-    if len(folded_id) < _MIN_FUZZY_LEN or _OPAQUE_TOKEN_RE.search(norm_id):
+    # Guard shared by the approximate tiers: length sanity.
+    if len(folded_id) < _MIN_FUZZY_LEN:
         return None
 
     # Tier 3: contiguous containment with edge-only decorations.
@@ -307,6 +307,12 @@ def fuzzy_match_slug(model_id: str, aa_slugs: dict[str, Any]) -> str | None:
         return None
 
     # Tier 4: strict difflib similarity, insertions/deletions only
+    # Opaque/stealth ids (containing tokens like "-preview-", "-x-", "-stealth-")
+    # are never matched by difflib: they are too easily confused with unrelated
+    # models (e.g. "x-preview-f" -> "o1-preview"). Containment tier above is
+    # unaffected because it requires verbatim edge-only decoration.
+    if _OPAQUE_TOKEN_RE.search(norm_id):
+        return None
     scored: list[tuple[float, str]] = []
     for norm, slug in aa_normalized.items():
         fold = _alnum_fold(norm)

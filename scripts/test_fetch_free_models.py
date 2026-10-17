@@ -1352,3 +1352,87 @@ def test_first_seen_ignores_meta_router_models():
         assert newly == 0
         assert models[0]["released"] is None
         assert first_seen == {}
+
+
+def test_preview_aliases_match_their_base_aa_slug():
+    """A '-preview' alias is a real variant, not an opaque id to skip.
+
+    The opaque-token guard is tier-4-only now; tier-3 containment still
+    resolves 'step-5-preview-free' to the AA slug 'step-5' (43.7) because the
+    core 'step5' sits intact inside the decorated id. Re-adding the opaque
+    check to the tier-3 guard would floor this model at the 25.0 smart floor
+    — the exact regression this pins down.
+    """
+    aa = {"step-5": {"intelligence": 43.7}}
+    assert ff.fuzzy_match_slug("step-5-preview-free", aa) == "step-5"
+    assert ff.fuzzy_match_slug("stepfun-ai/step-5-preview", aa) == "step-5"
+
+
+def test_first_seen_grew_detects_a_brand_new_model():
+    census = {"old-free", "step-5-preview-free"}
+    first_seen = {"old-free": "2026-09-26"}
+    assert ff._first_seen_grew(census, first_seen) is True
+
+
+def test_first_seen_grew_is_false_when_nothing_new():
+    assert ff._first_seen_grew({"old-free"}, {"old-free": "2026-09-26"}) is False
+
+
+def test_first_seen_grew_ignores_meta_router_ids():
+    """Auto-fallback terminators are never real candidates, so they must not
+    trigger an AA refresh."""
+    assert ff._first_seen_grew(set(ff.AUTO_FALLBACK_MODELS), {}) is False
+
+
+def test_forced_aa_fetch_refreshes_the_cache(tmp_path, monkeypatch):
+    """force=True bypasses a fresh cache and writes a fresh snapshot, so a
+    model the snapshot predates is scored this run instead of floored."""
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "test-key")
+    ff.save_cache({"old-slug": {"intelligence": 1.0}})
+
+    def _fake_urlopen(req, timeout=None):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [
+                    {
+                        "slug": "new-slug",
+                        "evaluations": {"artificial_analysis_intelligence_index": 43.7},
+                        "released": "2026-09-18",
+                    },
+                ]}).encode()
+        return _Resp()
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _fake_urlopen)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    assert "new-slug" in data
+    assert "new-slug" in (ff.load_cache() or {})
+
+
+def test_non_forced_aa_fetch_uses_the_fresh_cache(tmp_path, monkeypatch):
+    """The default path is unchanged: a fresh cache is a no-op, no network."""
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    ff.save_cache({"cached-slug": {"intelligence": 12.0}})
+
+    def _boom(req, timeout=None):
+        raise AssertionError("a fresh cache must not trigger a network call")
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _boom)
+    data = ff.fetch_artificial_analysis_data()
+    assert "cached-slug" in data
+
+
+def test_forced_aa_refetch_without_a_key_keeps_the_last_snapshot(tmp_path, monkeypatch):
+    """A forced refresh with no API key must fall back to the cache, never
+    empty the enrichment (which would floor every model at 25.0)."""
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    ff.save_cache({"keep-slug": {"intelligence": 30.0}})
+    monkeypatch.delenv("ARTIFICIAL_ANALYSIS_API_KEY", raising=False)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    assert "keep-slug" in data
