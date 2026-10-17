@@ -1336,6 +1336,9 @@ def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
             datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
         except ValueError:
             continue
+        checked = datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
+        if (datetime.now(UTC) - checked).total_seconds() > 24 * 3600:
+            continue
         live[model_id] = entry
     return live
 
@@ -2255,15 +2258,20 @@ def fetch_nvidia_nim() -> list[dict[str, Any]]:
     return free_models
 
 
-def fetch_artificial_analysis_data() -> dict[str, dict[str, Any]]:
+def fetch_artificial_analysis_data(force: bool = False) -> dict[str, dict[str, Any]]:
     """Fetch intelligence scores and release dates from Artificial Analysis API.
 
     Returns a dict mapping model slugs to {"intelligence": float, "released": str | None}.
     Uses a local cache (free-models-cache.json) to avoid redundant API calls.
     Requires ARTIFICIAL_ANALYSIS_API_KEY environment variable.
+
+    ``force=True`` bypasses the cache so a brand-new model (one the cached
+    snapshot may predate) is scored this run instead of falling to the smart
+    floor. Key-less or failed forced fetches fall back to the last valid
+    snapshot, so a forced refresh can never empty the enrichment.
     """
-    # Try cache first
-    cached = load_cache()
+    # Try cache first (skip it on a forced refresh)
+    cached = None if force else load_cache()
     if cached is not None:
         print(f"Artificial Analysis: using cached enrichment data ({len(cached)} models)", file=sys.stderr)
         return cached
@@ -2271,6 +2279,9 @@ def fetch_artificial_analysis_data() -> dict[str, dict[str, Any]]:
     api_key = os.getenv("ARTIFICIAL_ANALYSIS_API_KEY")
     if not api_key:
         print("Artificial Analysis: API key not set, skipping enrichment (set ARTIFICIAL_ANALYSIS_API_KEY to enable)", file=sys.stderr)
+        if force:
+            print("Artificial Analysis: forced refresh without a key; falling back to the last valid snapshot.", file=sys.stderr)
+            return load_cache() or {}
         return {}
 
     print("Fetching intelligence scores and release dates from Artificial Analysis API...", file=sys.stderr)
@@ -2283,10 +2294,16 @@ def fetch_artificial_analysis_data() -> dict[str, dict[str, Any]]:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"Artificial Analysis: fetch failed: {e}", file=sys.stderr)
+        if force:
+            print("Artificial Analysis: forced refresh failed; falling back to the last valid snapshot.", file=sys.stderr)
+            return load_cache() or {}
         return {}
 
     if not data or not isinstance(data, dict) or "data" not in data:
         print("Artificial Analysis: no data or unexpected format", file=sys.stderr)
+        if force:
+            print("Artificial Analysis: forced refresh returned unusable data; falling back to the last valid snapshot.", file=sys.stderr)
+            return load_cache() or {}
         return {}
 
     result = {}
@@ -2494,6 +2511,21 @@ def output_table(data: list[dict]) -> None:
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
+def _first_seen_grew(
+    census: set[str], first_seen: dict[str, str]
+) -> bool:
+    """True if the census contains a brand-new model id.
+
+    A fresh provider listing the pipeline has never recorded means the
+    first-seen cache is about to grow this run. That is exactly the signal
+    to refresh aa-enrichment-cache.json: its snapshot may predate the model
+    (published to Artificial Analysis after the snapshot was taken), and a
+    24h-TTL snapshot would otherwise leave the newcomer floored at the
+    deterministic 25.0 for models Artificial Analysis has already scored.
+    """
+    return bool(census - AUTO_FALLBACK_MODELS - set(first_seen))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch free models from Kilo Code, OpenCode, Ollama Cloud, Google AI Studio, NVIDIA NIM, and CommandCode APIs"
@@ -2583,7 +2615,12 @@ def main() -> None:
     census -= AUTO_FALLBACK_MODELS
 
     # Enrich with Artificial Analysis data (intelligence scores + release dates)
-    aa_data = fetch_artificial_analysis_data()
+    # Keep the enrichment snapshot in step with first-seen: a brand-new
+    # census id forces a live pull (falling back to the cache if the key is
+    # unset or the fetch fails) so the newcomer is scored from Artificial
+    # Analysis rather than floored at the deterministic 25.0.
+    force_aa_refresh = _first_seen_grew(census, load_first_seen_state()[0])
+    aa_data = fetch_artificial_analysis_data(force=force_aa_refresh)
     if aa_data:
         for model in all_models:
             # Providers can override the AA lookup key: Google's *-latest

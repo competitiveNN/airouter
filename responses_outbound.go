@@ -116,6 +116,7 @@ type chatRequestBody struct {
 	Temperature *float64
 	TopP        *float64  `json:"top_p"`
 	Stop        *[]string `json:"stop"`
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 }
 
 // upstreamItem is one entry of the Responses `input` array as it goes ON THE
@@ -215,6 +216,9 @@ func chatBodyToResponses(body []byte, endpointModel string) ([]byte, error) {
 	}
 	if in.MaxTokens != nil {
 		out["max_output_tokens"] = *in.MaxTokens
+	}
+	if in.ReasoningEffort != nil {
+		out["reasoning_effort"] = *in.ReasoningEffort
 	}
 
 	// A leading system message becomes `instructions`, which is the field the

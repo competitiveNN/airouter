@@ -167,6 +167,7 @@ func toChatCompletionRequest(req *responsesRequest) (*ChatCompletionRequest, err
 		FrequencyPenalty: req.FrequencyPenalty,
 		MaxTokens:        req.MaxOutputTokens,
 		Stream:           req.Stream,
+		ReasoningEffort:  req.ReasoningEffort,
 	}, nil
 }
 

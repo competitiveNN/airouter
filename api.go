@@ -34,6 +34,7 @@ type ChatCompletionRequest struct {
 	FrequencyPenalty *float64                `json:"frequency_penalty,omitempty"`
 	LogitBias        map[string]int          `json:"logit_bias,omitempty"`
 	User             string                  `json:"user,omitempty"`
+	ReasoningEffort  *string                 `json:"reasoning_effort,omitempty"`
 }
 
 type ChatCompletionMessage struct {
