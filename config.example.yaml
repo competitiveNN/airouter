@@ -32,7 +32,13 @@
 # `preferences:` are yours to edit and are preserved across syncs.
 
 providers:
-  # Example: NVIDIA NIM (three keys so a 429 falls through to the next key)
+  # To rotate API keys, add a numbered entry with the same url and its own
+  # *_API_KEY_N env var (nvidia2, gemini2, commandcode2, ...). A rate limit on
+  # one key then falls through to the next key on the same model instead of
+  # failing the request. One entry per provider is kept here so the example
+  # stays short -- add more as you need them.
+
+  # Example: NVIDIA NIM
   nvidia:
     url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY        # set this in .envrc
@@ -52,12 +58,12 @@ providers:
     url: https://api.kilo.ai/api/gateway/v1
     api_key_env: KILOCODE_API_KEY      # set this in .envrc
 
-  # Example: Google AI Studio (Gemini) - four keys for key rotation
+  # Example: Google AI Studio (Gemini)
   gemini:
     url: https://generativelanguage.googleapis.com/v1beta/openai
     api_key_env: GEMINI_API_KEY        # set this in .envrc
 
-  # Example: CommandCode local proxy (two keys for key rotation)
+  # Example: CommandCode local proxy
   commandcode:
     url: http://127.0.0.1:3050/v1
     api_key_env: COMMANDCODE_API_KEY   # set this in .envrc
