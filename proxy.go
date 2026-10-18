@@ -82,9 +82,38 @@ func (p *Proxy) effectiveProtocol(ep *ModelEndpoint) protocol {
 	return fn(ep)
 }
 
-// SetProxyService wires the proxy pool into the Proxy. Endpoints with
-// Proxy: true route upstream traffic through a proxy from the pool. Nil
-// disables proxying (direct connections only).
+// proxyTries resolves this endpoint's proxy budget: the maximum number of
+// different proxies to try before the endpoint gives up. 0 means a direct
+// connection (no proxy).
+//
+// The endpoint's own value wins when it is non-zero (a per-model override);
+// otherwise the provider's provider-wide setting applies, and when the
+// provider does not set one the connection stays direct. A provider missing
+// from the config also resolves to direct: buildRequest turns that into an
+// error later, and there is nothing to proxy through.
+func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
+	if ep.Proxy > 0 {
+		return ep.Proxy
+	}
+	if p == nil || p.config == nil {
+		return 0
+	}
+	cfg := p.config.Load()
+	if cfg == nil {
+		return 0
+	}
+	provider, ok := cfg.Providers[ep.Provider]
+	if !ok || provider.Proxy <= 0 {
+		return 0
+	}
+	return provider.Proxy
+}
+
+// SetProxyService wires the proxy pool into the Proxy. Endpoints whose
+// resolved proxy budget is greater than 0 route upstream traffic through a
+// proxy from the pool, where that budget comes from the endpoint's own proxy
+// value or, by default, its provider's. Nil disables proxying (direct
+// connections only).
 func (p *Proxy) SetProxyService(svc *ProxyService) {
 	p.proxyMu.Lock()
 	p.proxySvc = svc
@@ -520,7 +549,7 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	// as ProxyError so the router can cool down the proxy instead of the
 	// endpoint and retry with a different proxy.
 	var usedProxy *ProxyInfo
-	if endpoint.Proxy > 0 {
+	if p.proxyTries(&endpoint) > 0 {
 		p.proxyMu.RLock()
 		svc := p.proxySvc
 		p.proxyMu.RUnlock()
@@ -673,7 +702,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 
 	proxied := false
 	var usedProxy *ProxyInfo
-	if endpoint.Proxy > 0 {
+	if p.proxyTries(&endpoint) > 0 {
 		p.proxyMu.RLock()
 		svc := p.proxySvc
 		p.proxyMu.RUnlock()

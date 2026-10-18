@@ -62,8 +62,8 @@ func main() {
 	// Proxy service: fetches proxy lists from proxy_sources.txt every 15 min,
 	// geolocates each proxy, and maintains a priority-sorted pool (EU/NA
 	// preferred, all others as backup). It only runs when at least one
-	// endpoint has proxying enabled; otherwise the periodic fetching is
-	// unnecessary overhead.
+	// provider or endpoint has proxying enabled; otherwise the periodic
+	// fetching is unnecessary overhead.
 	proxySvc := NewProxyService("proxy_sources.txt", 15*time.Minute)
 	if proxyEnabled(cfg) {
 		go proxySvc.Start(ctx)

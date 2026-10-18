@@ -1101,14 +1101,15 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// For proxied endpoints, retry with different proxies before giving up
 		// on the endpoint. A proxy transport/dial failure is a proxy problem,
 		// not an endpoint problem, so the endpoint must not be cooled down;
-		// only the proxy is. ep.Proxy is the maximum number of different
-		// proxies to try (0 = direct connection, no proxy). Even a direct
-		// connection gets one attempt.
+		// only the proxy is. proxyTries is the maximum number of different
+		// proxies to try: the endpoint's own proxy value, or its provider's when
+		// the endpoint does not set one (0 from both = direct connection). Even
+		// a direct connection gets one attempt.
 		var lastErr error
 		var resp *http.Response
 		gotResp := false
-		maxProxyTries := ep.Proxy
-		if maxProxyTries == 0 {
+		maxProxyTries := g.proxy.proxyTries(ep)
+		if maxProxyTries <= 0 {
 			maxProxyTries = 1
 		}
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
@@ -1515,15 +1516,16 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// only the proxy is. Non-proxy errors (direct connection or endpoint
 		// HTTP errors) cool down the endpoint as before. A proxy failure at
 		// client.Do happens before any content is sent, so it is safe to retry
-		// on the same endpoint. ep.Proxy is the maximum number of different
-		// proxies to try (0 = direct connection, no proxy). Even a direct
-		// connection gets one attempt.
+		// on the same endpoint. proxyTries is the maximum number of different
+		// proxies to try: the endpoint's own proxy value, or its provider's when
+		// the endpoint does not set one (0 from both = direct connection). Even
+		// a direct connection gets one attempt.
 		var partial string
 		var toolCalls []streamToolCall
 		var completionTokens int
 		var err error
-		maxProxyTries := ep.Proxy
-		if maxProxyTries == 0 {
+		maxProxyTries := g.proxy.proxyTries(ep)
+		if maxProxyTries <= 0 {
 			maxProxyTries = 1
 		}
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
