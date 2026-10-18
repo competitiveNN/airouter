@@ -190,11 +190,23 @@ def _bad_protocol(ep: dict) -> bool:
     value is a claim with no content. config.go's protocolFor maps anything it
     does not recognise to chat, so both a typo and an empty value produce a file
     that says one thing and routes another.
+
+    The Command Code spellings are legal only on a commandcode provider: the
+    router posts them to that provider's /alpha/generate envelope, so a chat
+    provider declaring one would ship the wrong wire shape to the wrong host.
+    Provider-gated here (and in validate-config.py) so the two checks agree.
     """
     if "protocol" not in ep:
         return False
     value = ep.get("protocol")
-    return value is None or str(value).strip().lower() not in ("chat", "responses")
+    if value is None:
+        return True
+    v = str(value).strip().lower()
+    if v in ("chat", "responses"):
+        return False
+    provider = str(ep.get("provider", ""))
+    return not (provider.startswith("commandcode")
+                and v in ("commandcode", "command-code", "cc"))
 
 
 def check(
@@ -368,7 +380,8 @@ def check(
             proto = ep.get("protocol")
             if _bad_protocol(ep):
                 problems.append(
-                    f"rule13: {tag} protocol={proto!r} is neither chat nor responses; "
+                    f"rule13: {tag} protocol={proto!r} is neither chat nor responses "
+                    f"(nor a commandcode spelling on a commandcode provider); "
                     f"config.go falls back to chat for anything it does not "
                     f"recognise, so the file would claim a shape the router ignores"
                 )

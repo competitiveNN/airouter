@@ -576,6 +576,9 @@ def auto_fallback_terminator(
     )
 
 
+COMMANDCODE_SPELLINGS = frozenset({"commandcode", "command-code", "cc"})
+
+
 def _normalize_protocol(value: object) -> str | None:
     """The protocol name to write, or None when there is nothing to write.
 
@@ -583,10 +586,19 @@ def _normalize_protocol(value: object) -> str | None:
     is dropped rather than passed through: config.go already falls back to chat
     for anything it does not recognize, so writing `protocol: respones` would be
     a claim in the file that means nothing and looks deliberate.
+
+    The accepted set is exactly config.go's protocolFor (the runtime source of
+    truth), minus chat: chat is what the router does with an absent field, so
+    spelling it out buys nothing and would bury the two shapes that matter. The
+    Command Code spellings collapse to the one canonical `commandcode`, matching
+    the protocolCommandCode constant, so a `protocol: command-code` in the file
+    round-trips instead of being rewritten away.
     """
     if not isinstance(value, str):
         return None
     v = value.strip().lower()
+    if v in COMMANDCODE_SPELLINGS:
+        return "commandcode"
     return v if v in ("responses", "chat") else None
 
 
@@ -696,6 +708,11 @@ def build_chain(
         delete a correct value.
         """
         protocol = m.protocol or protocols.get((provider, m.id))
+        if protocol is None and provider.startswith('commandcode'):
+            # Command Code has no OpenAI-compatible API surface: the gateway
+            # speaks the CLI's /alpha/generate envelope for it, so chat is
+            # never a working shape for one of these endpoints.
+            protocol = 'commandcode'
         return {
             'provider': provider,
             'model': m.id,

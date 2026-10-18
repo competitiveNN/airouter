@@ -682,7 +682,7 @@ func ccBuildEnvelope(clientBody []byte, model, apiKey string, clientHeaders map[
 	params := map[string]any{
 		"model":      model,
 		"messages":   ccMessages,
-		"max_tokens": ccMinInt(ccDerefInt(req.MaxTokens, 64000), 200000),
+		"max_tokens": ccMaxTokens(req.MaxTokens),
 		"stream":     true, // the CC API always streams
 	}
 	if len(systemBlocks) > 0 {
@@ -819,7 +819,7 @@ func ccConvertMessage(m ccClientMessage, toolNameMap map[string]string) map[stri
 		if m.ReasoningContent != "" {
 			parts = append(parts, map[string]any{"type": "reasoning", "text": m.ReasoningContent})
 		}
-		if content, ok := ccAssistantContent(m.Content); ok {
+		if content, ok := ccAssistantContent(m.Content, m.ReasoningContent != ""); ok {
 			parts = append(parts, content...)
 		}
 		for _, tc := range m.ToolCalls {
@@ -891,9 +891,11 @@ func ccUserContent(content json.RawMessage) []any {
 }
 
 // ccAssistantContent extracts the text/reasoning parts of an assistant
-// message's content array. A reasoning part already covered by
-// reasoning_content is not duplicated.
-func ccAssistantContent(content json.RawMessage) ([]any, bool) {
+// message's content array. hasReasoning reports whether the message also
+// carries reasoning_content; a reasoning part in the array is then
+// dropped rather than echoed twice on the wire, exactly as the reference
+// proxy guards with `!msg.reasoning_content`.
+func ccAssistantContent(content json.RawMessage, hasReasoning bool) ([]any, bool) {
 	if len(content) == 0 {
 		return nil, false
 	}
@@ -916,9 +918,9 @@ func ccAssistantContent(content json.RawMessage) ([]any, bool) {
 		t, _ := p["type"].(string)
 		if t == "text" {
 			out = append(out, p)
-		} else if t == "reasoning" {
-			// Only forward a reasoning part that is not already carried
-			// by the reasoning_content field.
+		} else if t == "reasoning" && !hasReasoning {
+			// A reasoning part already carried by reasoning_content is
+			// not duplicated onto the wire.
 			out = append(out, p)
 		}
 	}
@@ -1073,11 +1075,17 @@ func ccBodyModel(body []byte, fallback string) string {
 	return fallback
 }
 
-func ccDerefInt(p *int, def int) int {
-	if p == nil {
-		return def
+// ccMaxTokens resolves the budget the envelope sends, following the
+// reference's `Math.min(max_tokens || 64000, 200000)`: an absent OR an
+// explicit-zero max_tokens means the default. A literal 0 would promise
+// the upstream a budget of zero, i.e. a guaranteed empty completion that
+// its own zero-output guard then rejects as a rate-limit-family failure.
+func ccMaxTokens(p *int) int {
+	v := 64000
+	if p != nil && *p != 0 {
+		v = *p
 	}
-	return *p
+	return ccMinInt(v, 200000)
 }
 
 func ccMinInt(a, b int) int {
@@ -1466,6 +1474,14 @@ func (r *ccStreamToChatReader) translateLine(line []byte) []byte {
 		return r.chunk(map[string]any{}, reason, usage)
 
 	case "error":
+		// The upstream event also carries statusCode / code / isRetryable
+		// (ccEventError). They are deliberately NOT turned into a status
+		// here: a mid-stream error event reaches the cooldown classifier
+		// as an ordinary statusless failure (ExtractSSEError ->
+		// ApplyCooldownFromErrorForSession), which the router treats as
+		// transient and bounded. That is a pinned policy -- a failure type
+		// deciding its own penalty is what cooldown_classification_test.go
+		// TestASSEErrorTakesTheTransientPath exists to prevent.
 		msg := ev.Message
 		if ev.Error != nil && ev.Error.Message != "" {
 			msg = ev.Error.Message

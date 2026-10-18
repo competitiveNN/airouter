@@ -578,6 +578,20 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		// Command Code error statuses go through the same CC_STATUS_MAP
+		// the non-streaming path applies (api.go), so the cooldown
+		// classifier sees the OpenAI-equivalent status on streaming
+		// attempts too. Without it a raw 402 bypasses the transient 429
+		// escalation curve and walks into a soft ban after three
+		// consecutive failures.
+		if p.effectiveProtocol(&endpoint) == protocolCommandCode {
+			if mapped := ccMapError(resp.StatusCode, bodyBytes); mapped != nil {
+				if ra := ParseRetryAfter(resp.Header.Get("Retry-After")); ra > mapped.RetryAfter {
+					mapped.RetryAfter = ra
+				}
+				return "", nil, 0, mapped
+			}
+		}
 		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 

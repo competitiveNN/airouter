@@ -472,7 +472,14 @@ SUITE_TEST_FLOORS = {
     # pins the contract on a SYNTHETIC entry, so it still holds after a
     # regeneration strips protocols from the shipped file -- which is the state
     # in which the naive form starts "working" again and the hole re-opens.
-    "scripts/test_regenerate_config.py": 66,
+    #
+    # 73 -- the 66 above plus 7 for `protocol: commandcode` as a first-class
+    # config option: the four runtime spellings (commandcode/command-code/cc/
+    # whitespace) collapsing to the canonical name and the typo still dropped,
+    # the emitter writing the canonical spelling, the preservation regression
+    # for a commandcode record, validate-config accepting it on a commandcode
+    # provider and rejecting it elsewhere, and rule 13 doing the same.
+    "scripts/test_regenerate_config.py": 73,
     # EXACT, matching every other floor in this table (66/66, 65/65, 19/19).
     # An earlier version of this entry sat at 14 against 22 functions on the
     # theory that a floor should have slack so that adding tests needs no edit.

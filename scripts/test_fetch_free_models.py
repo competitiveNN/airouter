@@ -528,20 +528,21 @@ def test_a_removed_id_is_paid():
         ff.urllib.request.urlopen = orig
 
 
-def test_probe_uses_the_endpoint_config_yaml_routes():
-    """The probe must hit the server the gateway will use.
-
-    config.yaml routes commandcode at 127.0.0.1:3050 while the built-in endpoint
-    is api.commandcode.ai. Probing the public host answers 403 for every model,
-    which reads as "none are free" and empties the chain.
+def test_probe_uses_the_endpoint_config_yaml_routes(monkeypatch):
+    """The probe must hit an OpenAI-compatible front end, never api.commandcode.ai
+    directly: that host answers 403 on /models for every plan and cannot judge
+    any free deal. The base is COMMANDCODE_PROBE_BASE when set, else the local
+    commandcode-proxy at 127.0.0.1:3050.
     """
-    url = ff.commandcode_base_url()
-    assert url.endswith("/v1"), url
-    assert "api.commandcode.ai" not in url, (
-        "the probe fell back to the public endpoint, which answers 403 "
-        "plan-restricted for every model and cannot judge any deal"
-    )
+    monkeypatch.delenv("COMMANDCODE_PROBE_BASE", raising=False)
+    url = ff.commandcode_probe_base()
+    assert url == "http://127.0.0.1:3050/v1", url
+    assert ff.commandcode_models_url().endswith("/models")
     assert ff.commandcode_chat_url().endswith("/chat/completions")
+
+    monkeypatch.setenv("COMMANDCODE_PROBE_BASE", "http://127.0.0.1:9050/v1")
+    url = ff.commandcode_probe_base()
+    assert url == "http://127.0.0.1:9050/v1", url
     assert ff.commandcode_models_url().endswith("/models")
 
 
