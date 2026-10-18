@@ -37,6 +37,25 @@ providers:
   # one key then falls through to the next key on the same model instead of
   # failing the request. One entry per provider is kept here so the example
   # stays short -- add more as you need them.
+  #
+  # Optional keys, on top of url / api_key_env / headers:
+  #
+  #   proxy: <N>   Route this provider's upstream traffic through the proxy pool
+  #                (public HTTP CONNECT and SOCKS5 proxies, refreshed every 15
+  #                minutes from proxy_sources.txt). 0 or omitted = direct
+  #                connection. N > 0 = maximum number of different proxies to
+  #                try on an endpoint before falling back to the next model in
+  #                the chain.
+  #                Set it here, once, and every chain entry that does not carry
+  #                its own proxy value inherits it. A proxy dial/CONNECT failure
+  #                cools down the proxy (30s) and retries with a different
+  #                proxy; an endpoint error (HTTP status, TLS handshake through
+  #                an established tunnel) cools down the endpoint as usual.
+  #                The proxy service starts automatically when any provider or
+  #                endpoint asks for it, so nothing runs when all values are 0.
+  #
+  # A chain entry may override its provider with its own `proxy: <N>` (same
+  # meaning, this endpoint only) -- see the models: section below.
 
   # Example: NVIDIA NIM
   nvidia:
@@ -84,8 +103,9 @@ models:
       #   model: your-best-smart-model  # placeholder
       #   vision: false
       #   intelligence: 50.0
-      #   proxy: 0   # route via proxy pool (HTTPS/SOCKS5). 0 = disabled; N = max
-      #     proxies to try on this endpoint before chain fallback
+      #   proxy: 0   # OPTIONAL override of the provider's proxy setting. 0 = inherit
+      #     it (or direct when the provider sets none); N = max proxies to try
+      #     on this endpoint before chain fallback
       # - provider: kilocode
       #   model: kilo-auto/free  # last: auto fallback (placeholder)
       #   vision: true

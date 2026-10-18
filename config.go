@@ -21,6 +21,18 @@ type ProviderConfig struct {
 	URL       string            `yaml:"url"`
 	APIKeyEnv string            `yaml:"api_key_env"`
 	Headers   map[string]string `yaml:"headers,omitempty"`
+
+	// Proxy is the provider-wide proxy setting: the maximum number of
+	// different proxies to try on any endpoint that routes through this
+	// provider, before falling back to the next model in the chain. 0 (or
+	// omitted) means direct connections for this provider.
+	//
+	// This exists so the common case stays one line instead of one line per
+	// model: proxy a provider once and every chain entry that does not carry
+	// its own proxy value inherits that. An endpoint's own proxy value, when
+	// set to a non-zero number, takes precedence over this one (a per-model
+	// override for the rare chain entry that needs a different budget).
+	Proxy int `yaml:"proxy,omitempty"`
 }
 
 // opencodeProviderPrefixes lists provider names whose upstream endpoint is an
@@ -588,12 +600,14 @@ type ModelEndpoint struct {
 	Protocol string `yaml:"protocol,omitempty"`
 
 	// Proxy routes this endpoint's upstream traffic through a proxy from the
-	// proxy pool (see proxy service). Defaults to 0: direct connection.
-	// When greater than 0, the gateway picks a proxy from the prioritized pool
-	// (European and North American proxies first, all others as backup) and
-	// dials the upstream through it (HTTPS or SOCKS5). The value is the
-	// maximum number of different proxies to try on this endpoint before
-	// falling back to the next model in the chain.
+	// proxy pool (see proxy service). It overrides the provider's own proxy
+	// setting, and defaults to 0: inherit the provider's Proxy value, which is
+	// itself a direct connection when the provider does not set one.
+	// When resolved to a value greater than 0, the gateway picks a proxy from
+	// the prioritized pool (European and North American proxies first, all
+	// others as backup) and dials the upstream through it (HTTPS or SOCKS5).
+	// The value is the maximum number of different proxies to try on this
+	// endpoint before falling back to the next model in the chain.
 	Proxy int `yaml:"proxy,omitempty"`
 }
 
@@ -1036,9 +1050,18 @@ func ExtractSSEError(data []byte) error {
 	return nil
 }
 
-// proxyEnabled reports whether any endpoint in any model chain has proxying
-// enabled. When false, the proxy service does not need to run.
+// proxyEnabled reports whether any provider, or any endpoint in any model
+// chain, has proxying enabled. When false, the proxy service does not need to
+// run.
 func proxyEnabled(cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, provider := range cfg.Providers {
+		if provider.Proxy > 0 {
+			return true
+		}
+	}
 	for _, model := range cfg.Models {
 		for _, ep := range model.Chain {
 			if ep.Proxy > 0 {
