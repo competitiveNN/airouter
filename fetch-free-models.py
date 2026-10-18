@@ -1336,9 +1336,6 @@ def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
             datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
         except ValueError:
             continue
-        checked = datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
-        if (datetime.now(UTC) - checked).total_seconds() > 24 * 3600:
-            continue
         live[model_id] = entry
     return live
 
@@ -1864,6 +1861,22 @@ def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
 # Only the routed endpoint can tell a live deal from a dead one.
 
 
+def commandcode_probe_base() -> str:
+    """The base URL the CommandCode free-deal probes hit.
+
+    config.yaml may now route commandcode straight at api.commandcode.ai with
+    `protocol: commandcode`; that host serves neither /models nor
+    /chat/completions, so the probes keep going through an OpenAI-compatible
+    front end (the local commandcode-proxy at 127.0.0.1:3050 today). The
+    COMMANDCODE_PROBE_BASE environment variable names it; without it the
+    default is that local proxy so probing preserves current behavior.
+    """
+    env = os.environ.get("COMMANDCODE_PROBE_BASE", "").strip()
+    if env:
+        return env.rstrip("/")
+    return "http://127.0.0.1:3050/v1"
+
+
 def commandcode_base_url() -> str:
     """The base URL config.yaml routes commandcode through, else the default."""
     config = Path(__file__).resolve().parent / "config.yaml"
@@ -1886,11 +1899,11 @@ def commandcode_base_url() -> str:
 
 
 def commandcode_models_url() -> str:
-    return commandcode_base_url() + "/models"
+    return commandcode_probe_base() + "/models"
 
 
 def commandcode_chat_url() -> str:
-    return commandcode_base_url() + "/chat/completions"
+    return commandcode_probe_base() + "/chat/completions"
 
 
 def commandcode_is_free_candidate(model_id: str) -> bool:

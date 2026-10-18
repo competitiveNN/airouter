@@ -760,21 +760,30 @@ def _checker_problems(config_text=None, models_path="/tmp/free-models.json"):
 # assert against regardless of what the sync emits.
 # --------------------------------------------------------------------------
 
-def _inject_protocol(config_text, value):
+def _inject_protocol(config_text, value, provider=None):
     """Return config_text with the first chain entry declaring protocol=value.
 
     Any existing `protocol:` key in that entry is removed first, so there is
     exactly one and its value is the one asked for. Everything else in the
     file -- comments, blank lines, ordering -- is byte-identical.
+
+    With `provider`, the first entry belonging to that provider is targeted
+    instead of the first entry in the file, so a rule that is provider-scoped
+    (commandcode spellings) can be aimed at a commandcode entry or deliberately
+    away from one.
     """
     lines = config_text.splitlines(keepends=True)
 
     entry = None
     for i, line in enumerate(lines):
-        if line.startswith("      - "):
+        if provider is None:
+            if line.startswith("      - "):
+                entry = i
+                break
+        elif line.startswith(f"      - provider: {provider}"):
             entry = i
             break
-    assert entry is not None, "fixture has no chain entry"
+    assert entry is not None, "fixture has no matching chain entry"
 
     # The entry's own keys are indented 8 spaces; the next entry starts at 6
     # with a dash, and a key shallower than 8 ends the models block.
@@ -1362,6 +1371,40 @@ def test_a_fresh_probe_verdict_outranks_the_configured_protocol():
     assert "protocol: responses" in _entry_yaml(chain[0])
 
 
+def test_commandcode_spellings_normalize_to_one_canonical_protocol():
+    """config.go's protocolFor is the runtime source of truth: it accepts
+    commandcode / command-code / cc, so the generator does too -- emitted as the
+    one canonical name that matches the protocolCommandCode constant."""
+    assert gen._normalize_protocol("commandcode") == "commandcode"
+    assert gen._normalize_protocol("command-code") == "commandcode"
+    assert gen._normalize_protocol("cc") == "commandcode"
+    assert gen._normalize_protocol(" CommandCode ") == "commandcode"
+    # The typo protection is what this replaces: still dropped.
+    assert gen._normalize_protocol("respones") is None
+
+
+def test_commandcode_spellings_are_written_out_canonically():
+    chain = gen.build_chain([_model("cc-only", "commandcode", 40.0,
+                                    protocol="command-code")], "work")
+    text = _entry_yaml(chain[0])
+    assert "protocol: commandcode" in text, text
+    assert "command-code" not in text, text
+
+
+def test_an_unprobed_commandcode_record_keeps_the_configured_protocol():
+    """The preservation regression, for the shape a commandcode chain needs.
+
+    `protocol: commandcode` is the field that puts the router on the provider's
+    /alpha/generate envelope. The generator owns the whole models section, so a
+    spelling it cannot re-emit is one it would silently delete on the next sync
+    -- the endpoint would fall back to posting a chat envelope at Command Code.
+    """
+    protocols = {("commandcode", "cc-only"): "commandcode"}
+    chain = gen.build_chain([_model("cc-only", "commandcode", 40.0)],
+                            "work", protocols=protocols)
+    assert "protocol: commandcode" in _entry_yaml(chain[0])
+
+
 def test_the_protocol_reaches_every_key_of_a_multi_key_group():
     """nvidia-nim is one model id on three config providers. A protocol attached
     to only one of them is a bug that only shows up on one key."""
@@ -1430,13 +1473,13 @@ def test_parse_protocols_reads_every_chain_and_ignores_junk():
 def test_every_protocol_in_the_shipped_config_is_one_the_router_honours():
     """The invariant that holds whatever the file contains, unlike its contents.
 
-    config.go's protocolFor maps anything unrecognised to chat, so a value here
-    that is not chat/responses is a file claiming a shape the router never uses.
-    The shipped config is generated, so this reads it rather than assuming
-    anything about it.
+    config.go's protocolFor maps anything unrecognised to chat; chat,
+    responses and commandcode are the shapes the router actually uses
+    (commandcode goes to /alpha/generate via commandcode.go). The shipped
+    config is generated, so this reads it rather than assuming anything.
     """
     for (provider, model), protocol in gen.parse_protocols(CONFIG.read_text()).items():
-        assert protocol in ("chat", "responses"), (provider, model, protocol)
+        assert protocol in ("chat", "responses", "commandcode"), (provider, model, protocol)
 
 
 def test_a_declared_protocol_survives_a_regeneration():
@@ -1578,6 +1621,49 @@ def test_validate_config_accepts_both_real_protocols(tmp_path):
         assert yaml.safe_load(shaped)["models"]["smart"]["chain"][0]["protocol"] == value
         run = _validate_config(tmp_path, shaped)
         assert run.returncode == 0, f"{value}: " + run.stdout
+
+
+def test_validate_config_accepts_commandcode_on_a_commandcode_provider(tmp_path):
+    """config.go routes a commandcode spelling to the /alpha/generate envelope,
+    which is exactly right for a commandcode provider and nowhere else."""
+    shaped = _inject_protocol(CONFIG.read_text(), "commandcode",
+                              provider="commandcode")
+    parsed = yaml.safe_load(shaped)["models"]["smart"]["chain"]
+    assert [e for e in parsed if e.get("model") == "reflection/beam:free"
+            and e["provider"] == "commandcode"][0]["protocol"] == "commandcode"
+    run = _validate_config(tmp_path, shaped)
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
+def test_validate_config_rejects_commandcode_on_a_non_commandcode_provider(tmp_path):
+    """A chat provider claiming commandcode would make the router post an
+    /alpha/generate envelope to a host that never asked for it."""
+    shaped = _inject_protocol(CONFIG.read_text(), "commandcode")
+    parsed = yaml.safe_load(shaped)["models"]["smart"]["chain"][0]
+    assert parsed["provider"] != "commandcode"
+    assert parsed["protocol"] == "commandcode"
+    run = _validate_config(tmp_path, shaped)
+    assert run.returncode == 1, run.stdout
+    assert "protocol must be" in run.stdout, run.stdout
+
+
+def test_rule13_accepts_commandcode_on_a_commandcode_provider():
+    if not Path("/tmp/free-models.json").exists():
+        pytest.skip("no fetched model list on this machine")
+    shaped = _inject_protocol(CONFIG.read_text(), "commandcode",
+                              provider="commandcode")
+    problems = _checker_problems(shaped)
+    assert not [p for p in problems if p.startswith("rule13")], problems
+
+
+def test_rule13_rejects_commandcode_on_a_non_commandcode_provider():
+    if not Path("/tmp/free-models.json").exists():
+        pytest.skip("no fetched model list on this machine")
+    shaped = _inject_protocol(CONFIG.read_text(), "commandcode")
+    assert yaml.safe_load(shaped)["models"]["smart"]["chain"][0]["protocol"] == "commandcode"
+    problems = _checker_problems(shaped)
+    assert [p for p in problems if p.startswith("rule13")
+            and "commandcode" in p], problems
 
 
 def test_protocol_injection_is_real_when_the_entry_already_has_one():

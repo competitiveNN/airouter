@@ -1309,7 +1309,7 @@ commit-level claim the anchor check cannot:
   **set**, not a count — the same substitution that fixed the fuzz gate, for
   the same reason: a count is satisfied by any equally-wrong list.
 
-It found real drift immediately. `979dcf6` and `ee4bf69` were unpushed and
+It found real drift immediately. `6580efa` and `e0f5108` were unpushed and
 missing from the handoff list, so a handoff built from that document would not
 have carried them. Both were added.
 
@@ -1337,7 +1337,7 @@ as a positive assertion: a code commit with a README tweak must be reported.
 Both rules were run against the same fixture, and the old one passes it while
 the new one catches it.
 
-Two real commits were hiding under the loose rule. `b950b3a` and `6ca056f` both
+Two real commits were hiding under the loose rule. `8f6d578` and `c0726c5` both
 touched `dist/README.md` alongside real script changes, and neither appeared in
 the handoff list — a handoff built from that document would have missed both.
 Narrowing the rule is what surfaced them, which is the strongest evidence that

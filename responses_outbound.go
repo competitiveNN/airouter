@@ -112,11 +112,11 @@ type chatRequestBody struct {
 		Parameters  json.RawMessage `json:"parameters"`
 	} `json:"tools"`
 
-	MaxTokens   *int `json:"max_tokens"`
-	Temperature *float64
-	TopP        *float64  `json:"top_p"`
-	Stop        *[]string `json:"stop"`
-	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	MaxTokens       *int `json:"max_tokens"`
+	Temperature     *float64
+	TopP            *float64  `json:"top_p"`
+	Stop            *[]string `json:"stop"`
+	ReasoningEffort *string   `json:"reasoning_effort,omitempty"`
 }
 
 // upstreamItem is one entry of the Responses `input` array as it goes ON THE

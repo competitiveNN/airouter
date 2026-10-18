@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -590,5 +591,131 @@ func TestRedactProxyURL(t *testing.T) {
 	}
 	if got := redactProxyURL(""); got != "(invalid proxy url)" {
 		t.Fatalf("redactProxyURL(\"\") = %q", got)
+	}
+}
+
+// TestCCAssistantReasoningNotDuplicated pins the reference's
+// `!msg.reasoning_content` guard: a client echoing its reasoning in BOTH
+// reasoning_content and a content[] reasoning part must not send the same
+// thinking text twice on the wire. When reasoning_content is absent the
+// reasoning part must survive.
+func TestCCAssistantReasoningNotDuplicated(t *testing.T) {
+	reasoningPartsOf := func(t *testing.T, body []byte) []string {
+		t.Helper()
+		envelope, _, err := ccBuildEnvelope(body, "m", ccTestAPIKey, nil)
+		if err != nil {
+			t.Fatalf("ccBuildEnvelope: %v", err)
+		}
+		var env struct {
+			Params struct {
+				Messages []struct {
+					Role    string `json:"role"`
+					Content []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"messages"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal(envelope, &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v", err)
+		}
+		for _, m := range env.Params.Messages {
+			if m.Role != "assistant" {
+				continue
+			}
+			var out []string
+			for _, p := range m.Content {
+				if p.Type == "reasoning" {
+					out = append(out, p.Text)
+				}
+			}
+			return out
+		}
+		t.Fatal("no assistant message in the envelope")
+		return nil
+	}
+
+	both := []byte(`{"model":"m","messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","reasoning_content":"think","content":[{"type":"reasoning","text":"think"},{"type":"text","text":"answer"}]}
+	]}`)
+	if got := reasoningPartsOf(t, both); len(got) != 1 || got[0] != "think" {
+		t.Fatalf("reasoning parts = %v, want exactly one 'think': reasoning_content plus a reasoning part must not duplicate the thinking text", got)
+	}
+
+	onlyPart := []byte(`{"model":"m","messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","content":[{"type":"reasoning","text":"think"},{"type":"text","text":"answer"}]}
+	]}`)
+	if got := reasoningPartsOf(t, onlyPart); len(got) != 1 || got[0] != "think" {
+		t.Fatalf("reasoning parts = %v, want exactly one 'think' kept when reasoning_content is absent", got)
+	}
+}
+
+// TestCCMaxTokensExplicitZeroUsesDefault pins the reference's
+// `Math.min(max_tokens || 64000, 200000)`: an absent OR explicit-zero
+// max_tokens means the default budget. A literal 0 promises the upstream
+// an empty completion, which its zero-output guard rejects as a
+// rate-limit-family failure.
+func TestCCMaxTokensExplicitZeroUsesDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"absent", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, 64000},
+		{"explicit zero", `{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":0}`, 64000},
+		{"explicit budget", `{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":100}`, 100},
+		{"above the cap", `{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":500000}`, 200000},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			envelope, _, err := ccBuildEnvelope([]byte(c.body), "m", ccTestAPIKey, nil)
+			if err != nil {
+				t.Fatalf("ccBuildEnvelope: %v", err)
+			}
+			var env struct {
+				Params struct {
+					MaxTokens int `json:"max_tokens"`
+				} `json:"params"`
+			}
+			if err := json.Unmarshal(envelope, &env); err != nil {
+				t.Fatalf("unmarshal envelope: %v", err)
+			}
+			if env.Params.MaxTokens != c.want {
+				t.Fatalf("params.max_tokens = %d, want %d", env.Params.MaxTokens, c.want)
+			}
+		})
+	}
+}
+
+// TestCCStreamHTTPStatusIsMapped pins streaming-path parity with the
+// non-streaming path (api.go): a Command Code HTTP error must reach the
+// cooldown classifier as its CC_STATUS_MAP equivalent. A raw 402 would
+// bypass the transient 429 escalation curve and walk into a soft ban
+// after three consecutive failures.
+func TestCCStreamHTTPStatusIsMapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"error":{"message":"You have insufficient credits to make this request. Please purchase more credits","code":"PAYMENT_REQUIRED"}}`))
+	}))
+	defer srv.Close()
+
+	p := NewProxy(&Config{Providers: map[string]ProviderConfig{
+		"commandcode": {URL: srv.URL},
+	}})
+	endpoint := ModelEndpoint{Provider: "commandcode", Model: "m", Protocol: "commandcode"}
+	_, _, _, err := p.StreamToClient(context.Background(), io.Discard, nopFlusher{},
+		[]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`), endpoint, 5*time.Second, "s")
+	if err == nil {
+		t.Fatal("expected the 402 upstream to fail the attempt")
+	}
+	var pe *ProviderError
+	if !errors.As(err, &pe) {
+		t.Fatalf("got %T (%v), want *ProviderError", err, err)
+	}
+	if pe.StatusCode != 429 {
+		t.Fatalf("StatusCode = %d, want 429: CC_STATUS_MAP maps 402 to the rate-limit family", pe.StatusCode)
 	}
 }
