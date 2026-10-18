@@ -36,12 +36,6 @@ providers:
   nvidia:
     url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY        # set this in .envrc
-  nvidia2:
-    url: https://integrate.api.nvidia.com/v1
-    api_key_env: NVIDIA_API_KEY_2      # set this in .envrc
-  nvidia3:
-    url: https://integrate.api.nvidia.com/v1
-    api_key_env: NVIDIA_API_KEY_3      # set this in .envrc
 
   # Example: Ollama Cloud
   ollama:
@@ -62,26 +56,11 @@ providers:
   gemini:
     url: https://generativelanguage.googleapis.com/v1beta/openai
     api_key_env: GEMINI_API_KEY        # set this in .envrc
-  gemini2:
-    url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GEMINI_API_KEY_2      # set this in .envrc
-  gemini3:
-    url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GEMINI_API_KEY_3      # set this in .envrc
-  gemini4:
-    url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GEMINI_API_KEY_4      # set this in .envrc
-  gemini5:
-    url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GEMINI_API_KEY_5      # set this in .envrc
 
   # Example: CommandCode local proxy (two keys for key rotation)
   commandcode:
     url: http://127.0.0.1:3050/v1
     api_key_env: COMMANDCODE_API_KEY   # set this in .envrc
-  commandcode2:
-    url: http://127.0.0.1:3050/v1
-    api_key_env: COMMANDCODE_API_KEY_2 # set this in .envrc
 
 preferences:
   newest_first_on_tie: true
