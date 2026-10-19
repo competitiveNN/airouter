@@ -1094,6 +1094,22 @@ func TestChatPageBenchmarkUI(t *testing.T) {
 		"if (generating || benchRunning) return;",
 		"while (row.cells.length > 1) row.deleteCell(1);",
 		"bad.colSpan = 4;",
+		// Concurrency slider (1..32).
+		`id="bench-concurrency-input"`,
+		`min="1"`,
+		`max="32"`,
+		`id="bench-concurrency-val"`,
+		// Context window slider (4 positions).
+		`id="bench-window-input"`,
+		`min="1"`,
+		`max="4"`,
+		`id="bench-window-val"`,
+		"var BENCH_WINDOWS = [",
+		"var benchWindow = 0;",
+		// A dedicated stop button that can abort a run at any time.
+		`id="bench-stop"`,
+		"function stopBenchmark",
+		"$('bench-stop').onclick = stopBenchmark;",
 	} {
 		if !strings.Contains(chatHTML, want) {
 			t.Errorf("chatHTML missing %q", want)
