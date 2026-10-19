@@ -709,7 +709,9 @@ select, input[type=text] { background: #1b1e24; color: #e6e6e6; border: 1px soli
 .bench-table th { color: #8b93a1; font-weight: normal; }
 .bench-table th:first-child, .bench-table td:first-child { text-align: left; }
 .bench-error { color: #e08080; }
-</style>
+.bench-bar { margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: #8b93a1; }
+.bench-bar input[type=range] { width: 120px; }
+.bench-bar label { min-width: 44px; text-align: right; }</style>
 </head>
 <body>
 <div id="app">
@@ -733,6 +735,17 @@ select, input[type=text] { background: #1b1e24; color: #e6e6e6; border: 1px soli
       <select id="model-select" title="Model"></select>
       <input type="text" id="model-input" placeholder="model name" spellcheck="false" style="display:none">
       <button id="benchmark" title="Measure prefill and decode speed at several context depths">Benchmark</button>
+      <button id="bench-stop" class="danger" style="display:none" title="Stop the running benchmark">Stop benchmark</button>
+      <div id="bench-concurrency" class="bench-bar">
+        <label for="bench-concurrency-input">Concurrency</label>
+        <input type="range" id="bench-concurrency-input" min="1" max="32" value="1">
+        <span id="bench-concurrency-val">1</span>
+      </div>
+      <div id="bench-window" class="bench-bar">
+        <label for="bench-window-input">Context window</label>
+        <input type="range" id="bench-window-input" min="1" max="4" value="1">
+        <span id="bench-window-val">1</span>
+      </div>
     </div>
     <div id="messages"></div>
     <div id="composer">
@@ -999,6 +1012,8 @@ function persistUI() {
   ui.endpointId = $('endpoint-select').value;
   ui.model = currentModel();
   ui.protocol = $('protocol-select').value;
+  ui.benchConcurrency = benchConcurrency;
+  ui.benchWindow = benchWindow;
   save(LS_UI, ui);
 }
 
@@ -1476,6 +1491,18 @@ function statsFromHeaders(resp) {
 // first-token latency.
 var BENCH_DEPTHS = [512, 4096, 16384, 65536];
 
+// BENCH_WINDOWS are the context windows the benchmark
+// can sweep. Slider position 1 is the default window
+// (512 / 4k / 16k / 64k); each later position shifts
+// the whole sequence up, topping out at 512k.
+var BENCH_WINDOWS = [
+  [512, 4096, 16384, 65536],
+  [4096, 16384, 65536, 131072],
+  [16384, 65536, 131072, 262144],
+  [65536, 131072, 262144, 524288]
+];
+var benchWindow = 0;
+
 // BENCH_MAX_TOKENS caps the completion so decode speed
 // is comparable across depths: every depth produces
 // (up to) the same number of output tokens, timed
@@ -1484,7 +1511,11 @@ var BENCH_MAX_TOKENS = 256;
 
 var benchRunning = false;
 var benchStopping = false;
+var benchFinished = false;
+var benchBubble = null;
 var benchAbortCtrl = null;
+var benchAbortCtrls = [];
+var benchConcurrency = 1;
 
 function benchLabel(depth) {
   return depth >= 1024 ? (depth / 1024) + 'k' : String(depth);
@@ -1508,21 +1539,54 @@ function benchPrompt(tokens) {
   return s;
 }
 
+// stopBenchmark aborts every depth request still in
+// flight and ends the run. Called by the Benchmark
+// button (which becomes Stop) and by the dedicated
+// "Stop benchmark" button, so a run can be stopped at
+// any time without reloading the page.
+function stopBenchmark() {
+  if (!benchRunning) return;
+  benchStopping = true;
+  benchAbortCtrls.forEach(function (c) { c.abort(); });
+  benchFinishNote(true);
+}
+
+// benchFinishNote ends a benchmark run: it resets the shared
+// benchmark state, restores the buttons, and appends the
+// stopped/complete note to the current benchmark bubble. It runs
+// exactly once per run — a finished flag guards against the note
+// being appended twice if aborts and completions settle together.
+function benchFinishNote(stopped) {
+  if (benchFinished) return;
+  benchFinished = true;
+  benchRunning = false;
+  benchStopping = false;
+  benchAbortCtrls = [];
+  if ($('benchmark')) $('benchmark').textContent = 'Benchmark';
+  if ($('bench-stop')) $('bench-stop').style.display = 'none';
+  if (benchBubble) {
+    var note = document.createElement('p');
+    note.className = 'stats';
+    note.textContent = stopped ? 'benchmark stopped' : 'benchmark complete';
+    benchBubble.appendChild(note);
+    benchBubble = null;
+  }
+}
+
 // runBenchmark sends one request per depth to the
 // selected endpoint and model and records the
 // proxy's own measurements (first-token latency,
 // prefill and decode tokens per second) in a table
-// in the chat. Depths run sequentially so each
-// measurement is taken with the endpoint otherwise
-// idle. The button turns into Stop for the duration;
-// stopping aborts the in-flight depth and ends the
-// run. A depth that fails (a 64k prompt exceeds the
+// in the chat. Up to benchConcurrency depths run in
+// parallel, each with its own row and abort
+// controller. The button turns into Stop for the
+// duration; stopping aborts every in-flight depth.
+// A depth that fails (a 64k prompt exceeds the
 // model's context, say) shows its error in the
 // table and the run continues.
 function runBenchmark() {
   if (benchRunning) {
-    benchStopping = true;
-    if (benchAbortCtrl) benchAbortCtrl.abort();
+    stopBenchmark();
     return;
   }
   if (generating) {
@@ -1533,10 +1597,11 @@ function runBenchmark() {
   if (!ep || !ep.url) { alert('Add an API endpoint first (button at the bottom left).'); return; }
   var model = currentModel();
   var protocol = $('protocol-select').value;
+  var depths = BENCH_WINDOWS[benchWindow];
 
   var col = appendMessage('assistant', '', null, null);
   var bubble = col.querySelector('.bubble');
-  var labels = BENCH_DEPTHS.map(benchLabel);
+  var labels = depths.map(benchLabel);
   bubble.innerHTML = '<p>Benchmarking <b>' + esc(model) + '</b> at ' + labels.join(' / ') + ' tokens…</p>';
   var table = document.createElement('table');
   table.className = 'bench-table';
@@ -1549,31 +1614,36 @@ function runBenchmark() {
   }
   bubble.appendChild(table);
 
-  benchRunning = true;
-  $('benchmark').textContent = 'Stop';
-
-  function finish(stopped) {
-    benchRunning = false;
-    benchStopping = false;
-    benchAbortCtrl = null;
-    $('benchmark').textContent = 'Benchmark';
-    var note = document.createElement('p');
-    note.className = 'stats';
-    note.textContent = stopped ? 'benchmark stopped' : 'benchmark complete';
-    bubble.appendChild(note);
-  }
-
-  var idx = 0;
-  function next() {
-    if (benchStopping) { finish(true); return; }
-    if (!benchRunning) return;
-    if (idx >= BENCH_DEPTHS.length) { finish(false); return; }
-    var depth = BENCH_DEPTHS[idx++];
+  // One row per depth, all created up front; up to
+  // benchConcurrency requests are in flight at once.
+  var rows = depths.map(function (depth) {
     var row = table.insertRow(-1);
     var cells = [];
     for (var i = 0; i < names.length; i++) cells.push(row.insertCell(-1));
     cells[0].textContent = benchLabel(depth);
     for (var j = 1; j < names.length; j++) cells[j].textContent = '…';
+    return { depth: depth, row: row, cells: cells };
+  });
+
+  benchRunning = true;
+  benchStopping = false;
+  benchFinished = false;
+  benchAbortCtrls = [];
+  benchBubble = bubble;
+  $('benchmark').textContent = 'Stop';
+  $('bench-stop').style.display = '';
+
+  var nextIdx = 0;
+  var doneCount = 0;
+  var inFlight = 0;
+
+  function startOne() {
+    if (benchFinished || benchStopping || !benchRunning) return;
+    if (nextIdx >= depths.length) return;
+    var entry = rows[nextIdx++];
+    var depth = entry.depth;
+    var row = entry.row;
+    var cells = entry.cells;
 
     var prompt = benchPrompt(depth);
     var payload = {
@@ -1590,6 +1660,10 @@ function runBenchmark() {
     }
 
     benchAbortCtrl = new AbortController();
+    benchAbortCtrls.push(benchAbortCtrl);
+    var abortCtrl = benchAbortCtrl;
+    inFlight++;
+
     doSend(payload, protocol,
       function () {},
       function (s) {
@@ -1600,13 +1674,13 @@ function runBenchmark() {
         cells[4].textContent = s.decode_tokens_per_sec ? Math.round(s.decode_tokens_per_sec) + ' t/s' : '—';
       },
       function () {},
-      benchAbortCtrl.signal
+      abortCtrl.signal
     ).then(function () {
-      next();
+      done();
     }).catch(function (err) {
       if (err && err.name === 'AbortError') {
         cells[1].textContent = 'stopped';
-        finish(true);
+        done();
         return;
       }
       // A failed depth does not end the run: the
@@ -1617,10 +1691,20 @@ function runBenchmark() {
       bad.className = 'bench-error';
       bad.colSpan = 4;
       bad.textContent = 'Error: ' + (err && err.message ? err.message : err);
-      next();
+      done();
     });
   }
-  next();
+
+  function done() {
+    if (benchFinished) return;
+    inFlight--;
+    doneCount++;
+    if (doneCount >= depths.length) { benchFinishNote(false); return; }
+    if (benchStopping || !benchRunning) return;
+    if (inFlight < benchConcurrency) startOne();
+  }
+
+  for (var i = 0; i < benchConcurrency; i++) startOne();
 }
 
 // ---------- wiring ----------
@@ -1659,6 +1743,20 @@ function init() {
 
   renderEndpoints();
   if (ui.protocol) $('protocol-select').value = ui.protocol;
+  if (typeof ui.benchConcurrency === 'number' && ui.benchConcurrency >= 1 && ui.benchConcurrency <= 32) benchConcurrency = ui.benchConcurrency;
+  var cc = $('bench-concurrency-input');
+  if (cc) {
+    cc.value = benchConcurrency;
+    $('bench-concurrency-val').textContent = benchConcurrency;
+    cc.oninput = function () { benchConcurrency = parseInt(cc.value, 10) || 1; $('bench-concurrency-val').textContent = benchConcurrency; persistUI(); };
+  }
+  if (typeof ui.benchWindow === 'number' && ui.benchWindow >= 0 && ui.benchWindow <= 3) benchWindow = ui.benchWindow;
+  var cw = $('bench-window-input');
+  if (cw) {
+    cw.value = benchWindow + 1;
+    $('bench-window-val').textContent = benchWindow + 1;
+    cw.oninput = function () { benchWindow = parseInt(cw.value, 10) - 1 || 0; $('bench-window-val').textContent = benchWindow + 1; persistUI(); };
+  }
   renderModels();
   refreshModels();
 
@@ -1687,6 +1785,7 @@ function init() {
   $('model-input').onchange = persistUI;
   $('send').onclick = send;
   $('benchmark').onclick = runBenchmark;
+  $('bench-stop').onclick = stopBenchmark;
   $('stop').onclick = function () {
     if (abortCtrl) abortCtrl.abort();
   };
