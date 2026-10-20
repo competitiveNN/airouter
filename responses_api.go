@@ -144,7 +144,17 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			// pending anywhere in the chain; there is nothing to wait
 			// for, so fail fast.
 			if wait > 0 {
-				timer := time.NewTimer(minDuration(wait, 30*time.Second))
+				sleep, ok := cycleBackSleep(wait, walk)
+				if !ok {
+					// The shortest cooldown in the chain outlasts the budget
+					// this request has left, so waiting would only delay the
+					// 503 that the budget is about to force anyway.
+					log.Printf("[debug] session=%s model=%s -> responses cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+					g.recordRequest(req.Model, 503, time.Since(start))
+					return
+				}
+				timer := time.NewTimer(sleep)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
@@ -323,7 +333,14 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(retryBody), tried)
 		if ep == nil {
 			if wait > 0 {
-				timer := time.NewTimer(minDuration(wait, 30*time.Second))
+				sleep, ok := cycleBackSleep(wait, walk)
+				if !ok {
+					log.Printf("[debug] session=%s model=%s -> responses stream cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					writeSSEError(w, flusher, "All models are currently unavailable")
+					g.recordRequest(req.Model, 503, time.Since(start))
+					return
+				}
+				timer := time.NewTimer(sleep)
 				select {
 				case <-ctx.Done():
 					timer.Stop()

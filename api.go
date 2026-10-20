@@ -962,6 +962,34 @@ func (b *budgetState) exhaustedNow() bool {
 // elapsed is the wall-clock time spent so far, for logging.
 func (b *budgetState) elapsed() time.Duration { return time.Since(b.start) }
 
+// remaining is the wall-clock time this request's fallback walk has left
+// before the budget forces a 503. It goes negative once the budget is spent,
+// which is exactly what the cycle-back waiter compares against: a wait that
+// outlasts the remaining budget cannot help, because the loop re-checks the
+// budget the instant the wait ends.
+func (b *budgetState) remaining() time.Duration { return b.budget - time.Since(b.start) }
+
+// cycleBackSleep returns how long the cycle-back waiter may sleep, and false
+// when the request must give up NOW instead of waiting.
+//
+// The wait is capped at 30s so a long cooldown cannot hold a request open
+// indefinitely. The cap is not the whole story: a wait that outlasts the
+// budget the request has left is pure latency, because the loop re-checks the
+// budget the instant the wait ends and returns the 503 the budget was going
+// to force anyway.
+//
+// Measured on 2026-10-20 against a 30s transport cooldown and a 12s
+// small-request budget: the request was held open for 30.2s and then returned
+// exactly the 503 it would have returned immediately. The client saw a hung
+// request for half a minute and got the same answer.
+func cycleBackSleep(wait time.Duration, walk *budgetState) (time.Duration, bool) {
+	sleep := minDuration(wait, 30*time.Second)
+	if remaining := walk.remaining(); sleep >= remaining {
+		return 0, false
+	}
+	return sleep, true
+}
+
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
 	start := time.Now()
 	ctx := r.Context()
@@ -1067,7 +1095,17 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			// pending anywhere in the chain; there is nothing to wait
 			// for, so fail fast.
 			if wait > 0 {
-				timer := time.NewTimer(minDuration(wait, 30*time.Second))
+				sleep, ok := cycleBackSleep(wait, walk)
+				if !ok {
+					// The shortest cooldown in the chain outlasts the budget
+					// this request has left, so waiting would only delay the
+					// 503 that the budget is about to force anyway.
+					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+					g.recordRequest(req.Model, 503, time.Since(start))
+					return
+				}
+				timer := time.NewTimer(sleep)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
@@ -1480,9 +1518,16 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			// cooldown is pending anywhere in the chain; there is nothing
 			// to wait for, so fail fast.
 			if wait > 0 {
-				fmt.Fprintf(w, ": reconnecting in %v\n\n", wait.Round(time.Second))
+				sleep, ok := cycleBackSleep(wait, walk)
+				if !ok {
+					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					writeSSEError(w, flusher, "All models are currently unavailable")
+					g.recordRequest(req.Model, 503, time.Since(start))
+					return
+				}
+				fmt.Fprintf(w, ": reconnecting in %v\n\n", sleep.Round(time.Second))
 				flusher.Flush()
-				timer := time.NewTimer(minDuration(wait, 30*time.Second))
+				timer := time.NewTimer(sleep)
 				select {
 				case <-ctx.Done():
 					timer.Stop()

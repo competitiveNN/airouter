@@ -861,7 +861,7 @@ on hand-picked cases alone.
   minimized crashers under `testdata/fuzz` would be committed.
 
 • `dist/` bundle (was stale, one commit behind) — the exported bundle still
-  pointed at `a861dd5` while HEAD was `4c03ed2`, so the artifact a colleague
+  pointed at `8cfd99a` while HEAD was `6ab9869`, so the artifact a colleague
   would have been handed did not contain the two rounds of fixes. Regenerated,
   and then verified the way it would actually be used: a fresh clone at
   `origin/master`, a single `git fetch` of the bundle, then `go build` and the
@@ -1133,7 +1133,7 @@ unfixed gate on a deliberately added second package:
     no fabricated counterexample
 
 The probe package used for these controls was removed afterwards; the tree is
-byte-identical to `ba4a6c4` apart from the three files this round changed.
+byte-identical to `ef1847a` apart from the three files this round changed.
 
 ### Round 10 (2026-09-29) — making the gate's blind spot permanent
 
@@ -1149,7 +1149,7 @@ gate's discovery had been. Verified by moving `router.go` into `./subpkg`: the
 check failed with `summarizeError: not found in any .go file` for symbols
 sitting in a subdirectory, and the remediation it printed is to add an entry to
 `ALLOWLIST` — a wrong fix, and a permanent one, for a symbol that was never
-deleted. Fixed in `56dfbdf`, not in this round — see "a claim that outlived its
+deleted. Fixed in `dd371d8`, not in this round — see "a claim that outlived its
 commit" below, which is why it is named here rather than folded in. The fix is
 `rglob`, skipping `.git` and `vendor`, sorted because the sources are joined
 into one corpus and `rglob`'s ordering is filesystem-dependent.
@@ -1161,7 +1161,7 @@ It needs no Go toolchain and no network; the stub records its arguments and
 enforces the one real constraint that matters (`-fuzz` takes a single package).
 Seven cases: multi-package discovery, usage errors, the set-difference check,
 a subdirectory crasher, a healthy-repo liveness check, the empty-discovery
-error, and a negative control that runs the `cb4e826` gate against the same
+error, and a negative control that runs the `4dc53c8` gate against the same
 fixtures and requires it to fail.
 
 The liveness case (5) is the one that keeps the rest honest. Every other case
