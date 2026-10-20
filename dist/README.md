@@ -154,6 +154,7 @@ What `origin/master` is missing, oldest first:
 - `b5fcb69` feat: add per-endpoint proxy support with fallback proxy max
 - `63c85c1` feat: set proxy per provider, keep per-endpoint as an override
 - `2d61a7d` feat: proxy pool service, source extractors, readiness and latency prioritisation
+- `a85b6c8` fix: clamp cycle-back wait to remaining fallback budget; fix audit citations and dist list
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
