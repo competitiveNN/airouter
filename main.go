@@ -64,11 +64,18 @@ func main() {
 	// preferred, all others as backup). It only runs when at least one
 	// provider or endpoint has proxying enabled; otherwise the periodic
 	// fetching is unnecessary overhead.
+	// The built-in source list lives in proxysources.go; proxy_sources.txt is
+	// an optional file that can add further sources (see docs/proxy_sources.txt
+	// for the reference copy of the built-in list).
 	proxySvc := NewProxyService("proxy_sources.txt", 15*time.Minute)
 	if proxyEnabled(cfg) {
-		go proxySvc.Start(ctx)
 		proxy.SetProxyService(proxySvc)
-		log.Println("Proxy service enabled (pool refresh every 15 min)")
+		// Seed the ready-pool requirement before the loop starts so the first
+		// top-up already knows how many proxies must be proven reachable.
+		proxy.UpdateRequiredReady()
+		go proxySvc.Start(ctx)
+		log.Printf("Proxy service enabled (pool refresh every 15 min, %d proxies must be ready)",
+			proxySvc.RequiredReady())
 	}
 
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
