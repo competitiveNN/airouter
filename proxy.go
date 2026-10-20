@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,6 +132,66 @@ func (p *Proxy) MarkProxyDown(proxyURL string, d time.Duration) {
 	if svc != nil {
 		svc.MarkDown(proxyURL, d)
 	}
+}
+
+// MarkProxyReady records that a proxy was just proven usable, so it counts
+// against the ready-pool requirement. Called only on a real success through the
+// proxy, which is the strongest evidence available.
+func (p *Proxy) MarkProxyReady(proxyURL string) {
+	p.proxyMu.RLock()
+	svc := p.proxySvc
+	p.proxyMu.RUnlock()
+	if svc != nil {
+		svc.MarkReady(proxyURL)
+	}
+}
+
+// requiredProxyTries is how many proxies must be simultaneously ready: the sum
+// of every enabled provider's proxy budget, plus any per-endpoint overrides.
+//
+// The sum, not the maximum, because different requests are routed to different
+// providers, and each is allowed to spend its own budget of attempts on
+// distinct proxies. With two providers configured `proxy: 3`, up to six
+// distinct proxies can be needed at once, so six must be ready for that path to
+// actually be usable rather than failing over to a direct connection.
+func (p *Proxy) requiredProxyTries() int {
+	if p == nil || p.config == nil {
+		return 0
+	}
+	cfg := p.config.Load()
+	if cfg == nil {
+		return 0
+	}
+	total := 0
+	for _, provider := range cfg.Providers {
+		if provider.Proxy > 0 {
+			total += provider.Proxy
+		}
+	}
+	for _, model := range cfg.Models {
+		for _, ep := range model.Chain {
+			if ep.Proxy > 0 {
+				total += ep.Proxy
+			}
+		}
+	}
+	return total
+}
+
+// UpdateRequiredReady pushes the current ready-pool requirement into the proxy
+// service. Must be called at startup and on every config reload, or the
+// requirement keeps the value it had when the process started.
+func (p *Proxy) UpdateRequiredReady() {
+	if p == nil {
+		return
+	}
+	p.proxyMu.RLock()
+	svc := p.proxySvc
+	p.proxyMu.RUnlock()
+	if svc == nil {
+		return
+	}
+	svc.SetRequiredReady(p.requiredProxyTries())
 }
 
 // commandCodeClient returns the HTTP client Command Code upstreams
@@ -486,6 +548,13 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 type ProxyError struct {
 	Proxy *ProxyInfo
 	Err   error
+
+	// MidStream marks a failure that happened after content had already been
+	// written to the client. The caller must NOT retry the attempt: the client
+	// already holds partial output, so re-running the same endpoint would
+	// duplicate it. The proxy is still marked down and the request still falls
+	// back to the next model in the chain, resuming from the replayed context.
+	MidStream bool
 }
 
 func (e *ProxyError) Error() string {
@@ -496,34 +565,80 @@ func (e *ProxyError) Unwrap() error {
 	return e.Err
 }
 
-// isProxyConnectError reports whether err is a transport-level failure that is
-// unambiguously the proxy's fault: a dial failure to the proxy, or a proxy CONNECT
-// rejection. TLS handshake failures through an established tunnel, or endpoint
-// HTTP errors, are not proxy errors and are reported as ProviderError so the
-// endpoint (not the proxy) is cooled down.
-func isProxyConnectError(err error) bool {
+// proxyFault reports whether err should be charged to the proxy that carried the
+// request rather than to the endpoint behind it. Callers pass it only when the
+// attempt actually went through a proxy.
+//
+// When a proxy is in the path the tunnel, the certificate and the connection all
+// belong to the proxy, so a transport-layer failure is the proxy's doing. Measured
+// live on 2026-10-18 against public free proxies, these are the failure modes that
+// actually occur, and every one of them was previously classified as an ENDPOINT
+// fault -- which cooled the endpoint and left the broken proxy in rotation:
+//
+//   - CONNECT refused: net.OpError{Op:"proxyconnect"} wrapping the dial error.
+//     Go puts "proxyconnect" on the INNER net.OpError, not on url.Error (whose Op
+//     is the HTTP method, "Post"/"Get"), so matching on url.Error.Op never fires.
+//   - A MITM proxy answering inside the tunnel: an x509 hostname or authority
+//     failure for the ORIGIN's host, which the origin itself would not produce.
+//   - A proxy too slow to finish the tunnel: context deadline / i/o timeout.
+//   - A proxy that drops the connection once the tunnel stood: EOF / reset.
+//
+// An endpoint's HTTP status never reaches here -- client.Do returns those as a
+// response, not an error -- so this cannot steal an endpoint's 429 or 5xx. The one
+// thing this CAN over-attribute is a genuine origin outage behind a working
+// tunnel: it burns a few proxy attempts and marks those proxies down briefly
+// before the chain moves on. Retrying a proxy is cheap and a wrong proxy penalty
+// lasts 30s, so the bias is deliberately towards blaming the proxy.
+func proxyFault(err error) bool {
 	if err == nil {
 		return false
 	}
-	// http.Transport wraps proxy CONNECT failures as url.Error with Op
-	// containing "proxyconnect".
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		if strings.Contains(urlErr.Op, "proxyconnect") {
-			return true
-		}
-		// Dial failure to the proxy: url.Error wrapping net.OpError{Op: "dial"}.
-		var netErr *net.OpError
-		if errors.As(urlErr.Err, &netErr) && netErr.Op == "dial" {
-			return true
-		}
+	// The client hung up. Not the proxy's fault, and not worth a cooldown on
+	// anything: the request is already gone.
+	if errors.Is(err, context.Canceled) {
+		return false
 	}
-	// SOCKS5 dialer path returns net.OpError{Op: "dial"} directly.
+	// Any network-layer fault: the tunnel never stood, or stood and died. Covers
+	// the proxyconnect shape above plus the SOCKS5 dialer's dial errors, and --
+	// because resolution happens at the proxy -- DNS failures too.
 	var netErr *net.OpError
-	if errors.As(err, &netErr) && netErr.Op == "dial" {
+	if errors.As(err, &netErr) {
 		return true
 	}
-	return false
+	// The proxy answered where the origin should have.
+	if tlsIntercepted(err) {
+		return true
+	}
+	// Timeouts of any flavour: the http client's header timeout, our per-attempt
+	// context, or a raw net deadline. context.DeadlineExceeded implements
+	// net.Error with Timeout() == true, so one check covers both spellings.
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// tlsIntercepted reports whether err means something other than the origin
+// finished the TLS handshake: a certificate that does not verify for the host we
+// asked for, an unknown authority, or bytes that are not a TLS record at all.
+// Through a direct connection these would be endpoint faults; through a proxy
+// that built a CONNECT tunnel they are the proxy answering instead.
+func tlsIntercepted(err error) bool {
+	var verification *tls.CertificateVerificationError
+	if errors.As(err, &verification) {
+		return true
+	}
+	var hostname *x509.HostnameError
+	if errors.As(err, &hostname) {
+		return true
+	}
+	var authority *x509.UnknownAuthorityError
+	if errors.As(err, &authority) {
+		return true
+	}
+	var record *tls.RecordHeaderError
+	return errors.As(err, &record)
 }
 
 func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, error) {
@@ -569,14 +684,19 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 
 	resp, err := client.Do(req)
 	if err != nil {
-		// Only unambiguous proxy connection errors (dial failures, CONNECT
-		// rejections) cool down the proxy and trigger a proxy retry. TLS
-		// handshake failures through an established tunnel, EOFs, timeouts on
-		// body read, etc. are endpoint errors and cool down the endpoint.
-		if usedProxy != nil && isProxyConnectError(err) {
+		// Nothing has reached the client yet, so a proxy fault here is safe to
+		// retry on the same endpoint with a different proxy. See proxyFault for
+		// why every transport-layer failure is charged to the proxy.
+		if usedProxy != nil && proxyFault(err) {
 			return nil, &ProxyError{Proxy: usedProxy, Err: err}
 		}
 		return nil, &ProviderError{Err: err}
+	}
+	// The proxy carried this request as far as a response header. That is the
+	// strongest evidence of usability we ever get for a proxy, so it renews the
+	// readiness mark.
+	if usedProxy != nil {
+		p.MarkProxyReady(usedProxy.URL)
 	}
 	return resp, nil
 }
@@ -729,14 +849,18 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 
 	resp, err := client.Do(req)
 	if err != nil {
-		// Only unambiguous proxy connection errors (dial failures, CONNECT
-		// rejections) cool down the proxy and trigger a proxy retry. TLS
-		// handshake failures through an established tunnel, EOFs, timeouts on
-		// body read, etc. are endpoint errors and cool down the endpoint.
-		if usedProxy != nil && isProxyConnectError(err) {
+		// Nothing has reached the client yet, so a proxy fault here is safe to
+		// retry on the same endpoint with a different proxy. See proxyFault for
+		// why every transport-layer failure is charged to the proxy.
+		if usedProxy != nil && proxyFault(err) {
 			return "", nil, 0, &ProxyError{Proxy: usedProxy, Err: err}
 		}
 		return "", nil, 0, &ProviderError{Err: err}
+	}
+	// The proxy carried this request as far as a response header, so it counts
+	// as proven usable and renews its readiness mark.
+	if usedProxy != nil {
+		p.MarkProxyReady(usedProxy.URL)
 	}
 	defer resp.Body.Close()
 
@@ -799,7 +923,15 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	idle := newIdleTimeoutReader(guarded, p.streamIdleTimeout)
 	defer idle.Close()
 
-	return p.streamSSE(w, flusher, idle, endpoint.Model)
+	partial, toolCalls, completionTokens, sErr := p.streamSSE(w, flusher, idle, endpoint.Model)
+	if sErr != nil && usedProxy != nil && proxyFault(sErr) {
+		// The stream died at the transport layer with a proxy in the path, so the
+		// proxy takes the penalty. MidStream is set because content may already
+		// have been flushed: the caller must move to the NEXT model rather than
+		// re-run this endpoint, which would repeat what the client already saw.
+		return partial, toolCalls, completionTokens, &ProxyError{Proxy: usedProxy, Err: sErr, MidStream: true}
+	}
+	return partial, toolCalls, completionTokens, sErr
 }
 
 // firstByteReader applies firstCtx (the size-based timeout) to only the first
@@ -889,7 +1021,27 @@ type idleTimeoutReader struct {
 	timer   *time.Timer
 	closed  bool
 	resetCh chan struct{}
+	// idle records that the watchdog fired. Without it the Read that follows
+	// returns whatever closing the body produced -- an io.EOF, a bare
+	// "read on closed response body", or a reset -- and the caller cannot tell a
+	// deliberate idle timeout from a stream that simply ended. See Read.
+	idle atomic.Bool
 }
+
+// errStreamIdle is returned by idleTimeoutReader.Read once the watchdog has
+// fired. It is a net.Error timeout rather than a bare error so that proxyFault
+// can charge the proxy in the path (and, on a direct connection, so the
+// cooldown classifier sees a retryable timeout rather than an EOF that looks
+// like a normally ended stream).
+type streamIdleError struct{}
+
+func (streamIdleError) Error() string {
+	return "stream idle timeout: no data within the configured window"
+}
+func (streamIdleError) Timeout() bool   { return true }
+func (streamIdleError) Temporary() bool { return true }
+
+var errStreamIdle error = streamIdleError{}
 
 func newIdleTimeoutReader(r io.Reader, timeout time.Duration) *idleTimeoutReader {
 	return &idleTimeoutReader{
@@ -927,7 +1079,14 @@ func (i *idleTimeoutReader) Read(p []byte) (int, error) {
 			i.timer.Stop()
 		}
 	}
+	timedOut := i.idle.Load()
 	i.mu.Unlock()
+	if err != nil && timedOut {
+		// The watchdog closed the body to end a stalled stream, and the error we
+		// got back is that close, not the stream itself. Report the timeout so the
+		// proxy in the path is charged and the chain moves on.
+		return 0, errStreamIdle
+	}
 	return n, err
 }
 
@@ -966,6 +1125,7 @@ func (i *idleTimeoutReader) onIdle() {
 		return
 	}
 	i.closed = true
+	i.idle.Store(true)
 	if c, ok := i.r.(io.Closer); ok {
 		c.Close()
 	}

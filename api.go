@@ -1134,14 +1134,18 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if !gotResp {
 			cancel()
 			g.recordAttempt(ep, time.Since(attemptStart), false)
-			if isClientDisconnect(lastErr) {
+			var pErr *ProxyError
+			if !errors.As(lastErr, &pErr) && isClientDisconnect(lastErr) {
+				// A ProxyError is excluded first: the reset lands on the leg
+				// between the gateway and the PROXY, so it looks exactly like a
+				// client hangup to the string match, but the client is still
+				// waiting and must be given the next model instead of a 499.
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
-			var pErr *ProxyError
 			if !errors.As(lastErr, &pErr) {
 				// Only cool down the endpoint for non-proxy errors.
 				g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
@@ -1536,6 +1540,12 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 					// Proxy failure: mark the proxy down and try again with a
 					// different proxy on the same endpoint.
 					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					if pErr.MidStream {
+						// Content already reached the client, so re-running this
+						// endpoint would duplicate it. Fall through to the
+						// next-model resume path below instead of retrying.
+						break
+					}
 					continue
 				}
 				// Non-proxy error: endpoint failure.
@@ -1561,8 +1571,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		}
 
 		g.recordAttempt(ep, time.Since(attemptStart), false)
-		if isClientDisconnect(err) {
+		var midErr *ProxyError
+		if !errors.As(err, &midErr) && isClientDisconnect(err) {
 			// Client went away; nothing to resume and no point cooling a model.
+			// A ProxyError is excluded first: the reset lands on the leg between
+			// the gateway and the PROXY, so it looks exactly like a client
+			// hangup to the string match, but the client is still waiting and
+			// must be given the resumed stream instead of a 499.
 			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
@@ -1592,10 +1607,16 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// requests that share the same session ID.
 		tried[ep.Key()] = true
 		g.recordFallback(ep)
-		if g.testCooldown > 0 {
-			g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
-		} else {
-			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+		var pErr *ProxyError
+		if !errors.As(err, &pErr) {
+			// Only cool down the endpoint for non-proxy errors. A proxy failure
+			// already took its penalty on the proxy above, and charging the
+			// endpoint too would drop a healthy model from rotation.
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			}
 		}
 		g.recordCooldown()
 		// Mid-stream failure after we already flushed content to the client:
@@ -1858,6 +1879,13 @@ func (g *GatewayContext) ReloadConfig(cfg *Config) {
 	// to be pushed into it or it silently no-ops until restart.
 	if g.metrics != nil {
 		g.metrics.SetLabelCap(cfg.Preferences.MaxLabelCardinalityValue())
+	}
+	// The ready-pool requirement is derived from the provider proxy budgets, so
+	// it changes with the config. Without this, enabling a proxy on another
+	// provider would leave the requirement at its startup value and the pool
+	// would be under-provisioned for the new chain.
+	if g.proxy != nil {
+		g.proxy.UpdateRequiredReady()
 	}
 	providers := 0
 	models := 0

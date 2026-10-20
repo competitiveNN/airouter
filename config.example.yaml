@@ -42,10 +42,10 @@ providers:
   #
   #   proxy: <N>   Route this provider's upstream traffic through the proxy pool
   #                (public HTTP CONNECT and SOCKS5 proxies, refreshed every 15
-  #                minutes from proxy_sources.txt). 0 or omitted = direct
-  #                connection. N > 0 = maximum number of different proxies to
-  #                try on an endpoint before falling back to the next model in
-  #                the chain.
+  #                minutes from the built-in source list in proxysources.go).
+  #                0 or omitted = direct connection. N > 0 = maximum number of
+  #                different proxies to try on an endpoint before falling back
+  #                to the next model in the chain.
   #                Set it here, once, and every chain entry that does not carry
   #                its own proxy value inherits it. A proxy dial/CONNECT failure
   #                cools down the proxy (30s) and retries with a different

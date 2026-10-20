@@ -1,0 +1,27 @@
+# Reference copy of the built-in proxy sources.
+#
+# The authoritative list lives in Go, in defaultProxySources (proxysources.go),
+# because proxy sources are long-lived and frequently updated and therefore
+# belong in the repository rather than in a file that only one machine has.
+# This file is documentation, not configuration -- editing it changes nothing.
+#
+# To ADD a source without a code change, create a file named proxy_sources.txt
+# in the gateway's working directory and put the URL on its own line. Added
+# sources are fetched alongside the built-ins (see ProxyService.loadSources);
+# a missing or empty file simply leaves the built-ins alone. Blank lines and
+# lines starting with '#' are ignored.
+#
+# Each source has its own extractor because the formats genuinely differ:
+# two are plain ip:port lists, one is JSON whose protocol is an ARRAY and whose
+# port may be a number, and three are HTML whose ports are not plain table
+# cells (one computes them with obfuscated JavaScript).
+#
+# A source is discarded whole when its contents report they are older than
+# proxySourceMaxAge (15 minutes); re-fetched every 15 minutes.
+
+https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/refs/heads/main/proxies/top-trusted.txt
+https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/protocols/https.txt
+https://proxylist.geonode.com/api/proxy-list?anonymityLevel=anonymous&protocols=https%2Csocks5&speed=medium&page=1&limit=500&sort_by=responseTime&sort_type=asc
+https://spys.one/en/anonymous-proxy-list/
+https://spys.one/en/socks-proxy-list/
+https://proxydb.net/?anonlvl=4&country=&protocol=https&protocol=socks5&sort_column_id=checked&sort_order_desc=true
