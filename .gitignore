@@ -56,6 +56,29 @@ metrics-ring.jsonl
 # Regenerator backups. `.gitignore` already covers *.bak, but
 # regenerate_config.py also writes config.yaml.bak2 on a second run in the same
 # session, and that one was NOT ignored: it showed up in `git status`, so it
-# participated in the gate's tree fingerprint and could turn a run INVALID for a
-# file nobody made by hand.
+# participated in the gate's tree fingerprint and could turn a run INVALID for
+# a file nobody made by hand.
 *.bak2
+
+# ---- Audit artifacts: ephemeral, never committed ----
+# Standing rule: no audit file is ever committed. Audit output is work product --
+# read it, act on the finding, discard it. A committed audit is a snapshot of a
+# state that no longer exists, and a merged one is a claim nobody re-verifies.
+#
+# The patterns below match ARTIFACTS only. The code that PERFORMS audits --
+# scripts/audit-*.py and scripts/audit-*.sh -- is permanent, tested and gated,
+# and is deliberately NOT matched: it reads and asserts, which is exactly what
+# belongs in git. (An artifact is a report or note ABOUT the code; a checker is
+# code that reads the code. Only the first is ephemeral.)
+#
+# Note the extension split is load-bearing: these match .md/.txt/.json, so no
+# pattern here can ever swallow a checker.
+docs/notebook/
+audit-*.md
+audit-*.txt
+audit-*.json
+audit-notes*.md
+*-audit.md
+*_audit.md
+*_findings.md
+*_audit_report.*

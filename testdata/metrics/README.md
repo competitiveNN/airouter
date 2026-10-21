@@ -75,7 +75,7 @@ enough distinct endpoint labels to force evictions, and scrape:
 Replacing the file is expected to require revisiting the numbers recorded in
 `TestInvariantSixThresholdHasNoHeadroom` — that is the point of keeping the
 measurement in a test rather than in a commit message. See
-`docs/audit.md` for the round-by-round history behind both fixtures.
+`docs/RUNBOOK.md` for the round-by-round history behind both fixtures.
 
 ## A caveat worth keeping
 

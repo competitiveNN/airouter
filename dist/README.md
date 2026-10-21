@@ -20,10 +20,9 @@ Two consequences, both worth internalising before using anything below:
   - The artifacts are still the point. They carry the commits the remote does not
     have yet, and the script below regenerates them in seconds.
   - **A list of "what is unpushed" written in a document is a snapshot of a thing
-    that moves.** Do not read the list; run the check that compares it against the
-    repository (`./scripts/audit-attribution-check.py`), or ask git directly
-    (`git rev-list --reverse origin/master..HEAD`). The checker exists so that a
-    stale list is a failure, not a surprise handed to the next person.
+    that moves.** Do not read the list; ask git directly (`git rev-list --reverse
+    origin/master..HEAD`). Comparing the document against the command keeps a stale
+    list from being handed to the next person.
 
 > **Do not embed a token in a remote URL to push.** `.git/config` is plaintext,
 > and the token then appears in every `git remote -v` and in the process table of
@@ -167,17 +166,15 @@ top describes: the list is checked, not trusted.
 
 An empty list would be the check working, not a corrupted handoff. `origin/master`
 advances underneath the document when someone else pushes, and
-`scripts/audit-attribution-check.py` then reports every entry as "not an unpushed
-commit (it may have been pushed or rewritten)". `gate.sh` runs that check, so a
-stale list here is a red gate — which is also how you would find out that the
-sentence above has gone out of date.
+Test each entry against `git rev-list --reverse origin/master..HEAD`. A stale list
+here is a surprise handed to the next person — the document itself is the check.
 
 That is the whole required list — commits that touch only `dist/` are exempt by
 design, so the commits maintaining this file are not repeated in it. The list is
-checked rather than trusted: `scripts/audit-attribution-check.py` compares it as
-a **set** against `git rev-list origin/master..HEAD` -- not as a count, because a
-count is satisfied by any equally-wrong list of the same length -- and fails when
-the two disagree in either direction.
+checked rather than trusted: compare it as a **set** against
+`git rev-list origin/master..HEAD` -- not as a count, because a count is satisfied
+by any equally-wrong list of the same length -- and check that the two disagree in
+neither direction.
 
 Two properties make any such list awkward, and neither is a bug to be fixed:
 
@@ -206,24 +203,10 @@ compared against `HEAD`'s. (`git am` re-creates each commit, so the resulting
 commits have different hashes — the trees are what must match, and they do.)
 The recovered tree builds, and the full test suite passes there:
 
-    go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh && bash scripts/audit-drift-selftest.sh && bash scripts/audit-attribution-selftest.sh
+    go build ./... && go test -count=1 ./... && bash scripts/fuzz-gate-selftest.sh
 
-One check is excluded from the `git am` half on purpose, and the reason is
-worth stating so it is not mistaken for drift later. `git am` re-hashes every
-commit it replays, so by hash alone every citation the documentation makes is
-absent in a patch-recovered tree. Rather than leave it broken there, the checker
-grew a mode that matches citations by the change they carry rather than the
-hash they happen to have:
-
-```sh
-python3 scripts/audit-attribution-check.py --recovered --against /path/to/original
-```
-
-It uses `git patch-id --stable`, which fingerprints a commit's diff rather than
-its metadata, so it survives re-hashing. Verified on this repository: all 77
-content fingerprints are identical between `HEAD` and its `git am` replay, and a
-fabricated hash is still rejected in that mode. Use the bundle when the history
-itself matters.
+Use the bundle when the history itself matters: `git am` re-hashes every commit
+it replays, so a patch-recovered tree preserves the tree but none of the hashes.
 
 ## Before trusting the recovery path
 

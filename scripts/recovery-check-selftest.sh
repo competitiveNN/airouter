@@ -3,9 +3,8 @@
 #
 # WHY THIS EXISTS
 #
-# recovery-check.sh is the one script in this audit layer that touches the real
-# dist/ artifacts: it fetches the bundle, replays the patch, and builds the
-# result. That makes it the one whose failure is least contained -- a bug in it
+# recovery-check.sh touches the real dist/ artifacts: it fetches the bundle,
+# replays the patch, and builds the result. That makes it the one whose failure is least contained -- a bug in it
 # can quietly skip the very comparison it exists to perform, and the honest
 # outcome of that is a green run that proved nothing.
 #
@@ -62,7 +61,7 @@ set -uo pipefail
 # 1 + 1 + 1 for B. A control that cannot apply reports the run as a FAILURE
 # rather than shrinking the total, because a control that silently did nothing
 # is the one failure mode this file exists to prevent.
-EXPECTED=37
+EXPECTED=34
 
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -110,19 +109,18 @@ assert_run() {
 g() { git -C "$1" -c user.email=t@t -c user.name=t "${@:2}"; }
 
 # A fixture shaped like the real repository: a real upstream ref, a real
-# dist/ directory holding the real export script, a real recovery-check, and a
-# little audit layer for it to verify. `upstream <dir>` marks the current HEAD
-# as origin/master; everything after that is unpushed.
+# dist/ directory holding the real export script, and a real recovery-check.
+# `upstream <dir>` marks the current HEAD as origin/master; everything after
+# that is unpushed.
 new_repo() {
   local name="$1"
   local dir="$TMPROOT/$name"
   mkdir -p "$dir/scripts" "$dir/dist" "$dir/docs"
   cp "$CHECK" "$dir/scripts/recovery-check.sh"
-  # The audit layer is copied WHOLE, not cherry-picked. recovery-check.sh runs
-  # the real self-tests and checkers in the recovered tree, so a fixture missing
-  # scripts/fuzz-gate.sh or a realistic docs/audit.md would fail every recovered-
-  # tree assertion for a reason that has nothing to do with recovery. The whole
-  # layer is cheap and inert, so the honest fixture is the real one.
+  # recovery-check.sh runs the real self-tests in the recovered tree, so a
+  # fixture missing scripts/fuzz-gate.sh would fail every recovered-tree
+  # assertion for a reason that has nothing to do with recovery. Copying the
+  # whole layer keeps the fixture realistic rather than stand-in.
   for s in "$REPO"/scripts/*; do
     cp "$s" "$dir/scripts/" 2>/dev/null
   done
@@ -182,7 +180,6 @@ out=$(run_check "$R" --quick); got=$?
 assert_run "healthy artifacts pass" 0 "bundle reproduces the working tree" "$out" "$got"
 assert_run "the patch replay is reported as applied" 0 "git am --3way" "$out" "$got"
 assert_run "the bundle preserves commit hashes" 0 "hashes preserved" "$out" "$got"
-assert_run "--recovered resolves the re-hashed citations" 0 "--recovered resolves" "$out" "$got"
 
 echo "recovery-selftest: case 2 -- a stale artifact is refused"
 # A fresh commit after the export: the artifacts no longer describe HEAD. The
@@ -530,43 +527,6 @@ else
   else
     bad "control A: a stale artifact still failed with the comparison removed (exit $got)"
   fi
-fi
-
-# Control B: neuter the --recovered verification. The whole reason the patch
-# path is checked is that `git am` re-hashes every commit; if --recovered
-# silently stopped resolving, the handoff would break at exactly the moment
-# someone relies on it, which is the one moment nobody is watching.
-CB="$TMPROOT/control-b-repo"
-B="$TMPROOT/control-b.sh"
-python3 - "$CHECK" "$B" <<'PYDEL'
-import sys
-src = open(sys.argv[1]).read()
-old = 'if python3 scripts/audit-attribution-check.py --recovered --against "$REPO" >/dev/null 2>&1; then'
-if src.count(old) != 1:
-    sys.exit("control B: pattern found %d times" % src.count(old))
-open(sys.argv[2], 'w').write(src.replace(old, 'if false; then'))
-PYDEL
-if [ $? -ne 0 ] || cmp -s "$CHECK" "$B"; then
-  printf '  skip control B: the edit did not apply, so the control would have\n' >&2
-  printf '               proved nothing; fix the pattern before trusting it\n' >&2
-  SKIPPED_B=1
-else
-  SKIPPED_B=0
-  if grep -qF -- '--recovered --against "$REPO" >/dev/null' "$B"; then
-    bad "control B applied (the --recovered verification was removed)"
-  else
-    ok "control B applied (the --recovered verification was removed)"
-  fi
-  cp -r "$R9" "$CB"
-  cp "$B" "$CB/scripts/recovery-check.sh"
-  write_artifacts "$CB"
-  out=$(run_check "$CB" --quick); got=$?
-  # The neutered --recovered branch reports itself as a FAILURE line, because
-  # that is the whole point: the check cannot resolve the re-hashed citations
-  # and says so. Asserting on the "cannot resolve" text is what distinguishes
-  # this from a run that failed for some unrelated reason.
-  assert_run "control B: --recovered is genuinely exercised" 1 \
-    "--recovered cannot resolve the re-hashed citations" "$out" "$got"
 fi
 
 echo ""

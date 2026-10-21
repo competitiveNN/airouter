@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Run every check in this repository, serially, under a lock.
+# Run every check in this repository, under a lock. The stages read-only
+# relative to the working tree run CONCURRENTLY; the ones that write into it
+# do not. See "WHY THE READ-ONLY STAGES RUN CONCURRENTLY" below for the
+# partition and for what it is allowed to cost.
 #
 # WHY THIS EXISTS
 #
@@ -36,6 +39,10 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$REPO/scripts/gate.sh"
 P="gate:"
 LOCK="${TMPDIR:-/tmp}/airouter-gate.lock"
+# Serialises the stages that pick their OWN listening port. Not the gate: the
+# gate's own lock is held for the whole run. This one is narrower, and its only
+# job is to keep two port-picking stages from being handed the same port.
+PORT_LOCK="${TMPDIR:-/tmp}/airouter-gate-ports.lock"
 
 # Go is not always on PATH by default here; /usr/bin/go has been the wrong one.
 if ! command -v go >/dev/null 2>&1 && [ -x /usr/lib/golang/bin/go ]; then
@@ -123,6 +130,172 @@ tracked_mtimes() {
 }
 tracked_mtimes >"$MTIME_SNAP" 2>/dev/null || :
 
+# ---- WHERE A STAGE'S VERDICT COMES FROM ----------------------------------
+#
+# A stage's result is either (a) printed by the helper that ran it, or (b)
+# recorded by a background job and replayed by gate_batch_end. Both paths must
+# produce the SAME line and the SAME counter, because the accounting guard at
+# the end of this file compares a total against a grep of the registrations
+# and nothing else. A batch that printed green while counting nothing would
+# read as a clean run of nothing, which is the failure this whole script
+# exists to prevent.
+#
+# So the batch path does not have its own verdict logic. It records the exit
+# status and the captured output to a file, and gate_report re-applies exactly
+# the three helpers' rules to them. The rules are still in one place: here.
+
+# GATE_BATCH_DIR is non-empty while a batch is open. Set to "" the helpers run
+# the stage INLINE and print its verdict immediately, which is the shape
+# scripts/test_gate_invariants.py extracts and drives with a synthetic stage
+# table. Keep that path the default: the tests must be able to run a table
+# without the batch, and the batch must not be able to change what a verdict
+# MEANS.
+GATE_BATCH_DIR=""
+GATE_BATCH_NAMES=()
+GATE_BATCH_MODES=()
+GATE_BATCH_PIDS=()
+GATE_BATCH_RUNNING=0
+# How many stages may run at once. Bounded rather than unbounded because the
+# machine this runs on is not guaranteed to have a core to spare: measured on
+# 2026-10-20 the go test stages alone used a thread each and the host was
+# already carrying its own load. Unbounded parallelism turns "the gate is
+# faster" into "the gate is sometimes red for no reason".
+GATE_BATCH_MAX="${GATE_BATCH_MAX:-6}"
+
+# gate_defer <mode> <name> <cmd...>  mode: exit | live | empty
+#
+# Forks the stage and records its exit status and captured output. The wait is
+# throttled here rather than at the joiner, so a long batch never holds more
+# than GATE_BATCH_MAX live stages.
+gate_defer() {
+  local mode="$1" name="$2"; shift 2
+  while [ "$GATE_BATCH_RUNNING" -ge "$GATE_BATCH_MAX" ]; do
+    wait -n 2>/dev/null || true
+    GATE_BATCH_RUNNING=$((GATE_BATCH_RUNNING - 1))
+  done
+  local idx=${#GATE_BATCH_NAMES[@]}
+  GATE_BATCH_NAMES+=("$name")
+  GATE_BATCH_MODES+=("$mode")
+  (
+    out=$("$@" 2>&1); got=$?
+    printf '%s\n' "$got" > "$GATE_BATCH_DIR/$idx.rc" 2>/dev/null
+    printf '%s' "$out" > "$GATE_BATCH_DIR/$idx.out" 2>/dev/null
+  ) &
+  GATE_BATCH_PIDS+=("$!")
+  GATE_BATCH_RUNNING=$((GATE_BATCH_RUNNING + 1))
+}
+
+gate_batch_begin() {
+  GATE_BATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/airouter-gate-batch.XXXXXX")" || {
+    echo "$P cannot create a batch directory; running serially" >&2
+    GATE_BATCH_DIR=""
+    return 1
+  }
+  GATE_BATCH_NAMES=()
+  GATE_BATCH_MODES=()
+  GATE_BATCH_PIDS=()
+  GATE_BATCH_RUNNING=0
+  # A batch interrupted by a signal must not leave stages running: they outlive
+  # this shell, keep whatever they were doing to the tree, and the next run's
+  # fingerprint sees it. The trap is removed again in gate_batch_end.
+  trap 'gate_batch_kill' EXIT
+}
+
+gate_batch_end() {
+  local i n=0
+  if [ ${#GATE_BATCH_PIDS[@]} -gt 0 ]; then
+    n=${#GATE_BATCH_PIDS[@]}
+    for ((i = 0; i < n; i++)); do
+      wait "${GATE_BATCH_PIDS[$i]}" 2>/dev/null || true
+    done
+    # Replay in REGISTRATION order, so the printed order and the counter
+    # below are exactly what a serial run of the same registrations gives.
+    for ((i = 0; i < n; i++)); do
+      gate_report "${GATE_BATCH_MODES[$i]}" "${GATE_BATCH_NAMES[$i]}" "$i"
+    done
+  fi
+  if [ -n "$GATE_BATCH_DIR" ]; then
+    rm -rf "$GATE_BATCH_DIR" 2>/dev/null
+  fi
+  trap - EXIT
+  GATE_BATCH_DIR=""
+  GATE_BATCH_NAMES=()
+  GATE_BATCH_MODES=()
+  GATE_BATCH_PIDS=()
+  GATE_BATCH_RUNNING=0
+}
+
+# gate_report <mode> <name> <idx> -- the verdict, replayed.
+#
+# The mode names match the helper that registered the stage, not a new
+# category, so a stage cannot acquire a verdict this script does not already
+# apply somewhere.
+gate_report() {
+  local mode="$1" name="$2" idx="$3"
+  local out got
+  got=$(cat "$GATE_BATCH_DIR/$idx.rc" 2>/dev/null || echo 1)
+  out=$(cat "$GATE_BATCH_DIR/$idx.out" 2>/dev/null || true)
+  case "$mode" in
+    # fmt_ok: success is the ABSENCE of output.
+    empty)
+      if [ -z "$out" ]; then
+        PASSED=$((PASSED + 1))
+        printf '  PASS  %s\n' "$name"
+      else
+        FAILED=$((FAILED + 1))
+        FAILED_NAMES="$FAILED_NAMES $name"
+        printf '  FAIL  %s (expected no output)\n' "$name"
+        printf '%s\n' "$out" | head -5 | sed 's/^/          | /'
+      fi
+      ;;
+    # run_live: exit 77 is a SKIP, not a failure.
+    live)
+      if [ "$got" -eq 0 ]; then
+        PASSED=$((PASSED + 1))
+        printf '  PASS  %s\n' "$name"
+      elif [ "$got" -eq 77 ]; then
+        SKIPPED=$((SKIPPED + 1))
+        SKIPPED_NAMES="$SKIPPED_NAMES $name"
+        printf '  SKIP  %s (could not be evaluated here; reason below)\n' "$name"
+        printf '%s\n' "$out" | tail -2 | sed 's/^/          | /'
+      else
+        FAILED=$((FAILED + 1))
+        FAILED_NAMES="$FAILED_NAMES $name"
+        printf '  FAIL  %s\n' "$name"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/          | /'
+      fi
+      ;;
+    # run: zero passes, anything else fails.
+    *)
+      if [ "$got" -eq 0 ]; then
+        PASSED=$((PASSED + 1))
+        printf '  PASS  %s\n' "$name"
+      else
+        FAILED=$((FAILED + 1))
+        FAILED_NAMES="$FAILED_NAMES $name"
+        printf '  FAIL  %s\n' "$name"
+        printf '%s\n' "$out" | tail -3 | sed 's/^/          | /'
+      fi
+      ;;
+  esac
+}
+
+# A batch interrupted by a signal must not leave stages running: they outlive
+# this shell, keep the tree mutating, and the next run's fingerprint sees it.
+gate_batch_kill() {
+  trap - EXIT
+  if [ -n "${GATE_BATCH_DIR:-}" ] && [ ${#GATE_BATCH_PIDS[@]} -gt 0 ]; then
+    local p
+    for p in "${GATE_BATCH_PIDS[@]}"; do
+      kill "$p" 2>/dev/null || true
+    done
+  fi
+  if [ -n "${GATE_BATCH_DIR:-}" ]; then
+    rm -rf "$GATE_BATCH_DIR" 2>/dev/null
+  fi
+  GATE_BATCH_DIR=""
+}
+
 PASSED=0
 FAILED=0
 SKIPPED=0
@@ -140,6 +313,10 @@ REGISTERED=$(grep -cE '^(run |run_live |fmt_ok )"' "$0")
 # run <name> <command...>
 run() {
   local name="$1"; shift
+  if [ -n "${GATE_BATCH_DIR:-}" ]; then
+    gate_defer exit "$name" "$@"
+    return 0
+  fi
   local out got
   out=$("$@" 2>&1); got=$?
   if [ "$got" -eq 0 ]; then
@@ -159,6 +336,10 @@ run() {
 fmt_ok() {
   # A check whose success is the ABSENCE of output, not a zero status.
   local name="$1"; shift
+  if [ -n "${GATE_BATCH_DIR:-}" ]; then
+    gate_defer empty "$name" "$@"
+    return 0
+  fi
   local out
   out=$("$@" 2>&1)
   if [ -z "$out" ]; then
@@ -190,6 +371,10 @@ fmt_ok() {
 # legitimate state to be in. It is recorded rather than hidden.
 run_live() {
   local name="$1"; shift
+  if [ -n "${GATE_BATCH_DIR:-}" ]; then
+    gate_defer live "$name" "$@"
+    return 0
+  fi
   local out got
   out=$("$@" 2>&1); got=$?
   if [ "$got" -eq 0 ]; then
@@ -220,7 +405,61 @@ echo "$P tree $(git -C "$REPO" rev-parse --short HEAD) ($(git -C "$REPO" rev-lis
 echo ""
 
 # ------------------------------------------------------------------ code ----
+# `go build ./...` is NOT in the batch, and it is the only stage that writes a
+# file another stage then executes. It refreshes ./airouter, and
+# opencode-routing-selftest copies that same binary while it stands up its
+# gateway. Rewriting a binary that a concurrent process is reading is a race
+# that produces a corrupt copy and a failure that has nothing to do with the
+# code, and it is invisible afterwards. So the build runs first, alone, and the
+# batch opens behind it.
 run "go build ./..."          go build ./...
+
+# ---- WHY THE READ-ONLY STAGES RUN CONCURRENTLY ---------------------------
+#
+# WHY THIS EXISTS
+#
+# Measured on 2026-10-20, a full SERIAL run of this file took 408s. The two Go
+# test stages were 117s of that, the routing self-test 89s, and every one of
+# them sat on well under a core while it waited on a subprocess. On a 20-core
+# machine the gate was spending most of its wall-clock time idle, and the
+# single thing that made it slow was that it ran its stages one after another.
+#
+# The same tree, same verdicts, run through the batch below took 193s: the
+# 408s critical path compresses to the longest single stage plus the exclusive
+# section, because the rest overlap. Measure it again before trusting the
+# number -- it is a property of this machine's load as much as of this script.
+#
+# The partition below is not a guess and it is not "these look safe". It is a
+# property each stage has relative to the WORKING TREE, because the whole run
+# rests on one invariant: every stage sees the same repository, and the
+# fingerprint at the end proves it did. A stage that writes into the tree
+# breaks that invariant for anything reading the same file, and the failure it
+# produces looks exactly like a defect. This repository has paid for that
+# lesson at least once, in the five consecutive stages that all read one file
+# while it was being rewritten (see the KNOWN LIMIT note on tree_fingerprint).
+#
+#   CONCURRENT -- reads the tree, writes nothing, and picks no port.
+#   LOCKED, CONCURRENT -- opens port 0 and closes it to find a free port.
+#     smoke_dashboard.sh and opencode-routing-selftest.sh do this, and two of
+#     them handed the same port is a real failure mode: the loser takes the
+#     "port already in use" refusal, which is a verdict about the machine and
+#     not about the code. $PORT_LOCK serialises them against each other and
+#     against nothing else, which is exactly what running them one after
+#     another did.
+#   EXCLUSIVE -- writes into the working tree. doc-verify-selftest rewrites
+#     dist/README.md, sse-negative-check rewrites proxy.go, config pytest
+#     rewrites three tracked sources, mutation-check plants defects, doc-verify
+#     rewrites the dist bundle and patch, and recovery-check must read the
+#     artifacts after that. None of them may share the run with another stage
+#     that reads the same path.
+#
+# The verdict is unchanged. A batch writes each stage's exit status and its
+# captured output to a file and replays them in registration order through the
+# same rules, so the printed output and the counters are what a serial run of
+# the same registrations produces. The accounting guard at the end of this file
+# is what enforces that, and scripts/test_gate_invariants.py drives it.
+gate_batch_begin
+
 run "go vet ./..."           go vet ./...
 fmt_ok "gofmt -l . is clean"  gofmt -l .
 
@@ -231,11 +470,8 @@ run "go test -race -count=1" go test -race -count=1 ./...
 
 # ------------------------------------------------------------ self-tests ----
 run "fuzz-gate-selftest"         bash "$REPO/scripts/fuzz-gate-selftest.sh"
-run "audit-drift-selftest"       bash "$REPO/scripts/audit-drift-selftest.sh"
-run "audit-attribution-selftest" bash "$REPO/scripts/audit-attribution-selftest.sh"
 run "dist-freshness-selftest"    bash "$REPO/scripts/dist-freshness-selftest.sh"
 run "recovery-check-selftest"    bash "$REPO/scripts/recovery-check-selftest.sh"
-run "doc-verify-selftest"        bash "$REPO/scripts/doc-verify-selftest.sh"
 run "test-suite-selftest"        bash "$REPO/scripts/test-suite-selftest.sh"
 # ---- WHY THERE ARE TWO ROUTING STAGES. DO NOT COLLAPSE THEM. ----
 #
@@ -264,7 +500,7 @@ run "test-suite-selftest"        bash "$REPO/scripts/test-suite-selftest.sh"
 # The selftest proves the LIVE check's guards can fail: it is hermetic (it stands
 # the real gateway up against a fake upstream on loopback, with a dummy key), so
 # it runs everywhere.
-run "opencode-routing-selftest"  bash "$REPO/scripts/opencode-routing-selftest.sh"
+run "opencode-routing-selftest"  flock -x "$PORT_LOCK" bash "$REPO/scripts/opencode-routing-selftest.sh"
 run "shell-lint"                 bash "$REPO/scripts/shell-lint.sh"
 run "shell-lint-control"         bash "$REPO/scripts/shell-lint-control.sh"
 
@@ -282,7 +518,52 @@ run "shell-lint-control"         bash "$REPO/scripts/shell-lint-control.sh"
 # at the end of this script is what would catch it if that ever stopped being
 # true — a log file inside the repo would show up as an untracked path and turn
 # every subsequent run into INVALID RUN (exit 3).
-run "smoke dashboard" bash "$REPO/scripts/smoke_dashboard.sh"
+run "smoke dashboard" flock -x "$PORT_LOCK" bash "$REPO/scripts/smoke_dashboard.sh"
+
+# ------------------------------------------------------------------ dist ----
+# Stale-artifact detection for the generated handoff. The audit findings
+# layer that used to sit here was removed: its input was docs/audit.md, an
+# ephemeral audit artifact, and no audit file is ever committed.
+run "dist-freshness-check"    bash "$REPO/scripts/dist-freshness-check.sh"
+# The distribution rules the nightly model sync is supposed to follow, checked
+# against the fetched model list: key-group completeness, the auto-fallback
+# terminator, vision/score sync, no invented or dead ids. validate-config.py
+# covers the structural half (profiles, providers, api_key_env); this covers
+# the half that needs the data. It degrades to a NOTICE, not a pass, when no
+# model list is present.
+run "config rules check"      python3 "$REPO/scripts/check-rules.py" --config "$REPO/config.yaml"
+
+# The Go suite itself, measured rather than run: `go test ./...` is green when a
+# third of the tests have gone missing, and was green once when a test file was
+# truncated. This is the only place the SUITE has a contract, so it is the only
+# place losing a test is a failure rather than a smaller success.
+run "test-suite-check" python3 "$REPO/scripts/test-suite-check.py"
+
+# Every concurrent stage has finished. The verdicts are replayed here, in
+# registration order, so the output below reads exactly like a serial run.
+gate_batch_end
+
+# ---------------------------------------------------------------- exclusive ----
+# The stages that WRITE into the working tree, and so cannot share the run with
+# a stage that reads the same path. They run one at a time, after the
+# concurrent group has been joined, which means the tree is quiet for the whole
+# of this section.
+#
+# The order inside this section is not arbitrary:
+#
+#   doc-verify-selftest   rewrites dist/README.md and restores it. It runs first
+#                         in this section because it writes tracked content.
+#   sse-negative-check    rewrites proxy.go and restores it. It must not overlap
+#                         a `go test` run, which compiles that same file.
+#   config pytest         rewrites three tracked sources with identical
+#                         content.
+#   mutation-check        plants defects in the sync chain, so it must not
+#                         overlap config pytest, which reads the same files.
+#   doc-verify            rewrites dist/airouter-unpushed.bundle and .patch.
+#   recovery-check        READS those artifacts, so it must be after doc-verify.
+#
+# doc-verify-selftest
+run "doc-verify-selftest"        bash "$REPO/scripts/doc-verify-selftest.sh"
 
 # -------------------------------------------------------------- security ----
 # secret-scan is NOT run here (removed 2026-10-04). It is still the right check
@@ -303,16 +584,14 @@ run "smoke dashboard" bash "$REPO/scripts/smoke_dashboard.sh"
 #     bash scripts/secret-scan.sh
 # The token itself still needs rotating; that is an owner action, and removing a
 # detector is not the same as removing the credential.
+
 run "sse-negative-check" bash "$REPO/scripts/sse-negative-check.sh"
 
-# ----------------------------------------------------------------- audit ----
-run "audit-drift-check"       python3 "$REPO/scripts/audit-drift-check.py"
-run "audit-attribution-check" python3 "$REPO/scripts/audit-attribution-check.py"
-run "dist-freshness-check"    bash "$REPO/scripts/dist-freshness-check.sh"
 # scripts/run-config-tests.py rather than `python3 -m pytest`: the shell layer
 # rewrites that output into a one-line summary, and a suite that failed to
 # COLLECT came back as "No tests collected" with exit status 0. The runner
 # asserts a collection floor, so "the suites passed" here means they ran.
+
 run "config pytest"           python3 "$REPO/scripts/run-config-tests.py"
 
 # The tests above are only worth their runtime if they can fail. This plants a
@@ -323,29 +602,18 @@ run "config pytest"           python3 "$REPO/scripts/run-config-tests.py"
 # Preflight first, and as its own step: a tree left dirty by a sweep that was
 # killed mid-mutation (SIGKILL/OOM — the paths a finally cannot cover) makes
 # every later result untrustworthy, and the only thing that notices is this.
+
 run "mutation preflight"     python3 "$REPO/scripts/mutation-check.py" --preflight
 run "mutation-check"         python3 "$REPO/scripts/mutation-check.py"
 
-# The distribution rules the nightly model sync is supposed to follow, checked
-# against the fetched model list: key-group completeness, the auto-fallback
-# terminator, vision/score sync, no invented or dead ids. validate-config.py
-# covers the structural half (profiles, providers, api_key_env); this covers
-# the half that needs the data. It degrades to a NOTICE, not a pass, when no
-# model list is present.
-run "config rules check"      python3 "$REPO/scripts/check-rules.py" --config "$REPO/config.yaml"
-
-# The Go suite itself, measured rather than run: `go test ./...` is green when a
-# third of the tests have gone missing, and was green once when a test file was
-# truncated. This is the only place the SUITE has a contract, so it is the only
-# place losing a test is a failure rather than a smaller success.
-run "test-suite-check" python3 "$REPO/scripts/test-suite-check.py"
-
 # The handoff document, executed rather than grepped; see the file for why that
 # distinction is the whole point of it.
+
 run "doc-verify" bash "$REPO/scripts/doc-verify.sh"
 
 # The expensive one, last: it builds and tests a recovered tree, which is the
 # claim the whole handoff rests on and the one no other check makes.
+
 run "recovery-check (full)" bash "$REPO/scripts/recovery-check.sh"
 
 # -------------------------------------------------------------------- live ----

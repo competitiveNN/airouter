@@ -37,7 +37,7 @@ WHAT IS CHECKED
      that only logs passes forever.
 
 The baseline is a SUPERSET contract, not a count. A count is satisfied by any
-equally-wrong set -- the same reasoning that made scripts/audit-attribution-check
+equally-wrong set -- the same reasoning that made the attribution checker
 compare commit sets instead of lengths. `EXPECTED=205` would be satisfied by 205
 tests of which 40 were different tests, would need editing every time a test is
 added, and would name nothing when it failed. Here, adding tests is free, and
