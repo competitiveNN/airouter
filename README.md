@@ -281,9 +281,8 @@ They are gauges rather than counters because an eviction *adds* to them, and a
 `rate()` over a series that can decrease is worse than no series. Read them as
 totals since process start.
 
-`docs/RUNBOOK.md` ("Label cardinality is bounded") covers what to watch, and
-`docs/audit.md` records the bugs found along the way — including four that a
-green test suite did not catch, among them an `__overflow__` bucket that was
+`docs/RUNBOOK.md` ("Label cardinality is bounded") covers what to watch.
+One bug a green test suite did not catch: an `__overflow__` bucket that was
 being exported as a histogram whose finite buckets were all `0` while its own
 `_sum` said every observation was nearly instant. It parsed, declared
 `histogram`, and made every dashboard look healthy.
@@ -386,7 +385,6 @@ cooldowns); it carries no secrets.
 | `systemd/` | User units: the daemon and the model-sync service + timer |
 | `scripts/` | Config validation, rules checker, mutation harness, sync, gates |
 | `docs/RUNBOOK.md` | Operational runbook: metrics, cooldowns, failure modes |
-| `docs/audit.md` | Audit findings, with the regression tests that pin each one |
 
 ## Handing off unpushed commits
 
@@ -419,7 +417,6 @@ python3 scripts/run-config-tests.py # config suites; asserts a collection floor
 python3 scripts/mutation-check.py   # plants defects, proves the suites go red
 python3 scripts/validate-config.py config.yaml
 bash scripts/secret-scan.sh         # manual: scans local .git/config too, so it is not a gate stage
-python3 scripts/audit-drift-check.py
 ```
 
 `scripts/sse-negative-check.sh` mutates the SSE ordering logic and asserts

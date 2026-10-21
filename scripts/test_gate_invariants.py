@@ -39,6 +39,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -368,8 +369,38 @@ def _tracked_mtimes_helper() -> str:
     return text[start:end + 2] + "\n"
 
 
-def extract_stage_machine_parts() -> tuple[str, str]:
+def _batch_machinery_lines() -> list[str]:
+    """gate.sh's batch machinery: its variables and its five helpers, verbatim.
+
+    Everything from the banner that introduces it to just before `PASSED=0`.
+    Extracted rather than restated so a test that drives the batch path is
+    driving the real thing: if someone deletes a helper, or reorders the
+    variables so they no longer precede the counters, this fails.
+    """
+    lines = _gate_lines()
+    prefix = "# ---- WHERE A STAGE'S VERDICT COMES FROM"
+    banner = next(
+        i for i, l in enumerate(lines) if l.startswith(prefix)
+    )
+    counters = next(
+        i for i, l in enumerate(lines) if l.startswith("PASSED=0")
+    )
+    assert counters > banner, "the batch machinery does not precede the counters"
+    body = lines[banner:counters]
+    for name in ("gate_defer", "gate_batch_begin", "gate_batch_end", "gate_report", "gate_batch_kill"):
+        assert body.count(f"{name}() {{") == 1, f"the batch machinery lost {name}()"
+    return body
+
+
+def extract_stage_machine_parts(include_batch: bool = False) -> tuple[str, str]:
     """(prefix, summary) — the gate's arithmetic, verbatim, in two halves.
+
+    include_batch prepends the concurrent-batch machinery (its variables and
+    its five helpers) to the prefix, so a test can drive a stage table through
+    the BATCH path rather than only the inline one. The default stays False
+    because every existing test drives the inline path, and the inline path is
+    the one the accounting guard's own synthetic table must not depend on the
+    batch for -- otherwise a gate with no batch at all would fail them.
 
     Together these are what registers a stage, what each helper counts, and what
     the summary line reports. Extracting them lets a test run a synthetic stage
@@ -415,8 +446,13 @@ def extract_stage_machine_parts() -> tuple[str, str]:
         f"gate.sh sections are out of the expected order: counters={counters_start} "
         f"registered={registered} summary={summary_start}"
     )
+    batch_machine = []
+    if include_batch:
+        batch_machine = _batch_machinery_lines()
+
     prefix = "\n".join(
-        lines[counters_start:registered + 1]
+        batch_machine
+        + lines[counters_start:registered + 1]
         + ["REGISTERED=__N__"]          # the real grep counts gate.sh's own stages
         + function("run")
         + function("fmt_ok")
@@ -749,3 +785,290 @@ def test_shell_lint_notice_names_the_file_not_a_scratch_elsewhere(tmp_path):
     rc, out = run_lint(repo)
     assert rc == 0, out
     assert "outside.sh" not in out, f"a file outside scripts/ was swept:\n{out}"
+
+# ------------------------------------------------- the concurrent batch ----
+#
+# Everything above drives gate.sh's stage helpers INLINE. That is the path the
+# accounting guard and the synthetic stage table exercise, and it is still the
+# path a stage takes when it is not in a batch. The batch is a second path to
+# the same verdicts, and a second path to the same verdicts is exactly where a
+# gate grows a way to report green having checked nothing -- so it gets its
+# own tests, and they compare the two paths against each other rather than
+# against a paraphrase of either.
+
+# The stages that are allowed to run inside the concurrent batch.
+#
+# This is an ALLOWLIST, not a denylist, and that is the whole point. A denylist
+# of the stages known to write into the tree would let a NEW writer into the
+# batch silently, which is the mistake that matters: a stage that rewrites a
+# tracked file while another stage reads it produces a failure that looks like
+# a defect and is not one. With an allowlist, a new stage has to be added here
+# deliberately, and the diff says so.
+#
+# Each entry is safe because it READS the working tree and writes nothing into
+# it. The two that pick their own listening port are here too: they are
+# serialised against each other by $PORT_LOCK, which the test below checks.
+BATCH_ALLOWLIST = {
+    "go vet ./...",
+    "gofmt -l . is clean",
+    "go test -count=1",
+    "go test -race -count=1",
+    "fuzz-gate-selftest",
+    "dist-freshness-selftest",
+    "recovery-check-selftest",
+    "test-suite-selftest",
+    "opencode-routing-selftest",
+    "shell-lint",
+    "shell-lint-control",
+    "smoke dashboard",
+    "dist-freshness-check",
+    "config rules check",
+    "test-suite-check",
+}
+
+# The stages that WRITE into the working tree, and so must run alone. Listed
+# here so the test can assert they are all OUTSIDE the batch, and that they
+# are all present -- a stage that quietly disappeared is a stage that stopped
+# being run, which is what the accounting guard exists to catch but which this
+# list also catches from the other side.
+EXCLUSIVE_STAGES = {
+    "doc-verify-selftest",
+    "sse-negative-check",
+    "config pytest",
+    "mutation preflight",
+    "mutation-check",
+    "doc-verify",
+    "recovery-check (full)",
+}
+
+
+def _batch_region() -> list[str]:
+    """The lines between gate_batch_begin and gate_batch_end, verbatim.
+
+    The two call sites are matched as whole lines, so the DEFINITIONS
+    (`gate_batch_begin() {`) are not mistaken for them.
+    """
+    lines = _gate_lines()
+    begin = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.strip() == "gate_batch_begin":
+            begin = i
+        elif line.strip() == "gate_batch_end":
+            end = i
+            break
+    assert begin is not None, "gate.sh never opens a batch"
+    assert end is not None, "gate.sh never closes a batch"
+    assert end > begin, "the batch is closed before it is opened"
+    return lines[begin:end]
+
+
+def _stages_in(lines: list[str]) -> list[str]:
+    """The stage names registered in these lines, in order."""
+    return re.findall(r'^(?:run|run_live|fmt_ok) "([^"]+)"', "\n".join(lines), re.M)
+
+
+def test_only_read_only_stages_run_inside_the_batch():
+    """The batch may contain only stages that write nothing into the tree.
+
+    The failure this prevents is the expensive one to debug: a stage that
+    rewrites a tracked file while a concurrent stage is reading it, producing
+    a red gate that has nothing to do with the code and that reproduces only
+    sometimes. An allowlist turns that from "who thought of that" into "the
+    diff says the stage was added to the list".
+    """
+    inside = set(_stages_in(_batch_region()))
+    unexpected = inside - BATCH_ALLOWLIST
+    assert not unexpected, (
+        f"these stages are inside the concurrent batch but are not on the "
+        f"allowlist of read-only stages: {sorted(unexpected)}. A stage that "
+        f"writes into the working tree must run alone."
+    )
+    # And the allowlist must not rot: a stage that left the batch has to be
+    # taken off the list, or the list stops describing the batch.
+    stale = BATCH_ALLOWLIST - inside
+    assert not stale, (
+        f"the batch allowlist names stages that are no longer in the batch: "
+        f"{sorted(stale)}. Remove them, or the list stops being a description "
+        f"of what runs concurrently."
+    )
+
+
+def test_every_exclusive_stage_is_outside_the_batch():
+    """The stages that write into the tree must all be outside the batch."""
+    inside = set(_stages_in(_batch_region()))
+    assert not (inside & EXCLUSIVE_STAGES), (
+        f"tree-writing stages are inside the concurrent batch: "
+        f"{sorted(inside & EXCLUSIVE_STAGES)}"
+    )
+    # ...and they must all still be registered somewhere. A stage that vanished
+    # from the file is a stage that stopped running, and the accounting guard
+    # would notice the total but not the intent.
+    all_stages = set(_stages_in(_gate_lines()))
+    missing = EXCLUSIVE_STAGES - all_stages
+    assert not missing, f"these exclusive stages are no longer registered: {sorted(missing)}"
+
+
+def test_the_port_picking_stages_are_serialised_against_each_other():
+    """Two stages that pick their own free port must not run at the same time.
+
+    Each of them binds port 0, reads the port the kernel gave it, and closes
+    it. Two of them doing that in the same instant can be handed the SAME
+    port, and the loser fails with "port already in use" -- a verdict about the
+    machine, not about the code, and a red gate that reproduces only sometimes.
+    $PORT_LOCK is what keeps them apart.
+    """
+    text = GATE.read_text()
+    for stage in ("smoke dashboard", "opencode-routing-selftest"):
+        line = next(
+            (l for l in text.splitlines() if l.startswith(f'run "{stage}" ')),
+            None,
+        )
+        assert line is not None, f"the stage {stage!r} is not registered"
+        assert 'flock -x "$PORT_LOCK"' in line, (
+            f"the stage {stage!r} picks its own port and is not serialised "
+            f"against the other one: {line!r}"
+        )
+
+
+def test_the_port_lock_is_not_the_gate_lock():
+    """The port lock must be its own file, or it would serialise the whole run.
+
+    $LOCK is held for the entire gate run, so a stage that took it would wait
+    for the run that is waiting for it.
+    """
+    text = GATE.read_text()
+    m = re.search(r'^PORT_LOCK="([^"]+)"', text, re.M)
+    assert m, "gate.sh has no PORT_LOCK"
+    l = re.search(r'^LOCK="([^"]+)"', text, re.M)
+    assert l, "gate.sh has no LOCK"
+    assert m.group(1) != l.group(1), "the port lock and the gate lock are the same file"
+    assert m.group(1) != "${TMPDIR:-/tmp}/airouter-gate.lock", (
+        "the port lock is the gate lock"
+    )
+
+
+def _drive_batch(prefix: str, summary: str, body: str, registered: int):
+    """Compose a runnable script with a batch around the body."""
+    script = (
+        "#!/usr/bin/env bash\n"
+        'P="gate:"\nSTART_FP=same\nEND_FP=same\n'
+        + prefix.replace("REGISTERED=__N__", f"REGISTERED={registered}")
+        + body
+        + summary
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def run_stage_table_batched(table: list[tuple[str, str]]):
+    """Run a synthetic stage table through the BATCH path of the real helpers."""
+    prefix, summary = extract_stage_machine_parts(include_batch=True)
+    body = (
+        "gate_batch_begin\n"
+        + "".join(f'run "{name}" bash -c {shlex.quote(snippet)}\n' for name, snippet in table)
+        + "gate_batch_end\n"
+    )
+    proc = _drive_batch(prefix, summary, body, len(table))
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def test_the_batch_path_and_the_inline_path_agree_on_every_verdict():
+    """The two paths must be indistinguishable, stage for stage.
+
+    The batch exists to save wall-clock time. It must not change WHAT the gate
+    says. The strongest form of that claim is a comparison: the same table,
+    through both paths, must produce the same summary and the same per-stage
+    lines. Anything else -- a stage the batch forgets to count, a failure the
+    batch reports as a pass -- shows up here as a difference.
+    """
+    table = [
+        ("alpha", "true"),
+        ("beta", "false"),
+        ("gamma", "true"),
+        ("delta", "echo boom >&2; exit 3"),
+    ]
+    serial_rc, serial_out = run_stage_table(table)
+    batch_rc, batch_out = run_stage_table_batched(table)
+    assert serial_rc == batch_rc, (
+        f"the batch changed the verdict: inline exited {serial_rc}, batch {batch_rc}\n"
+        f"inline:\n{serial_out}\nbatch:\n{batch_out}"
+    )
+    for line in ("gate: 2 passed, 2 failed (4 stages registered)", "failed: beta delta"):
+        assert line in serial_out, f"the inline path lost {line!r}:\n{serial_out}"
+        assert line in batch_out, f"the batch path lost {line!r}:\n{batch_out}"
+    # And the per-stage verdicts, in order.
+    def verdicts(out: str) -> list[str]:
+        return [l.strip() for l in out.splitlines() if l.strip().startswith(("PASS", "FAIL", "SKIP"))]
+    assert verdicts(batch_out) == verdicts(serial_out), (
+        f"the batch printed different verdicts:\ninline: {verdicts(serial_out)}\n"
+        f"batch: {verdicts(batch_out)}"
+    )
+
+
+def test_a_failing_stage_in_a_batch_fails_the_run_and_is_named():
+    """A red stage inside a batch must still be red, and still be named."""
+    rc, out = run_stage_table_batched([("alpha", "true"), ("beta", "false")])
+    assert rc == 1, f"a failing batch stage did not fail the run:\n{out}"
+    assert "gate: 1 passed, 1 failed (2 stages registered)" in out, out
+    assert "failed: beta" in out, f"the failing batch stage was not named:\n{out}"
+
+
+def test_a_skipped_live_stage_in_a_batch_is_still_a_skip():
+    """run_live's 77 must stay a skip inside a batch.
+
+    A skip counted as a pass is how a live stage stops being run at all, and
+    the batch has its own verdict path, so the skip rule has to be proven
+    there too rather than only on the inline path.
+    """
+    prefix, summary = extract_stage_machine_parts(include_batch=True)
+    body = "gate_batch_begin\nrun_live \"live\" bash -c 'exit 77'\ngate_batch_end\n"
+    proc = _drive_batch(prefix, summary, body, 1)
+    out = proc.stdout + proc.stderr
+    assert "SKIP" in out, f"a 77 exit inside a batch was not a skip:\n{out}"
+    assert "1 skipped" in out, f"the skip was not counted as a skip:\n{out}"
+    assert "1 passed" not in out, f"the skip was counted as a pass:\n{out}"
+
+
+def test_the_batch_actually_runs_stages_concurrently():
+    """The batch must be concurrent, or the whole change is decoration.
+
+    Four stages that each sleep 0.6s take 2.4s one after another and about
+    0.6s together. The threshold sits between the two with room on both sides:
+    a serial batch fails it, and a loaded machine does not trip it.
+    """
+    table = [(f"slow{i}", "sleep 0.6") for i in range(4)]
+    prefix, summary = extract_stage_machine_parts(include_batch=True)
+    body = (
+        "gate_batch_begin\n"
+        + "".join(f'run "{name}" bash -c {shlex.quote(snippet)}\n' for name, snippet in table)
+        + "gate_batch_end\n"
+    )
+    started = time.monotonic()
+    proc = _drive_batch(prefix, summary, body, len(table))
+    elapsed = time.monotonic() - started
+    assert proc.returncode == 0, f"the batched run failed:\n{proc.stdout}\n{proc.stderr}"
+    assert elapsed < 1.5, (
+        f"four 0.6s stages took {elapsed:.2f}s in a batch; that is the serial "
+        f"time, so the batch is not running them concurrently"
+    )
+
+
+def test_the_batch_counts_a_stage_that_never_ran():
+    """A stage that cannot start must not vanish from the accounting.
+
+    If the batch lost a stage, the total would be short and the accounting
+    guard would catch it -- but the guard is at the END of the file, after
+    everything else has already been decided. A batch that dropped a stage
+    would still print the other verdicts. So the total is checked here too.
+    """
+    prefix, summary = extract_stage_machine_parts(include_batch=True)
+    body = (
+        "gate_batch_begin\n"
+        'run "alpha" bash -c true\n'
+        'run "beta" bash -c false\n'
+        "gate_batch_end\n"
+    )
+    proc = _drive_batch(prefix, summary, body, 2)
+    out = proc.stdout + proc.stderr
+    assert "gate: 1 passed, 1 failed (2 stages registered)" in out, out
+    assert "ACCOUNTING MISMATCH" not in out, out

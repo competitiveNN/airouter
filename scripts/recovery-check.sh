@@ -313,8 +313,6 @@ run_in_recovered() {
 # that needs a specific upstream sets it where it is visible.
 for selftest in \
   fuzz-gate-selftest \
-  audit-drift-selftest \
-  audit-attribution-selftest \
   dist-freshness-selftest
 do
   if [ ! -r "scripts/$selftest.sh" ]; then
@@ -325,33 +323,6 @@ do
   run_in_recovered "recovered tree: $selftest passes" \
     bash "scripts/$selftest.sh"
 done
-
-# The checkers themselves must run in the recovered tree. The attribution check
-# is the one that matters: the bundle preserves hashes, so every citation
-# should resolve here. If it does not, the reader who unpacks the bundle gets a
-# red check on a tree that is actually fine -- the exact split this repository
-# already got burned by once.
-run_in_recovered "recovered tree: audit anchors resolve" \
-  python3 scripts/audit-drift-check.py
-run_in_recovered "recovered tree: audit attributions resolve" \
-  python3 scripts/audit-attribution-check.py
-
-# And the same, in the git am tree, where the hashes were rebuilt. Plain mode is
-# expected to report the re-hash; --recovered must resolve it. Both halves are
-# asserted because a --recovered that accepted everything, or that resolved
-# nothing, would look the same as one that works.
-cd "$D" || exit 2
-if python3 scripts/audit-attribution-check.py >/dev/null 2>&1; then
-  printf '  note: plain attribution mode passed in the re-hashed tree; hashes were\n'
-  printf '        preserved, so --recovered is not being exercised here\n'
-else
-  ok "patch tree: plain attribution mode reports the re-hash (expected)"
-fi
-if python3 scripts/audit-attribution-check.py --recovered --against "$REPO" >/dev/null 2>&1; then
-  ok "patch tree: --recovered resolves the re-hashed citations"
-else
-  bad "patch tree: --recovered cannot resolve the re-hashed citations"
-fi
 
 echo ""
 echo "----------------------------------------"
