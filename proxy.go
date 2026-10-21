@@ -150,6 +150,49 @@ func (p *Proxy) MarkProxyReady(proxyURL string) {
 	}
 }
 
+// attemptClient returns the client and the proxy (nil = direct) for one attempt
+// to ep. Every proxy surface uses this so the streaming and non-streaming paths
+// cannot drift on how, or whether, an attempt is proxied: a nil usedProxy means
+// the attempt goes direct and the caller must not attribute faults to a proxy,
+// while a non-nil one is what the caller credits on success and charges on a
+// transport-layer failure.
+func (p *Proxy) attemptClient(ep *ModelEndpoint) (*http.Client, *ProxyInfo) {
+	client := p.client
+	transport := p.baseTransport
+	if p.effectiveProtocol(ep) == protocolCommandCode {
+		client = p.commandCodeClient()
+		transport = p.commandCodeTransport()
+	}
+	var usedProxy *ProxyInfo
+	if p.proxyTries(ep) > 0 {
+		p.proxyMu.RLock()
+		svc := p.proxySvc
+		p.proxyMu.RUnlock()
+		if svc != nil {
+			if proxy := svc.pick(); proxy != nil {
+				if tr := svc.TransportFor(transport, proxy); tr != nil {
+					client = &http.Client{Transport: tr}
+					usedProxy = proxy
+				} else {
+					// No transport could be built for this proxy: the attempt
+					// leaves the proxy path and no proxy is credited or blamed.
+					log.Printf("[proxy] cannot build a transport for %s/%s proxy %s; trying direct",
+						ep.Provider, ep.Model, redactProxyURL(proxy.URL))
+				}
+			} else {
+				// The operator asked for a proxy and none can be used, so the
+				// attempt goes direct. Deliberate (a request through a dead pool
+				// still beats no request), never silent: upstream traffic
+				// arriving from the gateway's own address is otherwise the only
+				// symptom.
+				log.Printf("[proxy] no usable proxy for %s/%s (pool=%d, ready=%d); trying direct",
+					ep.Provider, ep.Model, svc.pool.len(), svc.ReadyCount())
+			}
+		}
+	}
+	return client, usedProxy
+}
+
 // requiredProxyTries is how many proxies must be simultaneously ready: the sum
 // of every enabled provider's proxy budget, plus any per-endpoint overrides.
 //
