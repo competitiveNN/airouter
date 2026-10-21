@@ -666,6 +666,57 @@ func proxyFault(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
+// proxyAttribution reports whether a transport-layer failure on an attempt that
+// ACTUALLY went through a proxy should be charged to that proxy.
+//
+// proxyFault answers "what KIND of failure is this". This answers "and does this
+// attempt belong to the proxy". Both are needed, because the failure that
+// matters most here has no writable shape of its own: Go turns a non-200 CONNECT
+// response into a bare errors.New(reasonPhrase) (net/http/transport.go:1937),
+// so there is no net.OpError, no TLS error, no net.Error timeout and no EOF for
+// proxyFault to match on, and the reason phrase is whatever the proxy chose to
+// send. Measured live on 2026-10-21, with kilocode and opencode both configured
+// proxy:3:
+//
+//	cooldown kilocode:minimax/minimax-m3.1-flash:free status=0 errors=23
+//	  Post "https://api.kilo.ai/api/gateway/v1/chat/completions": Not Allowed
+//	cooldown opencode:deepseek-v4.1-flash-free status=0 errors=14
+//	  Post "https://opencode.ai/zen/v1/chat/completions": Bad Gateway
+//
+// Those are free proxies refusing the tunnel, not the providers. status_code 0
+// is the tell: a real provider 403/502 arrives as a RESPONSE with a status and
+// a body (see the ApplyCooldownForSession path in api.go), so it could never be
+// recorded as a statusless Post error string. Because proxyFault read them as
+// ordinary endpoint failures, Forward returned a ProviderError, api.go cooled
+// down the endpoint, error_count climbed to 13-23 and the circuit breaker
+// opened -- while the broken proxy stayed in rotation and the other two tries
+// of the proxy:3 budget were never spent.
+//
+// The bias is deliberate and documented on proxyFault: with a proxy in the path
+// the tunnel, the certificate and the connection all belong to it, so a
+// transport failure is the proxy's doing unless we know better. The one thing
+// this must not claim is the client's own disconnect, which arrives string-
+// matched as the same network error but is no proxy's fault.
+func proxyAttribution(err error, usedProxy bool) bool {
+	if err == nil || !usedProxy {
+		return false
+	}
+	// The client hung up: the request is already gone, and blaming a proxy for
+	// it would put a working proxy into cooldown.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	// A failure proxyFault already recognises: the tunnel never stood, stood and
+	// died, or the proxy answered where the origin should have.
+	if proxyFault(err) {
+		return true
+	}
+	// Everything else client.Do can fail with on an attempt the proxy carried --
+	// the bare CONNECT rejection above, net/http's own header timeout, an idle
+	// stall -- either travelled the proxy's tunnel or never left it.
+	return !isClientDisconnect(err)
+}
+
 // tlsIntercepted reports whether err means something other than the origin
 // finished the TLS handshake: a certificate that does not verify for the host we
 // asked for, an unknown authority, or bytes that are not a TLS record at all.
@@ -748,9 +799,11 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	resp, err := client.Do(req)
 	if err != nil {
 		// Nothing has reached the client yet, so a proxy fault here is safe to
-		// retry on the same endpoint with a different proxy. See proxyFault for
-		// why every transport-layer failure is charged to the proxy.
-		if usedProxy != nil && proxyFault(err) {
+		// retry on the same endpoint with a different proxy. See proxyAttribution
+		// for why every transport-layer failure on a proxied attempt belongs to
+		// the proxy -- including the CONNECT status-text rejection proxyFault
+		// cannot see (which used to land on the endpoint's cooldown instead).
+		if proxyAttribution(err, usedProxy != nil) {
 			return nil, &ProxyError{Proxy: usedProxy, Err: err}
 		}
 		return nil, &ProviderError{Err: err}
@@ -933,9 +986,11 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	resp, err := client.Do(req)
 	if err != nil {
 		// Nothing has reached the client yet, so a proxy fault here is safe to
-		// retry on the same endpoint with a different proxy. See proxyFault for
-		// why every transport-layer failure is charged to the proxy.
-		if usedProxy != nil && proxyFault(err) {
+		// retry on the same endpoint with a different proxy. See proxyAttribution
+		// for why every transport-layer failure on a proxied attempt belongs to
+		// the proxy -- including the CONNECT status-text rejection proxyFault
+		// cannot see (which used to land on the endpoint's cooldown instead).
+		if proxyAttribution(err, usedProxy != nil) {
 			return "", nil, 0, &ProxyError{Proxy: usedProxy, Err: err}
 		}
 		return "", nil, 0, &ProviderError{Err: err}

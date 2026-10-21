@@ -487,7 +487,10 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	client, usedProxy := g.proxy.attemptClient(&ep)
 	resp, err := client.Do(req)
 	if err != nil {
-		if usedProxy != nil && proxyFault(err) {
+		// proxyAttribution, not proxyFault: a bare CONNECT status-text rejection
+		// has no wrapper for proxyFault to match, so it used to land on the
+		// endpoint's cooldown instead of on the proxy.
+		if proxyAttribution(err, usedProxy != nil) {
 			return "", nil, &ProxyError{Proxy: usedProxy, Err: err}
 		}
 		return "", nil, &ProviderError{Err: err}
