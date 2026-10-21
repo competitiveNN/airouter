@@ -29,6 +29,11 @@ import (
 // polluting the pool with probes we will waste attempts on.
 const proxySourceMaxAge = 15 * time.Minute
 
+// proxyUserAgent is the User-Agent sent when fetching proxy lists. Some list
+// hosts (e.g. spys.one) return 403 to Go's default "Go-http-client/1.1", so we
+// identify as a browser to keep the refresh working from any egress.
+const proxyUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
 // proxydbHrefRe matches the only unambiguous part of a proxydb.net row: the
 // anchor href, which carries IP, port and protocol together. The visible port
 // is shadowed by a display:none decoy, so matching the <td> text reads the
@@ -234,8 +239,10 @@ func extractGeonode(body []byte) sourceExtract {
 //	<a href="/219.148.171.178/9445#https" title="">219.148.171.178</a>
 //	<a href="/219.148.171.178/9445#https" title="">9445</a>
 //
-// The href is the only unambiguous part, so that is what we match. Every proxy
-// appears twice (ip anchor and port anchor); dedupe keeps one.
+// The href is the only unambiguous part, so that is what we match. The page
+// lists each address once per protocol it speaks, so the same ip:port appears
+// under both #https and #socks5: those are two different proxies (dialling the
+// wrong one is a guaranteed failure), so the dedupe key carries the protocol.
 func extractProxydbNet(body []byte) sourceExtract {
 	matches := proxydbHrefRe.FindAllStringSubmatch(string(body), -1)
 	out := make([]*ProxyInfo, 0, len(matches))
@@ -243,12 +250,12 @@ func extractProxydbNet(body []byte) sourceExtract {
 	var asOf time.Time
 	for _, m := range matches {
 		ip, port, proto := m[1], m[2], m[3]
-		key := ip + ":" + port
+		protocol := normalizeProxyProtocol(proto, "")
+		key := protocol + "://" + net.JoinHostPort(ip, port)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		protocol := normalizeProxyProtocol(proto, "")
 		out = append(out, &ProxyInfo{
 			URL:      proxyURLFor(protocol, ip, port),
 			Protocol: protocol,

@@ -814,6 +814,14 @@ BATCH_ALLOWLIST = {
     "go test -count=1",
     "go test -race -count=1",
     "fuzz-gate-selftest",
+    # The audit selftests and checks sat here until their input went away:
+    # the findings layer read docs/audit.md, an ephemeral artifact no audit
+    # file is ever committed, and secret-scan moved to CI (.github/workflows/
+    # ci.yml, where actions/checkout gives it a clean .git/config). What is
+    # left of the audit story is the gate itself not going red for a finding
+    # nobody can fix -- see the security comment in gate.sh. A stage that is
+    # gone from gate.sh must leave this list too, or the list stops describing
+    # the batch and the staleness test below stays red for that reason alone.
     "dist-freshness-selftest",
     "recovery-check-selftest",
     "test-suite-selftest",

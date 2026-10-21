@@ -67,7 +67,14 @@ func main() {
 	// The built-in source list lives in proxysources.go; proxy_sources.txt is
 	// an optional file that can add further sources (see docs/proxy_sources.txt
 	// for the reference copy of the built-in list).
-	proxySvc := NewProxyService("proxy_sources.txt", 15*time.Minute)
+	//
+	// It resolves beside the config, like cooldowns.json and the journal:
+	// resolving it against the process CWD meant the daemon only ever found
+	// the file when started from the directory that holds it, so an operator
+	// running it with -config /etc/airouter/config.yaml silently lost every
+	// extra source they had configured.
+	proxySourcesPath := filepath.Join(filepath.Dir(*configPath), "proxy_sources.txt")
+	proxySvc := NewProxyService(proxySourcesPath, 15*time.Minute)
 	if proxyEnabled(cfg) {
 		proxy.SetProxyService(proxySvc)
 		// Seed the ready-pool requirement before the loop starts so the first

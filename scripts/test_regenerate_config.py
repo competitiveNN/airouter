@@ -1623,10 +1623,56 @@ def test_validate_config_accepts_both_real_protocols(tmp_path):
         assert run.returncode == 0, f"{value}: " + run.stdout
 
 
+def _a_commandcode_config():
+    """A synthetic config whose four chains each carry a commandcode key pair.
+
+    The shipped config.yaml is generated, and the regeneration correctly DROPS
+    commandcode from every chain once the catalog offers no free deal (all 26
+    ids checked paid on 2026-10-02: no :free suffix and neither seed present),
+    so a provider-scoped injection aimed at the shipped file now finds no entry
+    to aim at. That is the shipped file being correct, not a defect -- but it
+    left the two provider-scoped protocol cases below asserting against a
+    fixture that no longer exists, which is the same class of accident as a
+    no-op mutation: green once because the entry was there, a hard failure
+    after. Spelling the shape out here pins the contract ("legal exactly on a
+    commandcode provider") to a fixture that moves only when the code does.
+    """
+    def entry(prov):
+        return ("      - provider: %s\n" % prov +
+                "        model: reflection/beam:free  # 25.0\n"
+                "        vision: false\n"
+                "        intelligence: 25.0\n"
+                "        context_length: 262144\n")
+
+    terminator = ("      - provider: kilocode\n"
+                  "        model: kilo-auto/free  # last: kilocode "
+                  "(auto router probed live)\n"
+                  "        vision: true\n")
+    chain = "".join([entry("commandcode"), entry("commandcode2"), terminator])
+    return (
+        "providers:\n"
+        "  commandcode:\n"
+        "    url: https://api.commandcode.ai\n"
+        "  commandcode2:\n"
+        "    url: https://api.commandcode.ai\n"
+        "  kilocode:\n"
+        "    url: https://kilocode.ai/v1\n"
+        "models:\n"
+        "  smart:\n"
+        "    chain:\n" + chain +
+        "  work:\n"
+        "    chain:\n" + chain +
+        "  fast:\n"
+        "    chain:\n" + chain +
+        "  large:\n"
+        "    chain:\n" + chain
+    )
+
+
 def test_validate_config_accepts_commandcode_on_a_commandcode_provider(tmp_path):
     """config.go routes a commandcode spelling to the /alpha/generate envelope,
     which is exactly right for a commandcode provider and nowhere else."""
-    shaped = _inject_protocol(CONFIG.read_text(), "commandcode",
+    shaped = _inject_protocol(_a_commandcode_config(), "commandcode",
                               provider="commandcode")
     parsed = yaml.safe_load(shaped)["models"]["smart"]["chain"]
     assert [e for e in parsed if e.get("model") == "reflection/beam:free"
@@ -1650,7 +1696,7 @@ def test_validate_config_rejects_commandcode_on_a_non_commandcode_provider(tmp_p
 def test_rule13_accepts_commandcode_on_a_commandcode_provider():
     if not Path("/tmp/free-models.json").exists():
         pytest.skip("no fetched model list on this machine")
-    shaped = _inject_protocol(CONFIG.read_text(), "commandcode",
+    shaped = _inject_protocol(_a_commandcode_config(), "commandcode",
                               provider="commandcode")
     problems = _checker_problems(shaped)
     assert not [p for p in problems if p.startswith("rule13")], problems
