@@ -431,3 +431,75 @@ func (s *stalledReader) Close() error {
 	s.once.Do(func() { close(s.done) })
 	return nil
 }
+
+// TestProxyAttributionChargesTheProxyForWhatProxyFaultCannotSee pins the bug
+// proxyAttribution was written for. A proxy that answers a CONNECT with a
+// non-2xx status is turned by net/http into a bare errors.New(reason phrase), so
+// NO proxyFault branch matches it -- no net.OpError, no TLS error, no net.Error
+// timeout, no EOF. The old call sites used proxyFault there, so the fault
+// reached api.go as a ProviderError, the endpoint's cooldown took the hit, and
+// the broken proxy stayed in rotation.
+//
+// Both strings below were measured in cooldowns.json on 2026-10-21, charged to
+// the endpoints rather than to the proxies: kilocode's
+// minimax/minimax-m3.1-flash:free at 23 errors ("Not Allowed") and opencode's
+// deepseek-v4.1-flash-free at 14 errors ("Bad Gateway"), both with status_code 0
+// -- the tell that they are statusless Post failures, not provider responses.
+//
+// The refused CONNECT is generated, not fabricated: deadProxyClient makes the
+// transport produce the real thing.
+func TestProxyAttributionChargesTheProxyForWhatProxyFaultCannotSee(t *testing.T) {
+	c, err := deadProxyClient(t)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	_, refused := c.Get("https://example.invalid/v1/chat/completions")
+	if refused == nil {
+		t.Fatal("setup: expected the transport to refuse the CONNECT")
+	}
+	// The shape net/http records for a non-2xx CONNECT reply, wrapped in the
+	// url.Error client.Do returns. This is what the live cooldowns contained.
+	statusRejection := &url.Error{
+		Op:  "Post",
+		URL: "https://api.kilo.ai/api/gateway/v1/chat/completions",
+		Err: errors.New("Not Allowed"),
+	}
+
+	for _, tc := range []struct {
+		name      string
+		err       error
+		usedProxy bool
+		want      bool
+	}{
+		{"refused CONNECT, proxied", refused, true, true},
+		{"refused CONNECT, direct", refused, false, false},
+		{"bare CONNECT status rejection, proxied", statusRejection, true, true},
+		{"bare CONNECT status rejection, direct", statusRejection, false, false},
+		{"nil error is never charged", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := proxyAttribution(tc.err, tc.usedProxy); got != tc.want {
+				t.Errorf("proxyAttribution(%v, usedProxy=%v) = %v, want %v",
+					tc.err, tc.usedProxy, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProxyAttributionSparesTheProxyForTheClientsOwnDisconnect: the client's
+// cancellation arrives at client.Do string-matched as the same network error a
+// refusal produces, and it is no proxy's fault. Cooling a working proxy for it
+// would drop that proxy from rotation for nothing.
+func TestProxyAttributionSparesTheProxyForTheClientsOwnDisconnect(t *testing.T) {
+	for _, err := range []error{
+		context.Canceled,
+		&url.Error{Op: "Post", URL: "https://x.invalid", Err: context.Canceled},
+		// isClientDisconnect matches strings, so the wrapped spelling must not
+		// slip through the errors.Is check above it.
+		fmt.Errorf("Post \"https://x.invalid\": %w", context.Canceled),
+	} {
+		if proxyAttribution(err, true) {
+			t.Errorf("proxyAttribution(%v, usedProxy=true) = true, want false", err)
+		}
+	}
+}
