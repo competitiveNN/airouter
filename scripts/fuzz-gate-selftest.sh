@@ -312,18 +312,26 @@ echo
 # same two-package fixture; it is expected to break, which is the proof the
 # suite has teeth.
 #
-# The baseline is cb4e826 (round 8), NOT the commit before it. Round 8 is where
-# the FROZEN=1 and root-only-discovery defects were fixed; those are already
-# covered against the CURRENT gate by case 2 and case 3. What is checked here
-# is only what round 9 changed -- the round-9 gate is the one that runs
-# multi-package, so it is round 8's that must fail to.
+# The baseline gate is the previous committed version of scripts/fuzz-gate.sh
+# -- the round-8 gate in this repository's OWN history. cb4e826 was a dangling
+# object that existed only in this checkout's reflog: it is not reachable from
+# HEAD, so any baseline pinned to that hash is absent from every recovered tree
+# and this negative control could never run outside this machine. The previous
+# committed version of scripts/fuzz-gate.sh is reachable from origin/master and
+# is therefore present in both the checkout and any tree recovered from its
+# artifacts. Its blob is identical to cb4e826's, so nothing about the control
+# itself changes -- only where the baseline comes from.
 # ---------------------------------------------------------------------------
 echo "case 7: negative control — the pre-round-9 gate fails these fixtures"
 # ---------------------------------------------------------------------------
-OLD_GATE=$(git -C "$(dirname "$GATE_SOURCE")/.." show \
-  cb4e826:scripts/fuzz-gate.sh 2>/dev/null)
+REPO_ROOT="$(dirname "$GATE_SOURCE")/.."
+BASE_REV=$(git -C "$REPO_ROOT" log --format=%H -- scripts/fuzz-gate.sh | sed -n '2p')
+OLD_GATE=""
+if [ -n "$BASE_REV" ]; then
+  OLD_GATE=$(git -C "$REPO_ROOT" show "$BASE_REV:scripts/fuzz-gate.sh" 2>/dev/null)
+fi
 if [ -z "$OLD_GATE" ]; then
-  bad "could not reconstruct the pre-round-9 gate from cb4e826"
+  bad "could not reconstruct the pre-round-9 gate from $BASE_REV (previous version of scripts/fuzz-gate.sh)"
 else
   printf '%s\n' "$OLD_GATE" > "$TMPROOT/old-gate.sh"
   out=$(run_gate "$repo2" "$TMPROOT/old-gate.sh" 1); st=$?
