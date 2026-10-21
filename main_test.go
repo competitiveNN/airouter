@@ -3824,6 +3824,167 @@ func TestHandleChatCompletions_CycleBackRecoversMidRequest(t *testing.T) {
 	}
 }
 
+// TestHandleChatCompletions_CycleBackWaitIsClampedToTheBudget is the other half
+// of the same wait, and it pins a defect that was measured, not hypothesised:
+// the cycle-back wait was capped at 30s but was NOT clamped to what was left of
+// the request's own fallback budget, so a request whose budget was 12s could be
+// held open for 30.201s before returning the very 503 it would have returned
+// immediately. Measured against a dead upstream (connection refused in
+// microseconds) in scripts/opencode-routing-selftest.sh case 9: 63s for two
+// attempts, where the two attempts themselves cost 6s of that. The wait bought
+// nothing, because the loop re-checks exhaustedNow the instant it ends.
+//
+// The clamp is the same arithmetic the budget comment in handleCompletion
+// promises ("a client never waits longer than the budget allows"). This test
+// fails on the unclamped code by taking 30s instead of milliseconds, so it is
+// the ticking-bomb direction rather than the tautology: 30s is long enough that
+// a regressions-check run turns visibly red.
+func TestHandleChatCompletions_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{"message": "rate limited"},
+		})
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"b": {URL: backend.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "b", Model: "m1"},
+				{Provider: "b", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	// A cooldown far longer than any request budget, so the clamp is the only
+	// thing that can keep this fast. This is not decoration: it is the exact
+	// shape of a real 30s transport cooldown against a 12s small-request budget.
+	gateway.SetTestCooldown(30 * time.Second)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	started := time.Now()
+	gateway.HandleChatCompletions(rec, req)
+	elapsed := time.Since(started)
+
+	if rec.Code != 503 {
+		t.Fatalf("expected 503 once every endpoint is cooled down past the budget, got %d (body: %s)",
+			rec.Code, rec.Body.String())
+	}
+	// The verdict may not change, only when it arrives: 30s of a client being
+	// told nothing is the defect. Generous ceiling so a loaded CI box does not
+	// turn this red; the unclamped code takes 30s, an order of magnitude above.
+	if elapsed > 5*time.Second {
+		t.Errorf("the cycle-back wait was not clamped to the request budget: a 503 took %v, "+
+			"which is the full 30s cooldown rather than the %v budget it had left "+
+			"(see the clamp at the cycle-back waiter)",
+			elapsed.Round(time.Millisecond), fallbackBudget(requestTimeout(estimateTokens(&ChatCompletionRequest{
+				Model:    "smart",
+				Messages: []ChatCompletionMessage{{Role: "user", Content: "hi"}},
+			}))).Round(time.Millisecond))
+	}
+}
+
+// clampCycleBackTestCase is the shared setup behind the three clamp tests
+// below. The chat path, the chat streaming path and both Responses paths each
+// have their OWN cycle-back waiter, and each has to be proven to clamp on its
+// own: one test on the non-streaming chat path would stay green while the
+// other three waiters lost the clamp, which is the shape the budgetState
+// doc comment already records happening once.
+func clampCycleBackTestCase(t *testing.T, url, body string, wantInBody string) {
+	t.Helper()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"b": {URL: backend.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "b", Model: "m1"},
+				{Provider: "b", Model: "m2"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	// A cooldown far longer than any request budget, so the clamp is the only
+	// thing that can keep this fast: the exact shape of a real 30s transport
+	// cooldown against a 12s small-request budget.
+	gateway.SetTestCooldown(30 * time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	started := time.Now()
+	if url == "/v1/responses" {
+		gateway.HandleResponses(rec, req)
+	} else {
+		gateway.HandleChatCompletions(rec, req)
+	}
+	elapsed := time.Since(started)
+
+	out := rec.Body.String()
+	if !strings.Contains(out, wantInBody) {
+		t.Fatalf("expected the unavailable-models failure once every endpoint is cooled "+
+			"down past the budget, body:\n%s", out)
+	}
+	// The verdict may not change, only when it arrives: 30s of a client being
+	// told nothing is the defect. Generous ceiling so a loaded CI box does not
+	// turn this red; the unclamped code takes 30s, six times this.
+	if elapsed > 5*time.Second {
+		t.Errorf("the cycle-back wait was not clamped to the request budget: the request "+
+			"took %v, which is the full 30s cooldown rather than the %v budget it had left "+
+			"(see the clamp at the cycle-back waiter)",
+			elapsed.Round(time.Millisecond), fallbackBudget(requestTimeout(estimateTokens(&ChatCompletionRequest{
+				Model:    "smart",
+				Messages: []ChatCompletionMessage{{Role: "user", Content: "hi"}},
+			}))).Round(time.Millisecond))
+	}
+}
+
+// TestHandleChatCompletionsStreaming_CycleBackWaitIsClampedToTheBudget is the
+// streaming twin of the chat clamp test. An SSE client holds the connection
+// open, so an unclamped wait is worse here, not better.
+func TestHandleChatCompletionsStreaming_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
+	clampCycleBackTestCase(t, "/v1/chat/completions",
+		`{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`,
+		"All models are currently unavailable")
+}
+
+// TestHandleResponses_CycleBackWaitIsClampedToTheBudget pins the clamp on the
+// non-streaming Responses loop. This path shipped unbounded once -- see the
+// budgetState comment -- so it gets its own pin.
+func TestHandleResponses_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
+	clampCycleBackTestCase(t, "/v1/responses",
+		`{"model":"smart","input":"hi"}`,
+		"All models are currently unavailable")
+}
+
+// TestHandleResponsesStreaming_CycleBackWaitIsClampedToTheBudget pins the clamp
+// on the streaming Responses loop, the fourth and last waiter.
+func TestHandleResponsesStreaming_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
+	clampCycleBackTestCase(t, "/v1/responses",
+		`{"model":"smart","input":"hi","stream":true}`,
+		"All models are currently unavailable")
+}
+
 // TestHandleChatCompletionsStreaming_CycleBackRecoversMidRequest is
 // the streaming twin: while the chain is on cooldown the stream stays
 // alive with a `: reconnecting` comment, the request waits out the

@@ -27,11 +27,10 @@ type ProxyInfo struct {
 	Protocol    string // "https" or "socks5"
 	IP          string
 	Port        string
-	Country     string        // ISO country code (e.g. "US", "DE")
-	Continent   string        // continent code (e.g. "NA", "EU")
-	SourceURL   string        // source URL this proxy was fetched from
-	SourceIndex int           // index in proxy_sources.txt (lower = higher priority)
-	Latency     time.Duration // measured dial latency; lower is preferred
+	Country     string // ISO country code (e.g. "US", "DE")
+	Continent   string // continent code (e.g. "NA", "EU")
+	SourceURL   string // source URL this proxy was fetched from
+	SourceIndex int    // index in proxy_sources.txt (lower = higher priority)
 }
 
 // isPreferredContinent reports whether the proxy is in Europe or North
@@ -48,10 +47,13 @@ func isPreferredContinent(continent string) bool {
 // preferred-continent proxies first (EU then NA), then all others. Within
 // each group, proxies from higher-priority sources (lower SourceIndex) come
 // first, and ties are broken by source order then by IP.
+//
+// It is deliberately a plain snapshot: selection is ProxyService.pick's job,
+// because only that knows about cooldowns, readiness and measured latency. A
+// round-robin cursor here would pick proxies the request path must skip.
 type proxyPool struct {
-	mu      sync.RWMutex
-	list    []*ProxyInfo
-	nextIdx atomic.Int32 // round-robin cursor into list
+	mu   sync.RWMutex
+	list []*ProxyInfo
 }
 
 func (pp *proxyPool) get() []*ProxyInfo {
@@ -65,26 +67,14 @@ func (pp *proxyPool) get() []*ProxyInfo {
 func (pp *proxyPool) set(list []*ProxyInfo) {
 	pp.mu.Lock()
 	pp.list = list
-	pp.nextIdx.Store(0)
 	pp.mu.Unlock()
 }
 
+// len is the current pool size, for observability only.
 func (pp *proxyPool) len() int {
 	pp.mu.RLock()
 	defer pp.mu.RUnlock()
 	return len(pp.list)
-}
-
-// pick returns the next proxy from the pool using round-robin.
-func (pp *proxyPool) pick() *ProxyInfo {
-	pp.mu.RLock()
-	list := pp.list
-	pp.mu.RUnlock()
-	if len(list) == 0 {
-		return nil
-	}
-	idx := int(pp.nextIdx.Add(1) % int32(len(list)))
-	return list[idx]
 }
 
 // ProxyService fetches proxy lists from the configured sources, geolocates
@@ -133,7 +123,9 @@ type ProxyService struct {
 
 	// readyLatency records the measured dial latency for each ready proxy,
 	// so pick() can prefer the fastest. Entries are evicted together with
-	// the readiness mark.
+	// the readiness mark, and when the proxy leaves the pool: a map keyed by
+	// proxy URL is otherwise unbounded, because a free-proxy pool is
+	// replaced wholesale on every refresh.
 	readyLatencyMu sync.Mutex
 	readyLatency   map[string]time.Duration
 
@@ -161,6 +153,19 @@ type geoEntry struct {
 // effectively static for the life of a proxy, so a long TTL is safe; the bound
 // exists only so a bad answer is not permanent.
 const geoCacheTTL = 24 * time.Hour
+
+// geoCacheMaxEntries bounds the geolocation cache. A free-proxy pool is
+// replaced wholesale on every refresh, so without a bound the cache would
+// keep every address ever seen for the life of the process. The limit is far
+// above any real pool, so it only ever fires once the process has resolved
+// thousands of distinct addresses.
+const geoCacheMaxEntries = 8192
+
+// geoWorkers bounds how many geolocation lookups run concurrently. Geolocation
+// is one remote API call per address, so a cold refresh of a few hundred
+// proxies used to be a few hundred sequential round-trips; a small fan-out
+// collapses that while keeping the request burst modest.
+const geoWorkers = 4
 
 // NewProxyService builds a proxy service from the sources file. If no sources
 // are configured or the API key is missing, the service is still created but
@@ -256,15 +261,12 @@ func (s *ProxyService) readSourcesFile() []string {
 // API call per proxy, so a few hundred proxies meant a few hundred sequential
 // HTTP round-trips every 15 minutes for information that does not change. The
 // cache makes a refresh cost one call per IP we have not seen before.
-func (s *ProxyService) geolocate(ip string) (country, continent string) {
-	s.geoMu.Lock()
-	if e, ok := s.geoCache[ip]; ok && time.Since(e.at) < geoCacheTTL {
-		s.geoMu.Unlock()
+func (s *ProxyService) geolocate(ctx context.Context, ip string) (country, continent string) {
+	if e, ok := s.cachedGeo(ip); ok {
 		return e.country, e.continent
 	}
-	s.geoMu.Unlock()
 
-	country, continent = s.geolocateRemote(ip)
+	country, continent = s.geolocateRemote(ctx, ip)
 	if country == "" && continent == "" {
 		// Do not cache a negative result: a transient API failure would
 		// otherwise mark the proxy non-preferred for a whole day.
@@ -272,20 +274,105 @@ func (s *ProxyService) geolocate(ip string) (country, continent string) {
 	}
 
 	s.geoMu.Lock()
+	s.enforceGeoCacheBoundLocked()
 	s.geoCache[ip] = geoEntry{country: country, continent: continent, at: time.Now()}
 	s.geoMu.Unlock()
 	return country, continent
 }
 
+// cachedGeo reports the memoized geolocation for an IP without touching the
+// network, so a caller can tell "already known" from "needs a lookup".
+func (s *ProxyService) cachedGeo(ip string) (geoEntry, bool) {
+	s.geoMu.Lock()
+	defer s.geoMu.Unlock()
+	e, ok := s.geoCache[ip]
+	if !ok || time.Since(e.at) >= geoCacheTTL {
+		return geoEntry{}, false
+	}
+	return e, true
+}
+
+// enforceGeoCacheBoundLocked keeps the cache within geoCacheMaxEntries. The
+// caller must hold geoMu. An arbitrary half is dropped rather than one entry,
+// because the addresses in a pool move together: evicting a single entry would
+// simply be refilled on the next pass.
+func (s *ProxyService) enforceGeoCacheBoundLocked() {
+	if len(s.geoCache) < geoCacheMaxEntries {
+		return
+	}
+	excess := len(s.geoCache) - geoCacheMaxEntries/2
+	for k := range s.geoCache {
+		delete(s.geoCache, k)
+		excess--
+		if excess <= 0 {
+			break
+		}
+	}
+}
+
+// geolocateMissing resolves every IP in the list that is not already cached,
+// concurrently, so a cold refresh costs one fan-out instead of one round-trip
+// per proxy. Results land in the geoCache that geolocate reads, so the pass
+// that follows costs no lookups at all.
+//
+// ctx is honoured while feeding the workers, so a shutdown cannot leave the
+// refresh blocked behind a queue of lookups.
+func (s *ProxyService) geolocateMissing(ctx context.Context, ips []string) {
+	var pending []string
+	seen := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		if ip == "" || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if _, ok := s.cachedGeo(ip); ok {
+			continue
+		}
+		pending = append(pending, ip)
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	work := make(chan string)
+	var wg sync.WaitGroup
+	workers := geoWorkers
+	if workers > len(pending) {
+		workers = len(pending)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range work {
+				s.geolocate(ctx, ip)
+			}
+		}()
+	}
+feed:
+	for _, ip := range pending {
+		select {
+		case work <- ip:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	// Closed by the sending goroutine only: closing early would race a send
+	// and panic. Whatever is already queued drains, so no worker is left
+	// blocked on a channel that never closes.
+	close(work)
+	wg.Wait()
+}
+
 // geolocateRemote looks up the country and continent for an IP using the
 // IPGeolocation.io API (the same API the ipgeolocation CLI calls). On failure
 // it returns empty strings, which marks the proxy as non-preferred.
-func (s *ProxyService) geolocateRemote(ip string) (country, continent string) {
+func (s *ProxyService) geolocateRemote(ctx context.Context, ip string) (country, continent string) {
 	if s.apiKey == "" {
 		return "", ""
 	}
 	u := "https://api.ipgeolocation.io/v2/ipgeo?apiKey=" + url.QueryEscape(s.apiKey) + "&ip=" + url.QueryEscape(ip)
-	req, err := http.NewRequestWithContext(context.Background(), "GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return "", ""
 	}
@@ -314,11 +401,18 @@ func (s *ProxyService) geolocateRemote(ip string) (country, continent string) {
 }
 
 // fetchSource fetches one proxy source URL and returns the raw body.
-func (s *ProxyService) fetchSource(sourceURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(context.Background(), "GET", sourceURL, nil)
+//
+// The request is bound to the caller's context rather than to a background
+// one: a refresh bound to context.Background() kept issuing fetches after the
+// service had been asked to stop, which on shutdown meant the daemon waited on
+// sources it would never use.
+func (s *ProxyService) fetchSource(ctx context.Context, sourceURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", sourceURL, nil)
 	if err != nil {
 		return nil, err
 	}
+	// Some list hosts 403 Go's default "Go-http-client/1.1"; identify as a browser.
+	req.Header.Set("User-Agent", proxyUserAgent)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -568,7 +662,14 @@ func parseHTMLProxies(body []byte, sourceURL string, sourceIndex int) []*ProxyIn
 // Preferred continents (EU, NA) come first, then all others. Within each
 // group, entries are ordered by source priority (lower SourceIndex first),
 // then by their order within the source.
-func (s *ProxyService) fetchAll(sources []proxySource) []*ProxyInfo {
+// fetched is one source's body after extraction, kept aside so the whole
+// pass's addresses are known before any geolocation is performed.
+type fetched struct {
+	idx    int
+	result sourceExtract
+}
+
+func (s *ProxyService) fetchAll(ctx context.Context, sources []proxySource) []*ProxyInfo {
 	type tagged struct {
 		proxy  *ProxyInfo
 		prefer bool // true for EU/NA
@@ -578,8 +679,18 @@ func (s *ProxyService) fetchAll(sources []proxySource) []*ProxyInfo {
 
 	var all []tagged
 	order := 0
+
+	// Fetch and extract every source first, so the whole pass's addresses are
+	// known before any geolocation happens. Geolocation is a remote call per
+	// address, and doing it inline between fetches made a cold refresh a
+	// sequential round-trip per proxy: hundreds of proxies meant hundreds of
+	// blocking calls, with the refresh loop (and the ready pool behind it)
+	// stalled behind them. Resolving them as one bounded fan-out up front
+	// collapses that to a few concurrent rounds, and the lookups then hit the
+	// cache during the tagging loop below.
+	var bodies []fetched
 	for idx, source := range sources {
-		body, err := s.fetchSource(source.URL)
+		body, err := s.fetchSource(ctx, source.URL)
 		if err != nil {
 			log.Printf("[proxy] source %d (%s) fetch failed: %v", idx, source.Name, err)
 			continue
@@ -590,7 +701,13 @@ func (s *ProxyService) fetchAll(sources []proxySource) []*ProxyInfo {
 				return sourceExtract{Proxies: parseProxies(body, "", 0)}
 			}
 		}
-		result := extract(body)
+		bodies = append(bodies, fetched{idx: idx, result: extract(body)})
+	}
+	s.geolocateMissing(ctx, uniqueIPs(bodies))
+
+	for _, f := range bodies {
+		idx, source := f.idx, sources[f.idx]
+		result := f.result
 
 		// Freshness: a list that says its newest entry was checked more than
 		// proxySourceMaxAge ago is a list of addresses that have probably gone
@@ -622,7 +739,7 @@ func (s *ProxyService) fetchAll(sources []proxySource) []*ProxyInfo {
 			p.SourceURL = source.URL
 			p.SourceIndex = idx
 			if p.Country == "" || p.Continent == "" {
-				c, cont := s.geolocate(p.IP)
+				c, cont := s.geolocate(ctx, p.IP)
 				p.Country = c
 				p.Continent = cont
 			}
@@ -654,15 +771,74 @@ func (s *ProxyService) fetchAll(sources []proxySource) []*ProxyInfo {
 	return result
 }
 
+// uniqueIPs returns the addresses one pass still has to resolve, in first-seen
+// order and without duplicates, so the geolocation fan-out does not repeat work
+// a source that lists the same proxy twice would otherwise cause.
+func uniqueIPs(bodies []fetched) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, b := range bodies {
+		for _, p := range b.result.Proxies {
+			if p.IP == "" || seen[p.IP] {
+				continue
+			}
+			seen[p.IP] = true
+			out = append(out, p.IP)
+		}
+	}
+	return out
+}
+
 // refresh fetches every source and replaces the pool. Called every
 // refreshInterval and once at startup. The source list is re-resolved each time
 // so an edit to the sources file is picked up without a restart.
-func (s *ProxyService) refresh() {
-	list := s.fetchAll(s.loadSources())
+func (s *ProxyService) refresh(ctx context.Context) {
+	list := s.fetchAll(ctx, s.loadSources())
 	s.pool.set(list)
+	// The pool was just replaced, so bookkeeping for proxies that are no
+	// longer in it is dead weight. Every one of these maps is keyed by proxy
+	// URL and a free-proxy pool churns completely, so without this the
+	// cooldown and latency maps would grow for the life of the process.
+	s.pruneDroppedProxies(list)
 	log.Printf("[proxy] pool refreshed: %d proxies (%d preferred, %d backup, %d ready/%d required)",
 		len(list), s.countPreferred(list), len(list)-s.countPreferred(list),
 		s.readyCount(), s.RequiredReady())
+}
+
+// pruneDroppedProxies forgets cooldowns, readiness marks and measured latencies
+// for proxies that are no longer in the pool. Expired cooldowns are dropped
+// regardless: pick() already treats them as not down, so keeping them bought
+// nothing.
+func (s *ProxyService) pruneDroppedProxies(list []*ProxyInfo) {
+	live := make(map[string]bool, len(list))
+	for _, p := range list {
+		live[p.URL] = true
+	}
+	now := time.Now()
+
+	s.downMu.Lock()
+	for u, expiry := range s.down {
+		if !live[u] || !now.Before(expiry) {
+			delete(s.down, u)
+		}
+	}
+	s.downMu.Unlock()
+
+	s.readyMu.Lock()
+	for u := range s.ready {
+		if !live[u] {
+			delete(s.ready, u)
+		}
+	}
+	s.readyMu.Unlock()
+
+	s.readyLatencyMu.Lock()
+	for u := range s.readyLatency {
+		if !live[u] {
+			delete(s.readyLatency, u)
+		}
+	}
+	s.readyLatencyMu.Unlock()
 }
 
 func (s *ProxyService) countPreferred(list []*ProxyInfo) int {
@@ -718,7 +894,11 @@ func (s *ProxyService) pick() *ProxyInfo {
 		cands = append(cands, cand{p: p, down: downOk, ready: ready, latency: latency})
 	}
 
-	// Among ready proxies, prefer the lowest measured latency.
+	// Among ready proxies, prefer the lowest measured latency. A latency of
+	// zero means nobody has measured this proxy, not that it is infinitely
+	// fast: treating it as fast pinned every request to whichever proxy
+	// happened to gain its readiness mark from a successful request rather
+	// than from a probe, which is the proxy most likely to be busy.
 	var best *ProxyInfo
 	var bestLatency time.Duration
 	var fallback *ProxyInfo
@@ -727,7 +907,7 @@ func (s *ProxyService) pick() *ProxyInfo {
 			continue
 		}
 		if c.ready {
-			if best == nil || c.latency < bestLatency {
+			if best == nil || faster(c.latency, bestLatency) {
 				best = c.p
 				bestLatency = c.latency
 			}
@@ -740,6 +920,22 @@ func (s *ProxyService) pick() *ProxyInfo {
 		return best
 	}
 	return fallback
+}
+
+// faster reports whether candidate latency a should displace the incumbent.
+// A zero latency is the "never measured" sentinel: it loses to any real
+// measurement, and two of them compare equal.
+func faster(a, best time.Duration) bool {
+	if a == best {
+		return false
+	}
+	if best == 0 {
+		return true // an unmeasured incumbent is beaten by anything measured
+	}
+	if a == 0 {
+		return false // but an unmeasured candidate never displaces a measured one
+	}
+	return a < best
 }
 
 func (s *ProxyService) isDown(url string) bool {
@@ -945,7 +1141,7 @@ func (s *ProxyService) Start(ctx context.Context) {
 	// Immediate refresh so the pool is populated before the first request, then
 	// an immediate top-up so the ready pool is already at its required size
 	// instead of getting there one slow request at a time.
-	s.refresh()
+	s.refresh(ctx)
 	s.topUpReady(ctx)
 
 	refreshTicker := time.NewTicker(s.refreshInterval)
@@ -963,7 +1159,7 @@ func (s *ProxyService) Start(ctx context.Context) {
 		case <-s.stopCh:
 			return
 		case <-refreshTicker.C:
-			s.refresh()
+			s.refresh(ctx)
 			s.topUpReady(ctx)
 		case <-topUpTicker.C:
 			s.topUpReady(ctx)
@@ -976,31 +1172,36 @@ func (s *ProxyService) Stop() {
 	close(s.stopCh)
 }
 
-// Pool returns a copy of the current proxy pool.
-func (s *ProxyService) Pool() []*ProxyInfo {
-	return s.pool.get()
-}
-
 // TransportFor returns an http.Transport configured to route through the given
-// proxy. For HTTPS (HTTP CONNECT) proxies it sets Transport.Proxy; for SOCKS5
-// proxies it sets Transport.DialContext to a SOCKS5 dialer. The returned
-// transport is a clone of the shared base transport so connection pooling is
-// preserved across attempts.
+// proxy: HTTPS (HTTP CONNECT) proxies set Transport.Proxy, SOCKS5 proxies set
+// Transport.DialContext to a SOCKS5 dialer. The returned transport is a clone
+// of the shared base transport so connection pooling is preserved across
+// attempts. It returns nil when no transport can be built for the proxy.
+//
+// Returning nil rather than a bare clone matters. The callers attribute the
+// attempt to the proxy -- marking it ready on success, cooling it down on
+// failure -- so handing back a transport with no proxy configured would let the
+// request travel direct AND credit the proxy with a success it never carried.
 func (s *ProxyService) TransportFor(base *http.Transport, p *ProxyInfo) *http.Transport {
 	tr := base.Clone()
 	switch p.Protocol {
 	case "socks5":
 		dialer, err := proxy.SOCKS5("tcp", net.JoinHostPort(p.IP, p.Port), nil, proxy.Direct)
 		if err != nil {
-			log.Printf("[proxy] failed to create SOCKS5 dialer for %s: %v", p.URL, err)
-			return tr
+			// Unreachable against x/net v0.61, where SOCKS5 builds its dialer
+			// without touching the network and returns a nil error. Handled
+			// because the alternative is a clone that dials direct.
+			log.Printf("[proxy] cannot build a SOCKS5 dialer for %s: %v", p.URL, err)
+			return nil
 		}
 		tr.DialContext = dialer.(proxy.ContextDialer).DialContext
 	default:
 		proxyURL, err := url.Parse(p.URL)
 		if err != nil {
-			log.Printf("[proxy] invalid proxy URL %q: %v", p.URL, err)
-			return tr
+			// Also unreachable in practice: the URL is assembled by proxyURLFor
+			// from a host and port the extractors have already validated.
+			log.Printf("[proxy] unusable proxy URL %q: %v", p.URL, err)
+			return nil
 		}
 		tr.Proxy = http.ProxyURL(proxyURL)
 	}

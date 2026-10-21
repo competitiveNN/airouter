@@ -215,6 +215,321 @@ func TestProxydbReadsProtocolFromHref(t *testing.T) {
 	}
 }
 
+// TestProxydbKeepsBothProtocolsForOneAddress: the page lists the same address
+// once per protocol it speaks, so the dedupe key must carry the protocol. Keying
+// on ip:port silently discarded the SOCKS5 entry whenever an address listed both,
+// and a proxy dialed as the wrong protocol is a guaranteed failure.
+func TestProxydbKeepsBothProtocolsForOneAddress(t *testing.T) {
+	body := []byte(`<tr><td><a href="/9.9.9.9/8080#https" title="">9.9.9.9</a></td>
+	<td><div style="display:none">12</div><a href="/9.9.9.9/8080#https" title="">8080</a></td><td>HTTPS</td></tr>
+	<tr><td><a href="/9.9.9.9/8080#socks5" title="">9.9.9.9</a></td>
+	<td><div style="display:none">99</div><a href="/9.9.9.9/8080#socks5" title="">8080</a></td><td>SOCKS5</td></tr>`)
+
+	got := extractProxydbNet(body)
+	if len(got.Proxies) != 2 {
+		t.Fatalf("got %d proxies, want 2 (one address, both protocols)", len(got.Proxies))
+	}
+	seen := map[string]bool{}
+	for _, p := range got.Proxies {
+		if p.IP != "9.9.9.9" || p.Port != "8080" {
+			t.Errorf("got %s:%s, want 9.9.9.9:8080", p.IP, p.Port)
+		}
+		seen[p.Protocol] = true
+	}
+	if !seen["https"] || !seen["socks5"] {
+		t.Errorf("protocols found %v, want both https and socks5", seen)
+	}
+}
+
+// TestPickDoesNotTreatAnUnmeasuredProxyAsTheFastest: a zero latency means
+// nobody has measured this proxy yet, not that it is infinitely fast. Scoring
+// it as best pinned every request to whichever proxy happened to be proven ready
+// by a successful request rather than by a probe, so the proxies with an actual
+// measurement were never preferred.
+func TestPickDoesNotTreatAnUnmeasuredProxyAsTheFastest(t *testing.T) {
+	svc := NewProxyService("", time.Minute)
+	measured := &ProxyInfo{URL: "http://10.0.0.1:8080", IP: "10.0.0.1", Port: "8080", Protocol: "https"}
+	unmeasured := &ProxyInfo{URL: "http://10.0.0.2:8080", IP: "10.0.0.2", Port: "8080", Protocol: "https"}
+	svc.pool.set([]*ProxyInfo{unmeasured, measured})
+	// Both are proven ready; only one has a measured dial. This is the state the
+	// request path leaves behind: a successful request renews readiness without
+	// re-measuring the dial.
+	svc.markReady(measured.URL, 250*time.Millisecond)
+	svc.markReady(unmeasured.URL, 0)
+	svc.readyLatencyMu.Lock()
+	svc.readyLatency[measured.URL] = 250 * time.Millisecond
+	svc.readyLatencyMu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		got := svc.pick()
+		if got == nil {
+			t.Fatal("pick returned nil with a live pool")
+		}
+		if got.URL != measured.URL {
+			t.Fatalf("pick %d returned the unmeasured %s, want the measured %s",
+				i, got.URL, measured.URL)
+		}
+	}
+}
+
+// TestRefreshPrunesBookkeepingForProxiesThatLeftThePool: the cooldown and
+// latency maps are keyed by proxy URL, and a free-proxy pool is replaced
+// wholesale on every refresh, so without pruning they grew for the life of the
+// process while the pool stayed the same size.
+// TestRefreshPrunesBookkeepingForProxiesThatLeftThePool: the cooldown and
+// latency maps are keyed by proxy URL, and a free-proxy pool is replaced
+// wholesale on every refresh, so without pruning they grew for the life of the
+// process while the pool stayed the same size.
+//
+// refresh() itself is deliberately not called here: it resolves the built-in
+// source list, which means six real hosts, so a test would be slow and its
+// result would depend on which external sites happen to answer. The three
+// steps it performs are reproduced against a local source instead.
+func TestRefreshPrunesBookkeepingForProxiesThatLeftThePool(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "1.2.3.4:8080\n")
+	}))
+	defer srv.Close()
+
+	svc := NewProxyService("", time.Minute)
+	// Two proxies that were in a previous pool and are now gone, one of them
+	// carrying a live cooldown and readiness mark.
+	svc.MarkDown("http://198.51.100.1:9999", time.Hour)
+	svc.markReady("http://198.51.100.2:9999", time.Second)
+	svc.readyLatencyMu.Lock()
+	svc.readyLatency["http://198.51.100.2:9999"] = time.Second
+	svc.readyLatencyMu.Unlock()
+	if len(svc.down) != 1 || len(svc.readyLatency) != 1 {
+		t.Fatalf("precondition: down=%d readyLatency=%d, want 1 each", len(svc.down), len(svc.readyLatency))
+	}
+
+	list := svc.fetchAll(context.Background(), []proxySource{{
+		Name: "local", URL: srv.URL, Protocol: "https",
+		Extract: extractPlainProxyList,
+	}})
+	if len(list) != 1 {
+		t.Fatalf("fetched %d proxies, want 1", len(list))
+	}
+	svc.pool.set(list)
+	svc.pruneDroppedProxies(list)
+
+	if len(svc.down) != 0 {
+		t.Errorf("down map kept %d entries after the pool was replaced; those proxies are gone", len(svc.down))
+	}
+	if len(svc.readyLatency) != 0 {
+		t.Errorf("readyLatency kept %d entries after the pool was replaced", len(svc.readyLatency))
+	}
+	// The proxy that IS in the new pool keeps its bookkeeping: pruning must
+	// never discard state for a live proxy.
+	svc.MarkDown(list[0].URL, time.Hour)
+	svc.pruneDroppedProxies(svc.pool.get())
+	if !svc.isDown(list[0].URL) {
+		t.Error("a cooldown on a proxy that is still in the pool was discarded")
+	}
+	// And an expired cooldown is dropped even for a live proxy: pick() already
+	// treats it as not down, so keeping it bought nothing.
+	svc.MarkDown(list[0].URL, -time.Second)
+	svc.pruneDroppedProxies(svc.pool.get())
+	if svc.isDown(list[0].URL) {
+		t.Error("an expired cooldown survived pruning")
+	}
+}
+
+// TestGeolocateServesACachedIPWithoutALookup: the refresh loop runs every 15
+// minutes, so without the cache every pass re-resolved the whole pool even
+// though an IP's country never changes.
+func TestGeolocateServesACachedIPWithoutALookup(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `{"location":{"country_code2":"DE","continent_code":"EU"}}`)
+	}))
+	defer srv.Close()
+
+	svc := &ProxyService{
+		client:       srv.Client(),
+		apiKey:       "test-key",
+		geoCache:     map[string]geoEntry{},
+		down:         map[string]time.Time{},
+		ready:        map[string]time.Time{},
+		readyLatency: map[string]time.Duration{},
+	}
+	// The API host is a fixed literal, so the server above cannot be reached
+	// through it; asserting on the call count is what makes this meaningful,
+	// because any lookup that escaped the cache would hit the real host and
+	// almost certainly fail (returning "", which the test would catch).
+	svc.geoCache["203.0.113.9"] = geoEntry{country: "FR", continent: "EU", at: time.Now()}
+
+	country, continent := svc.geolocate(context.Background(), "203.0.113.9")
+	if country != "FR" || continent != "EU" {
+		t.Errorf("geolocate = %s/%s, want FR/EU served from the cache", country, continent)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("%d lookups were made for a cached IP, want 0", n)
+	}
+}
+
+// TestGeoCacheIsBounded: the cache is keyed by IP and a free-proxy pool is
+// replaced wholesale on every refresh, so an unbounded cache would keep every
+// address the process had ever seen. The bound only ever fires once the process
+// has resolved far more addresses than any real pool holds.
+func TestGeoCacheIsBounded(t *testing.T) {
+	svc := &ProxyService{
+		client:       &http.Client{},
+		apiKey:       "test-key",
+		geoCache:     map[string]geoEntry{},
+		down:         map[string]time.Time{},
+		ready:        map[string]time.Time{},
+		readyLatency: map[string]time.Duration{},
+	}
+
+	// Fill to the bound: one entry per distinct address, so the cache really
+	// reaches geoCacheMaxEntries rather than collapsing to a handful of keys.
+	for i := 0; i < geoCacheMaxEntries; i++ {
+		svc.geoCache[fmt.Sprintf("203.0.113.%d", i)] = geoEntry{
+			country: "DE", continent: "EU", at: time.Now(),
+		}
+	}
+	before := len(svc.geoCache)
+	if before != geoCacheMaxEntries {
+		t.Fatalf("seeded %d entries, want %d", before, geoCacheMaxEntries)
+	}
+
+	// One more insert trips the bound and drops roughly half.
+	svc.geoMu.Lock()
+	svc.enforceGeoCacheBoundLocked()
+	svc.geoCache["new-entry"] = geoEntry{country: "US", continent: "NA", at: time.Now()}
+	svc.geoMu.Unlock()
+
+	after := len(svc.geoCache)
+	if after >= geoCacheMaxEntries {
+		t.Errorf("cache has %d entries after inserting past the bound, want strictly fewer", after)
+	}
+	if _, ok := svc.geoCache["new-entry"]; !ok {
+		t.Error("the just-inserted entry was evicted; the bound should drop older entries")
+	}
+}
+
+// TestGeolocateMissingHonoursCancellation: feeding the workers must respect the
+// context, or a shutdown waits behind a queue of lookups that cannot finish.
+func TestGeolocateMissingHonoursCancellation(t *testing.T) {
+	svc := &ProxyService{
+		client:       &http.Client{},
+		apiKey:       "test-key",
+		geoCache:     map[string]geoEntry{},
+		down:         map[string]time.Time{},
+		ready:        map[string]time.Time{},
+		readyLatency: map[string]time.Duration{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// With a cancelled context and no API key the lookups return immediately,
+	// so this would deadlock if feeding the workers ignored the context.
+	done := make(chan struct{})
+	go func() {
+		svc.geolocateMissing(ctx, []string{"203.0.113.1", "203.0.113.2", "203.0.113.3"})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("geolocateMissing did not return on a cancelled context")
+	}
+}
+
+// TestGeolocateMissingSkipsAlreadyCachedIPs: a pool that is mostly unchanged
+// must not fan out lookups for addresses it has already resolved.
+func TestGeolocateMissingSkipsAlreadyCachedIPs(t *testing.T) {
+	svc := &ProxyService{
+		client:       &http.Client{},
+		geoCache:     map[string]geoEntry{},
+		down:         map[string]time.Time{},
+		ready:        map[string]time.Time{},
+		readyLatency: map[string]time.Duration{},
+	}
+	svc.geoCache["203.0.113.1"] = geoEntry{country: "DE", continent: "EU", at: time.Now()}
+
+	// With no API key every lookup is a no-op that returns empty strings and is
+	// never cached, so the cached entry is only disturbed if the fan-out
+	// decides to re-resolve an address it already knows.
+	svc.geolocateMissing(context.Background(), []string{"203.0.113.1", "203.0.113.2"})
+	after, ok := svc.cachedGeo("203.0.113.1")
+	if !ok || after.country != "DE" {
+		t.Errorf("cached entry for 203.0.113.1 was disturbed: %+v (ok=%v)", after, ok)
+	}
+}
+
+// TestFetchSourceSendsBrowserUserAgent: spys.one (and some other list hosts)
+// answer 403 to Go's default "Go-http-client/1.1", which drops a live source
+// from the pool. fetchSource must identify as a browser so the refresh survives
+// any egress; without this, the source silently fails to fetch and its proxies
+// never reach the pool.
+func TestFetchSourceSendsBrowserUserAgent(t *testing.T) {
+	var gotUA string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		fmt.Fprint(w, "1.2.3.4:8080\n")
+	}))
+	defer srv.Close()
+
+	svc := &ProxyService{
+		client:       srv.Client(),
+		geoCache:     map[string]geoEntry{},
+		down:         map[string]time.Time{},
+		ready:        map[string]time.Time{},
+		readyLatency: map[string]time.Duration{},
+	}
+	if _, err := svc.fetchSource(context.Background(), srv.URL); err != nil {
+		t.Fatalf("fetchSource: %v", err)
+	}
+	if gotUA != proxyUserAgent {
+		t.Errorf("User-Agent = %q, want the browser UA %q", gotUA, proxyUserAgent)
+	}
+}
+
+// TestTransportForRefusesAProxyItCannotRepresent: TransportFor must never fall
+// back to a bare base clone. Such a clone dials DIRECT, so the caller's
+// attribution (MarkProxyReady on success, MarkProxyDown on failure) would then
+// credit or charge a proxy that never carried the request, while the log claimed
+// the attempt went through it.
+func TestTransportForRefusesAProxyItCannotRepresent(t *testing.T) {
+	base := &http.Transport{}
+	svc := NewProxyService("", time.Minute)
+
+	// An empty scheme, or one with a control character in it, is what
+	// url.Parse rejects. Whether a given malformed URL is rejected is a
+	// standard-library detail, so assert on the outcome rather than driving
+	// the test off one specific spelling.
+	for _, bad := range []string{
+		"http://[bad",
+		"://missing-scheme",
+		"http://exa mple.com:8080",
+		"ht tp://host:8080",
+		"http://ho st:8080",
+	} {
+		p := &ProxyInfo{URL: bad, IP: "203.0.113.9", Port: "8080", Protocol: "https"}
+		if tr := svc.TransportFor(base, p); tr != nil {
+			t.Errorf("TransportFor returned a transport for unparseable URL %q; "+
+				"a caller would dial direct and still blame the proxy", bad)
+		}
+	}
+
+	// Conversely, a well-formed proxy must produce a real transport, so the
+	// nil-returning contract cannot be satisfied by always returning nil.
+	good := &ProxyInfo{URL: "http://203.0.113.9:8080", IP: "203.0.113.9", Port: "8080", Protocol: "https"}
+	if tr := svc.TransportFor(base, good); tr == nil {
+		t.Fatal("TransportFor returned nil for a well-formed proxy; the whole pool would be unusable")
+	}
+
+	// A SOCKS5 proxy is the other half: it must reach the SOCKS5 dialer branch
+	// and still produce a usable transport rather than nil.
+	socks := &ProxyInfo{URL: "socks5://203.0.113.9:1080", IP: "203.0.113.9", Port: "1080", Protocol: "socks5"}
+	if tr := svc.TransportFor(base, socks); tr == nil {
+		t.Error("TransportFor returned nil for a well-formed SOCKS5 proxy")
+	}
+}
+
 // TestStaleSourceIsDiscarded: a list whose newest entry is older than
 // proxySourceMaxAge is a list of addresses that have probably gone dead, so the
 // whole source is dropped instead of being probed one failed request at a time.
@@ -250,7 +565,7 @@ func TestStaleSourceIsDiscarded(t *testing.T) {
 				},
 			}}
 
-			got := svc.fetchAll(sources)
+			got := svc.fetchAll(context.Background(), sources)
 			if tc.wantKept && len(got) != 1 {
 				t.Errorf("source was discarded, want kept (%d proxies)", len(got))
 			}
@@ -280,7 +595,7 @@ func TestFetchAllStampsSourceIdentity(t *testing.T) {
 		},
 	}}
 
-	got := svc.fetchAll(sources)
+	got := svc.fetchAll(context.Background(), sources)
 	if len(got) != 1 {
 		t.Fatalf("got %d proxies, want 1", len(got))
 	}

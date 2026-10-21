@@ -26,8 +26,12 @@ import (
 type Proxy struct {
 	client *http.Client
 	// baseTransport is the shared transport. An attempt that needs its own
-	// header-timeout budget clones it (Clone shares the connection pool), so
-	// per-attempt timeouts do not cost pooling.
+	// header-timeout budget clones it. NOTE that http.Transport.Clone does
+	// NOT share the connection pool with the original: the clone gets a fresh
+	// pool and re-establishes its connections, so a clone costs pooling. That
+	// is unavoidable here because ResponseHeaderTimeout has no per-request
+	// equivalent -- bounding a request context would also bound the body,
+	// which a long generation must not be.
 	baseTransport *http.Transport
 
 	// ccTransport/ccClient route Command Code upstream traffic through
@@ -675,9 +679,25 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 				if p.effectiveProtocol(&endpoint) == protocolCommandCode {
 					base = p.commandCodeTransport()
 				}
-				tr := svc.TransportFor(base, proxy)
-				client = &http.Client{Transport: tr}
-				usedProxy = proxy
+				// A nil transport means no proxy could be built for this one:
+				// the attempt then leaves the proxy path, and usedProxy stays
+				// nil so the proxy is neither credited with a success nor
+				// charged with a failure it never had.
+				if tr := svc.TransportFor(base, proxy); tr != nil {
+					client = &http.Client{Transport: tr}
+					usedProxy = proxy
+				} else {
+					log.Printf("[proxy] cannot build a transport for %s/%s proxy %s; trying direct",
+						endpoint.Provider, endpoint.Model, redactProxyURL(proxy.URL))
+				}
+			} else {
+				// The operator asked for a proxy and none can be used, so this
+				// attempt leaves the proxy path entirely. That is deliberate
+				// (a request through a dead pool still beats no request), but it
+				// must not be silent: without this line the only symptom would be
+				// upstream traffic arriving from the gateway's own address.
+				log.Printf("[proxy] no usable proxy for %s/%s (pool=%d, ready=%d); trying direct",
+					endpoint.Provider, endpoint.Model, svc.pool.len(), svc.ReadyCount())
 			}
 		}
 	}
@@ -805,10 +825,14 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// The client saw "all models unavailable" when the real problem was that
 	// each attempt was allowed to run three times longer than its own budget.
 	//
-	// A cloned transport carries a per-attempt ResponseHeaderTimeout. Clone
-	// shares the connection pool, so this costs no pooling. The body phase is
-	// deliberately left unbounded: this deadline governs headers only, and a
-	// long generation must still be allowed to run to completion.
+	// A cloned transport carries a per-attempt ResponseHeaderTimeout. The
+	// clone's connection pool is new, so the attempt re-dials rather than
+	// reusing base's idle connections: ResponseHeaderTimeout is a transport
+	// setting with no per-request equivalent, and a request context would
+	// have to also bound the body, which a long generation must not be. The
+	// body phase is deliberately left unbounded: this deadline governs
+	// headers only.
+	//
 	// Select the transport and client for this attempt. Proxied endpoints
 	// route through a proxy from the pool (HTTPS via Transport.Proxy, SOCKS5
 	// via a custom DialContext); everything else uses the shared direct
@@ -828,12 +852,28 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		p.proxyMu.RUnlock()
 		if svc != nil {
 			if proxy := svc.pick(); proxy != nil {
-				tr := svc.TransportFor(transport, proxy)
-				tr.ResponseHeaderTimeout = timeout
-				client = &http.Client{Transport: tr}
-				transport = tr
-				usedProxy = proxy
-				proxied = true
+				// A nil transport means no proxy could be built for this one:
+				// the attempt then leaves the proxy path, and both usedProxy and
+				// proxied stay unset so the proxy is neither credited with a
+				// success it never carried nor charged with the failure.
+				if tr := svc.TransportFor(transport, proxy); tr != nil {
+					tr.ResponseHeaderTimeout = timeout
+					client = &http.Client{Transport: tr}
+					transport = tr
+					usedProxy = proxy
+					proxied = true
+				} else {
+					log.Printf("[proxy] cannot build a transport for %s/%s proxy %s; trying direct",
+						endpoint.Provider, endpoint.Model, redactProxyURL(proxy.URL))
+				}
+			} else {
+				// The operator asked for a proxy and none can be used, so this
+				// attempt leaves the proxy path entirely. That is deliberate
+				// (a request through a dead pool still beats no request), but it
+				// must not be silent: without this line the only symptom would be
+				// upstream traffic arriving from the gateway's own address.
+				log.Printf("[proxy] no usable proxy for %s/%s (pool=%d, ready=%d); trying direct",
+					endpoint.Provider, endpoint.Model, svc.pool.len(), svc.ReadyCount())
 			}
 		}
 	}

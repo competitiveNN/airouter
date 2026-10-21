@@ -380,6 +380,83 @@ def _score_below_floor(text, profile, floor):
     return text[:m.start(2)] + new_block + text[m.end(2):]
 
 
+def _large_head_ctx_below_second(text):
+    """Drop the large profile's first context_length one below the second entry's.
+
+    The rule sorts large by (ctx desc, intelligence desc). Whoever the head pair
+    is, a head window one below the second's leaves the sequence out of order
+    while every entry stays far above the 200,000 floor, so exactly the
+    "not sorted" diagnostic class fires and nothing else. Derived from the live
+    chain: a case that pins the thirteenth entry's exact id and window stops
+    planting the moment the generator drops that entry.
+    """
+    pattern = re.compile(r"(?ms)(^  large:\n    chain:\n)(.*?)(?=^  \w+:|\Z)")
+    m = pattern.search(text)
+    assert m, "no block for large"
+    ctxs = re.findall(r"(?m)^        context_length: (\d+)$", m.group(2))
+    assert len(ctxs) >= 2, f"large has {len(ctxs)} context windows, need 2"
+    head, second = ctxs[0], ctxs[1]
+    assert head >= second, (
+        f"the live large chain is already unsorted (head {head} < second "
+        f"{second}); the checker would not be the thing under test"
+    )
+    if head == second:
+        # An equal pair cannot be made unsorted by context alone; push the head
+        # below the second instead, which inverts the tuple order on the first
+        # component.
+        lowered = int(head) - 1
+    else:
+        lowered = int(second) - 1
+    entry = re.compile(
+        r"(?ms)^(      - provider: \S+\n        model: [^\n]*\n"
+        r"        vision: (?:true|false)\n        intelligence: [0-9.]+\n"
+        r"        context_length: )(\d+)"
+    )
+    m2 = entry.search(m.group(2))
+    assert m2, "no scored entry in the large chain to reorder"
+    new_block = (m.group(2)[:m2.start(2)] + repr(lowered)
+                 + m.group(2)[m2.end(2):])
+    out = text[:m.start(2)] + new_block + text[m.end(2):]
+    assert out != text, "the reorder mutation changed nothing"
+    return out
+
+
+def _large_head_ctx_below_floor(text):
+    """Drop one large entry's context_length below the checker's own floor.
+
+    The floor is read from the checker (`PROFILE_RULES["large"]["min_context"]`)
+    rather than restated here, so the case cannot drift from the rule it is
+    supposed to break. The entry is DERIVED from the live chain -- the previous
+    form pinned `thinkingmachines/inkling-small:free` by id and window, and
+    planted nothing at all once a regeneration dropped that entry.
+    """
+    floor = _checker().PROFILE_RULES["large"]["min_context"]
+    pattern = re.compile(r"(?ms)(^  large:\n    chain:\n)(.*?)(?=^  \w+:|\Z)")
+    m = pattern.search(text)
+    assert m, "no block for large"
+    entry = re.compile(
+        r"(?ms)^(      - provider: \S+\n        model: [^\n]*\n"
+        r"        vision: (?:true|false)\n        intelligence: [0-9.]+\n"
+        r"        context_length: )(\d+)"
+    )
+    m2 = entry.search(m.group(2))
+    assert m2, "no scored entry in the large chain to drop below the floor"
+    above = int(m2.group(2)) > floor
+    if above:
+        # This entry is above the floor, so lowering it leaves the rest of the
+        # profile alone; picking it keeps the "below floor" property without
+        # touching sort order in an unrelated way.
+        new_block = m.group(2)[:m2.start(2)] + repr(floor - 1) + m.group(2)[m2.end(2):]
+    else:
+        # Every entry sits at or below the floor already (a generation that has
+        # drifted); then the rule's premise is unmet and the case proves nothing.
+        raise AssertionError(
+            f"no large entry above the {floor} floor to push below it")
+    out = text[:m.start(2)] + new_block + text[m.end(2):]
+    assert out != text, "the below-floor mutation changed nothing"
+    return out
+
+
 def _invent_a_model_id(text):
     """Point one scored endpoint at a model id that does not exist in the fetched list.
 
@@ -542,23 +619,16 @@ CHECK_RULE_CASES = [
         # Scoped to `large`, and a context change rather than a model swap: the
         # profile is sorted by (ctx desc, intelligence desc), so dropping the
         # head entry's window below the next one is what breaks the order while
-        # keeping every entry above the 200,000 floor.
-        lambda t: _in_profile(
-            t, "large",
-            "        model: thinkingmachines/inkling-small:free  # 25.7\n"
-            "        vision: true\n        intelligence: 25.7\n        context_length: 1048576",
-            "        model: thinkingmachines/inkling-small:free  # 25.7\n"
-            "        vision: true\n        intelligence: 25.7\n        context_length: 262144"),
+        # keeping every entry above the floor. Derived from the live head pair
+        # so the case keeps biting as the composition changes -- it used to pin
+        # the thirteenth entry's exact id/window, and a regeneration dropped
+        # that entry, at which point this case planted nothing.
+        lambda t: _large_head_ctx_below_second(t),
         "not sorted by context_length",
     ),
     (
         "large entry below the context floor",
-        lambda t: _in_profile(
-            t, "large",
-            "        model: thinkingmachines/inkling-small:free  # 25.7\n"
-            "        vision: true\n        intelligence: 25.7\n        context_length: 1048576",
-            "        model: thinkingmachines/inkling-small:free  # 25.7\n"
-            "        vision: true\n        intelligence: 25.7\n        context_length: 131072"),
+        lambda t: _large_head_ctx_below_floor(t),
         "below context_length",
     ),
     (
