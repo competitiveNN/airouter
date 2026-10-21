@@ -1503,6 +1503,14 @@ var BENCH_WINDOWS = [
 ];
 var benchWindow = 0;
 
+// benchWindowLabel describes the current context window as
+// "min .. max" (e.g. "512 .. 64k") so the slider shows real
+// depth bounds instead of a meaningless index.
+function benchWindowLabel() {
+  var w = BENCH_WINDOWS[benchWindow];
+  return benchLabel(w[0]) + ' .. ' + benchLabel(w[w.length - 1]);
+}
+
 // BENCH_MAX_TOKENS caps the completion so decode speed
 // is comparable across depths: every depth produces
 // (up to) the same number of output tokens, timed
@@ -1573,17 +1581,39 @@ function benchFinishNote(stopped) {
   }
 }
 
-// runBenchmark sends one request per depth to the
-// selected endpoint and model and records the
-// proxy's own measurements (first-token latency,
-// prefill and decode tokens per second) in a table
-// in the chat. Up to benchConcurrency depths run in
-// parallel, each with its own row and abort
-// controller. The button turns into Stop for the
-// duration; stopping aborts every in-flight depth.
-// A depth that fails (a 64k prompt exceeds the
-// model's context, say) shows its error in the
-// table and the run continues.
+// benchMean returns the arithmetic mean of a list of
+// numbers, or 0 when the list is empty.
+function benchMean(list) {
+  if (!list.length) return 0;
+  var sum = 0;
+  for (var i = 0; i < list.length; i++) sum += list[i];
+  return sum / list.length;
+}
+
+// benchMax returns the largest value in a list of
+// numbers, or 0 when the list is empty.
+function benchMax(list) {
+  var best = 0;
+  for (var i = 0; i < list.length; i++) if (list[i] > best) best = list[i];
+  return best;
+}
+
+// runBenchmark sends benchConcurrency identical requests
+// per context depth to the selected endpoint and model,
+// one depth at a time, and records the proxy's own
+// measurements (first-token latency, prefill and decode
+// tokens per second) in a table in the chat. Running N
+// requests at the same depth is what makes the numbers
+// comparable: the prefill and decode columns are
+// aggregate throughput — the total tokens per second
+// the endpoint produced with N requests in flight — so
+// the figure rises when the provider is the same and
+// the load is higher. TTFT is the mean across the N
+// requests. The Benchmark button becomes Stop for the
+// duration; Stop (that button or the dedicated one)
+// aborts every in-flight depth. A depth that fails (a
+// 64k prompt exceeds the model's context, say) shows its
+// error in the table and the run continues.
 function runBenchmark() {
   if (benchRunning) {
     stopBenchmark();
@@ -1602,7 +1632,8 @@ function runBenchmark() {
   var col = appendMessage('assistant', '', null, null);
   var bubble = col.querySelector('.bubble');
   var labels = depths.map(benchLabel);
-  bubble.innerHTML = '<p>Benchmarking <b>' + esc(model) + '</b> at ' + labels.join(' / ') + ' tokens…</p>';
+  bubble.innerHTML = '<p>Benchmarking <b>' + esc(model) + '</b> at ' + labels.join(' / ') + ' tokens' +
+    (benchConcurrency > 1 ? ', ' + benchConcurrency + ' concurrent requests per depth' : '') + '…</p>';
   var table = document.createElement('table');
   table.className = 'bench-table';
   var head = table.insertRow(-1);
@@ -1614,8 +1645,11 @@ function runBenchmark() {
   }
   bubble.appendChild(table);
 
-  // One row per depth, all created up front; up to
-  // benchConcurrency requests are in flight at once.
+  // One row per depth, all created up front. Each depth
+  // is a batch of benchConcurrency requests; the batch
+  // must drain before the next depth starts, so the
+  // numbers describe that depth alone and not the
+  // leftovers of the one before it.
   var rows = depths.map(function (depth) {
     var row = table.insertRow(-1);
     var cells = [];
@@ -1634,77 +1668,102 @@ function runBenchmark() {
   $('bench-stop').style.display = '';
 
   var nextIdx = 0;
-  var doneCount = 0;
-  var inFlight = 0;
 
   function startOne() {
     if (benchFinished || benchStopping || !benchRunning) return;
-    if (nextIdx >= depths.length) return;
+    if (nextIdx >= rows.length) { benchFinishNote(false); return; }
     var entry = rows[nextIdx++];
     var depth = entry.depth;
     var row = entry.row;
     var cells = entry.cells;
 
     var prompt = benchPrompt(depth);
-    var payload = {
-      endpoint: { url: ep.url, api_key: ep.api_key },
-      model: model,
-      stream: true
-    };
-    if (protocol === 'responses') {
-      payload.input = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] }];
-      payload.max_output_tokens = BENCH_MAX_TOKENS;
-    } else {
-      payload.messages = [{ role: 'user', content: prompt }];
-      payload.max_tokens = BENCH_MAX_TOKENS;
-    }
+    var samples = [];
+    var settled = 0;
+    var firstError = null;
+    var aborted = false;
 
-    benchAbortCtrl = new AbortController();
-    benchAbortCtrls.push(benchAbortCtrl);
-    var abortCtrl = benchAbortCtrl;
-    inFlight++;
-
-    doSend(payload, protocol,
-      function () {},
-      function (s) {
-        if (!s) return;
-        cells[1].textContent = fmtInt(s.context_tokens);
-        cells[2].textContent = s.ttft_ms ? fmtInt(s.ttft_ms) + ' ms' : '—';
-        cells[3].textContent = s.prefill_tokens_per_sec ? Math.round(s.prefill_tokens_per_sec) + ' t/s' : '—';
-        cells[4].textContent = s.decode_tokens_per_sec ? Math.round(s.decode_tokens_per_sec) + ' t/s' : '—';
-      },
-      function () {},
-      abortCtrl.signal
-    ).then(function () {
-      done();
-    }).catch(function (err) {
-      if (err && err.name === 'AbortError') {
+    function renderBatch() {
+      if (benchFinished) return;
+      if (aborted || benchStopping) {
         cells[1].textContent = 'stopped';
-        done();
+        benchFinishNote(true);
         return;
       }
-      // A failed depth does not end the run: the
-      // error replaces the pending cells and the
-      // next depth still runs.
-      while (row.cells.length > 1) row.deleteCell(1);
-      var bad = row.insertCell(-1);
-      bad.className = 'bench-error';
-      bad.colSpan = 4;
-      bad.textContent = 'Error: ' + (err && err.message ? err.message : err);
-      done();
-    });
+      if (firstError) {
+        // A failed depth does not end the run: the error
+        // replaces the pending cells and the next depth
+        // still runs.
+        while (row.cells.length > 1) row.deleteCell(1);
+        var bad = row.insertCell(-1);
+        bad.className = 'bench-error';
+        bad.colSpan = 4;
+        bad.textContent = 'Error: ' + (firstError && firstError.message ? firstError.message : firstError);
+        startOne();
+        return;
+      }
+      if (samples.length) {
+        cells[1].textContent = fmtInt(benchMax(samples.map(function (s) { return s.context_tokens; })));
+        cells[2].textContent = benchMean(samples.map(function (s) { return s.ttft_ms; })) ?
+          fmtInt(Math.round(benchMean(samples.map(function (s) { return s.ttft_ms; })))) + ' ms' : '—';
+        cells[3].textContent = benchMean(samples.map(function (s) { return s.prefill_tokens_per_sec; })) ?
+          Math.round(benchMean(samples.map(function (s) { return s.prefill_tokens_per_sec; })) * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
+        cells[4].textContent = benchMean(samples.map(function (s) { return s.decode_tokens_per_sec; })) ?
+          Math.round(benchMean(samples.map(function (s) { return s.decode_tokens_per_sec; })) * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
+      }
+      startOne();
+    }
+
+    function settle() {
+      settled++;
+      benchAbortCtrls = [];
+      // Only the last request in the batch writes the row,
+      // which is where the aggregate is computed from every
+      // sample that arrived.
+      if (settled < benchConcurrency) return;
+      renderBatch();
+    }
+
+    for (var i = 0; i < benchConcurrency; i++) {
+      var payload = {
+        endpoint: { url: ep.url, api_key: ep.api_key },
+        model: model,
+        stream: true
+      };
+      if (protocol === 'responses') {
+        payload.input = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] }];
+        payload.max_output_tokens = BENCH_MAX_TOKENS;
+      } else {
+        payload.messages = [{ role: 'user', content: prompt }];
+        payload.max_tokens = BENCH_MAX_TOKENS;
+      }
+
+      benchAbortCtrl = new AbortController();
+      benchAbortCtrls.push(benchAbortCtrl);
+      var abortCtrl = benchAbortCtrl;
+
+      doSend(payload, protocol,
+        function () {},
+        function (s) {
+          if (!s) return;
+          samples.push(s);
+        },
+        function () {},
+        abortCtrl.signal
+      ).then(function () {
+        settle();
+      }).catch(function (err) {
+        if (err && err.name === 'AbortError') {
+          aborted = true;
+        } else if (!firstError) {
+          firstError = err;
+        }
+        settle();
+      });
+    }
   }
 
-  function done() {
-    if (benchFinished) return;
-    inFlight--;
-    doneCount++;
-    if (doneCount >= depths.length) { benchFinishNote(false); return; }
-    if (benchStopping || !benchRunning) return;
-    if (inFlight < benchConcurrency) startOne();
-  }
-
-  for (var i = 0; i < benchConcurrency; i++) startOne();
+  startOne();
 }
 
 // ---------- wiring ----------
@@ -1754,8 +1813,8 @@ function init() {
   var cw = $('bench-window-input');
   if (cw) {
     cw.value = benchWindow + 1;
-    $('bench-window-val').textContent = benchWindow + 1;
-    cw.oninput = function () { benchWindow = parseInt(cw.value, 10) - 1 || 0; $('bench-window-val').textContent = benchWindow + 1; persistUI(); };
+    $('bench-window-val').textContent = benchWindowLabel();
+    cw.oninput = function () { benchWindow = parseInt(cw.value, 10) - 1 || 0; $('bench-window-val').textContent = benchWindowLabel(); persistUI(); };
   }
   renderModels();
   refreshModels();
