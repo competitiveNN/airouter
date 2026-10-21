@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -174,21 +175,50 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		// request-level clock every recordRequest below measures against.
 		attemptStart := time.Now()
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
-		resp, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
-		if err != nil {
+		var lastErr error
+		var resp *http.Response
+		gotResp := false
+		maxProxyTries := g.proxy.proxyTries(ep)
+		if maxProxyTries <= 0 {
+			maxProxyTries = 1
+		}
+		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+			r, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
+			if err != nil {
+				var pErr *ProxyError
+				if errors.As(err, &pErr) {
+					// Proxy failure: mark the proxy down and try again with a
+					// different proxy on the same endpoint.
+					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					lastErr = err
+					continue
+				}
+				lastErr = err
+				break
+			}
+			resp = r
+			gotResp = true
+			break
+		}
+		if !gotResp {
 			cancel()
 			g.recordAttempt(ep, time.Since(attemptStart), false)
-			if isClientDisconnect(err) {
+			var pErr *ProxyError
+			if !errors.As(lastErr, &pErr) && isClientDisconnect(lastErr) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
-			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			if !errors.As(lastErr, &pErr) {
+				// Only cool down the endpoint for non-proxy errors; a proxy
+				// fault already landed on the proxy via MarkProxyDown above.
+				g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
+			}
 			g.recordCooldown()
 			if g.testCooldown > 0 {
-				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+				g.router.ApplyCooldownWithDuration(ep, 0, lastErr.Error(), sessionID, g.testCooldown)
 			}
 			continue
 		}
@@ -361,21 +391,48 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		// attempt fails before producing anything, nothing has been sent and
 		// we can fall back cleanly.
 		var buf strings.Builder
-		attempt := newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
+		var attempt *responsesStreamWriter
 		tokens := estimateTokens(req)
 		// attemptStart times this single upstream attempt; `start` above is
 		// the request-level clock. Sharing them would make the TPS figure a
 		// per-request rather than a per-attempt measurement.
 		attemptStart := time.Now()
-		text, toolCalls, err := g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt)
+
+		// A proxy fault is the proxy's doing, not the endpoint's, so retry
+		// with a different proxy on the same endpoint before giving up on it,
+		// and never charge the endpoint for the failure.
+		maxProxyTries := g.proxy.proxyTries(ep)
+		if maxProxyTries <= 0 {
+			maxProxyTries = 1
+		}
+		var text string
+		var toolCalls []streamToolCall
+		var err error
+		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+			buf.Reset()
+			attempt = newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
+			text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt)
+			if err == nil {
+				break
+			}
+			var pErr *ProxyError
+			if !errors.As(err, &pErr) {
+				break // endpoint failure: another proxy would not help
+			}
+			g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+		}
 		if err != nil {
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
+			var pErr *ProxyError
 			// ApplyCooldownFromErrorForSession already advances the circuit
 			// breaker state machine; the redundant RecordFailure call would
 			// double-count this failure and trip the circuit at half the
 			// configured threshold.
-			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			if !errors.As(err, &pErr) {
+				// Only the endpoint is at fault when no proxy was in the path.
+				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			}
 			g.recordCooldown()
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
@@ -412,6 +469,12 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 // streamResponsesAttempt runs one upstream attempt through the Responses
 // translator, writing into sw. It returns the accumulated text and tool calls
 // so a failure can carry them into the retry.
+//
+// Like every other proxy surface, a proxied endpoint routes through the pool: a
+// transport-layer failure with a proxy in the path becomes a ProxyError, so the
+// caller cools the proxy rather than the endpoint. Dialing direct here would
+// both silently bypass the operator's proxy setting and mis-attribute the fault
+// to a healthy endpoint.
 func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte, ep ModelEndpoint, sessionID string, sw *responsesStreamWriter) (string, []streamToolCall, error) {
 	providerCfg, ok := g.proxy.config.Load().Providers[ep.Provider]
 	if !ok {
@@ -421,9 +484,18 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	if err != nil {
 		return "", nil, err
 	}
-	resp, err := g.proxy.client.Do(req)
+	client, usedProxy := g.proxy.attemptClient(&ep)
+	resp, err := client.Do(req)
 	if err != nil {
+		if usedProxy != nil && proxyFault(err) {
+			return "", nil, &ProxyError{Proxy: usedProxy, Err: err}
+		}
 		return "", nil, &ProviderError{Err: err}
+	}
+	if usedProxy != nil {
+		// The proxy carried this request as far as a response header, which is
+		// the strongest evidence of usability available, so renew its mark.
+		g.proxy.MarkProxyReady(usedProxy.URL)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
