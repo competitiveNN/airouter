@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-10-20T04:14:26.432012Z",
+  "fetched_at": "2026-10-21T04:05:25.397838Z",
   "first_seen": {
     "beam-free": "2026-10-16",
     "cat-jam-free": "2026-10-14",
@@ -38,7 +38,7 @@
     "fledge-alpha-free": "2026-10-08",
     "inclusionai/ling-3.1-flash": "2026-10-14",
     "inclusionai/ling-3.1-flash:free": "2026-10-15",
-    "jev-1.13-free": "2026-10-19",
+    "jev-1.13-free": "2026-10-21",
     "ling-3.1-flash-free": "2026-10-15",
     "ll-alpha-free": "2026-10-16",
     "mimo-v2.5-free": "2026-10-08",
