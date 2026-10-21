@@ -1085,6 +1085,15 @@ func TestChatPageBenchmarkUI(t *testing.T) {
 		"var BENCH_MAX_TOKENS = 256;",
 		"function benchPrompt",
 		"function runBenchmark",
+		"function benchWindowLabel",
+		"$('bench-window-val').textContent = benchWindowLabel();",
+		// Concurrency is per depth: one request per depth is
+		// launched in a loop, and the depth's result is written
+		// only once every request in the batch has settled.
+		"concurrent requests per depth",
+		"function renderBatch()",
+		"if (settled < benchConcurrency) return;",
+		"renderBatch();",
 		"payload.max_tokens = BENCH_MAX_TOKENS;",
 		"payload.max_output_tokens = BENCH_MAX_TOKENS;",
 		"benchAbortCtrl = new AbortController();",
