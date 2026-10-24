@@ -1140,9 +1140,59 @@ function renderMessages() {
   }
   if (!chat) return;
   chat.messages.forEach(function (m) {
-    appendMessage(m.role, m.content, m.stats, m.thinking);
+    if (m.kind === 'benchmark') {
+      appendBenchmarkMessage(m.benchmark);
+    } else {
+      appendMessage(m.role, m.content, m.stats, m.thinking);
+    }
   });
   box.scrollTop = box.scrollHeight;
+}
+
+// appendBenchmarkMessage renders a completed benchmark from the
+// chat history. Benchmark entries are transcript records, not model
+// context, so they are skipped when the next request is built.
+function appendBenchmarkMessage(result) {
+  var col = appendMessage('assistant', '', null, null);
+  var bubble = col.querySelector('.bubble');
+  var labels = result.depths.map(benchLabel);
+  bubble.innerHTML = '<p>Benchmark <b>' + esc(result.model) + '</b> at ' + labels.join(' / ') + ' tokens' +
+    (result.concurrency > 1 ? ', ' + result.concurrency + ' concurrent requests per depth' : '') + '</p>';
+  var table = document.createElement('table');
+  table.className = 'bench-table';
+  var head = table.insertRow(-1);
+  var names = ['depth', 'context', 'ttft', 'prefill', 'decode'];
+  for (var i = 0; i < names.length; i++) {
+    var th = document.createElement('th');
+    th.textContent = names[i];
+    head.appendChild(th);
+  }
+  result.rows.forEach(function (entry) {
+    var row = table.insertRow(-1);
+    var depth = row.insertCell(-1);
+    depth.textContent = benchLabel(entry.depth);
+    if (entry.error) {
+      var bad = row.insertCell(-1);
+      bad.className = 'bench-error';
+      bad.colSpan = 4;
+      bad.textContent = 'Error: ' + entry.error;
+      return;
+    }
+    var context = row.insertCell(-1);
+    context.textContent = fmtInt(entry.context_tokens);
+    var ttft = row.insertCell(-1);
+    ttft.textContent = entry.ttft_ms ? fmtInt(entry.ttft_ms) + ' ms' : '—';
+    var prefill = row.insertCell(-1);
+    prefill.textContent = entry.prefill_tokens_per_sec ? Math.round(entry.prefill_tokens_per_sec) + ' t/s' : '—';
+    var decode = row.insertCell(-1);
+    decode.textContent = entry.decode_tokens_per_sec ? Math.round(entry.decode_tokens_per_sec) + ' t/s' : '—';
+  });
+  bubble.appendChild(table);
+  var note = document.createElement('p');
+  note.className = 'stats';
+  note.textContent = result.stopped ? 'benchmark stopped' : 'benchmark complete';
+  bubble.appendChild(note);
+  return col;
 }
 
 function statsText(s) {
@@ -1170,6 +1220,7 @@ function fmtInt(n) {
 function toResponsesItems(messages) {
   var items = [];
   messages.forEach(function (m) {
+    if (m.kind === 'benchmark') return;
     if (m.role === 'assistant') {
       var reasoning = m.reasoning || [];
       for (var i = 0; i < reasoning.length; i++) {
@@ -1228,7 +1279,7 @@ function send() {
   if (protocol === 'responses') {
     payload.input = toResponsesItems(chat.messages);
   } else {
-    payload.messages = chat.messages.map(function (m) { return { role: m.role, content: m.content }; });
+    payload.messages = chat.messages.filter(function (m) { return m.kind !== 'benchmark'; }).map(function (m) { return { role: m.role, content: m.content }; });
   }
 
   generating = true;
@@ -1521,6 +1572,8 @@ var benchRunning = false;
 var benchStopping = false;
 var benchFinished = false;
 var benchBubble = null;
+var benchResult = null;
+var benchChat = null;
 var benchAbortCtrl = null;
 var benchAbortCtrls = [];
 var benchConcurrency = 1;
@@ -1560,10 +1613,11 @@ function stopBenchmark() {
 }
 
 // benchFinishNote ends a benchmark run: it resets the shared
-// benchmark state, restores the buttons, and appends the
-// stopped/complete note to the current benchmark bubble. It runs
-// exactly once per run — a finished flag guards against the note
-// being appended twice if aborts and completions settle together.
+// benchmark state, restores the buttons, appends the stopped/complete
+// note to the current benchmark bubble, and saves the measured run in
+// the chat that started it. It runs exactly once per run — a finished
+// flag guards against the note being appended twice if aborts and
+// completions settle together.
 function benchFinishNote(stopped) {
   if (benchFinished) return;
   benchFinished = true;
@@ -1579,6 +1633,21 @@ function benchFinishNote(stopped) {
     benchBubble.appendChild(note);
     benchBubble = null;
   }
+  benchSave(stopped);
+}
+
+// benchSave writes the benchmark result to the chat that started it.
+// A benchmark is a transcript record, not model context: it stays in
+// the visible history but is filtered out of the next request payload.
+function benchSave(stopped) {
+  if (!benchResult || !benchChat) return;
+  benchResult.stopped = !!stopped;
+  benchChat.messages.push({ kind: 'benchmark', benchmark: benchResult });
+  benchChat.updated = Date.now();
+  save(LS_CHATS, chats);
+  renderChats();
+  benchResult = null;
+  benchChat = null;
 }
 
 // benchMean returns the arithmetic mean of a list of
@@ -1634,6 +1703,8 @@ function runBenchmark() {
   var labels = depths.map(benchLabel);
   bubble.innerHTML = '<p>Benchmarking <b>' + esc(model) + '</b> at ' + labels.join(' / ') + ' tokens' +
     (benchConcurrency > 1 ? ', ' + benchConcurrency + ' concurrent requests per depth' : '') + '…</p>';
+  benchResult = { model: model, depths: depths.slice(), concurrency: benchConcurrency, rows: [] };
+  benchChat = ensureChat();
   var table = document.createElement('table');
   table.className = 'bench-table';
   var head = table.insertRow(-1);
@@ -1656,7 +1727,7 @@ function runBenchmark() {
     for (var i = 0; i < names.length; i++) cells.push(row.insertCell(-1));
     cells[0].textContent = benchLabel(depth);
     for (var j = 1; j < names.length; j++) cells[j].textContent = '…';
-    return { depth: depth, row: row, cells: cells };
+    return { depth: depth, row: row, cells: cells, result: null };
   });
 
   benchRunning = true;
@@ -1699,17 +1770,31 @@ function runBenchmark() {
         bad.className = 'bench-error';
         bad.colSpan = 4;
         bad.textContent = 'Error: ' + (firstError && firstError.message ? firstError.message : firstError);
+        entry.result = { depth: depth, error: firstError && firstError.message ? firstError.message : String(firstError) };
+        benchResult.rows.push(entry.result);
         startOne();
         return;
       }
       if (samples.length) {
-        cells[1].textContent = fmtInt(benchMax(samples.map(function (s) { return s.context_tokens; })));
-        cells[2].textContent = benchMean(samples.map(function (s) { return s.ttft_ms; })) ?
-          fmtInt(Math.round(benchMean(samples.map(function (s) { return s.ttft_ms; })))) + ' ms' : '—';
-        cells[3].textContent = benchMean(samples.map(function (s) { return s.prefill_tokens_per_sec; })) ?
-          Math.round(benchMean(samples.map(function (s) { return s.prefill_tokens_per_sec; })) * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
-        cells[4].textContent = benchMean(samples.map(function (s) { return s.decode_tokens_per_sec; })) ?
-          Math.round(benchMean(samples.map(function (s) { return s.decode_tokens_per_sec; })) * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
+        var contextTokens = benchMax(samples.map(function (s) { return s.context_tokens; }));
+        var ttft = benchMean(samples.map(function (s) { return s.ttft_ms; }));
+        var prefill = benchMean(samples.map(function (s) { return s.prefill_tokens_per_sec; }));
+        var decode = benchMean(samples.map(function (s) { return s.decode_tokens_per_sec; }));
+        cells[1].textContent = fmtInt(contextTokens);
+        cells[2].textContent = ttft ?
+          fmtInt(Math.round(ttft)) + ' ms' : '—';
+        cells[3].textContent = prefill ?
+          Math.round(prefill * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
+        cells[4].textContent = decode ?
+          Math.round(decode * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
+        entry.result = {
+          depth: depth,
+          context_tokens: contextTokens,
+          ttft_ms: Math.round(ttft),
+          prefill_tokens_per_sec: prefill * (benchConcurrency > 1 ? benchConcurrency : 1),
+          decode_tokens_per_sec: decode * (benchConcurrency > 1 ? benchConcurrency : 1)
+        };
+        benchResult.rows.push(entry.result);
       }
       startOne();
     }
