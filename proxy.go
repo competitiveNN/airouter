@@ -154,9 +154,18 @@ func (p *Proxy) MarkProxyReady(proxyURL string) {
 // to ep. Every proxy surface uses this so the streaming and non-streaming paths
 // cannot drift on how, or whether, an attempt is proxied: a nil usedProxy means
 // the attempt goes direct and the caller must not attribute faults to a proxy,
-// while a non-nil one is what the caller credits on success and charges on a
+// while a non-nil one is what they credit on success and charge on a
 // transport-layer failure.
-func (p *Proxy) attemptClient(ep *ModelEndpoint) (*http.Client, *ProxyInfo) {
+//
+// timeout, when non-zero, bounds this attempt's connection phases — dial, TLS
+// handshake, response headers — by the request's own size-adjusted budget.
+// Without it the shared transport's global 15s/30s values decide, so a provider
+// that accepted the connection and then went silent held one attempt for 15s
+// even though the request's budget said 5s: exactly the long consecutive
+// failure a per-attempt budget exists to prevent. The timeouts are applied to a
+// CLONE rather than to the shared transport, because mutating the shared one
+// would change every other in-flight request.
+func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration) (*http.Client, *ProxyInfo) {
 	client := p.client
 	transport := p.baseTransport
 	if p.effectiveProtocol(ep) == protocolCommandCode {
@@ -171,6 +180,10 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint) (*http.Client, *ProxyInfo) {
 		if svc != nil {
 			if proxy := svc.pick(); proxy != nil {
 				if tr := svc.TransportFor(transport, proxy); tr != nil {
+					// TransportFor already built this transport for this one
+					// proxy, so bounding its timeouts cannot leak into
+					// another attempt.
+					applyAttemptTimeouts(tr, timeout)
 					client = &http.Client{Transport: tr}
 					usedProxy = proxy
 				} else {
@@ -189,6 +202,16 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint) (*http.Client, *ProxyInfo) {
 					ep.Provider, ep.Model, svc.pool.len(), svc.ReadyCount())
 			}
 		}
+	}
+	// The direct path shares one transport across every request, so it is
+	// cloned before this attempt's budget is applied. A clone starts with an
+	// empty connection pool, so the attempt re-dials instead of reusing an idle
+	// connection: that costs one handshake per attempt, which is the same price
+	// the chat streaming path already pays for the same guarantee.
+	if usedProxy == nil && transport != nil && timeout > 0 {
+		tr := transport.Clone()
+		applyAttemptTimeouts(tr, timeout)
+		client = &http.Client{Transport: tr}
 	}
 	return client, usedProxy
 }
@@ -890,6 +913,42 @@ func (p *Proxy) Warmup(ctx context.Context) {
 	}
 }
 
+// applyAttemptTimeouts bounds every phase of ONE upstream attempt by the
+// request's own size-adjusted timeout.
+//
+// The size-based timeout used to cover only the response-header wait. The
+// connection phases before it -- the TCP dial and the TLS handshake -- were
+// governed by the transport's global 15s, so a provider that accepted the
+// connection and then went silent could hold a single attempt for 15s even
+// though the request's budget said 5s. That is the "long consecutive failure"
+// this closes: an attempt now costs at most the timeout the request budget
+// allows, whatever phase it dies in.
+//
+// The dialer is wrapped rather than replaced: a SOCKS5 proxy transport carries
+// its own DialContext, and overwriting it would silently turn a proxied
+// request into a direct one. The wrapper only adds a deadline to the context
+// the underlying dialer already receives.
+//
+// The body phase is deliberately NOT bounded here. A long generation must not
+// be cut off; firstByteReader guards time-to-first-token and idleTimeoutReader
+// guards a stalled stream.
+func applyAttemptTimeouts(tr *http.Transport, timeout time.Duration) {
+	if tr == nil || timeout <= 0 {
+		return
+	}
+	tr.ResponseHeaderTimeout = timeout
+	tr.TLSHandshakeTimeout = timeout
+	base := tr.DialContext
+	if base == nil {
+		base = (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext
+	}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return base(dialCtx, network, addr)
+	}
+}
+
 func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration, sessionID string) (string, []streamToolCall, int, error) {
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
@@ -953,7 +1012,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 				// proxied stay unset so the proxy is neither credited with a
 				// success it never carried nor charged with the failure.
 				if tr := svc.TransportFor(transport, proxy); tr != nil {
-					tr.ResponseHeaderTimeout = timeout
+					applyAttemptTimeouts(tr, timeout)
 					client = &http.Client{Transport: tr}
 					transport = tr
 					usedProxy = proxy
@@ -979,7 +1038,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// set above; otherwise clone the transport to set the per-attempt budget.
 	if transport != nil && !proxied {
 		tr := transport.Clone()
-		tr.ResponseHeaderTimeout = timeout
+		applyAttemptTimeouts(tr, timeout)
 		client = &http.Client{Transport: tr}
 	}
 

@@ -663,26 +663,34 @@ func TestRouterSelectEndpointSkipsCooldown(t *testing.T) {
 	}
 }
 
-// TestRouterSelectEndpointAllInCooldown asserts the exhausted-chain result:
+// TestRouterSelectEndpointAllInCooldown asserts the exhausted-gateway result:
 // no endpoint plus a positive wait, which the handler turns into a 503 after
 // sleeping up to that wait. Renamed from TestRouterSelectNextAllInCooldown;
 // see TestRouterSelectEndpointSkipsCooldown.
+//
+// The scope is EVERY chain, not just the requested one. A session whose own
+// chain has run dry now fails over to another chain (see substituteChains), so
+// a request for `smart` with the whole `smart` chain cooled down is served by
+// `work` instead of failing -- that is the high-availability behaviour these
+// tests were adjusted for. "Nothing anywhere" is therefore the only condition
+// that yields no endpoint.
 func TestRouterSelectEndpointAllInCooldown(t *testing.T) {
 	cfg := loadTestConfig(t)
 	router := NewRouter(cfg, "")
 	sessionID := "test-session-4"
 
-	chain := cfg.Models["smart"].Chain
-
-	// Put all models in cooldown
-	for _, ep := range chain {
-		router.ApplyCooldown(&ep, 500, "server error")
+	// Put every endpoint of every chain in cooldown, so there is genuinely
+	// nothing left anywhere to route the session to.
+	for _, model := range cfg.Models {
+		for _, ep := range model.Chain {
+			router.ApplyCooldown(&ep, 500, "server error")
+		}
 	}
 
 	// Should return nil + wait duration
 	ep, wait := router.SelectEndpoint("smart", sessionID, false, nil)
 	if ep != nil {
-		t.Error("expected nil endpoint when all in cooldown")
+		t.Error("expected nil endpoint when all chains are in cooldown")
 	}
 	if wait <= 0 {
 		t.Error("expected positive wait duration")

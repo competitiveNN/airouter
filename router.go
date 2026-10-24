@@ -163,9 +163,25 @@ const (
 	defaultCircuitBreakerHalfOpenProbes = 1
 )
 
+// sessionEntry is the router's record of one sticky session.
+//
+// `model` is the logical model the CLIENT asked for; `chain` is the logical
+// chain the session is actually being served from. They differ after a
+// cross-chain failover: a request for `smart` whose `smart` chain has no
+// usable endpoint left moves the session onto `work`, and from then on every
+// request in that session is served from `work` until `work` fails too. The
+// split is what makes the swap durable rather than a per-request accident:
+// the next request must be able to tell "the client changed the model" (a
+// fresh pick from the newly requested chain) from "this session previously
+// failed over" (stay on the substitute chain it is now living on).
+//
+// A zero `chain` means the entry predates cross-chain failover — the legacy
+// state after a hot reload or a persisted session — and is treated as `model`.
 type sessionEntry struct {
 	ep       ModelEndpoint
 	lastUsed time.Time
+	model    string // logical model the client requested
+	chain    string // logical chain currently serving the session
 }
 
 const (
@@ -872,6 +888,47 @@ func (r *Router) minCooldownWait(chain []ModelEndpoint, requireVision bool) time
 	return minWait
 }
 
+// substituteChains is the order in which a session's own chain is abandoned
+// when no endpoint left in it can serve the request: every endpoint is on
+// cooldown, already tried and failed, marked no-vision for a vision request,
+// or otherwise ineligible.
+//
+// This is the fix for "the session is tied to the chain and fails
+// indefinitely". A chain that has run dry is not a request failure any more:
+// the session swaps to the next chain whose models actually work, and keeps
+// swapping on every subsequent request until it finds one. Without it, a
+// request whose whole chain was on cooldown had only two options — wait out
+// the shortest cooldown (which for a 404 is seven days) or return
+// 503 all_models_unavailable — even though the other three chains in the
+// same config were serving traffic happily.
+//
+// The order is not arbitrary, because a substitute is not equally usable for
+// every request:
+//
+//   - `large` comes second because those models carry the biggest context
+//     windows, so a prompt from ANY chain still fits.
+//   - `smart` comes third rather than first: in the shipped config `work` is
+//     a superset of `smart` (sync-instruction.txt rule 1: "work — the smart
+//     pool extended down to intelligence >= 15"), so if `work` is exhausted
+//     `smart` — a subset of the very same endpoints — is exhausted too and
+//     consulting it earlier would be pure latency. It is still consulted,
+//     just after `large`, because that superset relation is a property of the
+//     config and not of the code: an operator who trims `work` down must not
+//     silently lose `smart` as a fallback.
+//   - `fast` is last because it holds the smallest models, and therefore the
+//     smallest context windows: a request that outgrew `large` would be
+//     rejected outright by a `fast` model, trading a long wait for a fast
+//     error. It is the fallback of last resort, reached only when everything
+//     larger is down.
+//
+// Within a chain the configured order is always honoured; this list only
+// orders the CHAINS relative to each other.
+//
+// The requested chain is always tried first regardless of this list — it is
+// the client's explicit choice, and a substitute is only ever reached when
+// the requested chain has nothing left to offer.
+var substituteChains = []string{"work", "large", "smart", "fast"}
+
 // SelectEndpoint selects the next endpoint for a logical model, considering the
 // session's sticky routing, cooldowns, vision eligibility, and the set of
 // endpoints already tried in the current fallback sequence (tried).
@@ -881,82 +938,262 @@ func (r *Router) minCooldownWait(chain []ModelEndpoint, requireVision bool) time
 // requests with the same session ID from interfering with each other's
 // endpoint selection — one request's failures do not cause the other to skip
 // an endpoint it has not independently tried.
+//
+// When the requested chain has no usable endpoint left, the selection fails
+// over to another chain (see substituteChains) and RE-PINS the session onto
+// it, so the swap survives into the next request rather than being re-deriven
+// (and re-failed) on every turn. The failover is not one swap: every chain
+// that runs dry is abandoned in turn, so a session keeps moving until it
+// lands on a chain whose models actually work.
 func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bool, tried map[string]bool) (*ModelEndpoint, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	chain, ok := r.config.Load().Models[logicalModel]
-	if !ok || len(chain.Chain) == 0 {
+	cfg := r.config.Load()
+	model, ok := cfg.Models[logicalModel]
+	if !ok || len(model.Chain) == 0 {
 		return nil, 0
 	}
 
-	if se, ok := r.sessions[sessionID]; ok {
-		// Update lastUsed so the session isn't evicted while active.
+	se, known := r.sessions[sessionID]
+	if known {
+		// A session entry written before cross-chain failover existed (or
+		// restored by a hot reload) carries neither a chain nor a model.
+		// Such a session is bound to the chain the client is asking for
+		// right now, which is exactly the pre-failover semantics: sticky
+		// within the requested chain, re-pinned when its endpoint stops
+		// working.
+		if se.chain == "" {
+			se.chain = logicalModel
+			se.model = logicalModel
+		}
+		// Refresh lastUsed so an active session is not evicted by the
+		// background sweeper while it is still in use.
 		se.lastUsed = time.Now()
 		r.sessions[sessionID] = se
-		ep := se.ep
-		// The sticky pick is only valid while the pinned endpoint
-		// is still a member of the current chain. A hot-reload (the
-		// nightly model sync rewrites the chains and the file watcher
-		// reloads config.yaml in place) can remove it; isAvailableLocked
-		// knows nothing about chain membership, and the session sweeper
-		// even deletes cooldown entries for endpoints no longer in the
-		// config, so a removed endpoint would otherwise look permanently
-		// available and keep receiving this session's traffic until the
-		// session TTL expires. Falling through re-pins the session to a
-		// current endpoint below.
-		inChain := false
-		for i := range chain.Chain {
-			if chain.Chain[i].Key() == ep.Key() {
-				inChain = true
-				break
+	}
+
+	// The chains this selection may consult, in order: the requested chain
+	// always leads, a session that already failed over keeps serving from
+	// its substitute chain FIRST (the durable swap), and the remaining
+	// chains follow in substituteChains order.
+	chains := r.chainOrderLocked(cfg, logicalModel, se, known)
+
+	for _, chainName := range chains {
+		nextChain, hasChain := cfg.Models[chainName]
+		if !hasChain || len(nextChain.Chain) == 0 {
+			continue
+		}
+		endpoints := nextChain.Chain
+
+		// The chain this session is currently pinned to. Only this chain may
+		// serve the session's sticky endpoint; every other chain is a
+		// substitute and is walked in configured order.
+		serving := known && chainName == se.chain
+
+		// The sticky endpoint: only valid while it is still a member of THIS
+		// chain. A hot-reload (the nightly model sync rewrites the chains and
+		// the file watcher reloads config.yaml in place) can remove it;
+		// isAvailableLocked knows nothing about chain membership, and the
+		// session sweeper even deletes cooldown entries for endpoints no
+		// longer in the config, so a removed endpoint would otherwise look
+		// permanently available and keep receiving this session's traffic
+		// until the session TTL expires. Falling through re-pins the session
+		// to a current endpoint below.
+		capabilityFallback := false
+		if serving {
+			ep := se.ep
+			// isAvailableLocked can consume a half-open circuit probe, so it
+			// is called exactly once here and the result is reused.
+			inChain := r.endpointInChain(endpoints, ep)
+			available := inChain && r.isAvailableLocked(&ep)
+			if available && r.visionEligible(&ep, requireVision) && !tried[ep.Key()] {
+				// The client may have moved to a different logical model
+				// while the session stayed on this chain (a failover the
+				// client has not outgrown). Record the model it asks for
+				// now, so the next turn can tell a fresh request target
+				// from a stale failover.
+				if se.model != logicalModel {
+					se.model = logicalModel
+					r.sessions[sessionID] = se
+				}
+				return &ep, 0
+			}
+			// The sticky model is out: either cooled, marked no-vision, or
+			// already tried and failed in this request's fallback sequence.
+			capabilityFallback = available && !r.visionEligible(&ep, requireVision)
+		}
+
+		// A brand new session's FIRST pick is ROTATED across the head of the
+		// requested chain (see selectInitialEndpoint), so fresh traffic
+		// spreads over the top of the chain instead of piling onto depth 0.
+		// Rotation never applies to a substitute chain: a failover must
+		// escalate in configured order, not jump to an arbitrary depth.
+		if !known && chainName == logicalModel {
+			if ep := r.selectInitialEndpoint(logicalModel, sessionID, &nextChain, requireVision); ep != nil && !tried[ep.Key()] {
+				log.Printf("[debug] session=%s model=%s -> new session -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
+				r.bindSessionLocked(sessionID, *ep, logicalModel, chainName)
+				return ep, 0
 			}
 		}
-		available := inChain && r.isAvailableLocked(&ep)
-		if available && r.visionEligible(&ep, requireVision) && !tried[ep.Key()] {
-			return &ep, 0
-		}
-		// The sticky model is out: either cooled, marked no-vision, or already
-		// tried and failed in this request's fallback sequence.
-		capabilityFallback := available && !r.visionEligible(&ep, requireVision)
-		for _, next := range chain.Chain {
+
+		// Walk this chain from the head, skipping everything the config, the
+		// cooldown table, or this request's own walk has ruled out.
+		for i := range endpoints {
+			next := endpoints[i]
 			if r.isEligibleLocked(&next, requireVision) && !tried[next.Key()] {
 				if capabilityFallback {
-					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model, next.Provider, next.Model)
+					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, se.ep.Provider, se.ep.Model, next.Provider, next.Model)
 				}
-				if len(tried) == 0 {
-					r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+				// Rebind the session when this pick changes where the
+				// session lives:
+				//   - a brand-new session always binds its first pick;
+				//   - a pick from a DIFFERENT chain binds, because that is
+				//     the durable cross-chain swap: the session now lives
+				//     on the substitute chain and must not re-descend into
+				//     the dead one on the next turn;
+				//   - a pick from the SAME chain binds only when nothing
+				//     has been tried yet. That is the pre-existing rule:
+				//     the sticky endpoint was unavailable, so the session
+				//     moves down to the next model in its own chain. A
+				//     mid-chain fallback is a per-request step, not a
+				//     re-pin, and re-pinning on every one of them would
+				//     thrash the session between depths.
+				if !known || chainName != se.chain || len(tried) == 0 {
+					r.bindSessionLocked(sessionID, next, logicalModel, chainName)
 				}
 				return &next, 0
 			}
 		}
-		// All endpoints have been tried in this fallback sequence. Fall back to
-		// the first available one (ignoring the tried set) so we don't return
-		// nil and error out the client when there's still a chance one will work.
-		for _, next := range chain.Chain {
+
+		// Every endpoint in THIS chain has been tried in this request's
+		// fallback sequence (or is ineligible). Try the next chain: an
+		// untried endpoint there is a better bet than re-running one that
+		// already failed here, and it is what makes the failover cross
+		// chains rather than spin inside one.
+	}
+
+	// No chain has an untried usable endpoint. Cycle back to the first eligible
+	// endpoint of ANY chain — the last model of one chain leads back to the
+	// first of the next — so a model that recovers mid-request still serves
+	// this request instead of a guaranteed 503. The cycle-back across chains
+	// is the "keep swapping until you find one that works" guarantee expressed
+	// at request time.
+	for _, chainName := range chains {
+		nextChain, hasChain := cfg.Models[chainName]
+		if !hasChain || len(nextChain.Chain) == 0 {
+			continue
+		}
+		for i := range nextChain.Chain {
+			next := nextChain.Chain[i]
 			if r.isEligibleLocked(&next, requireVision) {
-				log.Printf("[debug] session=%s model=%s -> retry exhausted, retrying %s/%s", sessionID, logicalModel, next.Provider, next.Model)
-				r.sessions[sessionID] = sessionEntry{ep: next, lastUsed: time.Now()}
+				log.Printf("[debug] session=%s model=%s -> retry exhausted, cycling %s -> %s/%s", sessionID, logicalModel, chainName, next.Provider, next.Model)
+				r.bindSessionLocked(sessionID, next, logicalModel, chainName)
 				return &next, 0
 			}
 		}
-		// All endpoints are in cooldown. Return nil so the handler waits
-		// for the shortest cooldown to expire rather than hammering a
-		// cooled model on every iteration (which caused the
-		// "all cooled down, retrying X" spam loop). The handler's
-		// attempts counter bounds the total retries, so this never
-		// causes an infinite loop.
-		return nil, r.minCooldownWait(chain.Chain, requireVision)
 	}
 
-	// New session
-	if ep := r.selectInitialEndpoint(logicalModel, sessionID, &chain, requireVision); ep != nil {
-		log.Printf("[debug] session=%s model=%s -> new session -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
-		r.sessions[sessionID] = sessionEntry{ep: *ep, lastUsed: time.Now()}
-		return ep, 0
+	// Nothing is usable anywhere: every chain is in cooldown or otherwise
+	// ineligible. Return the SHORTEST remaining cooldown across all of them
+	// so the handler waits for whichever chain recovers first, rather than
+	// hammering a cooled model on every iteration (which caused the
+	// "all cooled down, retrying X" spam loop).
+	return nil, r.minCooldownWaitAcrossChains(cfg, chains, requireVision)
+}
+
+// chainOrderLocked returns the ordered chains a selection for logicalModel
+// should consult. The requested chain always leads — it is the client's
+// explicit choice — followed by substituteChains in order.
+//
+// A session that failed over onto another chain keeps serving from that chain
+// FIRST, so the swap is durable rather than being re-derived on every request
+// (which would re-enter the dead chain every turn). The condition guards
+// against the case where the client asks for a different model: `model` is
+// the model the session was last requested under, so a mismatch means a new
+// request target, and the requested chain wins instead of the stale substitute.
+//
+// The caller must hold r.mu.
+func (r *Router) chainOrderLocked(cfg *Config, logicalModel string, se sessionEntry, known bool) []string {
+	chains := make([]string, 0, len(substituteChains)+2)
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, ok := cfg.Models[name]; !ok {
+			return
+		}
+		for _, existing := range chains {
+			if existing == name {
+				return
+			}
+		}
+		chains = append(chains, name)
 	}
 
-	return nil, r.minCooldownWait(chain.Chain, requireVision)
+	// A known session bound to a substitute chain keeps serving from it, so
+	// the swap survives into the next request instead of re-entering the dead
+	// chain on every turn.
+	if known && se.chain != "" && se.chain != logicalModel && se.model == logicalModel {
+		add(se.chain)
+	}
+	add(logicalModel)
+	for _, name := range substituteChains {
+		add(name)
+	}
+	return chains
+}
+
+// bindSessionLocked points the session at ep, which lives in chain, keeping
+// `model` as the logical model the client asked for so a later request can
+// tell a durable failover from a fresh request target.
+//
+// The caller must hold r.mu.
+func (r *Router) bindSessionLocked(sessionID string, ep ModelEndpoint, model, chain string) {
+	r.sessions[sessionID] = sessionEntry{
+		ep:       ep,
+		lastUsed: time.Now(),
+		model:    model,
+		chain:    chain,
+	}
+}
+
+// endpointInChain reports whether ep is a member of chain, by key.
+//
+// The caller must hold r.mu only for consistency with the other chain walkers;
+// this function itself only reads its argument.
+func (r *Router) endpointInChain(chain []ModelEndpoint, ep ModelEndpoint) bool {
+	for i := range chain {
+		if chain[i].Key() == ep.Key() {
+			return true
+		}
+	}
+	return false
+}
+
+// minCooldownWaitAcrossChains reads r.cooldowns and r.noVision directly, so the
+// CALLER must hold r.mu. It is minCooldownWait applied across every chain a
+// selection consulted, so the wait a handler sleeps is the shortest one that
+// can actually help: waiting out a chain whose cooldowns are all longer than
+// another chain's buys nothing.
+//
+// A chain that contributes no wait (every endpoint either has no cooldown or
+// can never serve a vision request) is skipped rather than counted as a zero:
+// a zero would short-circuit the minimum and make the handler fail fast
+// instead of waiting for a chain that IS about to recover.
+func (r *Router) minCooldownWaitAcrossChains(cfg *Config, chains []string, requireVision bool) time.Duration {
+	minWait := time.Duration(0)
+	for _, name := range chains {
+		chain, ok := cfg.Models[name]
+		if !ok {
+			continue
+		}
+		w := r.minCooldownWait(chain.Chain, requireVision)
+		if w > 0 && (minWait == 0 || w < minWait) {
+			minWait = w
+		}
+	}
+	return minWait
 }
 
 // selectInitialEndpoint picks the first endpoint for a brand new session.
