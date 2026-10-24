@@ -165,7 +165,11 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 	// genuinely long single generation; without a fallback budget a chain of
 	// failing providers holds the socket for all ten minutes, which is far
 	// beyond what any of those attempts could justify.
-	walk := newBudgetState(turnStart, requestTimeout(estimateTokens(chatReq)))
+	// The per-attempt timeout the fallback budget is scaled against also
+	// bounds each upstream attempt, so a stalled provider cannot hold the
+	// socket for longer than the turn's own budget allows.
+	timeout := requestTimeout(estimateTokens(chatReq))
+	walk := newBudgetState(turnStart, timeout)
 
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
@@ -213,7 +217,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		// reached the client and the turn can still fail over cleanly.
 		var buf strings.Builder
 		attempt := newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
-		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt)
+		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt, timeout)
 		if err != nil {
 			tried[ep.Key()] = true
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)

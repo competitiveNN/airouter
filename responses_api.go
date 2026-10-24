@@ -411,7 +411,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
 			buf.Reset()
 			attempt = newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
-			text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt)
+			text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt, timeout)
 			if err == nil {
 				break
 			}
@@ -475,7 +475,12 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 // caller cools the proxy rather than the endpoint. Dialing direct here would
 // both silently bypass the operator's proxy setting and mis-attribute the fault
 // to a healthy endpoint.
-func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte, ep ModelEndpoint, sessionID string, sw *responsesStreamWriter) (string, []streamToolCall, error) {
+//
+// timeout bounds this attempt by the request's own size-adjusted budget: it
+// caps the connection phases (dial, TLS, response headers) through the
+// per-attempt transport, and the time-to-first-token through firstByteReader.
+// The idle watchdog below then bounds the rest of the stream.
+func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte, ep ModelEndpoint, sessionID string, sw *responsesStreamWriter, timeout time.Duration) (string, []streamToolCall, error) {
 	providerCfg, ok := g.proxy.config.Load().Providers[ep.Provider]
 	if !ok {
 		return "", nil, fmt.Errorf("unknown provider: %s", ep.Provider)
@@ -484,7 +489,7 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	if err != nil {
 		return "", nil, err
 	}
-	client, usedProxy := g.proxy.attemptClient(&ep)
+	client, usedProxy := g.proxy.attemptClient(&ep, timeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		// proxyAttribution, not proxyFault: a bare CONNECT status-text rejection
@@ -510,7 +515,23 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 		resp.Body.Close()
 		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
-	return translateChatSSE(resp.Body, sw, ep.Model)
+
+	// Bound the body exactly like the chat streaming path does. Without this
+	// the Responses surfaces had no watchdog at all: translateChatSSE read the
+	// upstream body through a bare bufio.Scanner, so an upstream that stalled
+	// after the headers — emitting neither a chunk nor an SSE error, and never
+	// closing the connection — held the client (or the WebSocket turn) open
+	// forever, with no error to fall back on. The response header is not the
+	// first byte of CONTENT either: a large prompt makes the provider prefill
+	// before it emits anything, so the time-to-first-token needs its own
+	// bound.
+	firstCtx, firstCancel := context.WithTimeout(ctx, timeout)
+	defer firstCancel()
+	guarded := &firstByteReader{r: resp.Body, firstCtx: firstCtx}
+	idle := newIdleTimeoutReader(guarded, g.proxy.streamIdleTimeout)
+	defer idle.Close()
+
+	return translateChatSSE(idle, sw, ep.Model)
 }
 
 // nopFlusher satisfies flushWriter while we buffer. The real flush happens
