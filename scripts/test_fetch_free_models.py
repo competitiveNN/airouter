@@ -121,13 +121,19 @@ def test_probe_adds_a_probe_only_record_when_the_router_is_not_listed(monkeypatc
     reads it. The placeholder carries no score, so it cannot be mistaken for a
     routable model.
     """
+    monkeypatch.setattr(ff, "probe_endpoint", lambda *a, **k: {
+        "verdict": "dead",
+        "status": 403,
+        "detail": "provider refused the model (HTTP 403)",
+        "checked_at": "2026-09-30T00:00:00Z",
+    })
     out = ff.probe_auto_fallbacks([], environ={"OPENCODE_API_KEY": "o-test"})
     monkey_patched = {m["id"]: m for m in out}
     assert "big-pickle" in monkey_patched
     rec = monkey_patched["big-pickle"]
     assert rec["probe_only"] is True
     assert rec["intelligence"] is None
-    assert rec["verified"] is False  # the real verdict, 403 in production
+    assert rec["verified"] is False  # a refusal is actionable evidence
 
 
 def test_unknown_verdict_leaves_verified_unset(monkeypatch):
