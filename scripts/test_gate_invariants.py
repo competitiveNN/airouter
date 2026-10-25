@@ -829,6 +829,7 @@ BATCH_ALLOWLIST = {
     "shell-lint",
     "shell-lint-control",
     "smoke dashboard",
+    "smoke chat",
     "dist-freshness-check",
     "config rules check",
     "test-suite-check",
@@ -920,14 +921,18 @@ def test_every_exclusive_stage_is_outside_the_batch():
 def test_the_port_picking_stages_are_serialised_against_each_other():
     """Two stages that pick their own free port must not run at the same time.
 
-    Each of them binds port 0, reads the port the kernel gave it, and closes
+    Each of them binds port 0, reads the port the kernel handed out, and closes
     it. Two of them doing that in the same instant can be handed the SAME
-    port, and the loser fails with "port already in use" -- a verdict about the
-    machine, not about the code, and a red gate that reproduces only sometimes.
-    $PORT_LOCK is what keeps them apart.
+    port, and the loser fails with "port already in use" -- a verdict about
+    the machine, not about the code, and a red gate that reproduces only
+    sometimes. $PORT_LOCK is what keeps them apart.
+
+    The list is every port-picking stage, so adding one without the lock is a
+    red test rather than an intermittent gate -- which is the whole point of
+    the lock being asserted instead of assumed.
     """
     text = GATE.read_text()
-    for stage in ("smoke dashboard", "opencode-routing-selftest"):
+    for stage in ("smoke dashboard", "smoke chat", "opencode-routing-selftest"):
         line = next(
             (l for l in text.splitlines() if l.startswith(f'run "{stage}" ')),
             None,

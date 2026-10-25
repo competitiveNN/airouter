@@ -520,6 +520,20 @@ run "shell-lint-control"         bash "$REPO/scripts/shell-lint-control.sh"
 # every subsequent run into INVALID RUN (exit 3).
 run "smoke dashboard" flock -x "$PORT_LOCK" bash "$REPO/scripts/smoke_dashboard.sh"
 
+# The chat page is the other surface the Go suite cannot reach. Every chat
+# assertion in chat_test.go is a string pin on the chatHTML constant, which
+# has no way to tell "the line exists" from "the line runs": the benchmark
+# once persisted fine in code and never reached the chat history, and every
+# pin stayed green. This runs the page's own script in node, against the real
+# gateway and a fake upstream on loopback, and asserts the persistence and
+# context contracts end to end -- including the reload, which is what the
+# original bug actually broke.
+#
+# Same hygiene as the dashboard stage: it picks its own ports, so it takes
+# $PORT_LOCK, and it writes nothing into the tree (config, built binary and
+# log all live in a mktemp dir), so the fingerprint stays clean.
+run "smoke chat" flock -x "$PORT_LOCK" bash "$REPO/scripts/smoke_chat.sh"
+
 # ------------------------------------------------------------------ dist ----
 # Stale-artifact detection for the generated handoff. The audit findings
 # layer that used to sit here was removed: its input was docs/audit.md, an
