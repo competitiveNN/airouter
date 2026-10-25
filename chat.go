@@ -1149,15 +1149,22 @@ function renderMessages() {
   box.scrollTop = box.scrollHeight;
 }
 
-// appendBenchmarkMessage renders a completed benchmark from the
-// chat history. Benchmark entries are transcript records, not model
-// context, so they are skipped when the next request is built.
+// appendBenchmarkMessage renders a benchmark from the chat history.
+// The stored record carries one row per depth in the order the depths
+// were measured, so the reloaded table has the same shape as the one
+// the run drew live. A benchmark entry is a transcript record, not
+// model context: it stays visible but is filtered out of the next
+// request payload.
 function appendBenchmarkMessage(result) {
+  if (!result) return null;
   var col = appendMessage('assistant', '', null, null);
   var bubble = col.querySelector('.bubble');
-  var labels = result.depths.map(benchLabel);
-  bubble.innerHTML = '<p>Benchmark <b>' + esc(result.model) + '</b> at ' + labels.join(' / ') + ' tokens' +
-    (result.concurrency > 1 ? ', ' + result.concurrency + ' concurrent requests per depth' : '') + '</p>';
+  var depths = result.depths || [];
+  var rows = result.rows || [];
+  var concurrency = Number(result.concurrency) || 1;
+  var labels = depths.map(benchLabel);
+  bubble.innerHTML = '<p>Benchmark <b>' + esc(result.model) + '</b> at ' + esc(labels.join(' / ')) + ' tokens' +
+    (concurrency > 1 ? ', ' + concurrency + ' concurrent requests per depth' : '') + '</p>';
   var table = document.createElement('table');
   table.className = 'bench-table';
   var head = table.insertRow(-1);
@@ -1167,16 +1174,26 @@ function appendBenchmarkMessage(result) {
     th.textContent = names[i];
     head.appendChild(th);
   }
-  result.rows.forEach(function (entry) {
+  for (var d = 0; d < depths.length; d++) {
+    var entry = rows[d] || null;
     var row = table.insertRow(-1);
     var depth = row.insertCell(-1);
-    depth.textContent = benchLabel(entry.depth);
-    if (entry.error) {
+    depth.textContent = benchLabel(depths[d]);
+    if (!entry || entry.state === 'pending') {
+      // A depth the run never finished: the run was stopped while it
+      // was in flight, or it was never reached.
+      var skipped = row.insertCell(-1);
+      skipped.className = 'bench-error';
+      skipped.colSpan = 4;
+      skipped.textContent = result.stopped ? 'stopped' : 'not run';
+      continue;
+    }
+    if (entry.state === 'error') {
       var bad = row.insertCell(-1);
       bad.className = 'bench-error';
       bad.colSpan = 4;
       bad.textContent = 'Error: ' + entry.error;
-      return;
+      continue;
     }
     var context = row.insertCell(-1);
     context.textContent = fmtInt(entry.context_tokens);
@@ -1186,7 +1203,7 @@ function appendBenchmarkMessage(result) {
     prefill.textContent = entry.prefill_tokens_per_sec ? Math.round(entry.prefill_tokens_per_sec) + ' t/s' : '—';
     var decode = row.insertCell(-1);
     decode.textContent = entry.decode_tokens_per_sec ? Math.round(entry.decode_tokens_per_sec) + ' t/s' : '—';
-  });
+  }
   bubble.appendChild(table);
   var note = document.createElement('p');
   note.className = 'stats';
@@ -1639,13 +1656,23 @@ function benchFinishNote(stopped) {
 // benchSave writes the benchmark result to the chat that started it.
 // A benchmark is a transcript record, not model context: it stays in
 // the visible history but is filtered out of the next request payload.
+//
+// The record is stored as a special message entry (kind: 'benchmark')
+// rather than as a chat message, because it is not a turn in the
+// conversation: sending it to the model would put a table of
+// measurements into the context window.
 function benchSave(stopped) {
   if (!benchResult || !benchChat) return;
   benchResult.stopped = !!stopped;
-  benchChat.messages.push({ kind: 'benchmark', benchmark: benchResult });
-  benchChat.updated = Date.now();
-  save(LS_CHATS, chats);
-  renderChats();
+  // A run that measured nothing (stopped before the first depth
+  // finished) has nothing worth keeping in the history.
+  var measured = benchResult.rows.filter(function (r) { return r.state === 'ok' || r.state === 'error'; });
+  if (measured.length) {
+    benchChat.messages.push({ kind: 'benchmark', benchmark: benchResult });
+    benchChat.updated = Date.now();
+    save(LS_CHATS, chats);
+    renderChats();
+  }
   benchResult = null;
   benchChat = null;
 }
@@ -1703,8 +1730,18 @@ function runBenchmark() {
   var labels = depths.map(benchLabel);
   bubble.innerHTML = '<p>Benchmarking <b>' + esc(model) + '</b> at ' + labels.join(' / ') + ' tokens' +
     (benchConcurrency > 1 ? ', ' + benchConcurrency + ' concurrent requests per depth' : '') + '…</p>';
-  benchResult = { model: model, depths: depths.slice(), concurrency: benchConcurrency, rows: [] };
+  // The chat the run belongs to is captured BEFORE the first request
+  // goes out: the user can switch chats while the benchmark runs, and
+  // the result must land in the chat it was started from.
   benchChat = ensureChat();
+  benchResult = {
+    model: model,
+    depths: depths.slice(),
+    concurrency: benchConcurrency,
+    // One row per depth, in depth order, so the table rebuilt from
+    // the stored record has the same shape as the one drawn live.
+    rows: depths.map(function (depth) { return { depth: depth, state: 'pending' }; })
+  };
   var table = document.createElement('table');
   table.className = 'bench-table';
   var head = table.insertRow(-1);
@@ -1721,14 +1758,27 @@ function runBenchmark() {
   // must drain before the next depth starts, so the
   // numbers describe that depth alone and not the
   // leftovers of the one before it.
-  var rows = depths.map(function (depth) {
+  var rows = depths.map(function (depth, idx) {
     var row = table.insertRow(-1);
     var cells = [];
     for (var i = 0; i < names.length; i++) cells.push(row.insertCell(-1));
     cells[0].textContent = benchLabel(depth);
     for (var j = 1; j < names.length; j++) cells[j].textContent = '…';
-    return { depth: depth, row: row, cells: cells, result: null };
+    return { depth: depth, idx: idx, row: row, cells: cells };
   });
+
+  // benchStoreRow writes a depth's outcome into the run's stored
+  // record, in place, so the saved benchmark and the rendered table
+  // describe the same depths in the same order. A run that is
+  // stopped mid-flight leaves the unmeasured depths as 'pending'
+  // and the interrupted one as 'stopped'.
+  function benchStoreRow(idx, patch) {
+    if (!benchResult || !benchResult.rows[idx]) return;
+    var row = benchResult.rows[idx];
+    for (var k in patch) {
+      if (Object.prototype.hasOwnProperty.call(patch, k)) row[k] = patch[k];
+    }
+  }
 
   benchRunning = true;
   benchStopping = false;
@@ -1745,6 +1795,7 @@ function runBenchmark() {
     if (nextIdx >= rows.length) { benchFinishNote(false); return; }
     var entry = rows[nextIdx++];
     var depth = entry.depth;
+    var depthIdx = entry.idx;
     var row = entry.row;
     var cells = entry.cells;
 
@@ -1757,6 +1808,10 @@ function runBenchmark() {
     function renderBatch() {
       if (benchFinished) return;
       if (aborted || benchStopping) {
+        // The whole run ends here: record the depth as
+        // interrupted so the saved table shows why it has
+        // no numbers, then stop.
+        benchStoreRow(depthIdx, { state: 'stopped' });
         cells[1].textContent = 'stopped';
         benchFinishNote(true);
         return;
@@ -1770,8 +1825,7 @@ function runBenchmark() {
         bad.className = 'bench-error';
         bad.colSpan = 4;
         bad.textContent = 'Error: ' + (firstError && firstError.message ? firstError.message : firstError);
-        entry.result = { depth: depth, error: firstError && firstError.message ? firstError.message : String(firstError) };
-        benchResult.rows.push(entry.result);
+        benchStoreRow(depthIdx, { state: 'error', error: firstError && firstError.message ? firstError.message : String(firstError) });
         startOne();
         return;
       }
@@ -1787,14 +1841,13 @@ function runBenchmark() {
           Math.round(prefill * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
         cells[4].textContent = decode ?
           Math.round(decode * (benchConcurrency > 1 ? benchConcurrency : 1)) + ' t/s' : '—';
-        entry.result = {
-          depth: depth,
+        benchStoreRow(depthIdx, {
+          state: 'ok',
           context_tokens: contextTokens,
           ttft_ms: Math.round(ttft),
           prefill_tokens_per_sec: prefill * (benchConcurrency > 1 ? benchConcurrency : 1),
           decode_tokens_per_sec: decode * (benchConcurrency > 1 ? benchConcurrency : 1)
-        };
-        benchResult.rows.push(entry.result);
+        });
       }
       startOne();
     }

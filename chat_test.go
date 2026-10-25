@@ -1134,3 +1134,71 @@ func TestChatPageBenchmarkUI(t *testing.T) {
 		t.Errorf("benchmark rows do not record decode speed")
 	}
 }
+
+// TestChatPageBenchmarkPersistsInChatHistory pins that a benchmark
+// run survives a reload.
+//
+// The benchmark used to be drawn into a transient DOM bubble that was
+// never written to the chat history, so the measurements were gone the
+// moment the page was reloaded: the user ran a benchmark, read the
+// table, and found nothing left to compare against.
+//
+// The fix stores the run as a special message entry (kind:
+// 'benchmark') in the chat that started it. Three things have to hold
+// for that to work, and each is pinned here:
+//
+//  1. the entry is written into the chat's messages and the chats are
+//     saved to localStorage, so it survives the reload;
+//  2. renderMessages recognises the entry and renders it back, so the
+//     reloaded page shows the table again;
+//  3. the entry is NOT sent to the model on the next turn. It is a
+//     measurement record, not a turn in the conversation, and sending
+//     it would put a table of numbers into the context window.
+//
+// This is a string pin over the page's script, like the rest of the
+// chat-page tests: the script is not executed by the Go suite. The
+// behavioural counterpart is scripts/smoke_chat.sh, which runs the page's
+// own JavaScript under node against the real gateway and asserts these
+// three contracts end to end, the reload included.
+func TestChatPageBenchmarkPersistsInChatHistory(t *testing.T) {
+	for _, want := range []string{
+		// (1) The run is written into the chat that started it and
+		// the chats are persisted.
+		"function benchSave(stopped)",
+		"benchChat.messages.push({ kind: 'benchmark', benchmark: benchResult });",
+		"save(LS_CHATS, chats);",
+		// benchFinishNote is the single exit point of a run, so it
+		// is where the save must hang off.
+		"benchSave(stopped);",
+		// (2) The reloaded page renders the stored entry back.
+		"function appendBenchmarkMessage(result)",
+		"if (m.kind === 'benchmark') {",
+		"appendBenchmarkMessage(m.benchmark);",
+		// (3) The entry is filtered out of the next request.
+		"if (m.kind === 'benchmark') return;",
+		"chat.messages.filter(function (m) { return m.kind !== 'benchmark'; })",
+	} {
+		if !strings.Contains(chatHTML, want) {
+			t.Errorf("chatHTML missing %q", want)
+		}
+	}
+	// A run that measured nothing must not leave an empty record
+	// behind: the history would show a benchmark table with no
+	// numbers in it.
+	if !strings.Contains(chatHTML, "if (measured.length) {") {
+		t.Errorf("an empty benchmark run is stored in the chat history")
+	}
+	// The stored record keeps one row per depth, in depth order, so
+	// the table rebuilt after a reload has the same shape as the one
+	// the run drew live.
+	for _, want := range []string{
+		"rows: depths.map(function (depth) { return { depth: depth, state: 'pending' }; })",
+		"benchStoreRow(depthIdx, {",
+		"state: 'ok',",
+		"state: 'error',",
+	} {
+		if !strings.Contains(chatHTML, want) {
+			t.Errorf("chatHTML missing %q", want)
+		}
+	}
+}
