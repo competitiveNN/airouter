@@ -151,6 +151,7 @@ git push origin master
 What `origin/master` is missing, oldest first:
 
 - `d805279` fix(chat): store a faithful benchmark record and prove it survives a reload
+- `9110ee6` test(sync): make the probe test hermetic so the suite stops depending on live opencode
 
 `origin/master` advanced underneath earlier versions of
 this list (the entries before this one — the web chat UI, the
