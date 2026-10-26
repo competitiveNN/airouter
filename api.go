@@ -25,6 +25,17 @@ const maxRequestBytes = 32 << 20 // 32 MiB
 // failure. The endpoint is not penalized for proxy errors -- only the proxy is.
 const proxyCooldown = 30 * time.Second
 
+// maxSessionInterruption is the contract this gateway makes to a client: once
+// a session has stopped receiving output, it either gets resumed output from
+// another model in the fallback chain or gets a terminal failure within 30s.
+// It is the ceiling applied to every failure/cooldown wait, and every attempt
+// is clamped to the interruption budget left, so the cumulative walk cannot
+// exceed it either.
+//
+// It is also the hard ceiling on the per-provider `max_interruption` setting:
+// a provider may shorten the window, never lengthen it past this.
+const maxSessionInterruption = 30 * time.Second
+
 type ChatCompletionRequest struct {
 	Model            string                  `json:"model"`
 	Messages         []ChatCompletionMessage `json:"messages"`
@@ -274,6 +285,19 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 // ApplyCooldownForSession for testing. Zero disables the override.
 func (g *GatewayContext) SetTestCooldown(d time.Duration) {
 	g.testCooldown = d
+}
+
+// providerMaxInterruption returns the interruption ceiling for the provider
+// behind the named endpoint, read from the live config and clamped to the
+// global maxSessionInterruption.
+//
+// It is the value that bounds this provider's cycle-back waits and its share
+// of the fallback budget. Every fallback loop asks the endpoint it is about
+// to use rather than a single global constant, so a provider configured for a
+// short interruption window (a local ollama endpoint that answers in
+// milliseconds) does not hold a client open for 30s on its cooldown.
+func (g *GatewayContext) providerMaxInterruption(provider string) time.Duration {
+	return ProviderMaxInterruption(g.config.Load(), provider)
 }
 
 // recordRequest records a request with a known model name. It is a no-op when
@@ -852,16 +876,36 @@ func extractCompletionTokens(body []byte) int {
 }
 
 // requestTimeout returns a timeout that scales with the request context size:
+// maxRequestAttemptTimeout is the largest connection/first-output budget one
+// upstream attempt may receive. It is deliberately five seconds shorter than
+// maxSessionInterruption: even when the largest attempt fails at the very end
+// of its budget, the fallback walk still has time to try another endpoint
+// instead of consuming the client's whole interruption allowance in one call.
+//
+// A context-size timeout must never be allowed to grow past this ceiling. A
+// 500k-token prompt used to produce a 55s attempt timeout, which by itself was
+// longer than the maximum interruption the client was promised.
+const maxRequestAttemptTimeout = maxSessionInterruption - 5*time.Second
+
+// requestTimeout returns a timeout that scales with the request context size:
 // 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens (ceil
-// division). It guards only time-to-first-token for streaming; the idle reader
-// bounds the rest.
+// division), capped at maxRequestAttemptTimeout.
+//
+// The cap is part of the timeout calculation, not a separate transport limit:
+// a larger prompt still gets a larger allowance up to the cap, but no single
+// attempt may consume the complete 30s interruption budget. The fallback
+// walk clamps each later attempt to the budget that is actually left.
 func requestTimeout(tokens int) time.Duration {
 	const base = 5 * time.Second
 	if tokens <= 1000 {
 		return base
 	}
 	extra := (tokens - 1000 + 9999) / 10000 // ceil division, 1s per extra 10k tokens
-	return base + time.Duration(extra)*time.Second
+	timeout := base + time.Duration(extra)*time.Second
+	if timeout > maxRequestAttemptTimeout {
+		return maxRequestAttemptTimeout
+	}
+	return timeout
 }
 
 // maxFallbackWallClock bounds the total time a single request may spend
@@ -880,7 +924,7 @@ func requestTimeout(tokens int) time.Duration {
 //
 // Attempts are also skipped entirely once this budget is spent, so the
 // fallback still degrades gracefully; it just stops grinding.
-const maxFallbackWallClock = 45 * time.Second
+const maxFallbackWallClock = maxSessionInterruption
 
 // fallbackBudget returns the wall-clock ceiling for one request's fallback
 // walk, scaled to the size of the request.
@@ -938,21 +982,33 @@ type budgetState struct {
 	budget    time.Duration
 	attempts  int
 	exhausted bool
+	// lastProgress starts at the request start and moves forward every time
+	// output reaches the client. Before the first output it is the start of
+	// the interruption; after the first output it is the start of the current
+	// gap. A successful long generation that then fails mid-stream is
+	// therefore still allowed a full failover budget for the RESUME, while the
+	// time it spent producing output is not counted as interruption.
+	lastProgress time.Time
 }
 
 // newBudgetState starts a budget for one request's fallback walk. timeout is
 // the per-attempt timeout; the budget is scaled from it by fallbackBudget.
 func newBudgetState(start time.Time, timeout time.Duration) *budgetState {
-	return &budgetState{start: start, budget: fallbackBudget(timeout)}
+	return &budgetState{start: start, budget: fallbackBudget(timeout), lastProgress: start}
 }
 
 // next records that another attempt is about to be made.
 func (b *budgetState) next() { b.attempts++ }
 
+// markProgress records that output reached the client, which starts a new
+// interruption window. The fallback loops call it from the streaming write
+// path, so a long generation is not charged against the resume budget.
+func (b *budgetState) markProgress() { b.lastProgress = time.Now() }
+
 // exhausted reports whether the walk should stop. The first attempt is always
 // allowed, so a request is never failed before it has been tried once.
 func (b *budgetState) exhaustedNow() bool {
-	if b.attempts > 0 && time.Since(b.start) > b.budget {
+	if b.attempts > 0 && b.elapsedSinceProgress() > b.budget {
 		b.exhausted = true
 		return true
 	}
@@ -962,28 +1018,64 @@ func (b *budgetState) exhaustedNow() bool {
 // elapsed is the wall-clock time spent so far, for logging.
 func (b *budgetState) elapsed() time.Duration { return time.Since(b.start) }
 
-// remaining is the wall-clock time this request's fallback walk has left
-// before the budget forces a 503. It goes negative once the budget is spent,
-// which is exactly what the cycle-back waiter compares against: a wait that
-// outlasts the remaining budget cannot help, because the loop re-checks the
-// budget the instant the wait ends.
-func (b *budgetState) remaining() time.Duration { return b.budget - time.Since(b.start) }
+// elapsedSinceProgress is the length of the current interruption: how long the
+// client has now been without new output. It is the interval the 30s contract
+// bounds.
+func (b *budgetState) elapsedSinceProgress() time.Duration {
+	return time.Since(b.lastProgress)
+}
+
+// remaining is the wall-clock time this request's fallback walk has left in
+// the current interruption window before the budget forces a 503. It goes
+// negative once the budget is spent, which is exactly what the cycle-back
+// waiter compares against: a wait that outlasts the remaining budget cannot
+// help, because the loop re-checks the budget the instant the wait ends.
+func (b *budgetState) remaining() time.Duration {
+	return b.budget - b.elapsedSinceProgress()
+}
+
+// attemptTimeout returns the timeout ONE upstream attempt may use. It is the
+// smaller of the request's size-derived allowance and the interruption budget
+// that is left, so a first long attempt does not let a second long attempt run
+// and put a double-length interruption in front of a client.
+//
+// A non-positive result means there is no budget left; the caller must give up
+// now rather than start an attempt whose promised bound is already spent.
+func (b *budgetState) attemptTimeout(preferred time.Duration) time.Duration {
+	if preferred <= 0 {
+		return 0
+	}
+	remaining := b.remaining()
+	if remaining <= 0 {
+		return 0
+	}
+	if preferred > remaining {
+		return remaining
+	}
+	return preferred
+}
 
 // cycleBackSleep returns how long the cycle-back waiter may sleep, and false
 // when the request must give up NOW instead of waiting.
 //
-// The wait is capped at 30s so a long cooldown cannot hold a request open
-// indefinitely. The cap is not the whole story: a wait that outlasts the
-// budget the request has left is pure latency, because the loop re-checks the
-// budget the instant the wait ends and returns the 503 the budget was going
-// to force anyway.
+// The wait is capped at the provider's own interruption ceiling (30s by
+// default), so a long cooldown cannot hold a request open indefinitely. The
+// cap is not the whole story: a wait that outlasts the budget the request has
+// left is pure latency, because the loop re-checks the budget the instant the
+// wait ends and returns the 503 the budget was going to force anyway.
 //
 // Measured on 2026-10-20 against a 30s transport cooldown and a 12s
 // small-request budget: the request was held open for 30.2s and then returned
 // exactly the 503 it would have returned immediately. The client saw a hung
 // request for half a minute and got the same answer.
-func cycleBackSleep(wait time.Duration, walk *budgetState) (time.Duration, bool) {
-	sleep := minDuration(wait, 30*time.Second)
+func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration) (time.Duration, bool) {
+	if ceiling <= 0 {
+		ceiling = maxSessionInterruption
+	}
+	if ceiling > maxSessionInterruption {
+		ceiling = maxSessionInterruption
+	}
+	sleep := minDuration(wait, ceiling)
 	if remaining := walk.remaining(); sleep >= remaining {
 		return 0, false
 	}
@@ -1089,17 +1181,15 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			// the chain, so the last model in the chain leads back to the
 			// first, and a model that recovers mid-request gives this
 			// request another chance instead of a guaranteed 503. The
-			// wait is capped at 30s, and the loop stays bounded by the
-			// wall-clock budget and the attempts counter above, so this
-			// cannot spin forever. A zero wait means no cooldown is
-			// pending anywhere in the chain; there is nothing to wait
-			// for, so fail fast.
+			// wait is capped at the provider's own interruption
+			// ceiling, and the loop stays bounded by the wall-clock
+			// budget and the attempts counter above, so this cannot
+			// spin forever. A zero wait means no cooldown is pending
+			// anywhere in the chain; there is nothing to wait for, so
+			// fail fast.
 			if wait > 0 {
-				sleep, ok := cycleBackSleep(wait, walk)
+				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
-					// The shortest cooldown in the chain outlasts the budget
-					// this request has left, so waiting would only delay the
-					// 503 that the budget is about to force anyway.
 					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
 					writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 					g.recordRequest(req.Model, 503, time.Since(start))
@@ -1128,9 +1218,21 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// not where it started.
 		g.inflight.UpdateEndpoint(sessionID, ep.Key())
 
-		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		// The provider's own interruption ceiling bounds how much silence
+		// this endpoint may put in front of the client. It is the smaller of
+		// the ceiling and what the fallback walk has left, so a provider
+		// configured for a short window (a local endpoint that answers in
+		// milliseconds) does not hold a client open for 30s on its cooldown.
+		attemptTimeout := walk.attemptTimeout(minDuration(timeout, g.providerMaxInterruption(ep.Provider)))
+		if attemptTimeout <= 0 {
+			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
+			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
+			return
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		start := time.Now()
-		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
+		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, attemptTimeout, tokens)
 		// attemptStart times this single upstream call, distinct from the
 		// request-level `start` above. Shadowing it would silently turn every
 		// time.Since(start) below into a per-attempt measurement, which is how
@@ -1512,13 +1614,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			// first, and a model that recovers mid-request gives this
 			// request another chance instead of a terminated stream. The
 			// reconnecting comment keeps the SSE connection alive during
-			// the wait. The wait is capped at 30s, and the loop stays
-			// bounded by the wall-clock budget and the attempts counter
-			// above, so this cannot spin forever. A zero wait means no
-			// cooldown is pending anywhere in the chain; there is nothing
-			// to wait for, so fail fast.
+			// the wait. The wait is capped at the provider's own interruption
+			// ceiling, and the loop stays bounded by the wall-clock budget and
+			// the attempts counter above, so this cannot spin forever. A zero
+			// wait means no cooldown is pending anywhere in the chain; there is
+			// nothing to wait for, so fail fast.
 			if wait > 0 {
-				sleep, ok := cycleBackSleep(wait, walk)
+				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
 					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
 					writeSSEError(w, flusher, "All models are currently unavailable")
@@ -1558,7 +1660,22 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// request, and a shadowed timer would make the request-latency metric
 		// report only the final attempt.
 		attemptStart := time.Now()
-		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, timeout, tokens)
+		// The provider's own interruption ceiling bounds how much silence this
+		// endpoint may put in front of the client. It is the smaller of the
+		// ceiling and what the fallback walk has left, so a provider configured
+		// for a short window (a local endpoint that answers in milliseconds)
+		// does not hold a client open for 30s on its cooldown.
+		ceiling := g.providerMaxInterruption(ep.Provider)
+		attemptTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+		if attemptTimeout <= 0 {
+			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
+			if accumulatedContent == "" {
+				writeSSEError(w, flusher, "All models are currently unavailable")
+			}
+			g.recordRequest(req.Model, 503, time.Since(start))
+			return
+		}
+		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, attemptTimeout, tokens)
 		// For proxied endpoints, retry with different proxies before giving up
 		// on the endpoint. A proxy transport/dial failure is a proxy problem,
 		// not an endpoint problem, so the endpoint must not be cooled down;
@@ -1578,7 +1695,19 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			maxProxyTries = 1
 		}
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
-			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, timeout, sessionID)
+			// Each proxy retry gets only what is left of the interruption
+			// budget. Recomputing here matters: without it, three long proxy
+			// attempts on one endpoint could hold the client silent for
+			// well over the interruption ceiling.
+			proxyTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+			if proxyTimeout <= 0 {
+				err = context.DeadlineExceeded
+				break
+			}
+			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, proxyTimeout, sessionID, StreamAttemptOptions{
+				MaxIdleTimeout: minDuration(ceiling, walk.budget),
+				OnProgress:     walk.markProgress,
+			})
 			if err != nil {
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {

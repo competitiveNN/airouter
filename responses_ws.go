@@ -201,11 +201,16 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
 		if ep == nil {
 			if wait > 0 {
+				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
+				if !ok {
+					g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+					return
+				}
 				select {
 				case <-ctx.Done():
 					g.wsSendError(conn, corrID, "Request cancelled", "server_error", "cancelled")
 					return
-				case <-time.After(minDuration(wait, 30*time.Second)):
+				case <-time.After(sleep):
 				}
 				continue
 			}
@@ -215,9 +220,21 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 
 		// Buffer this attempt: if it fails before producing output, nothing has
 		// reached the client and the turn can still fail over cleanly.
+		//
+		// The provider's own interruption ceiling bounds how much silence this
+		// endpoint may put in front of the client. It is the smaller of the
+		// ceiling and what the fallback walk has left, so a provider configured
+		// for a short window (a local endpoint that answers in milliseconds)
+		// does not hold a client open for 30s on its cooldown.
+		ceiling := g.providerMaxInterruption(ep.Provider)
+		attemptTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+		if attemptTimeout <= 0 {
+			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			return
+		}
 		var buf strings.Builder
 		attempt := newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
-		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt, timeout)
+		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt, attemptTimeout)
 		if err != nil {
 			tried[ep.Key()] = true
 			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)

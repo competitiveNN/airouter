@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -906,30 +907,38 @@ func TestMinCooldownWaitSkipsNoVision(t *testing.T) {
 }
 
 // TestStreamIdleTimeoutConfigurable verifies that the stream idle timeout is
-// configurable via Proxy.SetStreamIdleTimeout.
+// configurable via Proxy.SetStreamIdleTimeout, but can never exceed the
+// maximum interruption the gateway promises to a client.
 func TestStreamIdleTimeoutConfigurable(t *testing.T) {
 	cfg := loadTestConfig(t)
 	proxy := NewProxy(cfg)
 
-	// Default should be 60s.
-	if d := proxy.StreamIdleTimeout(); d != 60*time.Second {
-		t.Errorf("expected default stream idle timeout 60s, got %v", d)
+	// Default is the maximum session interruption.
+	if d := proxy.StreamIdleTimeout(); d != maxSessionInterruption {
+		t.Errorf("expected default stream idle timeout %v, got %v", maxSessionInterruption, d)
 	}
 
-	// Set to a custom value.
+	// A smaller custom value is honored.
+	proxy.SetStreamIdleTimeout(5 * time.Second)
+	if d := proxy.StreamIdleTimeout(); d != 5*time.Second {
+		t.Errorf("expected stream idle timeout 5s, got %v", d)
+	}
+
+	// A larger value is clamped: allowing 120s here would let one stalled
+	// provider interrupt a session for two minutes.
 	proxy.SetStreamIdleTimeout(120 * time.Second)
-	if d := proxy.StreamIdleTimeout(); d != 120*time.Second {
-		t.Errorf("expected stream idle timeout 120s, got %v", d)
+	if d := proxy.StreamIdleTimeout(); d != maxSessionInterruption {
+		t.Errorf("expected stream idle timeout to clamp to %v, got %v", maxSessionInterruption, d)
 	}
 
 	// Zero or negative values should be ignored.
 	proxy.SetStreamIdleTimeout(0)
-	if d := proxy.StreamIdleTimeout(); d != 120*time.Second {
-		t.Errorf("expected stream idle timeout to remain 120s, got %v", d)
+	if d := proxy.StreamIdleTimeout(); d != maxSessionInterruption {
+		t.Errorf("expected stream idle timeout to remain %v, got %v", maxSessionInterruption, d)
 	}
 	proxy.SetStreamIdleTimeout(-1 * time.Second)
-	if d := proxy.StreamIdleTimeout(); d != 120*time.Second {
-		t.Errorf("expected stream idle timeout to remain 120s, got %v", d)
+	if d := proxy.StreamIdleTimeout(); d != maxSessionInterruption {
+		t.Errorf("expected stream idle timeout to remain %v, got %v", maxSessionInterruption, d)
 	}
 }
 
@@ -2880,10 +2889,96 @@ func TestStreamSSE_IdleTimeoutClosesReader(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from idle timeout, got nil")
 	}
-	// Should return near-instantly after the idle timeout, not block for
-	// the full 10s that slowReader would otherwise hold.
+	// Should return near-instantly after the idle timeout, not block for the
+	// full 10s that slowReader would otherwise hold.
 	if elapsed > 2*time.Second {
 		t.Errorf("idle timeout took too long: %v (reader not closed?)", elapsed)
+	}
+}
+
+// trickleReader returns one byte at a time forever until it is closed. It
+// models an upstream that keeps sending bytes that are not useful output.
+type trickleReader struct {
+	mu   sync.Mutex
+	done chan struct{}
+}
+
+func (r *trickleReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	if r.done == nil {
+		r.done = make(chan struct{})
+	}
+	done := r.done
+	r.mu.Unlock()
+	select {
+	case <-time.After(10 * time.Millisecond):
+		if len(p) == 0 {
+			return 0, nil
+		}
+		p[0] = 'x'
+		return 1, nil
+	case <-done:
+		return 0, io.EOF
+	}
+}
+
+func (r *trickleReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done == nil {
+		r.done = make(chan struct{})
+	}
+	select {
+	case <-r.done:
+	default:
+		close(r.done)
+	}
+	return nil
+}
+
+// TestIdleTimeoutMeasuresClientSilenceNotUpstreamBytes proves that raw
+// upstream bytes do not reset the interruption watchdog. Role-only preambles,
+// keepalives, and buffered tool-call deltas are all traffic the client cannot
+// use; treating them as progress let one session remain silent indefinitely.
+func TestIdleTimeoutMeasuresClientSilenceNotUpstreamBytes(t *testing.T) {
+	idle := newIdleTimeoutReader(&trickleReader{}, 60*time.Millisecond)
+	defer idle.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			_, err := idle.Read(buf)
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errStreamIdle) {
+			t.Fatalf("idle read error = %v, want errStreamIdle", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("raw upstream bytes kept resetting the client-visible idle timeout")
+	}
+}
+
+// TestIdleTimeoutResetsOnClientProgress is the other half: actual output
+// reaches the client, so the watchdog must start a fresh window.
+func TestIdleTimeoutResetsOnClientProgress(t *testing.T) {
+	idle := newIdleTimeoutReader(&trickleReader{}, 80*time.Millisecond)
+	defer idle.Close()
+
+	deadline := time.Now().Add(240 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		idle.MarkProgress()
+		time.Sleep(30 * time.Millisecond)
+		if idle.idle.Load() {
+			t.Fatal("client-visible progress did not reset the idle timeout")
+		}
 	}
 }
 

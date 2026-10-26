@@ -139,13 +139,13 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			// the chain, so the last model in the chain leads back to the
 			// first, and a model that recovers mid-request gives this
 			// request another chance instead of a guaranteed 503. The
-			// wait is capped at 30s, and the loop stays bounded by the
-			// wall-clock budget and the attempts counter above, so this
-			// cannot spin forever. A zero wait means no cooldown is
-			// pending anywhere in the chain; there is nothing to wait
-			// for, so fail fast.
+			// wait is capped at the provider's own interruption ceiling,
+			// and the loop stays bounded by the wall-clock budget and the
+			// attempts counter above, so this cannot spin forever. A zero
+			// wait means no cooldown is pending anywhere in the chain;
+			// there is nothing to wait for, so fail fast.
 			if wait > 0 {
-				sleep, ok := cycleBackSleep(wait, walk)
+				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
 					// The shortest cooldown in the chain outlasts the budget
 					// this request has left, so waiting would only delay the
@@ -174,7 +174,20 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		// attemptStart times this single upstream call; `start` above is the
 		// request-level clock every recordRequest below measures against.
 		attemptStart := time.Now()
-		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		// The provider's own interruption ceiling bounds how much silence
+		// this endpoint may put in front of the client. It is the smaller
+		// of the ceiling and what the fallback walk has left, so a provider
+		// configured for a short window (a local endpoint that answers in
+		// milliseconds) does not hold a client open for 30s on its cooldown.
+		ceiling := g.providerMaxInterruption(ep.Provider)
+		attemptTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+		if attemptTimeout <= 0 {
+			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
+			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.recordRequest(req.Model, 503, time.Since(start))
+			return
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		var lastErr error
 		var resp *http.Response
 		gotResp := false
@@ -363,7 +376,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(retryBody), tried)
 		if ep == nil {
 			if wait > 0 {
-				sleep, ok := cycleBackSleep(wait, walk)
+				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
 					log.Printf("[debug] session=%s model=%s -> responses stream cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
 					writeSSEError(w, flusher, "All models are currently unavailable")
@@ -408,10 +421,21 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		var text string
 		var toolCalls []streamToolCall
 		var err error
+		// The provider's own interruption ceiling bounds how much silence
+		// this endpoint may put in front of the client. It is the smaller
+		// of the ceiling and what the fallback walk has left, so a provider
+		// configured for a short window (a local endpoint that answers in
+		// milliseconds) does not hold a client open for 30s on its cooldown.
+		ceiling := g.providerMaxInterruption(ep.Provider)
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+			proxyTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+			if proxyTimeout <= 0 {
+				err = context.DeadlineExceeded
+				break
+			}
 			buf.Reset()
 			attempt = newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
-			text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt, timeout)
+			text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt, proxyTimeout)
 			if err == nil {
 				break
 			}
@@ -485,7 +509,13 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	if !ok {
 		return "", nil, fmt.Errorf("unknown provider: %s", ep.Provider)
 	}
-	req, err := g.proxy.buildRequest(ctx, body, ep, &providerCfg, true, sessionID)
+	// This surface buffers the whole attempt and replays it only on success,
+	// so the client sees nothing until the attempt completes. The timeout is
+	// therefore an end-to-end interruption bound for this attempt, not just a
+	// time-to-first-byte bound.
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := g.proxy.buildRequest(attemptCtx, body, ep, &providerCfg, true, sessionID)
 	if err != nil {
 		return "", nil, err
 	}
@@ -525,10 +555,10 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	// first byte of CONTENT either: a large prompt makes the provider prefill
 	// before it emits anything, so the time-to-first-token needs its own
 	// bound.
-	firstCtx, firstCancel := context.WithTimeout(ctx, timeout)
+	firstCtx, firstCancel := context.WithTimeout(attemptCtx, timeout)
 	defer firstCancel()
 	guarded := &firstByteReader{r: resp.Body, firstCtx: firstCtx}
-	idle := newIdleTimeoutReader(guarded, g.proxy.streamIdleTimeout)
+	idle := newIdleTimeoutReader(guarded, minDuration(g.proxy.streamIdleTimeout, timeout))
 	defer idle.Close()
 
 	return translateChatSSE(idle, sw, ep.Model)

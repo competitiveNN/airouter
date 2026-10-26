@@ -33,6 +33,40 @@ type ProviderConfig struct {
 	// set to a non-zero number, takes precedence over this one (a per-model
 	// override for the rare chain entry that needs a different budget).
 	Proxy int `yaml:"proxy,omitempty"`
+
+	// MaxInterruption is the maximum time this provider's endpoint may
+	// leave a client without new output during a fallback walk, including
+	// the cycle-back wait when every endpoint in the chain is on cooldown.
+	//
+	// It is per-provider rather than one global setting because different
+	// backends have different latencies: a local ollama endpoint answers in
+	// milliseconds, so holding a client open for 30s on its cooldown is
+	// absurd, while a rate-limited hosted model may legitimately need most
+	// of that window to recover.
+	//
+	// The value is clamped to maxSessionInterruption at load time, so no
+	// provider can widen the gateway's interruption contract: 30s is the
+	// ceiling the client is promised, and it is the ceiling for every
+	// provider regardless of what is written here. Omitting the key (or
+	// setting 0) uses maxSessionInterruption, so existing configs keep
+	// their current behaviour.
+	MaxInterruption time.Duration `yaml:"max_interruption,omitempty"`
+}
+
+// ProviderMaxInterruption returns the effective interruption ceiling for
+// the named provider, clamped to the global maxSessionInterruption. The
+// returned value is always positive: a missing or zero config value falls
+// back to the global default.
+func ProviderMaxInterruption(cfg *Config, provider string) time.Duration {
+	if cfg != nil {
+		if p, ok := cfg.Providers[provider]; ok && p.MaxInterruption > 0 {
+			if p.MaxInterruption > maxSessionInterruption {
+				return maxSessionInterruption
+			}
+			return p.MaxInterruption
+		}
+	}
+	return maxSessionInterruption
 }
 
 // opencodeProviderPrefixes lists provider names whose upstream endpoint is an
@@ -904,6 +938,16 @@ func (c *Config) validate() error {
 		}
 		if !strings.HasPrefix(p.URL, "http://") && !strings.HasPrefix(p.URL, "https://") {
 			return fmt.Errorf("provider %s URL must start with http:// or https://: %q", name, p.URL)
+		}
+		// max_interruption shortens the per-provider interruption window but
+		// can never widen it past maxSessionInterruption — that is the hard
+		// client contract and a provider that tries to exceed it is a config
+		// mistake worth failing on rather than silently reinterpreting.
+		if p.MaxInterruption < 0 {
+			return fmt.Errorf("provider %s max_interruption must not be negative, got %v", name, p.MaxInterruption)
+		}
+		if p.MaxInterruption > maxSessionInterruption {
+			return fmt.Errorf("provider %s max_interruption %v exceeds the gateway ceiling %v", name, p.MaxInterruption, maxSessionInterruption)
 		}
 	}
 	for name, model := range c.Models {

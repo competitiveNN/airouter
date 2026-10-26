@@ -23,6 +23,39 @@ import (
 	"time"
 )
 
+// StreamAttemptOptions carries the per-request interruption controls for one
+// streaming attempt. The zero value preserves the proxy's own defaults, so
+// existing callers and tests do not need to supply anything.
+type StreamAttemptOptions struct {
+	// MaxIdleTimeout is the longest the client may see no output while this
+	// attempt is active. It is clamped by the caller to the interruption
+	// budget that is left.
+	MaxIdleTimeout time.Duration
+	// OnProgress is called whenever bytes reach the client. The gateway uses
+	// it to start a fresh interruption window and to release the attempt's
+	// connection/first-output deadline once output has started.
+	OnProgress func()
+}
+
+// progressWriter observes successful writes to the client. It is deliberately
+// a writer wrapper rather than a callback threaded through every SSE write
+// site: the chat stream has several distinct write paths (buffered release,
+// direct deltas, synthesized tool calls, and the final sentinel), and missing
+// one would leave the client-visible watchdog running while output was in
+// fact flowing.
+type progressWriter struct {
+	w        io.Writer
+	progress func()
+}
+
+func (w *progressWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 && w.progress != nil {
+		w.progress()
+	}
+	return n, err
+}
+
 type Proxy struct {
 	client *http.Client
 	// baseTransport is the shared transport. An attempt that needs its own
@@ -326,14 +359,14 @@ func NewProxy(cfg *Config) *Proxy {
 				// The response body (the actual generation) is guarded
 				// separately by firstByteReader / idleTimeoutReader.
 				DialContext: (&net.Dialer{
-					Timeout:   15 * time.Second,
+					Timeout:   10 * time.Second,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
-				TLSHandshakeTimeout:   15 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: maxRequestAttemptTimeout,
 			},
 		},
-		streamIdleTimeout: 60 * time.Second,
+		streamIdleTimeout: defaultStreamIdleTimeout,
 	}
 	p.baseTransport = p.client.Transport.(*http.Transport)
 
@@ -455,6 +488,12 @@ func stripJSONFields(v json.RawMessage, fields map[string]bool) (json.RawMessage
 
 func (p *Proxy) SetStreamIdleTimeout(d time.Duration) {
 	if d > 0 {
+		// The idle window is a client-visible interruption bound, not an
+		// operator preference. A larger value would let a stalled provider
+		// hold a session silent for longer than the gateway promises.
+		if d > maxSessionInterruption {
+			d = maxSessionInterruption
+		}
 		p.streamIdleTimeout = d
 	}
 }
@@ -949,16 +988,61 @@ func applyAttemptTimeouts(tr *http.Transport, timeout time.Duration) {
 	}
 }
 
-func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration, sessionID string) (string, []streamToolCall, int, error) {
+func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration, sessionID string, options ...StreamAttemptOptions) (string, []streamToolCall, int, error) {
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
 		return "", nil, 0, fmt.Errorf("unknown provider: %s", endpoint.Provider)
 	}
 
-	// Use the parent context for the request so the connection stays alive for
-	// the whole (potentially long) generation. The size-based timeout only
-	// guards the time-to-first-token via firstByteReader below.
-	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, true, sessionID)
+	opts := StreamAttemptOptions{}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	maxIdle := p.streamIdleTimeout
+	if opts.MaxIdleTimeout > 0 {
+		maxIdle = minDuration(maxIdle, opts.MaxIdleTimeout)
+	}
+	if maxIdle > maxSessionInterruption {
+		maxIdle = maxSessionInterruption
+	}
+
+	// One deadline covers the WHOLE pre-output attempt: DNS, dial, TLS,
+	// response headers, and the wait for the first client-visible event.
+	// Per-transport timeouts alone are not enough because they are sequential
+	// (a 15s dial plus a 15s TLS handshake plus a 30s header wait can consume
+	// 60s), and a request context with a fixed deadline would also kill a
+	// legitimate long generation after the first byte.
+	//
+	// WithCancelCause lets us stop the timer when output actually reaches the
+	// client without cancelling the request context. The body then remains
+	// governed by the client-visible idle watchdog instead of the initial
+	// attempt deadline.
+	attemptCtx, attemptCancel := context.WithCancelCause(ctx)
+	attemptTimeoutCause := errors.New("upstream attempt timeout")
+	var attemptTimer *time.Timer
+	var releaseOnce sync.Once
+	releaseAttempt := func() {
+		releaseOnce.Do(func() {
+			if attemptTimer != nil {
+				attemptTimer.Stop()
+			}
+		})
+	}
+	defer func() {
+		releaseAttempt()
+		attemptCancel(nil)
+	}()
+	if timeout > 0 {
+		attemptTimer = time.AfterFunc(timeout, func() {
+			attemptCancel(attemptTimeoutCause)
+		})
+	}
+
+	// Use the attempt context for the request so the timer can interrupt the
+	// connection/header phase. It is cancelled on timeout, but NOT when the
+	// first output arrives: only the timer is stopped then, so a long body
+	// phase stays alive.
+	req, err := p.buildRequest(attemptCtx, body, endpoint, &providerCfg, true, sessionID)
 	if err != nil {
 		return "", nil, 0, err
 	}
@@ -1044,6 +1128,9 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if errors.Is(context.Cause(attemptCtx), attemptTimeoutCause) {
+			err = fmt.Errorf("upstream attempt timed out after %v: %w", timeout, context.DeadlineExceeded)
+		}
 		// Nothing has reached the client yet, so a proxy fault here is safe to
 		// retry on the same endpoint with a different proxy. See proxyAttribution
 		// for why every transport-layer failure on a proxied attempt belongs to
@@ -1099,7 +1186,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// connection: if no chunk arrives within the configured stream idle timeout
 	// we treat it as a failure and fall back to the next model instead of
 	// hanging the client indefinitely.
-	firstCtx, firstCancel := context.WithTimeout(ctx, timeout)
+	firstCtx, firstCancel := context.WithTimeout(attemptCtx, timeout)
 	defer firstCancel()
 
 	// When the endpoint was addressed with the Responses API, translate the
@@ -1117,10 +1204,26 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	}
 
 	guarded := &firstByteReader{r: src, firstCtx: firstCtx}
-	idle := newIdleTimeoutReader(guarded, p.streamIdleTimeout)
+	idle := newIdleTimeoutReader(guarded, maxIdle)
 	defer idle.Close()
 
-	partial, toolCalls, completionTokens, sErr := p.streamSSE(w, flusher, idle, endpoint.Model)
+	// Every write that reaches the client is progress: release the initial
+	// attempt deadline, reset the client-visible idle watchdog, and tell the
+	// gateway to start a fresh interruption window for a possible failover.
+	progress := func() {
+		idle.MarkProgress()
+		releaseAttempt()
+		if opts.OnProgress != nil {
+			opts.OnProgress()
+		}
+	}
+	streamOut := io.Writer(w)
+	streamOut = &progressWriter{w: streamOut, progress: progress}
+
+	partial, toolCalls, completionTokens, sErr := p.streamSSE(streamOut, flusher, idle, endpoint.Model)
+	if sErr != nil && errors.Is(context.Cause(attemptCtx), attemptTimeoutCause) {
+		sErr = fmt.Errorf("upstream attempt timed out after %v: %w", timeout, context.DeadlineExceeded)
+	}
 	if sErr != nil && usedProxy != nil && proxyFault(sErr) {
 		// The stream died at the transport layer with a proxy in the path, so the
 		// proxy takes the penalty. MidStream is set because content may already
@@ -1189,14 +1292,18 @@ func (f *firstByteReader) Close() error {
 	return nil
 }
 
-// streamIdleTimeout bounds the time the router waits for the next chunk from an
-// upstream model once a stream has begun. The first chunk is additionally
-// bounded by the size-scaled timeout via firstByteReader. If an upstream stalls
-// (rate limit, dropped connection that never returns EOF, etc.) without
-// emitting an SSE error event, we detect it here and fall back to the next
-// model instead of hanging the client indefinitely. The actual value is
-// configurable via Proxy.streamIdleTimeout (default 60s).
-const defaultStreamIdleTimeout = 60 * time.Second
+// streamIdleTimeout bounds the time the CLIENT may see no output while an
+// upstream stream is active. It is reset only when output actually reaches the
+// client, not merely when the upstream sends bytes: role-only preambles,
+// keepalives, and tool-call deltas that are still buffered are not progress
+// from the client's point of view.
+//
+// If an upstream stalls (rate limit, dropped connection that never returns EOF,
+// etc.) without emitting an SSE error event, we detect it here and fall back to
+// the next model instead of hanging the client indefinitely. The value is
+// configurable through Proxy.SetStreamIdleTimeout, but is capped at the
+// maximum session interruption so no setting can break the 30s contract.
+const defaultStreamIdleTimeout = maxSessionInterruption
 
 // idleTimeoutReader wraps an io.Reader and returns an error if no data is read
 // for longer than timeout. It is used to detect mid-stream stalls that produce
@@ -1204,13 +1311,13 @@ const defaultStreamIdleTimeout = 60 * time.Second
 // the underlying reader (when it implements io.Closer) to unblock any in-flight
 // Read so the error can propagate and trigger a fallback.
 //
-// SAFETY: A dedicated watchdog goroutine waits on the timer channel. On each
-// successful Read we send a reset signal; the watchdog drains the timer channel
-// and resets it. This avoids the classic timer.Reset-after-fire race: with
-// time.AfterFunc there is no channel to drain, so Reset on a fired timer is
-// undefined. Using time.NewTimer + an explicit drain in the watchdog goroutine
-// makes the reset safe. The goroutine exits when the timer fires (timeout) or
-// when Close() is called (stream done).
+// SAFETY: A dedicated watchdog goroutine waits on the timer channel. Only a
+// client-visible progress event sends a reset signal; the watchdog drains the
+// timer channel and resets it. This avoids the classic timer.Reset-after-fire
+// race: with time.AfterFunc there is no channel to drain, so Reset on a fired
+// timer is undefined. Using time.NewTimer + an explicit drain in the watchdog
+// goroutine makes the reset safe. The goroutine exits when the timer fires
+// (timeout) or when Close() is called (stream done).
 type idleTimeoutReader struct {
 	r       io.Reader
 	timeout time.Duration
@@ -1241,29 +1348,50 @@ func (streamIdleError) Temporary() bool { return true }
 var errStreamIdle error = streamIdleError{}
 
 func newIdleTimeoutReader(r io.Reader, timeout time.Duration) *idleTimeoutReader {
-	return &idleTimeoutReader{
+	if timeout <= 0 {
+		timeout = defaultStreamIdleTimeout
+	}
+	i := &idleTimeoutReader{
 		r:       r,
 		timeout: timeout,
 		resetCh: make(chan struct{}, 1),
+	}
+	// Start the client-visible watchdog when the attempt starts, not on the
+	// first raw upstream read. A provider can send role-only preambles or
+	// keepalives for minutes without sending anything the client can use;
+	// those bytes must not reset this timer.
+	i.timer = time.NewTimer(i.timeout)
+	go i.watchdog()
+	return i
+}
+
+// MarkProgress records that output reached the client and starts a fresh idle
+// window. Upstream bytes alone do not call this: only the write path knows
+// whether an event was visible to the client or was still being buffered.
+func (i *idleTimeoutReader) MarkProgress() {
+	i.mu.Lock()
+	closed := i.closed
+	i.mu.Unlock()
+	if closed {
+		return
+	}
+	// Non-blocking send: if a reset is already pending, the watchdog will
+	// reset once and the latest progress is covered by that reset.
+	select {
+	case i.resetCh <- struct{}{}:
+	default:
 	}
 }
 
 func (i *idleTimeoutReader) Read(p []byte) (int, error) {
 	i.mu.Lock()
 	if i.closed {
+		timedOut := i.idle.Load()
 		i.mu.Unlock()
-		return 0, io.EOF
-	}
-	if i.timer == nil {
-		i.timer = time.NewTimer(i.timeout)
-		go i.watchdog()
-	} else {
-		// Notify the watchdog that data arrived so it resets the timer.
-		// Non-blocking send: if the buffer is full, a reset is already pending.
-		select {
-		case i.resetCh <- struct{}{}:
-		default:
+		if timedOut {
+			return 0, errStreamIdle
 		}
+		return 0, io.EOF
 	}
 	i.mu.Unlock()
 

@@ -203,6 +203,45 @@ def main() -> int:
                 f"{MIN_LABEL_CARDINALITY} and {MAX_LABEL_CARDINALITY}, got {cap}"
             )
 
+    # providers[].max_interruption shortens that provider's interruption
+    # window but can never widen it past maxSessionInterruption (30s), the
+    # hard client contract. Values are Go durations ("10s", "5m", ...).
+    import re as _re
+
+    _DUR = _re.compile(r"^(\d+)(\.\d+)?(ns|us|µs|ms|s|m|h)$")
+    MAX_INTER_SECONDS = 30.0
+
+
+    def _dur_seconds(v):
+        if not isinstance(v, str):
+            return None, "must be a string duration (e.g. \"10s\")"
+        m = _DUR.match(v.strip())
+        if not m:
+            return None, f"invalid Go duration {v!r}"
+        num = float(m.group(1)) + (float(m.group(2)) if m.group(2) else 0.0)
+        unit = m.group(3)
+        mult = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0,
+                "m": 60.0, "h": 3600.0}[unit]
+        return num * mult, None
+
+
+    for pname, p in providers.items():
+        mi = p.get("max_interruption")
+        if mi is None:
+            continue
+        secs, err = _dur_seconds(mi)
+        if err is not None:
+            problems.append(f"providers.{pname}.max_interruption {err}")
+        elif secs < 0:
+            problems.append(
+                f"providers.{pname}.max_interruption must not be negative, got {mi!r}"
+            )
+        elif secs > MAX_INTER_SECONDS:
+            problems.append(
+                f"providers.{pname}.max_interruption {mi!r} exceeds the gateway "
+                f"ceiling {MAX_INTER_SECONDS}s (maxSessionInterruption)"
+            )
+
     if problems:
         for p in problems:
             print(f"FAIL: {p}")
