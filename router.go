@@ -1310,6 +1310,41 @@ func (r *Router) ChainLength(logicalModel string) int {
 	return len(chain.Chain)
 }
 
+// MaxInterruptionFor returns the effective interruption ceiling for a logical
+// model: the smallest per-provider ceiling among the providers that can serve
+// it, considering the requested chain and all substitute chains. This is used
+// when no endpoint is available (every endpoint cooled down), so there is no
+// single endpoint to derive the ceiling from. Taking the minimum across the
+// eligible providers is the safe choice: a wait longer than the most
+// restrictive provider's ceiling would leave that provider's client waiting
+// past its contract.
+//
+// Never exceeds maxSessionInterruption; returns maxSessionInterruption if no
+// provider is found.
+func (r *Router) MaxInterruptionFor(logicalModel string) time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cfg := r.config.Load()
+	best := maxSessionInterruption
+	addChain := func(name string) {
+		chain, ok := cfg.Models[name]
+		if !ok || len(chain.Chain) == 0 {
+			return
+		}
+		for _, ep := range chain.Chain {
+			c := ProviderMaxInterruption(cfg, ep.Provider)
+			if c < best {
+				best = c
+			}
+		}
+	}
+	addChain(logicalModel)
+	for _, name := range substituteChains {
+		addChain(name)
+	}
+	return best
+}
+
 // Config returns the current configuration snapshot. It uses atomic.Load,
 // so it satisfies TSan. Used by the dashboard to render chains.
 func (r *Router) Config() *Config {

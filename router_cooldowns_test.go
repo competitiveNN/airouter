@@ -339,10 +339,14 @@ func TestFallbackWallClockBoundIsSane(t *testing.T) {
 	if maxFallbackWallClock <= 0 {
 		t.Fatal("maxFallbackWallClock must be positive")
 	}
-	// A client should never wait longer than this; keep it under a minute so
-	// proxies/clients with their own idle timeouts don't cut us off first.
-	if maxFallbackWallClock > time.Minute {
-		t.Errorf("maxFallbackWallClock = %v, want <= 1m", maxFallbackWallClock)
+	// A client must never be left without output for longer than this. The
+	// fallback walk, the attempt timeouts, and the cooldown wait all share the
+	// same ceiling.
+	if maxFallbackWallClock != maxSessionInterruption {
+		t.Errorf("maxFallbackWallClock = %v, want the session interruption ceiling %v", maxFallbackWallClock, maxSessionInterruption)
+	}
+	if maxFallbackWallClock > 30*time.Second {
+		t.Errorf("maxFallbackWallClock = %v, want <= 30s", maxFallbackWallClock)
 	}
 }
 
@@ -354,7 +358,7 @@ func TestFallbackWallClockBoundIsSane(t *testing.T) {
 func TestFallbackBudgetScalesWithRequestSize(t *testing.T) {
 	small := fallbackBudget(requestTimeout(4))      // 5s  per attempt -> 12s
 	medium := fallbackBudget(requestTimeout(25000)) // 7s  per attempt -> 20s
-	large := fallbackBudget(requestTimeout(200000)) // 25s per attempt -> 45s (ceiling)
+	large := fallbackBudget(requestTimeout(200000)) // 25s per attempt -> 30s (ceiling)
 
 	if small != 12*time.Second {
 		t.Errorf("small-request budget = %v, want 12s", small)
@@ -366,12 +370,12 @@ func TestFallbackBudgetScalesWithRequestSize(t *testing.T) {
 		t.Errorf("medium-request budget %v should be shorter than large %v", medium, large)
 	}
 	// The small-request budget exists specifically to cap a spinner at a
-	// tolerable length; a flat 45s is what we are trying to avoid here.
+	// tolerable length; a flat 30s is what we are trying to avoid here.
 	if small > 15*time.Second {
 		t.Errorf("small-request budget %v is too long; it defeats the purpose", small)
 	}
-	if large > maxFallbackWallClock {
-		t.Errorf("large-request budget %v exceeds the hard ceiling %v", large, maxFallbackWallClock)
+	if large != maxFallbackWallClock {
+		t.Errorf("large-request budget %v, want the hard ceiling %v", large, maxFallbackWallClock)
 	}
 }
 
@@ -1075,5 +1079,61 @@ func TestBudgetStateScaledByRequestSize(t *testing.T) {
 		if walk.budget > maxFallbackWallClock {
 			t.Errorf("tokens=%d: budget %v exceeds hard ceiling %v", tokens, walk.budget, maxFallbackWallClock)
 		}
+	}
+}
+
+// TestRequestTimeoutIsCappedByTheInterruptionBudget pins the context-size
+// calculation at its most important edge: a very large prompt may receive a
+// larger allowance, but never one that can consume the whole client-visible
+// interruption budget by itself.
+func TestRequestTimeoutIsCappedByTheInterruptionBudget(t *testing.T) {
+	if got := requestTimeout(200_000); got != maxRequestAttemptTimeout {
+		t.Errorf("200k-token timeout = %v, want the capped %v", got, maxRequestAttemptTimeout)
+	}
+	if got := requestTimeout(2_000_000); got != maxRequestAttemptTimeout {
+		t.Errorf("2M-token timeout = %v, want the capped %v", got, maxRequestAttemptTimeout)
+	}
+	if maxRequestAttemptTimeout >= maxSessionInterruption {
+		t.Errorf("per-attempt timeout %v must leave room inside the %v interruption budget", maxRequestAttemptTimeout, maxSessionInterruption)
+	}
+}
+
+// TestBudgetAttemptTimeoutUsesTheRemainingInterruption proves that a failed
+// first attempt cannot spend the same full timeout again. The production case
+// is an 18s first attempt followed by an 18s second attempt: without this
+// clamp the client would be silent for 36s.
+func TestBudgetAttemptTimeoutUsesTheRemainingInterruption(t *testing.T) {
+	walk := newBudgetState(time.Now(), 18*time.Second)
+	if walk.budget != maxSessionInterruption {
+		t.Fatalf("budget = %v, want %v", walk.budget, maxSessionInterruption)
+	}
+	walk.lastProgress = time.Now().Add(-20 * time.Second)
+	got := walk.attemptTimeout(18 * time.Second)
+	if got > 10*time.Second || got <= 0 {
+		t.Fatalf("attempt timeout = %v, want the ~10s left in the 30s budget", got)
+	}
+	walk.lastProgress = time.Now().Add(-31 * time.Second)
+	if got := walk.attemptTimeout(18 * time.Second); got != 0 {
+		t.Fatalf("attempt timeout with no budget left = %v, want 0", got)
+	}
+}
+
+// TestBudgetProgressStartsAFreshInterruptionWindow proves that output already
+// delivered to the client is not charged against the resume budget. A long
+// generation may legitimately run for minutes; what must stay bounded is the
+// silence after it breaks.
+func TestBudgetProgressStartsAFreshInterruptionWindow(t *testing.T) {
+	walk := newBudgetState(time.Now(), 18*time.Second)
+	walk.next()
+	walk.lastProgress = time.Now().Add(-time.Minute)
+	if !walk.exhaustedNow() {
+		t.Fatal("an interruption older than the budget must be exhausted")
+	}
+	walk.markProgress()
+	if walk.exhaustedNow() {
+		t.Fatal("client-visible progress must start a fresh interruption window")
+	}
+	if remaining := walk.remaining(); remaining <= 29*time.Second || remaining > maxSessionInterruption {
+		t.Fatalf("remaining after progress = %v, want a fresh ~30s window", remaining)
 	}
 }

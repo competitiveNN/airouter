@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 )
@@ -46,6 +47,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Cap the process heap at 50MB. The gateway is a thin proxy that
+	// buffers at most one attempt body at a time, so this is a soft
+	// ceiling: it pressures the GC to keep long-lived objects collected
+	// rather than letting heap usage drift upward across long-running
+	// sessions. (debug.SetMemoryLimit sets GOMEMLIMIT-equivalent; it is
+	// advisory — the GC tries to stay under it — but keeps the process
+	// small for operator deployments on constrained hosts.)
+	// Cap the process heap at 50MB. The gateway is a thin proxy that
+	// buffers at most one attempt body at a time, so this is a soft
+	// ceiling: it pressures the GC to keep long-lived objects collected
+	// rather than letting heap usage drift upward across long-running
+	// sessions. (debug.SetMemoryLimit sets GOMEMLIMIT-equivalent; it is
+	// advisory — the GC tries to stay under it — but keeps the process
+	// small for operator deployments on constrained hosts.)
+	// Cap the process heap at 50MB. The gateway is a thin proxy that
+	// buffers at most one attempt body at a time, so this is a soft
+	// ceiling: it pressures the GC to keep long-lived objects collected
+	// rather than letting heap usage drift upward across long-running
+	// sessions. (debug.SetMemoryLimit sets GOMEMLIMIT-equivalent; it is
+	// advisory — the GC tries to stay under it — but keeps the process
+	// small for operator deployments on constrained hosts.)
+	debug.SetMemoryLimit(50 * 1024 * 1024)
 
 	cooldownPath := filepath.Join(filepath.Dir(*configPath), "cooldowns.json")
 	// The dashboard journal lives beside the config for the same
