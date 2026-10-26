@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-10-22T04:15:46.146837Z",
+  "fetched_at": "2026-10-26T05:04:19.283548Z",
   "first_seen": {
     "beam-free": "2026-10-16",
     "cat-jam-free": "2026-10-14",
@@ -7,6 +7,7 @@
     "dots-studio/dots-3-note-preview:free": "2026-09-26",
     "exo-free": "2026-10-08",
     "fledge-alpha-free": "2026-10-02",
+    "flint-40b-free": "2026-10-26",
     "gemma-4-9b-it": "2026-09-26",
     "ibm/granite-3.0-3b-a800m-instruct": "2026-09-26",
     "ibm/granite-3.0-8b-instruct": "2026-09-26",
@@ -38,7 +39,6 @@
     "fledge-alpha-free": "2026-10-08",
     "inclusionai/ling-3.1-flash": "2026-10-14",
     "inclusionai/ling-3.1-flash:free": "2026-10-15",
-    "jev-1.13-free": "2026-10-21",
     "ling-3.1-flash-free": "2026-10-15",
     "ll-alpha-free": "2026-10-16",
     "longcat-2.5-preview-free": "2026-10-22",
