@@ -101,6 +101,16 @@ go build -o airouter .
 | `-allow-no-auth` | `false` | Run unauthenticated (insecure: every endpoint, admin included) |
 | `-warmup` | `false` | Fire test requests at each provider on startup |
 | `-tool-calls` | `false` | Synthesize tool-call events in streaming responses |
+| `-commandcode-port` | `3050` | Second listener serving the Command Code protocol as OpenAI-compatible `/v1/chat/completions` (empty disables it) |
+| `-commandcode-providers` | `commandcode,commandcode2` | Which providers that endpoint uses, in failover order |
+
+The Command Code endpoint exists because `api.commandcode.ai` is not an
+OpenAI-compatible surface. It is the built-in replacement for the separate
+`commandcode-proxy` process: clients POST normal Chat Completions bodies and
+name any Command Code model id, and the shim translates to `/alpha/generate`
+and back. It uses the same gateway key and shares the cooldown store, so a
+rate-limited key is skipped by both surfaces. Stop the external proxy before
+starting the gateway on the default port.
 
 Provider credentials come from the environment, named by `api_key_env`
 in the config — secrets are never written into the config file.

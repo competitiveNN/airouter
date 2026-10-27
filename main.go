@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -105,6 +106,8 @@ func main() {
 	warmup := flag.Bool("warmup", false, "Warm up model profiles on startup (fires test requests to each provider)")
 	toolCalls := flag.Bool("tool-calls", false, "Enable synthesized tool-call events in streaming responses (disabled by default for compatibility)")
 	pruneStats := flag.String("prune-stats", "", "Prune the dashboard stats journal at PATH to the 30-day retention window, then exit")
+	commandCodePort := flag.String("commandcode-port", "3050", "Port for the built-in Command Code API endpoint (empty string disables it)")
+	commandCodeProviders := flag.String("commandcode-providers", "commandcode,commandcode2", "Command Code providers exposed on that endpoint, in failover order")
 	flag.Parse()
 
 	// The prune mode is a maintenance operation, not a gateway: it
@@ -132,20 +135,6 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Cap the process heap at 50MB. The gateway is a thin proxy that
-	// buffers at most one attempt body at a time, so this is a soft
-	// ceiling: it pressures the GC to keep long-lived objects collected
-	// rather than letting heap usage drift upward across long-running
-	// sessions. (debug.SetMemoryLimit sets GOMEMLIMIT-equivalent; it is
-	// advisory — the GC tries to stay under it — but keeps the process
-	// small for operator deployments on constrained hosts.)
-	// Cap the process heap at 50MB. The gateway is a thin proxy that
-	// buffers at most one attempt body at a time, so this is a soft
-	// ceiling: it pressures the GC to keep long-lived objects collected
-	// rather than letting heap usage drift upward across long-running
-	// sessions. (debug.SetMemoryLimit sets GOMEMLIMIT-equivalent; it is
-	// advisory — the GC tries to stay under it — but keeps the process
-	// small for operator deployments on constrained hosts.)
 	// Cap the process heap at 50MB. The gateway is a thin proxy that
 	// buffers at most one attempt body at a time, so this is a soft
 	// ceiling: it pressures the GC to keep long-lived objects collected
@@ -236,6 +225,38 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	// The Command Code endpoint is a second, self-contained OpenAI-compatible
+	// surface on its own port. It exists because Command Code's upstream is not
+	// OpenAI-shaped: a client that wants it directly (rather than through one of
+	// the four logical models) needs the protocol translation in front of it,
+	// which used to mean running the separate commandcode-proxy process. The
+	// default port is the one that proxy listened on, so an existing
+	// `url: http://127.0.0.1:3050/v1` provider entry keeps working once the
+	// separate process is stopped.
+	var commandCodeServer *http.Server
+	if *commandCodePort != "" {
+		shim := NewCommandCodeShim(gateway, strings.Split(*commandCodeProviders, ","))
+		if shim.Enabled() {
+			commandCodeServer = &http.Server{
+				Addr:              ":" + *commandCodePort,
+				Handler:           recoveryMiddleware(shim.Handler()),
+				ReadTimeout:       30 * time.Second,
+				ReadHeaderTimeout: 10 * time.Second,
+				WriteTimeout:      300 * time.Second,
+				IdleTimeout:       120 * time.Second,
+			}
+			go func() {
+				log.Printf("Command Code API on port %s (providers: %s)", *commandCodePort, *commandCodeProviders)
+				if err := commandCodeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					// A busy port must not take the main gateway down with it.
+					log.Printf("Command Code API error: %v", err)
+				}
+			}()
+		} else {
+			log.Printf("Command Code API disabled: none of %q is configured", *commandCodeProviders)
+		}
+	}
+
 	defer cancel()
 
 	go func() {
@@ -246,6 +267,9 @@ func main() {
 		cancel()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
+		if commandCodeServer != nil {
+			commandCodeServer.Shutdown(shutdownCtx)
+		}
 		server.Shutdown(shutdownCtx)
 	}()
 
