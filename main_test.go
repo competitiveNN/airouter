@@ -6064,3 +6064,93 @@ func TestCircuitBreakerPersistenceLegacyFormat(t *testing.T) {
 		t.Error("expected circuit in merged envelope")
 	}
 }
+
+// --- panic recovery middleware ----------------------------------------------
+
+// TestRecoveryMiddlewarePreservesFlusher pins the property that broke every
+// streaming request: the recovery middleware wraps the ResponseWriter, and a
+// wrapper that embeds the http.ResponseWriter INTERFACE promotes only that
+// interface's own methods (Header, Write, WriteHeader). http.Flusher and
+// http.Hijacker are then silently dropped, so the handlers that assert for
+// them by type switch -- api.go, responses_api.go and chat.go for SSE,
+// gorilla/websocket for the upgrade -- all fail.
+//
+// The failure mode was silent and total: every streaming request answered
+// 500 "Streaming not supported" and no request ever reached a provider.
+func TestRecoveryMiddlewarePreservesFlusher(t *testing.T) {
+	handler := recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(http.Flusher); !ok {
+			t.Error("the recovery middleware dropped http.Flusher: every streaming request would fail with 500")
+			return
+		}
+		w.WriteHeader(200)
+		fmt.Fprint(w, "ok")
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "ok" {
+		t.Errorf("expected the handler body, got %q", rec.Body.String())
+	}
+}
+
+// TestRecoveryMiddlewarePreservesHijacker covers the websocket upgrade path,
+// which needs http.Hijacker rather than http.Flusher.
+func TestRecoveryMiddlewarePreservesHijacker(t *testing.T) {
+	handler := recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(http.Hijacker); !ok {
+			t.Error("the recovery middleware dropped http.Hijacker: every websocket upgrade would fail")
+			return
+		}
+		w.WriteHeader(426)
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/responses/ws", nil))
+
+	if rec.Code != 426 {
+		t.Fatalf("expected 426, got %d", rec.Code)
+	}
+}
+
+// TestRecoveryMiddlewarePanicBeforeOutputReturns500 covers the plain panic
+// path: nothing was sent yet, so the client gets a clean 500.
+func TestRecoveryMiddlewarePanicBeforeOutputReturns500(t *testing.T) {
+	handler := recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil))
+
+	if rec.Code != 500 {
+		t.Fatalf("expected 500 for a panic before any output, got %d", rec.Code)
+	}
+}
+
+// TestRecoveryMiddlewarePanicAfterOutputKeepsResponse covers a panic AFTER
+// the handler started streaming. Writing a 500 on top of an already-sent
+// header corrupts the response (net/http logs "superfluous WriteHeader" and
+// the error body is appended to the stream the client is still reading), so
+// the middleware must leave the started response alone.
+func TestRecoveryMiddlewarePanicAfterOutputKeepsResponse(t *testing.T) {
+	handler := recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, "partial")
+		panic("boom")
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("expected the started 200 to survive the panic, got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "Internal server error") {
+		t.Errorf("a 500 body was appended to an already-started response: %q", rec.Body.String())
+	}
+}
