@@ -4,6 +4,8 @@
 # Each provider has:
 #   url: The base URL for the OpenAI-compatible API
 #   api_key_env: Environment variable name containing the API key
+#   headers: Optional map of extra HTTP headers to send to this provider
+#            (e.g. {"HTTP-Referer": "...", "X-Title": "..."}).
 #
 # Models: Logical model names (smart, work, fast, large) mapped to fallback chains
 # Each chain is a list of endpoints, each specifying:
@@ -39,6 +41,17 @@ providers:
   # stays short -- add more as you need them.
   #
   # Optional keys, on top of url / api_key_env / headers:
+  #
+  #   timeout: <duration>   Per-provider request timeout for upstream calls
+  #                (e.g. 30s, 60s, 120s). Omitting or setting 0 uses the
+  #                built-in default client timeout. Raise this for providers
+  #                whose models do long-running work (reasoning, context
+  #                compression) so upstream calls are not cut off mid-stream.
+  #
+  #   max_interruption: <duration>   Maximum time this provider's endpoint may
+  #                leave a client without new output during a fallback walk,
+  #                including cooldown wait time. 0 or omitted uses the
+  #                global 30s ceiling. Cannot exceed 30s.
   #
   #   proxy: <N>   Route this provider's upstream traffic through the proxy pool
   #                (public HTTP CONNECT and SOCKS5 proxies, refreshed every 15
@@ -89,12 +102,37 @@ providers:
 
 preferences:
   newest_first_on_tie: true
+  # newest_first_on_tie: when true, the router prefers the newest/champion
+  #   model at chain depth 0 for new sessions; when false, sessions are
+  #   rotated across the top of the chain by initial_rotation_window.
+  #
+  # initial_rotation_window: how many endpoints at the head of a chain are
+  #   rotated between for the first pick of each new session. 0 disables
+  #   rotation (every new session starts at depth 0). Omitting the key uses
+  #   the built-in default. Only affects brand-new sessions; once a session
+  #   is pinned it stays sticky.
   initial_rotation_window: 8
+  #
+  # cooldown_jitter: random fraction (0.0 to 0.25) added to transient
+  #   cooldowns (429/5xx) so concurrent clients hitting the same
+  #   rate-limited provider don't all wake up at once. 0 disables jitter.
   cooldown_jitter: 0.25
+  #
+  # circuit_breaker_threshold: number of consecutive failures that trips the
+  #   circuit breaker for a provider. Explicit 0 disables it entirely.
+  #   Omitting the key uses the built-in default.
   circuit_breaker_threshold: 5
+  #
+  # circuit_half_open_probes: max probes allowed in half-open state before
+  #   another request is blocked. Omitting uses the built-in default.
   circuit_half_open_probes: 1
   # default_max_tokens: 0   # uncomment + set to override the auto behavior
+  #   Controls the output-token ceiling applied to requests that omit
+  #   max_tokens. nil (absent) = auto (half of profile context window);
+  #   0 = never default (send to provider as-is); positive = absolute value.
   # max_label_cardinality: 512   # uncomment to override the default
+  #   Bounds how many distinct provider/model labels the metrics registry
+  #   tracks. Must be between 16 and 65536.
 
 models:
   smart:
@@ -134,6 +172,10 @@ models:
       #   vision: false
       #   intelligence: 20.0
       #   context_length: 1000000
+      #   protocol: chat   # OPTIONAL: "responses" or "chat". Defaults to chat
+      #     when omitted or unrecognized. Per-endpoint; choose based on what
+      #     the provider supports (e.g. some models work on /chat/completions
+      #     but not /responses).
       # - provider: kilocode
       #   model: kilo-auto/free  # last: auto fallback (placeholder)
       #   vision: true
