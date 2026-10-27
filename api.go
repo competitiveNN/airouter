@@ -463,34 +463,39 @@ func apiKeysEqual(want, got string) bool {
 // client injecting a chosen ID to manipulate routing.
 func bodySessionID(body []byte) string {
 	// Only look at fields that identify the conversation: model + messages.
-	// We re-parse just those two fields rather than stripping the rest, so
-	// the result is well-defined regardless of other fields' presence or
-	// ordering.
-	var partial struct {
-		Model    string                   `json:"model"`
-		Messages []map[string]interface{} `json:"messages"`
-	}
-	if err := json.Unmarshal(body, &partial); err != nil || partial.Model == "" {
-		// Malformed body or missing model: fall back to a content hash of
-		// the whole body so the request still gets routed (the chat handler
-		// will return 400 anyway, but routing must not panic).
-		sum := sha256.Sum256(body)
-		return "body:" + hex.EncodeToString(sum[:])
+	// Both are hashed where they lie in the raw body, so the fingerprint
+	// costs one pass over the bytes instead of a decode-and-re-encode round
+	// trip that copied the whole conversation twice. That round trip was
+	// the single biggest source of garbage in the gateway: every request
+	// paid it, and a long body paid it again for every fallback attempt.
+	if obj, ok := scanJSONObject(body); ok {
+		modelSpan, hasModel := findJSONMember(obj, "model")
+		model, isString := jsonStringValue(body, modelSpan, hasModel)
+		if isString && model != "" {
+			// Build a deterministic byte stream from model + messages. We
+			// include content so different conversations with the same role
+			// layout don't collide.
+			h := sha256.New()
+			h.Write([]byte(model))
+			h.Write([]byte{0})
+			msgSpan, hasMessages := findJSONMember(obj, "messages")
+			if hasMessages {
+				hashJSONValue(h, body[msgSpan.Start:msgSpan.End])
+			} else {
+				// Keep the shape the decoder produced for a body with no
+				// messages, so such a body fingerprints the same way no
+				// matter which path computed it.
+				h.Write([]byte("null\n"))
+			}
+			return "ctx:" + hex.EncodeToString(h.Sum(nil)[:16])
+		}
 	}
 
-	// Build a deterministic byte stream from model + messages. We include
-	// content so different conversations with the same role layout don't
-	// collide.
-	h := sha256.New()
-	h.Write([]byte(partial.Model))
-	h.Write([]byte{0})
-	if err := json.NewEncoder(h).Encode(partial.Messages); err != nil {
-		// json.Encoder.Encode on a []map can't fail in practice, but fall
-		// back to a full-body hash so routing never panics.
-		sum := sha256.Sum256(body)
-		return "body:" + hex.EncodeToString(sum[:])
-	}
-	return "ctx:" + hex.EncodeToString(h.Sum(nil)[:16])
+	// Malformed body or missing model: fall back to a content hash of
+	// the whole body so the request still gets routed (the chat handler
+	// will return 400 anyway, but routing must not panic).
+	sum := sha256.Sum256(body)
+	return "body:" + hex.EncodeToString(sum[:])
 }
 
 func writeAPIError(w http.ResponseWriter, statusCode int, message, errType, code string) {
@@ -639,19 +644,30 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
-	body, err := io.ReadAll(r.Body)
+	body, err := readRequestBody(r)
 	if err != nil {
 		writeAPIError(w, 400, "Failed to read request body", "invalid_request_error", "bad_request")
 		g.recordRequest("", 400, time.Since(start))
 		return
 	}
 
-	var req ChatCompletionRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	// Only the routing knobs are decoded here. The conversation is already in
+	// the raw body, and decoding it copied every message's content (the
+	// message unmarshaler allocates the string) purely so the timeout
+	// estimate could measure it -- about a megabyte of garbage per request on
+	// a long conversation. The estimate is taken from the raw bytes instead
+	// (see estimateTokensFromBody) and the body is forwarded as it arrived.
+	var head struct {
+		Model     string `json:"model"`
+		Stream    bool   `json:"stream"`
+		MaxTokens *int   `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(body, &head); err != nil {
 		writeAPIError(w, 400, "Invalid JSON", "invalid_request_error", "bad_json")
 		g.recordRequest("", 400, time.Since(start))
 		return
 	}
+	req := &ChatCompletionRequest{Model: head.Model, Stream: head.Stream, MaxTokens: head.MaxTokens}
 
 	if !IsValidModel(req.Model) {
 		writeAPIError(w, 400, fmt.Sprintf("Unknown model: %s. Available: %s", req.Model, strings.Join(LogicalModels, ", ")), "invalid_request_error", "model_not_found")
@@ -673,9 +689,43 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 
 	if req.Stream {
-		g.handleStream(w, r, body, &req, sessionID)
+		g.handleStream(w, r, body, req, sessionID, estimateTokensFromBody(body))
 	} else {
-		g.handleCompletion(w, r, body, &req, sessionID)
+		g.handleCompletion(w, r, body, req, sessionID, estimateTokensFromBody(body))
+	}
+}
+
+// requestBodyHeadroom is spare capacity in the request buffer. The gateway
+// injects one short member (max_tokens) into bodies that omit it, and writing
+// that member into the headroom avoids a second copy of the body.
+const requestBodyHeadroom = 64
+
+// readRequestBody reads the request body into a single buffer.
+//
+// When the client sent a Content-Length, the buffer is sized for it up front.
+// io.ReadAll grows its buffer by doubling, so a 500 KB body costs about a
+// megabyte of garbage -- and the gateway sees bodies that size on every
+// request, from every client.
+func readRequestBody(r *http.Request) ([]byte, error) {
+	if r.ContentLength <= 0 {
+		// Chunked or unknown length: nothing to size the buffer from.
+		return io.ReadAll(r.Body)
+	}
+	buf := make([]byte, 0, r.ContentLength+1+requestBodyHeadroom)
+	for {
+		if len(buf) == cap(buf) {
+			// Grow, keeping the length: the extra capacity is the room the
+			// next Read fills.
+			buf = append(buf, 0)[:len(buf)]
+		}
+		n, err := r.Body.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err != nil {
+			if err == io.EOF {
+				return buf, nil
+			}
+			return nil, err
+		}
 	}
 }
 
@@ -689,6 +739,27 @@ func estimateTokens(req *ChatCompletionRequest) int {
 		totalChars += len(m.Content)
 	}
 	tokens := totalChars / 2
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
+}
+
+// estimateTokensFromBody approximates the request context size in tokens from
+// the raw request bytes. It measures the "messages" value when the body has one
+// and falls back to the whole body otherwise, then applies the same conservative
+// two-characters-per-token ratio as estimateTokens. Only bytes are measured, so
+// no message content is copied; the JSON structural overhead inside the span is
+// counted too, which can only raise the estimate -- and with it the timeout --
+// never shrink it below the text it encloses.
+func estimateTokensFromBody(body []byte) int {
+	chars := len(body)
+	if obj, ok := scanJSONObject(body); ok {
+		if span, found := findJSONMember(obj, "messages"); found {
+			chars = span.End - span.Start
+		}
+	}
+	tokens := chars / 2
 	if tokens < 1 {
 		tokens = 1
 	}
@@ -738,23 +809,18 @@ func (g *GatewayContext) defaultMaxTokensForModel(model string) int {
 // other fields and their ordering, and returns the original body unchanged
 // on any parse failure (fail-open so a request is never dropped).
 func injectMaxTokens(body []byte, maxTokens int) []byte {
-	var data map[string]json.RawMessage
-	if err := json.Unmarshal(body, &data); err != nil {
+	obj, ok := scanJSONObject(body)
+	if !ok {
 		return body
 	}
-	if _, ok := data["max_tokens"]; ok {
+	if _, found := findJSONMember(obj, "max_tokens"); found {
 		return body
 	}
 	val, err := json.Marshal(maxTokens)
 	if err != nil {
 		return body
 	}
-	data["max_tokens"] = val
-	out, err := json.Marshal(data)
-	if err != nil {
-		return body
-	}
-	return out
+	return insertJSONMemberReusing(body, obj.End, "max_tokens", val)
 }
 
 // appendAssistantMessage returns body with an assistant message appended to the
@@ -769,8 +835,8 @@ func injectMaxTokens(body []byte, maxTokens int) []byte {
 // replaying them as `{"function":{"arguments":...}}` with no name would produce
 // a malformed tool call that breaks the next model's parser.
 func appendAssistantMessage(body []byte, content string, toolCalls []streamToolCall) []byte {
-	var data map[string]json.RawMessage
-	if err := json.Unmarshal(body, &data); err != nil {
+	obj, ok := scanJSONObject(body)
+	if !ok {
 		return body
 	}
 	msg := map[string]interface{}{
@@ -812,22 +878,45 @@ func appendAssistantMessage(body []byte, content string, toolCalls []streamToolC
 	if err != nil {
 		return body
 	}
-	var msgs []json.RawMessage
-	if existing, ok := data["messages"]; ok {
-		if err := json.Unmarshal(existing, &msgs); err != nil {
-			return body
-		}
+
+	// The new message is spliced into the messages array in place: the
+	// conversation is forwarded verbatim, and re-encoding it would copy
+	// every message again for every failover.
+	span, found := findJSONMember(obj, "messages")
+	if !found {
+		arr := make([]byte, 0, len(msgJSON)+2)
+		arr = append(arr, '[')
+		arr = append(arr, msgJSON...)
+		arr = append(arr, ']')
+		return insertJSONMember(body, obj.End, "messages", arr)
 	}
-	msgs = append(msgs, msgJSON)
-	newMsgs, err := json.Marshal(msgs)
-	if err != nil {
+	existing := body[span.Start:span.End]
+	if len(existing) == 0 {
 		return body
 	}
-	data["messages"] = newMsgs
-	out, err := json.Marshal(data)
-	if err != nil {
+	if existing[0] == 'n' {
+		// A null messages array carried no messages, so it becomes the
+		// one-message array.
+		arr := make([]byte, 0, len(msgJSON)+2)
+		arr = append(arr, '[')
+		arr = append(arr, msgJSON...)
+		arr = append(arr, ']')
+		return replaceJSONValue(body, span, arr)
+	}
+	if existing[0] != '[' {
+		// Not an array: the old decoder rejected it too, and the body is
+		// forwarded unchanged.
 		return body
 	}
+	closing := span.End - 1
+	empty := skipJSONSpace(existing[1:len(existing)-1], 0) == len(existing)-2
+	out := make([]byte, 0, len(body)+len(msgJSON)+1)
+	out = append(out, body[:closing]...)
+	if !empty {
+		out = append(out, ',')
+	}
+	out = append(out, msgJSON...)
+	out = append(out, body[closing:]...)
 	return out
 }
 
@@ -1082,10 +1171,9 @@ func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration
 	return sleep, true
 }
 
-func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
+func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string, tokens int) {
 	start := time.Now()
 	ctx := r.Context()
-	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
 	// Wall-clock budget for this request's fallback walk. Shared by all four
 	// fallback loops so none can ship without the bound.
@@ -1476,10 +1564,9 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
+func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string, tokens int) {
 	start := time.Now()
 	ctx := r.Context()
-	tokens := estimateTokens(req)
 	timeout := requestTimeout(tokens)
 
 	w.Header().Set("Content-Type", "text/event-stream")

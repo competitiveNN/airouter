@@ -51,6 +51,12 @@ type ProviderConfig struct {
 	// setting 0) uses maxSessionInterruption, so existing configs keep
 	// their current behaviour.
 	MaxInterruption time.Duration `yaml:"max_interruption,omitempty"`
+
+	// Timeout is the per-provider request timeout applied to upstream calls.
+	// Omitting it (or setting 0) uses the default client timeout.
+	// A duration like 30s, 60s, etc. Long-running requests (large context
+	// compression, reasoning models) should raise this per provider.
+	Timeout time.Duration `yaml:"timeout,omitempty"`
 }
 
 // ProviderMaxInterruption returns the effective interruption ceiling for
@@ -233,30 +239,74 @@ func opencodeSessionFor(sessionID string) string {
 // Returns "" when there is nothing to anchor on (unparseable body, or no
 // system/user message at all), so the caller can fall back.
 func opencodeConversationID(body []byte) string {
-	var partial struct {
-		Model    string `json:"model"`
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
+	// The anchor is read from byte spans, never by decoding the conversation:
+	// this runs once per attempt on the OpenCode path (buildRequest), and a
+	// decode copies every message's content just to hash two of them.
+	obj, ok := scanJSONObject(body)
+	if !ok {
+		return ""
 	}
-	if err := json.Unmarshal(body, &partial); err != nil || partial.Model == "" {
+	modelSpan, found := findJSONMember(obj, "model")
+	if !found {
+		return ""
+	}
+	model, ok := jsonStringValue(body, modelSpan, found)
+	if !ok || model == "" {
+		return ""
+	}
+	msgsSpan, found := findJSONMember(obj, "messages")
+	if !found {
+		return ""
+	}
+	elems, ok := jsonArrayElements(body, msgsSpan)
+	if !ok {
 		return ""
 	}
 
-	h := sha256.New()
-	h.Write([]byte(partial.Model))
-	anchored := false
-	for _, role := range []string{"system", "user"} {
-		for _, m := range partial.Messages {
-			if m.Role != role {
-				continue
-			}
-			h.Write([]byte{0})
-			h.Write(m.Content)
-			anchored = true
-			break
+	var system, user []byte
+	var haveSystem, haveUser bool
+	for _, elem := range elems {
+		m, ok := jsonObjectAt(body, elem)
+		if !ok {
+			// The decoder this replaced rejected any non-object message, and
+			// with it the whole body.
+			return ""
 		}
+		role := ""
+		if roleSpan, found := findJSONMember(m, "role"); found {
+			r, ok := jsonStringValue(body, roleSpan, found)
+			if !ok {
+				return ""
+			}
+			role = r
+		}
+		contentSpan, contentFound := findJSONMember(m, "content")
+		content := jsonLiteralValue(body, contentSpan, contentFound)
+		switch role {
+		case "system":
+			if !haveSystem {
+				system, haveSystem = content, true
+			}
+		case "user":
+			if !haveUser {
+				user, haveUser = content, true
+			}
+		}
+	}
+
+	h := sha256.New()
+	h.Write([]byte(model))
+	anchored := false
+	for _, anchor := range []struct {
+		content []byte
+		found   bool
+	}{{system, haveSystem}, {user, haveUser}} {
+		if !anchor.found {
+			continue
+		}
+		h.Write([]byte{0})
+		h.Write(anchor.content)
+		anchored = true
 	}
 	if !anchored {
 		return ""
@@ -349,48 +399,104 @@ func opencodeRequestHeaders() map[string]string {
 // unchanged, and a client that already streams with both tools sees its
 // body untouched apart from the redundant `stream` re-assertion.
 func opencodeGateBody(body []byte) []byte {
-	var data map[string]json.RawMessage
-	if err := json.Unmarshal(body, &data); err != nil {
+	// The rewrite is done on byte spans: the body is scanned once and the two
+	// members the gate cares about are spliced, so every other byte the client
+	// sent is forwarded as it arrived. Decoding into a map and re-encoding was
+	// the largest single per-request cost on the OpenCode path.
+	obj, ok := scanJSONObject(body)
+	if !ok {
 		return body
 	}
+
+	streamSpan, hasStream := findJSONMember(obj, "stream")
+	streamOn := hasStream && bytes.Equal(jsonLiteralValue(body, streamSpan, hasStream), []byte("true"))
+
+	toolsSpan, hasTools := findJSONMember(obj, "tools")
+	var elems []jsonSpan
+	toolsIsArray := false
+	if hasTools {
+		elems, toolsIsArray = jsonArrayElements(body, toolsSpan)
+	}
+	var haveBash, haveRead bool
+	for _, elem := range elems {
+		switch jsonToolName(body, elem) {
+		case "bash":
+			haveBash = true
+		case "read":
+			haveRead = true
+		}
+	}
+	if streamOn && haveBash && haveRead {
+		return body
+	}
+
+	var edits []jsonEdit
 	// The gate is a hard upstream requirement, not a preference: a
 	// client that explicitly set stream=false is overridden, because
 	// the upstream answers 403 FreeTierError otherwise.
-	data["stream"] = json.RawMessage("true")
+	if !streamOn && hasStream {
+		edits = append(edits, jsonEdit{Start: streamSpan.Start, End: streamSpan.End, Replacement: []byte("true")})
+	}
 
-	var tools []map[string]json.RawMessage
-	if raw, ok := data["tools"]; ok {
-		_ = json.Unmarshal(raw, &tools)
+	var add [][]byte
+	for _, gate := range []struct {
+		name string
+		have bool
+	}{{"bash", haveBash}, {"read", haveRead}} {
+		if gate.have {
+			continue
+		}
+		raw, err := json.Marshal(opencodeGateTool(gate.name))
+		if err != nil {
+			return body
+		}
+		add = append(add, raw)
 	}
-	if !opencodeGateHasTool(tools, "bash") {
-		tools = append(tools, opencodeGateTool("bash"))
-	}
-	if !opencodeGateHasTool(tools, "read") {
-		tools = append(tools, opencodeGateTool("read"))
-	}
-	encoded, err := json.Marshal(tools)
-	if err != nil {
-		return body
-	}
-	data["tools"] = encoded
-	out, err := json.Marshal(data)
-	if err != nil {
-		return body
-	}
-	return out
-}
-
-// opencodeGateHasTool reports whether the tools array already declares
-// a tool with the given name. Both spellings are recognized: Chat
-// Completions nests the name under `function`, while the Responses API
-// and some gateways carry it flat.
-func opencodeGateHasTool(tools []map[string]json.RawMessage, name string) bool {
-	for _, tool := range tools {
-		if opencodeGateToolName(tool) == name {
-			return true
+	if len(add) > 0 {
+		switch {
+		case toolsIsArray:
+			at, sep, ok := jsonArrayInsertion(body, toolsSpan, elems)
+			if !ok {
+				return body
+			}
+			var repl []byte
+			for i, raw := range add {
+				if i > 0 || sep == "," {
+					repl = append(repl, ',')
+				}
+				repl = append(repl, raw...)
+			}
+			edits = append(edits, jsonEdit{Start: at, End: at, Replacement: repl})
+		case hasTools:
+			// Not an array (null, an object): the gate needs one, so the value
+			// is replaced wholesale.
+			edits = append(edits, jsonEdit{Start: toolsSpan.Start, End: toolsSpan.End, Replacement: encodeJSONArray(add)})
 		}
 	}
-	return false
+
+	// Members that did not exist are appended in one insertion: two separate
+	// insertions at the same offset would each believe the other needs the
+	// separator in front of it.
+	var inserted [][]byte
+	if !hasStream {
+		inserted = append(inserted, []byte(`"stream":true`))
+	}
+	if len(add) > 0 && !hasTools {
+		inserted = append(inserted, append([]byte(`"tools":`), encodeJSONArray(add)...))
+	}
+	if len(inserted) > 0 {
+		at, sep := jsonObjectInsertion(body, obj)
+		var repl []byte
+		for i, member := range inserted {
+			if i > 0 || sep == "," {
+				repl = append(repl, ',')
+			}
+			repl = append(repl, member...)
+		}
+		edits = append(edits, jsonEdit{Start: at, End: at, Replacement: repl})
+	}
+
+	return applyJSONEdits(body, edits)
 }
 
 func opencodeGateToolName(tool map[string]json.RawMessage) string {
@@ -996,13 +1102,28 @@ func (c *Config) GetProvider(provider string) (ProviderConfig, bool) {
 	return p, ok
 }
 
+// ReplaceModelName returns body with its top-level "model" field set to
+// modelName.
+//
+// The substitution is a splice: the model value is replaced where it lies in
+// the raw body and every other byte is forwarded exactly as the client sent
+// it. Decoding the body into a map and re-marshaling it copied the whole
+// conversation twice, and the gateway does this once per endpoint it tries
+// on the way down a fallback chain.
 func ReplaceModelName(body []byte, modelName string) ([]byte, error) {
-	var data map[string]json.RawMessage
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, err
-	}
 	modelJSON, err := json.Marshal(modelName)
 	if err != nil {
+		return nil, err
+	}
+	if obj, ok := scanJSONObject(body); ok {
+		if span, found := findJSONMember(obj, "model"); found {
+			return replaceJSONValue(body, span, modelJSON), nil
+		}
+		return insertJSONMember(body, obj.End, "model", modelJSON), nil
+	}
+	// A body the scanner does not understand: fall back to the decoder.
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
 		return nil, err
 	}
 	data["model"] = modelJSON
