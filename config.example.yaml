@@ -95,10 +95,17 @@ providers:
     url: https://generativelanguage.googleapis.com/v1beta/openai
     api_key_env: GEMINI_API_KEY        # set this in .envrc
 
-  # Example: CommandCode local proxy
+  # CommandCode (api.commandcode.ai) is not OpenAI-compatible: point the
+  # provider straight at the upstream and mark every endpoint that uses it
+  # with `protocol: commandcode`. The gateway then speaks /alpha/generate
+  # itself, so no separate commandcode-proxy process is needed.
   commandcode:
-    url: http://127.0.0.1:3050/v1
+    url: https://api.commandcode.ai
     api_key_env: COMMANDCODE_API_KEY   # set this in .envrc
+  # A second key on the same upstream: a 429 on the first falls through here.
+  commandcode2:
+    url: https://api.commandcode.ai
+    api_key_env: COMMANDCODE_API_KEY_2 # set this in .envrc
 
 preferences:
   newest_first_on_tie: true

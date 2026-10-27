@@ -53,6 +53,35 @@ Keys are read from environment variables named by `api_key_env`. The gateway
 refuses to start without a gateway API key (`GATEWAY_API_KEY` or `-api-key`)
 unless `-allow-no-auth` is passed (insecure).
 
+### The Command Code endpoint
+
+`api.commandcode.ai` answers `/alpha/generate` with an NDJSON event stream, not
+Chat Completions. Endpoints that use it carry `protocol: commandcode` and go
+through the translation in `commandcode.go`.
+
+The same translation is also exposed as a standalone OpenAI-compatible surface
+on its own port, for clients that want a Command Code model directly rather
+than one of the four logical models:
+
+```sh
+./airouter -commandcode-port 3050 -commandcode-providers commandcode,commandcode2
+```
+
+- It is the built-in replacement for the separate `commandcode-proxy` process.
+  Stop that process first, or the two will fight over port 3050 (the gateway
+  logs the bind error and keeps serving the main port).
+- `POST /v1/chat/completions` takes a normal Chat Completions body. The `model`
+  is passed to Command Code **verbatim** — no logical-model lookup, no chain
+  rewriting — so any model id the upstream accepts works, listed in `/v1/models`
+  or not.
+- It authenticates with the same gateway key.
+- The providers in `-commandcode-providers` are the failover order: each is a
+  different API key on the same upstream, so a rate-limited first key falls
+  through to the next. A session sticks to the key it started on.
+- Cooldowns are shared with the main gateway: a key that 429'd here is skipped
+  there too, and vice versa.
+- `/v1/responses` is not served; it answers 404 naming the supported path.
+
 ## Routing
 
 1. A request arrives for a logical model.

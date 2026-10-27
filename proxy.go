@@ -1072,59 +1072,8 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// body phase is deliberately left unbounded: this deadline governs
 	// headers only.
 	//
-	// Select the transport and client for this attempt. Proxied endpoints
-	// route through a proxy from the pool (HTTPS via Transport.Proxy, SOCKS5
-	// via a custom DialContext); everything else uses the shared direct
-	// transport.
-	client := p.client
-	transport := p.baseTransport
-	if p.effectiveProtocol(&endpoint) == protocolCommandCode {
-		client = p.commandCodeClient()
-		transport = p.commandCodeTransport()
-	}
-
-	proxied := false
-	var usedProxy *ProxyInfo
-	if p.proxyTries(&endpoint) > 0 {
-		p.proxyMu.RLock()
-		svc := p.proxySvc
-		p.proxyMu.RUnlock()
-		if svc != nil {
-			if proxy := svc.pick(); proxy != nil {
-				// A nil transport means no proxy could be built for this one:
-				// the attempt then leaves the proxy path, and both usedProxy and
-				// proxied stay unset so the proxy is neither credited with a
-				// success it never carried nor charged with the failure.
-				if tr := svc.TransportFor(transport, proxy); tr != nil {
-					applyAttemptTimeouts(tr, timeout)
-					client = &http.Client{Transport: tr}
-					transport = tr
-					usedProxy = proxy
-					proxied = true
-				} else {
-					log.Printf("[proxy] cannot build a transport for %s/%s proxy %s; trying direct",
-						endpoint.Provider, endpoint.Model, redactProxyURL(proxy.URL))
-				}
-			} else {
-				// The operator asked for a proxy and none can be used, so this
-				// attempt leaves the proxy path entirely. That is deliberate
-				// (a request through a dead pool still beats no request), but it
-				// must not be silent: without this line the only symptom would be
-				// upstream traffic arriving from the gateway's own address.
-				log.Printf("[proxy] no usable proxy for %s/%s (pool=%d, ready=%d); trying direct",
-					endpoint.Provider, endpoint.Model, svc.pool.len(), svc.ReadyCount())
-			}
-		}
-	}
-
-	// Apply the per-attempt header timeout to whatever transport is in use.
-	// For proxied endpoints where a proxy was selected, the timeout was already
-	// set above; otherwise clone the transport to set the per-attempt budget.
-	if transport != nil && !proxied {
-		tr := transport.Clone()
-		applyAttemptTimeouts(tr, timeout)
-		client = &http.Client{Transport: tr}
-	}
+	// Select the transport and client for this attempt; see attemptClient.
+	client, usedProxy := p.attemptClient(&endpoint, timeout)
 
 	resp, err := client.Do(req)
 	if err != nil {
