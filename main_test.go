@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -6152,5 +6153,449 @@ func TestRecoveryMiddlewarePanicAfterOutputKeepsResponse(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "Internal server error") {
 		t.Errorf("a 500 body was appended to an already-started response: %q", rec.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Byte-splice body rewrites
+//
+// ReplaceModelName, injectMaxTokens and appendAssistantMessage used to decode
+// the request body into map[string]json.RawMessage and re-marshal the map. On
+// a long conversation that copies the whole body twice per rewrite, and the
+// gateway rewrites the body once per endpoint it tries on the way down a
+// fallback chain. They now splice the changed bytes into the raw body instead.
+//
+// The tests below hold the rewrites to the behaviour they replaced: the JSON
+// the upstream sees must not change, whatever the key order.
+// ---------------------------------------------------------------------------
+
+// rewriteCorpus is the set of body shapes the splice rewrites must agree on
+// with the decoder round trip they replaced.
+var rewriteCorpus = []string{
+	`{"model":"smart","messages":[{"role":"user","content":"hello"}]}`,
+	`{"model":"smart","messages":[{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":100,"stream":true}`,
+	`{"messages":[],"model":"work"}`,
+	`{ "model" : "fast" , "messages" : [ ] }`,
+	`{ "model" : "fast" , "messages" : [ ] , "stream" : true }`,
+	`{"model":"large","messages":[{"role":"user","content":"a \"quoted\" word"}],"nested":{"a":[1,2,{"b":"c"}]}}`,
+	// An escaped quote followed by a brace and a bracket: a scanner that
+	// treats the escaped quote as the end of the string ends the
+	// conversation at the wrong byte.
+	`{"model":"smart","messages":[{"role":"user","content":"he said \"}\" and ]"}],"stream":true}`,
+	`{"model":"smart","messages":[{"role":"user","content":"line\nbreak\ttab"}],"stream":true}`,
+	`{"model":"smart","messages":[{"role":"user","content":"h\u00e9llo \u2603"}]}`,
+	`{"model":"smart","messages":[{"role":"user","content":"<html> & stuff"}]}`,
+	`{"model":"smart"}`,
+	`{"messages":[{"role":"user","content":"x"}]}`,
+	`{"model":"smart","messages":null}`,
+	`{"model":"smart","messages":{"not":"an array"}}`,
+	`{"model":"smart","messages":[{"role":"user","content":"x"}],"model":"fast"}`,
+	`{}`,
+	`{"model":123}`,
+	`{"model":""}`,
+	`[]`,
+	`not json`,
+	`{"model":"smart",}`,
+	`{"model":"smart"} trailing`,
+}
+
+// refReplaceModelName is the decode-and-re-encode rewrite that
+// ReplaceModelName replaced. It is the oracle the splice must match.
+func refReplaceModelName(body []byte, modelName string) ([]byte, error) {
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, err
+	}
+	modelJSON, err := json.Marshal(modelName)
+	if err != nil {
+		return nil, err
+	}
+	data["model"] = modelJSON
+	return json.Marshal(data)
+}
+
+// refInjectMaxTokens is the decode-and-re-encode rewrite that injectMaxTokens
+// replaced.
+func refInjectMaxTokens(body []byte, maxTokens int) []byte {
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	if _, ok := data["max_tokens"]; ok {
+		return body
+	}
+	val, err := json.Marshal(maxTokens)
+	if err != nil {
+		return body
+	}
+	data["max_tokens"] = val
+	out, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// refAppendAssistantMessage is the decode-and-re-encode rewrite that
+// appendAssistantMessage replaced.
+func refAppendAssistantMessage(body []byte, content string, toolCalls []streamToolCall) []byte {
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	msg := map[string]interface{}{
+		"role":    "assistant",
+		"content": content,
+	}
+	if len(toolCalls) > 0 {
+		atcs := make([]map[string]interface{}, 0, len(toolCalls))
+		for _, tc := range toolCalls {
+			if tc.Name == "" {
+				continue
+			}
+			m := map[string]interface{}{}
+			if tc.ID != "" {
+				m["id"] = tc.ID
+			}
+			if tc.Type != "" {
+				m["type"] = tc.Type
+			}
+			m["function"] = map[string]interface{}{
+				"arguments": tc.Arguments,
+				"name":      tc.Name,
+			}
+			atcs = append(atcs, m)
+		}
+		if len(atcs) > 0 {
+			msg["tool_calls"] = atcs
+		}
+	}
+	msgJSON, err := json.Marshal(msg)
+	if err != nil {
+		return body
+	}
+	var msgs []json.RawMessage
+	if existing, ok := data["messages"]; ok {
+		if err := json.Unmarshal(existing, &msgs); err != nil {
+			return body
+		}
+	}
+	msgs = append(msgs, msgJSON)
+	newMsgs, err := json.Marshal(msgs)
+	if err != nil {
+		return body
+	}
+	data["messages"] = newMsgs
+	out, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// sameJSONResult reports whether two rewrites of the same body mean the same
+// thing. A rewrite that cannot parse the body must hand it back untouched, so
+// in that case the bytes have to match exactly.
+func sameJSONResult(t *testing.T, got, want []byte) bool {
+	t.Helper()
+	var gotV, wantV interface{}
+	gotErr := json.Unmarshal(got, &gotV)
+	wantErr := json.Unmarshal(want, &wantV)
+	if gotErr != nil || wantErr != nil {
+		return bytes.Equal(got, want)
+	}
+	return reflect.DeepEqual(gotV, wantV)
+}
+
+func TestReplaceModelNameMatchesDecoderRoundTrip(t *testing.T) {
+	for _, body := range rewriteCorpus {
+		want, wantErr := refReplaceModelName([]byte(body), "endpoint-model")
+		got, gotErr := ReplaceModelName([]byte(body), "endpoint-model")
+		if (wantErr != nil) != (gotErr != nil) {
+			t.Errorf("body %q: error mismatch: splice=%v decoder=%v", body, gotErr, wantErr)
+			continue
+		}
+		if wantErr != nil {
+			continue
+		}
+		if !sameJSONResult(t, got, want) {
+			t.Errorf("body %q: splice produced %s, decoder produced %s", body, got, want)
+		}
+	}
+}
+
+func TestInjectMaxTokensMatchesDecoderRoundTrip(t *testing.T) {
+	for _, body := range rewriteCorpus {
+		want := refInjectMaxTokens([]byte(body), 4096)
+		got := injectMaxTokens([]byte(body), 4096)
+		if !sameJSONResult(t, got, want) {
+			t.Errorf("body %q: splice produced %s, decoder produced %s", body, got, want)
+		}
+	}
+}
+
+func TestAppendAssistantMessageMatchesDecoderRoundTrip(t *testing.T) {
+	tcs := []streamToolCall{
+		{Index: 0, ID: "call_1", Type: "function", Name: "read_file", Arguments: `{"path":"/x"}`},
+		// An incomplete call must be dropped by both implementations.
+		{Index: 1, ID: "call_2", Type: "function", Arguments: `{"path":"/y"}`},
+	}
+	for _, body := range rewriteCorpus {
+		want := refAppendAssistantMessage([]byte(body), "partial", tcs)
+		got := appendAssistantMessage([]byte(body), "partial", tcs)
+		if !sameJSONResult(t, got, want) {
+			t.Errorf("body %q: splice produced %s, decoder produced %s", body, got, want)
+		}
+	}
+}
+
+// TestScanJSONObjectSpans pins the scanner itself: a span has to point at
+// exactly the value it names, including when the value holds braces, brackets
+// and escaped quotes inside strings.
+func TestScanJSONObjectSpans(t *testing.T) {
+	body := []byte(`{"a":"x","model":"smart","messages":[{"role":"user","content":"he said \"}\" and ]"}],"z":1}`)
+	obj, ok := scanJSONObject(body)
+	if !ok {
+		t.Fatalf("scan failed on %s", body)
+	}
+	want := map[string]string{
+		"a":        `"x"`,
+		"model":    `"smart"`,
+		"messages": `[{"role":"user","content":"he said \"}\" and ]"}]`,
+		"z":        `1`,
+	}
+	if len(obj.Spans) != len(want) {
+		t.Fatalf("got %d spans, want %d", len(obj.Spans), len(want))
+	}
+	for _, span := range obj.Spans {
+		raw := string(body[span.Start:span.End])
+		if want[span.Key] != raw {
+			t.Errorf("key %q: span holds %q, want %q", span.Key, raw, want[span.Key])
+		}
+	}
+	if obj.End >= len(body) || body[obj.End] != '}' {
+		t.Errorf("obj.End does not point at the closing brace")
+	}
+}
+
+func TestScanJSONObjectRejectsWhatItDoesNotUnderstand(t *testing.T) {
+	for _, body := range []string{
+		``, `[]`, `"x"`, `1`, `null`, `tru`,
+		`{"a":1`, `{"a" 1}`, `{"a":1}}`, `{"a":1}{}`, `{"a":1} trailing`,
+		`{a:1}`, `{"a":}`, `{"a":1,}`,
+	} {
+		if _, ok := scanJSONObject([]byte(body)); ok {
+			t.Errorf("scanner accepted %q", body)
+		}
+	}
+}
+
+// TestBodySessionIDFingerprint pins what the fingerprint covers: the model
+// and the messages, and nothing else.
+func TestBodySessionIDFingerprint(t *testing.T) {
+	base := `{"model":"smart","messages":[{"role":"user","content":"hello"}]}`
+	id := bodySessionID([]byte(base))
+	if !strings.HasPrefix(id, "ctx:") {
+		t.Fatalf("expected a ctx: session id, got %q", id)
+	}
+
+	// Knobs that do not change the conversation must not move the id.
+	knobs := `{"model":"smart","messages":[{"role":"user","content":"hello"}],"temperature":0.2,"stream":true,"max_tokens":10}`
+	if got := bodySessionID([]byte(knobs)); got != id {
+		t.Errorf("a knob change moved the session id: %q vs %q", got, id)
+	}
+
+	// Reformatting is not a different conversation either.
+	spaced := `{ "model" : "smart" , "messages" : [ { "role" : "user" , "content" : "hello" } ] }`
+	if got := bodySessionID([]byte(spaced)); got != id {
+		t.Errorf("reformatting moved the session id: %q vs %q", got, id)
+	}
+
+	// Different content, or a different logical model, is a different
+	// conversation.
+	if got := bodySessionID([]byte(`{"model":"smart","messages":[{"role":"user","content":"hello!"}]}`)); got == id {
+		t.Errorf("different content produced the same session id %q", got)
+	}
+	if got := bodySessionID([]byte(`{"model":"work","messages":[{"role":"user","content":"hello"}]}`)); got == id {
+		t.Errorf("different model produced the same session id %q", got)
+	}
+
+	// Whitespace inside a string is content, not formatting.
+	a := bodySessionID([]byte(`{"model":"m","messages":[{"role":"user","content":"a b"}]}`))
+	b := bodySessionID([]byte(`{"model":"m","messages":[{"role":"user","content":"ab"}]}`))
+	if a == b {
+		t.Errorf("whitespace inside a message was treated as formatting")
+	}
+
+	// A body with no model still gets an id, from the whole body.
+	if got := bodySessionID([]byte(`{"messages":[]}`)); !strings.HasPrefix(got, "body:") {
+		t.Errorf("expected a body: session id for a model-less body, got %q", got)
+	}
+}
+
+// TestBodySessionIDDoesNotCopyTheConversation is the reason bodySessionID was
+// rewritten: its cost must not scale with the size of the conversation. It
+// used to decode the messages into []map[string]interface{} and re-encode
+// them, which allocated several times the body size on every request.
+func TestBodySessionIDDoesNotCopyTheConversation(t *testing.T) {
+	big := strings.Repeat("x", 200<<10)
+	body := []byte(`{"model":"smart","messages":[{"role":"user","content":"` + big + `"}]}`)
+
+	// Warm the code paths so the measurement only sees the per-call cost.
+	for i := 0; i < 5; i++ {
+		bodySessionID(body)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	const runs = 50
+	var sink string
+	for i := 0; i < runs; i++ {
+		sink = bodySessionID(body)
+	}
+	runtime.ReadMemStats(&after)
+	if sink == "" {
+		t.Fatal("bodySessionID returned an empty session id")
+	}
+	perCall := (after.TotalAlloc - before.TotalAlloc) / runs
+	if limit := uint64(len(body)) / 8; perCall > limit {
+		t.Errorf("bodySessionID allocated %d bytes per call on a %d-byte body (limit %d): it is copying the conversation again", perCall, len(body), limit)
+	}
+}
+
+// TestReadRequestBodySizesFromContentLength covers the read path: the buffer
+// is sized from Content-Length, and a client that lies about the length is
+// still read to EOF.
+func TestReadRequestBodySizesFromContentLength(t *testing.T) {
+	payload := strings.Repeat("z", 5000)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload))
+	got, err := readRequestBody(req)
+	if err != nil {
+		t.Fatalf("readRequestBody: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("read %d bytes, want %d", len(got), len(payload))
+	}
+	if want := len(payload) + 1 + requestBodyHeadroom; cap(got) != want {
+		t.Errorf("buffer cap is %d, want %d: the read grew a buffer it could have sized from Content-Length instead", cap(got), want)
+	}
+}
+
+func TestReadRequestBodyReadsPastALyingContentLength(t *testing.T) {
+	payload := strings.Repeat("q", 100)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(payload))
+	req.ContentLength = 10 // the client under-declared the body
+	got, err := readRequestBody(req)
+	if err != nil {
+		t.Fatalf("readRequestBody: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("read %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+func TestReadRequestBodyHandlesUnknownLength(t *testing.T) {
+	payload := "a chunked body with no length"
+	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(strings.NewReader(payload)))
+	req.ContentLength = -1
+	got, err := readRequestBody(req)
+	if err != nil {
+		t.Fatalf("readRequestBody: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("read %q, want %q", got, payload)
+	}
+}
+
+// TestInsertJSONMemberReusing is the reason request bodies are read with spare
+// capacity: injecting max_tokens must not cost a second copy of the body.
+func TestInsertJSONMemberReusing(t *testing.T) {
+	cases := []string{
+		`{"model":"m"}`,
+		`{"model":"m"}` + "\n",
+		`{ }`,
+		`{"model":"m","messages":[]}` + "  \n\t",
+		`{"a":1,"a":2}`,
+	}
+	for _, body := range cases {
+		// With headroom the insert is in place; without it the copy path runs.
+		for _, headroom := range []int{0, requestBodyHeadroom} {
+			buf := make([]byte, len(body), len(body)+headroom)
+			copy(buf, body)
+			obj, ok := scanJSONObject(buf)
+			if !ok {
+				t.Fatalf("scan failed for %q", body)
+			}
+			got := insertJSONMemberReusing(buf, obj.End, "max_tokens", []byte("42"))
+			want := string(insertJSONMember([]byte(body), obj.End, "max_tokens", []byte("42")))
+			if string(got) != want {
+				t.Errorf("headroom=%d body=%q:\ngot:  %s\nwant: %s", headroom, body, got, want)
+			}
+			var decoded struct {
+				MaxTokens int `json:"max_tokens"`
+			}
+			if err := json.Unmarshal(got, &decoded); err != nil {
+				t.Errorf("headroom=%d body=%q: result is not JSON: %v", headroom, body, err)
+			} else if decoded.MaxTokens != 42 {
+				t.Errorf("headroom=%d body=%q: max_tokens = %d, want 42", headroom, body, decoded.MaxTokens)
+			}
+			if headroom > 0 && uintptr(cap(got)) <= uintptr(len(body)) {
+				t.Errorf("body=%q: the in-place path did not reuse the buffer (cap %d)", body, cap(got))
+			}
+		}
+	}
+}
+
+// TestInjectMaxTokensDoesNotCopyTheBody pins the effect of the headroom: a body
+// read through readRequestBody is rewritten in place, so the injected member
+// costs bytes, not a copy of the conversation.
+func TestInjectMaxTokensDoesNotCopyTheBody(t *testing.T) {
+	big := strings.Repeat("x", 200<<10)
+	payload := `{"model":"smart","messages":[{"role":"user","content":"` + big + `"}]}`
+
+	newBody := func() []byte {
+		b, err := readRequestBody(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
+		if err != nil {
+			t.Fatalf("readRequestBody: %v", err)
+		}
+		return b
+	}
+	// allocPerCall reports the bytes one call allocates, averaged, after
+	// warming the path so the measurement sees steady state.
+	allocPerCall := func(runs int, fn func()) uint64 {
+		for i := 0; i < 5; i++ {
+			fn()
+		}
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for i := 0; i < runs; i++ {
+			fn()
+		}
+		runtime.ReadMemStats(&after)
+		return (after.TotalAlloc - before.TotalAlloc) / uint64(runs)
+	}
+
+	readOnly := allocPerCall(50, func() { newBody() })
+	withInject := allocPerCall(50, func() { injectMaxTokens(newBody(), 512) })
+	if withInject < readOnly {
+		t.Fatalf("injection measured cheaper than the bare read (%d < %d); the benchmark is broken", withInject, readOnly)
+	}
+	if delta, limit := withInject-readOnly, uint64(len(payload))/8; delta > limit {
+		t.Errorf("injecting max_tokens allocated %d extra bytes per call on a %d-byte body (limit %d): it is copying the body again", delta, len(payload), limit)
+	}
+
+	out := injectMaxTokens(newBody(), 512)
+	var decoded struct {
+		MaxTokens int `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("injected body is not JSON: %v", err)
+	}
+	if decoded.MaxTokens != 512 {
+		t.Errorf("max_tokens = %d, want 512", decoded.MaxTokens)
+	}
+	if !strings.Contains(string(out), big[:64]) {
+		t.Error("the conversation was damaged by the injection")
 	}
 }
