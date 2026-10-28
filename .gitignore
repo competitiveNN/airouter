@@ -4,6 +4,7 @@
 
 # Build artifacts
 airouter
+commandcode-proxy
 NOTES.txt
 __pycache__/
 *.bak

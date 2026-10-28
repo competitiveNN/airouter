@@ -64,7 +64,12 @@ on its own port, for clients that want a Command Code model directly rather
 than one of the four logical models:
 
 ```sh
+# Built into the gateway (second listener on 3050):
 ./airouter -commandcode-port 3050 -commandcode-providers commandcode,commandcode2
+
+# Or as a standalone binary that serves only the shim:
+make commandcode-proxy
+./commandcode-proxy -config config.yaml -port 3050 -providers commandcode,commandcode2
 ```
 
 - It is the built-in replacement for the separate `commandcode-proxy` process.
