@@ -170,6 +170,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 	// socket for longer than the turn's own budget allows.
 	timeout := requestTimeout(estimateTokens(chatReq))
 	walk := newBudgetState(turnStart, timeout)
+	tokens := estimateTokens(chatReq)
 
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
@@ -198,7 +199,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		}
 		walk.next()
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, wait := g.router.SelectEndpointForTokens(req.Model, sessionID, requestHasVision(body), tried, tokens)
 		if ep == nil {
 			if wait > 0 {
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))

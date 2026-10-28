@@ -688,10 +688,26 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	tokens := estimateTokensFromBody(body)
+
+	// A prompt larger than every reachable model's context window cannot be
+	// served by any walk: the upstreams accept the connection and then produce
+	// nothing until the attempt timeout fires, so the client spends the whole
+	// interruption budget and gets an error anyway. Reject it up front and name
+	// the largest window on offer. Endpoints with an unknown window count as
+	// fitting (see contextFits), so this can only fire when every endpoint
+	// advertises a window too small for the request.
+	if fits, largest := g.router.ContextCapacity(req.Model, tokens); !fits {
+		msg := fmt.Sprintf("Request is about %d tokens, which exceeds every %s model's context window (largest advertised: %d tokens). Reduce the conversation, or use a model whose window fits it.", tokens, req.Model, largest)
+		writeAPIError(w, 400, msg, "invalid_request_error", "context_length_exceeded")
+		g.recordRequest(req.Model, 400, time.Since(start))
+		return
+	}
+
 	if req.Stream {
-		g.handleStream(w, r, body, req, sessionID, estimateTokensFromBody(body))
+		g.handleStream(w, r, body, req, sessionID, tokens)
 	} else {
-		g.handleCompletion(w, r, body, req, sessionID, estimateTokensFromBody(body))
+		g.handleCompletion(w, r, body, req, sessionID, tokens)
 	}
 }
 
@@ -1243,7 +1259,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 		walk.next()
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, wait := g.router.SelectEndpointForTokens(req.Model, sessionID, requestHasVision(body), tried, tokens)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
@@ -1675,7 +1691,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		}
 		walk.next()
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, wait := g.router.SelectEndpointForTokens(req.Model, sessionID, requestHasVision(body), tried, tokens)
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
