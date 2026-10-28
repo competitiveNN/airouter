@@ -806,6 +806,11 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", endpoint.Provider)
 	}
+	if providerCfg.Timeout > 0 {
+		timeoutCtx, cancel := context.WithTimeout(ctx, providerCfg.Timeout)
+		ctx = timeoutCtx
+		defer cancel()
+	}
 
 	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, false, sessionID)
 	if err != nil {
@@ -997,6 +1002,12 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	opts := StreamAttemptOptions{}
 	if len(options) > 0 {
 		opts = options[0]
+	}
+	if providerCfg.Timeout > 0 && providerCfg.Timeout > timeout {
+		timeout = providerCfg.Timeout
+	}
+	if timeout > maxSessionInterruption {
+		timeout = maxSessionInterruption
 	}
 	maxIdle := p.streamIdleTimeout
 	if opts.MaxIdleTimeout > 0 {
