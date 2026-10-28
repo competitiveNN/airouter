@@ -384,7 +384,7 @@ func (s *ProxyService) geolocateRemote(ctx context.Context, ip string) (country,
 	if resp.StatusCode != 200 {
 		return "", ""
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLargeRequestBytes))
 	if err != nil {
 		return "", ""
 	}
@@ -421,7 +421,7 @@ func (s *ProxyService) fetchSource(ctx context.Context, sourceURL string) ([]byt
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("source %s returned status %d", sourceURL, resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, maxLargeRequestBytes))
 }
 
 // parseProxies parses a raw response body into ProxyInfo entries. It detects

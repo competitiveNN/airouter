@@ -528,7 +528,7 @@ def auto_fallback_terminator(
             return 'unknown'
         return 'live' if rec.verified is True else 'dead'
 
-    if 'opencode' in providers_present and 'kilocode' not in providers_present:
+    if 'opencode' in providers_present and 'kilocode' not in providers_present and 'kilocode' in providers_present:
         preferred, rescue = 'opencode', 'kilocode'
         why = 'kilocode absent from chain'
     elif 'kilocode' in providers_present:

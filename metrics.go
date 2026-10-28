@@ -47,13 +47,26 @@ type Metrics struct {
 	failuresTotal    atomic.Int64
 	failuresByStatus map[labelKey]*atomic.Int64
 	fallbacksTotal   atomic.Int64
+	// transportDropsTotal counts client-side disconnects observed during a
+	// request (the gateway gave up sending), as distinct from upstream errors.
+	// Operators use it to distinguish "our network broke" from "the model
+	// failed": an upstream failure increments cooldowns/fallbacks, while a
+	// transport drop increments only this counter.
+	transportDropsTotal atomic.Int64
 	// fallbacksByFromEndpoint counts fallbacks triggered by each endpoint
 	// (the model that failed and caused the fail-over). Low-cardinality and
 	// actionable: operators can see which upstreams are the weakest link.
 	fallbacksByFromEndpoint map[labelKey]*atomic.Int64
-	cooldownsApplied        atomic.Int64
-	latencySumNS            atomic.Int64
-	latencyCount            atomic.Int64
+	// midstreamFallbacksTotal counts fail-overs that happened after at least
+	// one byte of content had already reached the client (so the gateway had
+	// to replay what the client already received — a seam the client can
+	// see). split from fallbacksByFromEndpoint so an operator can tell total
+	// routing pressure from invisible-to-the-client routing pressure.
+	midstreamFallbacksTotal      atomic.Int64
+	midstreamFallbacksByEndpoint map[labelKey]*atomic.Int64
+	cooldownsApplied             atomic.Int64
+	latencySumNS                 atomic.Int64
+	latencyCount                 atomic.Int64
 	// latencyBuckets[i] is the count of requests whose latency fell at or
 	// below the boundary defined by latencyBoundaries[i]. The last bucket
 	// (+Inf) catches everything above the largest finite boundary.
@@ -222,19 +235,20 @@ var attemptLatencyBoundaries = []float64{
 // NewMetrics creates a new Metrics instance with pre-allocated maps.
 func NewMetrics() *Metrics {
 	m := &Metrics{
-		requestsByModel:         make(map[labelKey]*atomic.Int64),
-		requestsByStatus:        make(map[labelKey]*atomic.Int64),
-		failuresByStatus:        make(map[labelKey]*atomic.Int64),
-		fallbacksByFromEndpoint: make(map[labelKey]*atomic.Int64),
-		circuitTransitions:      make(map[labelKey]*atomic.Int64),
-		attemptsByEndpoint:      make(map[labelKey]*atomic.Int64),
-		attemptFailuresByEnd:    make(map[labelKey]*atomic.Int64),
-		attemptLatencyNSByEnd:   make(map[labelKey]*atomic.Int64),
-		attemptHistByEnd:        make(map[labelKey][]atomic.Int64),
-		attemptIndex:            make(map[labelKey]int),
-		labelsCap:               defaultMaxLabelValues,
-		overflowKey:             overflowLabelKey,
-		attemptRing:             make([]*attemptTick, dashboardRingLen),
+		requestsByModel:              make(map[labelKey]*atomic.Int64),
+		requestsByStatus:             make(map[labelKey]*atomic.Int64),
+		failuresByStatus:             make(map[labelKey]*atomic.Int64),
+		fallbacksByFromEndpoint:      make(map[labelKey]*atomic.Int64),
+		midstreamFallbacksByEndpoint: make(map[labelKey]*atomic.Int64),
+		circuitTransitions:           make(map[labelKey]*atomic.Int64),
+		attemptsByEndpoint:           make(map[labelKey]*atomic.Int64),
+		attemptFailuresByEnd:         make(map[labelKey]*atomic.Int64),
+		attemptLatencyNSByEnd:        make(map[labelKey]*atomic.Int64),
+		attemptHistByEnd:             make(map[labelKey][]atomic.Int64),
+		attemptIndex:                 make(map[labelKey]int),
+		labelsCap:                    defaultMaxLabelValues,
+		overflowKey:                  overflowLabelKey,
+		attemptRing:                  make([]*attemptTick, dashboardRingLen),
 	}
 	m.attemptLatencyBounds = attemptLatencyBoundaries
 	m.latencyBoundaries = defaultLatencyBuckets
@@ -368,6 +382,33 @@ func (m *Metrics) Fallback(fromEndpoint string) {
 // endpoint is a provider:model key subject to the same config churn.
 func (m *Metrics) counterFallbackFrom(key labelKey) *atomic.Int64 {
 	return m.admitCollapsible(m.fallbacksByFromEndpoint, key, labelNameEndpoint)
+}
+
+// MidStreamFailover records a fail-over that happened after at least one byte
+// of content had already reached the client, so the gateway replayed part of
+// what the client already received. Unlike a pre-output fallback, these are
+// perceptible to the client as a stream seam, so counting them separately lets
+// operators identify endpoints that fail in a way the user can feel.
+func (m *Metrics) MidStreamFailover(fromEndpoint string) {
+	m.midstreamFallbacksTotal.Add(1)
+	if fromEndpoint == "" {
+		return
+	}
+	m.counterMidStreamFallbackFrom(singleLabelKey("endpoint", fromEndpoint)).Add(1)
+}
+
+// counterMidStreamFallbackFrom returns the atomic counter for the given
+// endpoint, creating it on first access. Bounded like the attempt telemetry.
+func (m *Metrics) counterMidStreamFallbackFrom(key labelKey) *atomic.Int64 {
+	return m.admitCollapsible(m.midstreamFallbacksByEndpoint, key, labelNameEndpoint)
+}
+
+// TransportDrop records that the client disconnected mid-request and the
+// gateway abandoned the response. Unlike Cooldown/Fallback this says nothing
+// about upstream health; it measures the request leg between the client and
+// the gateway.
+func (m *Metrics) TransportDrop() {
+	m.transportDropsTotal.Add(1)
 }
 
 // Cooldown records a model cooldown application.
@@ -1009,6 +1050,29 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# HELP airouter_cooldowns_applied_total Number of cooldown applications")
 	fmt.Fprintln(w, "# TYPE airouter_cooldowns_applied_total counter")
 	fmt.Fprintf(w, "airouter_cooldowns_applied_total %d\n", m.cooldownsApplied.Load())
+
+	fmt.Fprintln(w, "# HELP airrouter_transport_drops_total Number of responses abandoned because the client disconnected")
+	fmt.Fprintln(w, "# TYPE airrouter_transport_drops_total counter")
+	fmt.Fprintf(w, "airouter_transport_drops_total %d\n", m.transportDropsTotal.Load())
+
+	// -- Mid-stream fallback visibility ----------------------------------
+	// Mid-stream failovers (those that started after content reached the
+	// client) are split out because they are perceptible to the client as a
+	// stream seam, unlike pre-output fallbacks. The total routing pressure is
+	// still captured in airrouter_fallbacks_total; this series isolates the
+	// user-visible subset.
+	fmt.Fprintln(w, "# HELP airrouter_midstream_fallbacks_total Number of mid-stream (post-content) model failovers")
+	fmt.Fprintln(w, "# TYPE airrouter_midstream_fallbacks_total counter")
+	fmt.Fprintf(w, "airouter_midstream_fallbacks_total %d\n", m.midstreamFallbacksTotal.Load())
+
+	fmt.Fprintln(w, "# HELP airrouter_midstream_fallbacks_total_by_endpoint Number of mid-stream failovers triggered by each endpoint")
+	fmt.Fprintln(w, "# TYPE airrouter_midstream_fallbacks_total_by_endpoint counter")
+	m.mu.RLock()
+	for k, c := range m.midstreamFallbacksByEndpoint {
+		writeSample(w, "airrouter_midstream_fallbacks_total_by_endpoint", k, c.Load())
+	}
+	m.mu.RUnlock()
+	// -- end mid-stream ---------------------------------------------------
 
 	// Circuit state transitions: per (from, to, endpoint) counters.
 	fmt.Fprintln(w, "# HELP airouter_circuit_state_transitions Number of circuit breaker state transitions")

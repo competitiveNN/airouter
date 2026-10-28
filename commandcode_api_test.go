@@ -115,7 +115,7 @@ func ccShimGateway(t *testing.T, ups map[string]*ccShimUpstream, chains map[stri
 	proxy := g.proxy
 	proxy.SetProtocolResolver(router.ProtocolFor)
 
-	shim := NewCommandCodeShim(g, ordered)
+	shim := NewCommandCodeShim(g, ordered, 0)
 	srv := httptest.NewServer(shim.Handler())
 	t.Cleanup(srv.Close)
 	return shim, srv
@@ -387,7 +387,7 @@ func TestCommandCodeShimDisabledWithoutProviders(t *testing.T) {
 	t.Cleanup(router.Close)
 	g := NewGatewayContext(router, NewProxy(cfg), cfg, "", testGatewayKey, false)
 
-	if shim := NewCommandCodeShim(g, []string{"commandcode", "commandcode2"}); shim.Enabled() {
+	if shim := NewCommandCodeShim(g, []string{"commandcode", "commandcode2"}, 0); shim.Enabled() {
 		t.Fatal("shim reports enabled with no providers configured")
 	}
 	if shim := NewCommandCodeShim(g, nil); shim.Enabled() {
@@ -431,7 +431,7 @@ func TestCommandCodeShimSessionAffinityIsStable(t *testing.T) {
 	router := NewRouter(cfg, "")
 	t.Cleanup(router.Close)
 	g := NewGatewayContext(router, NewProxy(cfg), cfg, "", testGatewayKey, false)
-	s := NewCommandCodeShim(g, []string{"a", "b", "c"})
+	s := NewCommandCodeShim(g, []string{"a", "b", "c"}, 0)
 	id := "ctx:00112233445566778899aabbccddeeff"
 	first := s.endpoints("m", id)
 	for i := 0; i < 20; i++ {

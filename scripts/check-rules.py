@@ -41,8 +41,15 @@ from pathlib import Path
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent
+
+# make model_blacklist importable
+sys.path.insert(0, str(REPO))
+import model_blacklist
+sys.path.remove(str(REPO))
+
 GENERATOR = REPO / "regenerate_config.py"
 DEFAULT_MODELS = "/tmp/free-models.json"
+BLACKLIST_DEFAULT = REPO / "blacklisted-models.json"
 
 AUTO_MODELS = {"kilo-auto/free", "big-pickle"}
 ROUTABLE_PROFILES = ["smart", "work", "fast", "large"]
@@ -214,7 +221,11 @@ def check(
     cfg: dict,
     config_text: str,
     index: dict[tuple[str, str], object] | None,
+    blacklist: dict[str, Any] | None = None,
 ) -> list[str]:
+    import os
+    if blacklist is None:
+        blacklist = model_blacklist.load_blacklist(BLACKLIST_DEFAULT)
     problems: list[str] = []
     providers = set((cfg.get("providers") or {}).keys())
     models = cfg.get("models") or {}
@@ -315,6 +326,12 @@ def check(
                 problems.append(f"rule8: {tag} is a permanently excluded id")
             if mid.lower().startswith("stealth/") and not str(provider).startswith("commandcode"):
                 problems.append(f"rule8: {tag} is stealth/* outside commandcode")
+            # rule 14: a permanently blacklisted model must not appear in config.yaml
+            src = model_blacklist.source_for_config_provider(str(provider))
+            if model_blacklist.is_blacklisted(src, mid, blacklist):
+                problems.append(f"rule14: {tag} is permanently blacklisted "
+                                f"(blacklisted-models.json); re-admit by deleting its "
+                                f"entry and rerunning the sync")
 
             if mid in AUTO_MODELS:  # the terminator, already checked above
                 continue
@@ -505,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(REPO / "config.yaml"), help="config.yaml to check")
     ap.add_argument("--models", default=DEFAULT_MODELS, help="fetched free-model list (fetch-free-models.py --json)")
+    ap.add_argument("--blacklist", default=str(BLACKLIST_DEFAULT), help="persistent blacklist (blacklisted-models.json)")
     args = ap.parse_args(argv)
 
     rc = load_generator()
@@ -521,7 +539,8 @@ def main(argv: list[str] | None = None) -> int:
               "fetch-free-models.py --json --probe-auto --save to enable them."
         )
 
-    problems = check(rc, cfg, Path(args.config).read_text(), index)
+    blacklist = model_blacklist.load_blacklist(Path(args.blacklist))
+    problems = check(rc, cfg, Path(args.config).read_text(), index, blacklist=blacklist)
     if problems:
         print(f"FAIL: {len(problems)} rule violation(s) in {args.config}")
         for p in problems:
@@ -529,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     profiles = ", ".join(f"{p}={len(c['chain'])}" for p, c in sorted((cfg['models']).items()))
-    print(f"OK: rules 3-13 hold ({profiles})" + ("" if index else "; vision/score checks skipped"))
+    print(f"OK: rules 3-14 hold ({profiles})" + ("" if index else "; vision/score checks skipped"))
     return 0
 
 

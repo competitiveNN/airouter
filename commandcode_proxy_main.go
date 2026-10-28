@@ -28,6 +28,10 @@ func main() {
 	gatewayAPIKey := flag.String("api-key", "", "Gateway API key (optional, can be set via GATEWAY_API_KEY env var)")
 	allowNoAuth := flag.Bool("allow-no-auth", false, "Allow running without an API key (INSECURE)")
 	providers := flag.String("providers", "commandcode,commandcode2", "Command Code providers to expose, in failover order")
+	maxConcurrentRequests := flag.Int("max-concurrent-requests", 0, "Maximum concurrent Command Code proxy requests (0 = use config or default of 4; negative disables the cap)")
+	flag.IntVar(maxConcurrentRequests, "max-concurrent", 0, "Same as -max-concurrent-requests")
+	flag.IntVar(maxConcurrentRequests, "max-inflight", 0, "Same as -max-concurrent-requests")
+	flag.IntVar(maxConcurrentRequests, "commandcode-max-concurrent", 0, "Same as -max-concurrent-requests")
 	flag.Parse()
 
 	if *gatewayAPIKey == "" {
@@ -81,7 +85,7 @@ func main() {
 	// up within 3 s, exactly like the gateway.
 	go watchConfig(ctx, *configPath, gateway)
 
-	shim := NewCommandCodeShim(gateway, strings.Split(*providers, ","))
+	shim := NewCommandCodeShim(gateway, strings.Split(*providers, ","), *maxConcurrentRequests)
 	if !shim.Enabled() {
 		log.Fatalf("Command Code proxy disabled: none of %q is configured in %s", *providers, *configPath)
 	}

@@ -42,6 +42,13 @@ from model_utils import (  # noqa: F401
     normalize_slug,
     save_cache,
 )
+from model_blacklist import (
+    BLACKLIST_FILE,
+    COOLDOWNS_FILE,
+    filter_models,
+    load_blacklist,
+    update_blacklist_from_cooldowns,
+)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 KILO_ENDPOINT = "https://api.kilo.ai/api/gateway/v1/models"
@@ -2445,12 +2452,20 @@ def fetch_artificial_analysis_data(force: bool = False) -> dict[str, dict[str, A
         slug = model.get("slug", "")
         if not slug:
             continue
-        evaluations = model.get("evaluations", {})
+        evaluations = model.get("evaluations") or {}
         intelligence = evaluations.get("artificial_analysis_intelligence_index")
-        released = model.get("released") or model.get("release_date") or model.get("published_at")
+        coding_index = evaluations.get("artificial_analysis_coding_index")
+        # Use the overall intelligence index if available; otherwise fall back
+        # to the coding index so that models that AA has scored for coding but
+        # not for general intelligence are not silently floored at 25.0.
         entry: dict[str, Any] = {}
         if intelligence is not None:
             entry["intelligence"] = float(intelligence)
+            entry["intelligence_source"] = "artificial analysis intelligence index"
+        elif coding_index is not None:
+            entry["intelligence"] = float(coding_index)
+            entry["intelligence_source"] = "artificial analysis coding index"
+        released = model.get("released") or model.get("release_date") or model.get("published_at")
         if released:
             entry["released"] = str(released)
         if entry:
@@ -2747,7 +2762,39 @@ def main() -> None:
              "be dead, and only treats a verdict as evidence when the provider REFUSED the "
              "call (a 429, 5xx or timeout is recorded as unknown, never as dead).",
     )
+    parser.add_argument(
+        "--blacklist", metavar="FILE",
+        default=str(BLACKLIST_FILE),
+        help="Permanent blacklist of models gone upstream (404/not-found older than two "
+             "weeks). Models in this file are removed from the output whatever any provider "
+             "lists. Default: blacklisted-models.json beside this script.",
+    )
+    parser.add_argument(
+        "--no-blacklist", action="store_true",
+        help="Ignore the blacklist and emit every candidate the providers list. "
+             "Re-admits models the gateway has recorded as gone, so it must not be left "
+             "set in a scheduled sync.",
+    )
+    parser.add_argument(
+        "--blacklist-report", action="store_true",
+        help="Print what the blacklist says about free-model availability and exit. "
+             "No network, no provider work: this is the sync's pre-flight check, "
+             "runnable when every provider is down.",
+    )
     args = parser.parse_args()
+
+    # Blacklist report: offline, read-free pre-flight. Show it before
+    # the UA check so it works even on machines with no network.
+    if args.blacklist_report:
+        blacklist = load_blacklist(args.blacklist)
+        print(f"Permanent blacklist ({args.blacklist}): {len(blacklist)} entries")
+        for key in sorted(blacklist):
+            e = blacklist[key]
+            if isinstance(e, dict):
+                print(f"  {key}: {e.get('reason', '?')}, blocked {e.get('date', '?')}")
+            else:
+                print(f"  {key}: {e}")
+        sys.exit(0)
 
     # Before any provider work: the UA version is independent of every provider
     # and its key, so this still reports on a run where nothing else is
@@ -2828,16 +2875,47 @@ def main() -> None:
             match_id = model.get("match_id")
             if match_id == "":
                 continue
-            model_id = match_id or model.get("id", "")
-            # Try direct match first, then fuzzy match with weight-stripping
-            aa_entry = aa_data.get(model_id)
-            if not aa_entry:
-                matched_slug = fuzzy_match_slug(model_id, aa_data)
-                if matched_slug:
-                    aa_entry = aa_data.get(matched_slug)
+            ids_to_try = []
+            primary_id = match_id or model.get("id", "")
+            ids_to_try.append(primary_id)
+            if "/" in primary_id:
+                ids_to_try.append(primary_id.replace("/", "-"))
+            # Keep ORDER; dedupe
+            seen_ids = []
+            for i in ids_to_try:
+                if i not in seen_ids:
+                    seen_ids.append(i)
+            aa_entry = None
+            matched_slug = None
+            # Prefer a representation that yields scored (intelligence-bearing)
+            # data; try every candidate id before giving up.
+            candidates_entries = []
+            for try_id in seen_ids:
+                ae = aa_data.get(try_id)
+                if not ae:
+                    ms = fuzzy_match_slug(try_id, aa_data)
+                    if ms:
+                        ae = aa_data.get(ms)
+                if not ae:
+                    continue
+                # If unscored, try the scored-only universe.
+                if "intelligence" not in ae:
+                    scored_universe = {k: v for k, v in aa_data.items() if "intelligence" in v}
+                    ms = fuzzy_match_slug(try_id, scored_universe)
+                    if ms:
+                        ae = scored_universe.get(ms)
+                candidates_entries.append((try_id, ae))
+            # Pick: any scored over any unscored; otherwise first.
+            scored = [c for c in candidates_entries if c[1] and "intelligence" in c[1]]
+            if scored:
+                aa_entry = scored[0][1]
+            elif candidates_entries:
+                aa_entry = candidates_entries[0][1]
             if aa_entry:
                 if "intelligence" in aa_entry:
                     model["intelligence"] = aa_entry["intelligence"]
+                    if "intelligence_source" in aa_entry:
+                        model["intelligence_source"] = aa_entry["intelligence_source"]
                 if "released" in aa_entry and model.get("released") is None:
                     model["released"] = aa_entry["released"]
 
@@ -2856,7 +2934,14 @@ def main() -> None:
             if match_id == "":
                 continue
             model_id = match_id or model.get("id", "")
-            arena_name = fuzzy_match_slug(model_id, arena_data)
+            ids_to_try = [model_id]
+            if "/" in model_id:
+                ids_to_try.append(model_id.replace("/", "-"))
+            arena_name = None
+            for try_id in ids_to_try:
+                arena_name = fuzzy_match_slug(try_id, arena_data)
+                if arena_name:
+                    break
             if arena_name:
                 entry = arena_data[arena_name]
                 model["elo"] = entry["elo"]
@@ -2936,6 +3021,39 @@ def main() -> None:
             f", {pruned} pruned (unlisted for {FIRST_SEEN_MISSING_DAYS}+ days)"
         )
     print(summary_line, file=sys.stderr)
+
+    # Apply permanent blacklist. Now that release dates are fully populated
+    # (AA + first-seen cache), scan cooldowns.json for models that have
+    # been marked "not found" (404) and are older than two weeks. Those go
+    # into the persistent blacklist. Then filter the current fetch through
+    # whatever ended up in the file — the set only ever grows.
+    if not args.no_blacklist:
+        cooldowns_path = Path(COOLDOWNS_FILE)
+        if cooldowns_path.exists():
+            newly = update_blacklist_from_cooldowns(
+                all_models, cooldowns_path=cooldowns_path,
+                blacklist_path=args.blacklist,
+            )
+            if newly:
+                print(f"Blacklist: permanently blacklisted {len(newly)} new model(s) "
+                      f"from cooldowns.json (not found >= 2 weeks old)",
+                      file=sys.stderr)
+                for entry in newly:
+                    print(f"  {entry}", file=sys.stderr)
+        blacklist = load_blacklist(args.blacklist)
+        before_blacklist = len(all_models)
+        all_models = filter_models(all_models, blacklist)
+        if before_blacklist != len(all_models):
+            print(f"Blacklist: filtered {before_blacklist - len(all_models)} models "
+                  f"({len(all_models)} remain)", file=sys.stderr)
+        elif blacklist:
+            print(f"Blacklist: no model in the current fetch matches the "
+                  f"{len(blacklist)} permanently blacklisted entry/entities",
+                  file=sys.stderr)
+    else:
+        print("Blacklist: !!! --no-blacklist — emitting every candidate the "
+              "providers list, including models the gateway has recorded as gone. "
+              "Do not leave this set in a scheduled sync.", file=sys.stderr)
 
     # Per-source breakdown in the summary line
     by_source: dict[str, int] = {}

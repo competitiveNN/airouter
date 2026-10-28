@@ -137,7 +137,8 @@ preferences:
   #   Controls the output-token ceiling applied to requests that omit
   #   max_tokens. nil (absent) = auto (half of profile context window);
   #   0 = never default (send to provider as-is); positive = absolute value.
-  # max_label_cardinality: 512   # uncomment to override the default
+  #   max_label_cardinality: 512   # uncomment to override the default
+      # commandcode_proxy_max_concurrent: 4   # uncomment to override the default concurrency cap
   #   Bounds how many distinct provider/model labels the metrics registry
   #   tracks. Must be between 16 and 65536.
 
