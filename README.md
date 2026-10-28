@@ -89,9 +89,17 @@ every past chat.
 ## Running it
 
 ```sh
-go build -o airouter .
+make build               # ./airouter
+make commandcode-proxy   # ./commandcode-proxy, the standalone shim
 ./airouter -config config.yaml -port 8080 -api-key "$AIROUTER_API_KEY"
 ```
+
+`make` with no target builds both. `make commandcode-proxy` compiles the same
+package with the `commandcode_proxy` build tag, which swaps the gateway entry
+point for the shim-only one: the result serves `/v1/chat/completions`,
+`/v1/models` and `/health` on port 3050 and nothing else. It reads the same
+config and shares `cooldowns.json`, so it can run instead of the gateway's
+built-in endpoint, or alongside it on a different port.
 
 | Flag | Default | What it does |
 |---|---|---|
