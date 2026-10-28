@@ -473,6 +473,7 @@ func parseTextProxies(body []byte, sourceURL string, sourceIndex int) []*ProxyIn
 
 var (
 	textProxyRe = regexp.MustCompile(`^(?:(\w+)://)?([0-9a-fA-F:.]+):(\d+)(?::(\w+))?$`)
+	htmlProxyRe = regexp.MustCompile(`(?is)<td[^>]*>\s*([0-9a-fA-F:.]{1,45})\s*</td>\s*<td[^>]*>\s*(\d{1,5})\s*</td>`)
 )
 
 func parseTextLine(line string) *ProxyInfo {
@@ -630,7 +631,7 @@ func parseHTMLProxies(body []byte, sourceURL string, sourceIndex int) []*ProxyIn
 	html := string(body)
 
 	// Match <td>ip</td><td>port</td> pairs in either order.
-	re := regexp.MustCompile(`(?is)<td[^>]*>\s*([0-9a-fA-F:.]{1,45})\s*</td>\s*<td[^>]*>\s*(\d{1,5})\s*</td>`)
+	re := htmlProxyRe
 	matches := re.FindAllStringSubmatch(html, -1)
 
 	var out []*ProxyInfo
