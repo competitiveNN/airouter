@@ -28,7 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +62,15 @@ ARENA_CODE_LATEST_URL = (
 ARENA_CODE_DATA_URL = (
     "https://raw.githubusercontent.com/oolong-tea-2026/arena-ai-leaderboards/main/data/{date}/code.json"
 )
+ARENA_CODE_TREE_URL = (
+    "https://api.github.com/repos/oolong-tea-2026/arena-ai-leaderboards/git/trees/main?recursive=1"
+)
 ARENA_CACHE_FILE = Path(__file__).resolve().parent / "arena-code-cache.json"
 ARENA_CACHE_TTL_HOURS = 24
+# Arena leaderboard files stopped being published for recent upstream snapshots
+# (last known-good date: 2026-10-07). When the latest snapshot lacks code.json,
+# fall back to the newest snapshot that actually published one.
+ARENA_FALLBACK_MAX_AGE_DAYS = 45
 # arena code-ELO band (~1440-1700) is mapped onto the AA intelligence scale
 # (~0-63) so the two signals are comparable when ELO is used as a fallback.
 # 1200 == ELO baseline (random), 1700 ~= AA ceiling (63).
@@ -325,6 +332,30 @@ OLLAMA_FREE_MODELS_CTX: dict[str, int] = {
     "nemotron-3-ultra": 1_000_000,
 }
 
+# Ollama Cloud free-tier discovery.  Ollama's search page renders results via
+# htmx; fetching with an ``HX-Request`` header returns just the results
+# fragment which lists models one per <li>, each carrying the model href,
+# context window and any tier tags such as "free".
+OLLAMA_SEARCH_URL = "https://ollama.com/search?c=cloud"
+
+
+def _parse_ollama_ctx(raw: str) -> int | None:
+    """Parse an Ollama context-window string like ``1M`` or ``262k`` to int."""
+    raw = raw.strip().lower()
+    if not raw:
+        return None
+    mult = 1
+    if raw.endswith("m"):
+        mult = 1_000_000
+        raw = raw[:-1]
+    elif raw.endswith("k"):
+        mult = 1_000
+        raw = raw[:-1]
+    try:
+        return int(float(raw) * mult)
+    except ValueError:
+        return None
+
 OPENCODE_FREE_MODELS_CTX: dict[str, int] = {
     "deepseek-v4-flash-free":   131_072,
     "laguna-s-2.1-free":        131_072,
@@ -504,6 +535,32 @@ def fetch_json(
         print(f"Invalid JSON: {e}", file=sys.stderr)
     except TimeoutError:
         print(f"Request timed out after {TIMEOUT}s", file=sys.stderr)
+    return None
+
+
+def _fetch_text(url: str, headers: dict[str, str]) -> str | None:
+    """Fetch raw text (HTML) with retry on 429/5xx and timeout handling."""
+    req = urllib.request.Request(url, headers=headers)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < MAX_RETRIES:
+                retry_after = int(e.headers.get("Retry-After", str(BACKOFF_BASE ** attempt)))
+                print(f"Rate limited (429), waiting {retry_after}s... (attempt {attempt}/{MAX_RETRIES})", file=sys.stderr)
+                time.sleep(retry_after)
+                continue
+            if 500 <= e.code < 600 and attempt < MAX_RETRIES:
+                wait = BACKOFF_BASE ** attempt
+                print(f"Server error {e.code}, retrying in {wait}s... (attempt {attempt}/{MAX_RETRIES})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            print(f"HTTP {e.code}: {e.reason}", file=sys.stderr)
+            return None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            print(f"Network error fetching {url}: {e}", file=sys.stderr)
+            return None
     return None
 
 
@@ -2149,14 +2206,78 @@ def fetch_commandcode() -> list[dict[str, Any]]:
     return free_models
 
 
-def fetch_ollama() -> list[dict[str, Any]]:
-    """Return the curated Ollama Cloud free-tier marklist."""
+def fetch_ollama_free_from_search() -> list[dict[str, Any]]:
+    """Scrape Ollama Cloud free-tier models from the search page.
+
+    Ollama's search page renders results client-side via htmx; an
+    ``HX-Request`` header returns the results fragment listing models one
+    per ``<li>``, each with the model href, context window and tier tags
+    such as ``free``.  Pagination is followed while ``data-has-more`` is
+    true.
+
+    Returns a list of ``{"id": str, "context_length": int | None}`` dicts
+    for models tagged "free".
+    """
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    headers = dict(HEADERS)
+    headers.update({
+        "HX-Request": "true",
+        "HX-Target": "#searchresults",
+        "HX-Trigger": "search",
+        "Accept": "text/html, */*; q=0.1",
+    })
+    page = 1
+    while True:
+        url = f"{OLLAMA_SEARCH_URL}&page={page}" if page > 1 else OLLAMA_SEARCH_URL
+        body = _fetch_text(url, headers)
+        if body is None:
+            break
+        items = re.findall(r"<li[^>]*>.*?</li>", body, re.DOTALL)
+        for item in items:
+            name_m = re.search(r'href="/library/([^"]+)"', item)
+            name = name_m.group(1) if name_m else None
+            if not name or name in seen:
+                continue
+            has_free = ">free<" in item
+            ctx_m = re.search(r"<span >([0-9]+[kMG])</span>", item)
+            ctx = _parse_ollama_ctx(ctx_m.group(1)) if ctx_m else None
+            seen.add(name)
+            if has_free:
+                results.append({"id": name, "context_length": ctx})
+        if 'data-has-more="true"' not in body:
+            break
+        page += 1
+        if page > 20:
+            break
     print(
-        f"Ollama: emitting {len(OLLAMA_FREE_MODELS)} curated free models "
-        f"(no API call)",
+        f"Ollama: found {len(results)} free models on cloud search "
+        f"({len(seen)} total listed)",
         file=sys.stderr,
     )
-    return [m for m in (normalize_ollama(mid) for mid in sorted(OLLAMA_FREE_MODELS)) if m is not None]
+    return results
+
+
+def fetch_ollama() -> list[dict[str, Any]]:
+    """Return the Ollama Cloud free-tier marklist (curated + scraped)."""
+    global OLLAMA_FREE_MODELS_CTX
+    scraped = fetch_ollama_free_from_search()
+    scraped_ids = {m["id"] for m in scraped}
+    # Merge curated and scraped free models.  Curated IDs take precedence
+    # for context length; scraped context is used only when we have none.
+    merged_ids = set(OLLAMA_FREE_MODELS) | scraped_ids
+    merged_ctx = dict(OLLAMA_FREE_MODELS_CTX)
+    for m in scraped:
+        if m["context_length"] is not None and m["id"] not in merged_ctx:
+            merged_ctx[m["id"]] = m["context_length"]
+    # Expose merged ctx for normalize_ollama.
+    OLLAMA_FREE_MODELS_CTX = merged_ctx
+    print(
+        f"Ollama: emitting {len(merged_ids)} free models "
+        f"({len(OLLAMA_FREE_MODELS)} curated, {len(scraped_ids)} scraped)",
+        file=sys.stderr,
+    )
+    return [m for m in (normalize_ollama(mid) for mid in sorted(merged_ids)) if m is not None]
 
 
 def resolve_google_latest_versions() -> dict[str, str]:
@@ -2363,6 +2484,48 @@ def save_arena_cache(enrichment: dict[str, Any]) -> None:
     }, indent=2))
 
 
+def find_latest_arena_code_date() -> str | None:
+    """Return the newest snapshot date whose ``data/<date>/code.json`` exists.
+
+    The upstream ``latest.json`` pointer points at the newest snapshot, but
+    that snapshot sometimes ships only ``_index.json`` (the per-leaderboard
+    ``code.json`` stopped being published for recent upstream runs). Falling
+    back to the newest snapshot that actually published ``code.json`` keeps
+    the ELO feed alive instead of silently dropping it.
+
+    Returns None if the tree cannot be read or no snapshot published a
+    ``code.json`` within ``ARENA_FALLBACK_MAX_AGE_DAYS`` days.
+    """
+    tree = fetch_json(ARENA_CODE_TREE_URL)
+    if not isinstance(tree, dict):
+        print("Arena code: could not read repo tree", file=sys.stderr)
+        return None
+    files = tree.get("tree")
+    if not isinstance(files, list):
+        print("Arena code: unexpected tree format", file=sys.stderr)
+        return None
+    cutoff = datetime.now(UTC).date() - timedelta(days=ARENA_FALLBACK_MAX_AGE_DAYS)
+    dates: list[date] = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str) or not path.endswith("/code.json"):
+            continue
+        parts = path.split("/")
+        if len(parts) != 3:
+            continue
+        try:
+            d = date.fromisoformat(parts[1])
+        except ValueError:
+            continue
+        if d >= cutoff:
+            dates.append(d)
+    if not dates:
+        return None
+    return max(dates).isoformat()
+
+
 def normalize_elo_to_intelligence(elo: float) -> float:
     """Approximate ELO -> AA intelligence index for fallback use only."""
     return round(max(elo - ELO_BASE, 0.0) * ELO_TO_INTELLIGENCE, 1)
@@ -2383,11 +2546,33 @@ def fetch_arena_code_data() -> dict[str, dict[str, Any]]:
     if not latest or not isinstance(latest, dict) or "date" not in latest:
         print("Arena code: could not resolve latest snapshot date", file=sys.stderr)
         return {}
-    date = latest["date"]
-    data = fetch_json(ARENA_CODE_DATA_URL.format(date=date))
-    if not data or not isinstance(data, dict) or "models" not in data:
-        print("Arena code: no data or unexpected format", file=sys.stderr)
-        return {}
+    latest_date = latest["date"]
+
+    def load_for(date: str) -> dict[str, dict[str, Any]] | None:
+        data = fetch_json(ARENA_CODE_DATA_URL.format(date=date))
+        if data and isinstance(data, dict) and "models" in data:
+            return data
+        return None
+
+    data = load_for(latest_date)
+    if data is None:
+        # Upstream stopped publishing per-leaderboard files for recent
+        # snapshots (only _index.json). Fall back to the newest snapshot
+        # that actually shipped code.json.
+        fallback = find_latest_arena_code_date()
+        if fallback and fallback != latest_date:
+            print(
+                f"Arena code: latest snapshot ({latest_date}) lacks code.json; "
+                f"falling back to {fallback}",
+                file=sys.stderr,
+            )
+            data = load_for(fallback)
+        if data is None:
+            print(
+                f"Arena code: no data or unexpected format ({latest_date} "
+                f"{fallback if fallback else ''})", file=sys.stderr,
+            )
+            return {}
 
     result: dict[str, dict[str, Any]] = {}
     for m in data["models"]:
