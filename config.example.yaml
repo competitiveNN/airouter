@@ -44,9 +44,13 @@ providers:
   #
   #   timeout: <duration>   Per-provider request timeout for upstream calls
   #                (e.g. 30s, 60s, 120s). Omitting or setting 0 uses the
-  #                built-in default client timeout. Raise this for providers
-  #                whose models do long-running work (reasoning, context
-  #                compression) so upstream calls are not cut off mid-stream.
+  #                built-in default client timeout. This bounds the connection
+  #                and header-wait phases up to the first byte; once output
+  #                starts streaming it is released so a long generation is
+  #                never cut off mid-stream. Raise this for providers whose
+  #                models take long to produce the first token (reasoning,
+  #                context-compression prefill), not to extend a stream already
+  #                in progress.
   #
   #   max_interruption: <duration>   Maximum time this provider's endpoint may
   #                leave a client without new output during a fallback walk,
@@ -102,10 +106,6 @@ providers:
   commandcode:
     url: https://api.commandcode.ai
     api_key_env: COMMANDCODE_API_KEY   # set this in .envrc
-  # A second key on the same upstream: a 429 on the first falls through here.
-  commandcode2:
-    url: https://api.commandcode.ai
-    api_key_env: COMMANDCODE_API_KEY_2 # set this in .envrc
 
 preferences:
   newest_first_on_tie: true
