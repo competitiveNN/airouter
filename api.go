@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"sort"
@@ -1181,10 +1182,65 @@ func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration
 		ceiling = maxSessionInterruption
 	}
 	sleep := minDuration(wait, ceiling)
+	// Full jitter on wake: sessions waiting on the same cooldown still
+	// wake at slightly different moments so they do not re-hit the provider
+	// in lockstep. The 0..25% haircut (hostname independence) shaves at most
+	// a quarter of the cooldown window off the sleep; SelectEndpoint is
+	// re-evaluated afterwards, so a short sleep just retries sooner.
+	if sleep > 0 {
+		jitter := sleep / 4
+		if jitter > 0 {
+			sleep -= time.Duration(rand.Int64N(int64(jitter)))
+		}
+	}
 	if remaining := walk.remaining(); sleep >= remaining {
 		return 0, false
 	}
 	return sleep, true
+}
+
+// isRetryableForChain classifies whether a failed upstream attempt warrants
+// retrying on the next chain entry. 429/5xx/timeouts and protocol/quota
+// refusals are (the refusal is endpoint-specific and the other endpoint may
+// still answer). 400/401/403/404 are not: the request is unacceptable or the
+// endpoint is misconfigured, so an immediate retry of the next entry is fair
+// at most once before surfacing.
+func isRetryableForChain(statusCode int, body string) bool {
+	if statusCode == 0 {
+		return true
+	}
+	if statusCode == 429 {
+		return true
+	}
+	if statusCode >= 500 && statusCode <= 599 {
+		return true
+	}
+	if isProtocolUnsupported(statusCode, body) {
+		return true
+	}
+	if isQuotaRefusal(statusCode, body) {
+		return true
+	}
+	return false
+}
+
+const interAttemptBackoff = 250 * time.Millisecond
+
+// interAttemptWait pauses the request's fallback walk by a small jittered
+// duration before advancing to the next chain entry. It reuses
+// cycleBackSleep's remaining-budget check so a pause never outlasts the walk.
+func (g *GatewayContext) interAttemptWait(walk *budgetState, ceiling time.Duration, ctx context.Context) {
+	wait := interAttemptBackoff + time.Duration(rand.Int64N(int64(interAttemptBackoff/4)))
+	sleep, ok := cycleBackSleep(wait, walk, ceiling)
+	if !ok || sleep <= 0 {
+		return
+	}
+	timer := time.NewTimer(sleep)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+	case <-timer.C:
+	}
 }
 
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string, tokens int) {
@@ -1208,6 +1264,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	// request. Without it, an endpoint that refuses both shapes would bounce
 	// between them forever inside the fallback budget.
 	protocolFlips := map[string]bool{}
+	nonRetryableAdvanced := false
 
 	// The session is inflight for the lifetime of the request:
 	// the dashboard counts the sessions each model is serving
@@ -1457,6 +1514,21 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				// so the handler doesn't sleep for hours.
 				g.router.ApplyCooldownWithDuration(ep, resp.StatusCode, string(respBody), sessionID, g.testCooldown)
 			}
+			// retry_scope: 400/401/403/404 (except protocol/quota refusals)
+			// advance the chain at most once, then surface the upstream error.
+			if !isProtocolUnsupported(resp.StatusCode, string(respBody)) &&
+				!isQuotaRefusal(resp.StatusCode, string(respBody)) &&
+				!isRetryableForChain(resp.StatusCode, string(respBody)) {
+				if nonRetryableAdvanced {
+					writeAPIError(w, 502, fmt.Sprintf("upstream error: %s", string(respBody)), "upstream_error", "upstream_error")
+					g.recordRequest(req.Model, 502, time.Since(start))
+					return
+				}
+				nonRetryableAdvanced = true
+			}
+			if isRetryableForChain(resp.StatusCode, string(respBody)) {
+				g.interAttemptWait(walk, g.providerMaxInterruption(ep.Provider), ctx)
+			}
 			g.recordRequest(req.Model, resp.StatusCode, time.Since(start))
 			continue
 		}
@@ -1613,6 +1685,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	// request. Without it, an endpoint that refuses both shapes would bounce
 	// between them forever inside the fallback budget.
 	protocolFlips := map[string]bool{}
+	_ = protocolFlips
 
 	// doneSent tracks whether we've already written the [DONE] sentinel to
 	// the client. We must always send it before returning so the client

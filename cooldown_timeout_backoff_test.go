@@ -144,7 +144,7 @@ func withinSlack(t *testing.T, got, want time.Duration, what string) {
 // of the base look like a regression; asserting only "more than 4m" cannot be
 // satisfied by the curve this file exists to replace.
 func TestTheStaleRampWouldHaveCalledFourMinutesEnough(t *testing.T) {
-	r := NewRouter(&Config{}, "")
+	r := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 	ep := &ModelEndpoint{Provider: "nvidia3", Model: "deepseek-ai/deepseek-v4.1-flash"}
 	timeout := realHeaderTimeout(t)
 
@@ -182,7 +182,7 @@ const timeoutWait = 30 * time.Second
 // steeper base that also raised the bound would be the soft ban that
 // cooldown_classification_test.go exists to prevent.
 func TestATimeoutRampsSteeperThanTheGenericTransientCurve(t *testing.T) {
-	r := NewRouter(&Config{}, "")
+	r := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 	ep := &ModelEndpoint{Provider: "nvidia3", Model: "deepseek-ai/deepseek-v4.1-flash"}
 	timeout := realHeaderTimeout(t)
 
@@ -205,7 +205,7 @@ func TestATimeoutRampsSteeperThanTheGenericTransientCurve(t *testing.T) {
 	// from 1 to the ceiling, a timeout must wait longer than the generic status-0
 	// curve for the same count.
 	for n := 1; n <= 12; n++ {
-		r2 := NewRouter(&Config{}, "")
+		r2 := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 		ep2 := &ModelEndpoint{Provider: "p", Model: "m"}
 		for i := 0; i < n; i++ {
 			r2.ApplyCooldownFromError(ep2, timeout)
@@ -229,7 +229,7 @@ func TestATimeoutRampsSteeperThanTheGenericTransientCurve(t *testing.T) {
 // cooldown entries carried status_code 0. A steeper ramp must not turn back into
 // a ban: the bound is maxCooldown, forever, at any error count.
 func TestATimeoutIsStillBoundedAndNeverSoftBanned(t *testing.T) {
-	r := NewRouter(&Config{}, "")
+	r := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 	timeout := realHeaderTimeout(t)
 	prev := time.Duration(0)
 	for n := 1; n <= 100; n++ {
@@ -297,7 +297,7 @@ func TestANonTimeoutFailureKeepsTheGenericCurve(t *testing.T) {
 				t.Fatalf("the setup is wrong: isTimeoutMessage(%q) = %v, want %v",
 					tc.err.Error(), got, tc.timeoutWording)
 			}
-			r := NewRouter(&Config{}, "")
+			r := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 			ep := &ModelEndpoint{Provider: "p", Model: "m"}
 			r.ApplyCooldownFromError(ep, tc.err)
 			got := recordedCooldown(t, r, ep)
@@ -313,7 +313,7 @@ func TestANonTimeoutFailureKeepsTheGenericCurve(t *testing.T) {
 
 	// And after four of them the generic curve is still in charge, which is the
 	// number the stale log line was actually reporting.
-	r := NewRouter(&Config{}, "")
+	r := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 	ep := &ModelEndpoint{Provider: "p", Model: "m"}
 	for i := 0; i < 4; i++ {
 		r.ApplyCooldownFromError(ep, &bareTransportError{msg: "unexpected EOF"})
@@ -364,14 +364,14 @@ func TestATimeoutIsRecognisedByTypeAndNotOnlyByText(t *testing.T) {
 
 	// End to end, on the type path: a deadline that no text match can find still
 	// takes the steeper ramp, through the ordinary production entry point.
-	r := NewRouter(&Config{}, "")
+	r := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 	ep := &ModelEndpoint{Provider: "nvidia3", Model: "deepseek-ai/deepseek-v4.1-flash"}
 	r.ApplyCooldownFromError(ep, timeoutError{})
 	withinSlack(t, recordedCooldown(t, r, ep), 2*time.Minute, "unrecognisable-message timeout")
 
 	// And the same holds once the type is gone and only the message survives,
 	// which is what the reported log line is.
-	r2 := NewRouter(&Config{}, "")
+	r2 := NewRouter(&Config{Preferences: &Preferences{CooldownJitter: 0}}, "")
 	ep2 := &ModelEndpoint{Provider: "nvidia3", Model: "deepseek-ai/deepseek-v4.1-flash"}
 	r2.ApplyCooldownFromError(ep2, bare)
 	withinSlack(t, recordedCooldown(t, r2, ep2), 2*time.Minute, "message-only timeout")

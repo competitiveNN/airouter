@@ -162,7 +162,7 @@ func TestApplyAttemptTimeoutsIgnoresANonPositiveTimeout(t *testing.T) {
 // the shared transport is never mutated: its timeouts are global, so a
 // per-attempt budget applied to it would change every other in-flight
 // request. The attempt gets its own transport instead.
-func TestAttemptClientBoundsTheAttemptWithoutMutatingTheSharedTransport(t *testing.T) {
+func TestAttemptClientReusesTheSharedTransport(t *testing.T) {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
 			"p": {URL: "https://example.com/v1", APIKeyEnv: "K"},
@@ -171,6 +171,7 @@ func TestAttemptClientBoundsTheAttemptWithoutMutatingTheSharedTransport(t *testi
 	p := NewProxy(cfg)
 	shared := p.baseTransport
 	before := shared.ResponseHeaderTimeout
+	beforeTLS := shared.TLSHandshakeTimeout
 
 	const timeout = 3 * time.Second
 	ep := ModelEndpoint{Provider: "p", Model: "m"}
@@ -182,16 +183,13 @@ func TestAttemptClientBoundsTheAttemptWithoutMutatingTheSharedTransport(t *testi
 	if !ok {
 		t.Fatalf("expected an *http.Transport, got %T", client.Transport)
 	}
-	if tr == shared {
-		t.Fatal("expected the attempt to get its own transport")
-	}
-	if tr.ResponseHeaderTimeout != timeout {
-		t.Fatalf("header timeout is %v, want %v", tr.ResponseHeaderTimeout, timeout)
-	}
-	if tr.TLSHandshakeTimeout != timeout {
-		t.Fatalf("TLS handshake timeout is %v, want %v", tr.TLSHandshakeTimeout, timeout)
+	if tr != shared {
+		t.Fatal("expected the attempt to reuse the shared transport, not a clone")
 	}
 	if shared.ResponseHeaderTimeout != before {
 		t.Fatalf("the shared transport was mutated: %v -> %v", before, shared.ResponseHeaderTimeout)
+	}
+	if shared.TLSHandshakeTimeout != beforeTLS {
+		t.Fatalf("the shared transport was mutated: %v -> %v", beforeTLS, shared.TLSHandshakeTimeout)
 	}
 }
