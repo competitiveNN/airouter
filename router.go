@@ -192,6 +192,12 @@ const (
 	sessionTTL = 2 * time.Hour
 	// sessionSweepInterval is how often the sweeper scans for stale sessions.
 	sessionSweepInterval = time.Hour
+	// maxSessionEntries caps how many sticky sessions the router holds at once.
+	// The sessions map is keyed by a hash of the request body, so a workload of
+	// unique bodies accumulates entries until the TTL sweep runs. The TTL alone
+	// cannot bound the map between sweeps, so evictStaleSessions also trims to
+	// this ceiling by dropping the least-recently-used entry (LRU).
+	maxSessionEntries = 5000
 	// cooldownSaveInterval is how long to wait before flushing cooldown state
 	// to disk after a change. A burst of failures coalesces into a single
 	// write instead of one per failure, bounding disk I/O under load.
@@ -466,11 +472,28 @@ func (r *Router) sweepSessions() {
 }
 
 func (r *Router) evictStaleSessions() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Collect stale ids under a read lock, then drop them under a write lock
+	// so the scan does not block session read-modify-write windows for the
+	// duration of an O(n) map walk.
+	r.mu.RLock()
 	now := time.Now()
+	stale := make([]string, 0)
 	for sid, se := range r.sessions {
 		if now.Sub(se.lastUsed) > sessionTTL {
+			stale = append(stale, sid)
+		}
+	}
+	r.mu.RUnlock()
+
+	if len(stale) == 0 {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now = time.Now()
+	for _, sid := range stale {
+		if se, ok := r.sessions[sid]; ok && now.Sub(se.lastUsed) > sessionTTL {
 			delete(r.sessions, sid)
 		}
 	}
