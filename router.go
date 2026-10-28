@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -443,6 +444,11 @@ func (r *Router) cleanupStaleEntries() {
 			delete(r.noVision, k)
 		}
 	}
+	for k := range r.learnedProtocol {
+		if !valid[k] {
+			delete(r.learnedProtocol, k)
+		}
+	}
 	for k := range r.tps {
 		if !valid[k] {
 			delete(r.tps, k)
@@ -497,6 +503,9 @@ func (r *Router) evictStaleSessions() {
 			delete(r.sessions, sid)
 		}
 	}
+	// Hard ceiling: drop least-recently-used sessions beyond the cap
+	// regardless of age. TTL alone cannot bound the map between sweeps.
+	r.evictOverCapLocked()
 }
 
 // Close stops the background session sweeper and flushes any pending cooldown
@@ -1250,6 +1259,30 @@ func (r *Router) bindSessionLocked(sessionID string, ep ModelEndpoint, model, ch
 		lastUsed: time.Now(),
 		model:    model,
 		chain:    chain,
+	}
+	r.evictOverCapLocked()
+}
+
+// evictOverCapLocked trims the sessions map to maxSessionEntries by evicting the
+// least-recently-used entries. Caller must hold r.mu (write).
+func (r *Router) evictOverCapLocked() {
+	if len(r.sessions) <= maxSessionEntries {
+		return
+	}
+	type item struct {
+		id       string
+		lastUsed time.Time
+	}
+	items := make([]item, 0, len(r.sessions))
+	for sid, se := range r.sessions {
+		items = append(items, item{id: sid, lastUsed: se.lastUsed})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].lastUsed.Before(items[j].lastUsed)
+	})
+	excess := len(r.sessions) - maxSessionEntries
+	for i := 0; i < excess; i++ {
+		delete(r.sessions, items[i].id)
 	}
 }
 
