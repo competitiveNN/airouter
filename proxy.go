@@ -91,8 +91,13 @@ type Proxy struct {
 	metricsMu sync.RWMutex
 	metrics   *Metrics
 
-	// proxySvc routes proxied endpoints through the proxy pool. Nil when no
-	// endpoint has proxying enabled.
+	// upstreamSlots bounds concurrent upstream attempts. nil/disabled when
+	// cap is 0 (unlimited). Acquired by acquireUpstream.
+	upstreamSlots chan struct{}
+	// maxUpstreamConcurrency is the configured cap (0 = unlimited).
+	maxUpstreamConcurrency int
+
+	// Proxy pool wiring. Guarded by proxyMu.
 	proxyMu  sync.RWMutex
 	proxySvc *ProxyService
 }
@@ -100,6 +105,7 @@ type Proxy struct {
 // SetMetrics attaches the shared metrics collector to the proxy so stream-level
 // signals (SSE comment routing) are recorded. Nil disables recording, which is
 // the case for the many unit tests that build a bare &Proxy{}.
+// SetProtocolResolver wires the router's learned-protocol lookup.
 // SetProtocolResolver wires the router's learned-protocol lookup.
 func (p *Proxy) SetProtocolResolver(fn func(*ModelEndpoint) protocol) {
 	p.protocolMu.Lock()
@@ -351,6 +357,7 @@ func NewProxy(cfg *Config) *Proxy {
 			Transport: &http.Transport{
 				MaxIdleConns:        200,
 				MaxIdleConnsPerHost: 50,
+				MaxConnsPerHost:     100,
 				IdleConnTimeout:     90 * time.Second,
 				// Bound the connection-setup phases so a fallback request to a
 				// flaky provider cannot hang forever inside http.Client.Do.
@@ -367,6 +374,18 @@ func NewProxy(cfg *Config) *Proxy {
 		streamIdleTimeout: defaultStreamIdleTimeout,
 	}
 	p.baseTransport = p.client.Transport.(*http.Transport)
+
+	// Upstream concurrency cap: bounds how many upstream attempts run at
+	// once so a client burst cannot become unbounded dial fan-out. Sorted,
+	// operator-tunable via preferences. A zero cap disables the limit.
+	maxUp := defaultMaxUpstreamConcurrency
+	if cfg != nil && cfg.Preferences != nil {
+		maxUp = cfg.Preferences.MaxUpstreamConcurrencyValue()
+	}
+	p.maxUpstreamConcurrency = maxUp
+	if maxUp > 0 {
+		p.upstreamSlots = make(chan struct{}, maxUp)
+	}
 
 	// Command Code upstream proxy. http.Transport.Proxy issues CONNECT
 	// for https targets on its own, so the tunnel carries end-to-end
@@ -800,6 +819,11 @@ func tlsIntercepted(err error) bool {
 }
 
 func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, error) {
+	release, err := p.acquireUpstream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", endpoint.Provider)
@@ -992,6 +1016,11 @@ func applyAttemptTimeouts(tr *http.Transport, timeout time.Duration) {
 }
 
 func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Flusher, body []byte, endpoint ModelEndpoint, timeout time.Duration, sessionID string, options ...StreamAttemptOptions) (string, []streamToolCall, int, error) {
+	release, err := p.acquireUpstream(ctx)
+	if err != nil {
+		return "", nil, 0, err
+	}
+	defer release()
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
 		return "", nil, 0, fmt.Errorf("unknown provider: %s", endpoint.Provider)
@@ -1107,7 +1136,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
 		// Command Code error statuses go through the same CC_STATUS_MAP
 		// the non-streaming path applies (api.go), so the cooldown
 		// classifier sees the OpenAI-equivalent status on streaming
@@ -1132,7 +1161,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// /alpha/generate always answers with an NDJSON event stream whose Content-
 	// Type is not text/event-stream, and the translator below turns it into SSE.
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") && p.effectiveProtocol(&endpoint) != protocolCommandCode {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
 		resp.Body.Close()
 		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
@@ -2197,4 +2226,33 @@ func stripToolCallDeltas(raw []byte) []byte {
 		}
 	}
 	return bytes.Join(lines, []byte("\n"))
+}
+
+// ErrUpstreamSaturated is returned when the upstream concurrency cap is
+// exhausted and an attempt cannot acquire a slot in time. Handlers map it
+// to 503 + Retry-After.
+var ErrUpstreamSaturated = errors.New("upstream saturated")
+
+// acquireUpstream acquires one upstream attempt slot. release must be
+// called (typically via defer) when the attempt completes. Returns an
+// error if the cap is full and the slot is not available promptly.
+func (p *Proxy) acquireUpstream(ctx context.Context) (func(), error) {
+	if p == nil || p.upstreamSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case p.upstreamSlots <- struct{}{}:
+		return func() { <-p.upstreamSlots }, nil
+	default:
+	}
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case p.upstreamSlots <- struct{}{}:
+		return func() { <-p.upstreamSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrUpstreamSaturated
+	}
 }

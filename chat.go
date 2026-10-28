@@ -85,12 +85,10 @@ type chatEndpointRef struct {
 	APIKey string `json:"api_key"`
 }
 
-// chatHTTPClient talks to arbitrary remote endpoints. Streams can be
-// long, so there is no overall client timeout; the dial and
-// response-header timeouts bound the wait for a stalled upstream.
-// The server's own WriteTimeout (300s) caps total stream lifetime.
 var chatHTTPClient = &http.Client{
 	Transport: &http.Transport{
+		MaxConnsPerHost:       100,
+		MaxIdleConnsPerHost:   50,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		ResponseHeaderTimeout: 300 * time.Second,
 	},
@@ -294,6 +292,15 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 		writeAPIError(w, 413, "Request body too large", "invalid_request_error", "request_too_large")
 		return
 	}
+	var headCap struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &headCap); err == nil {
+		if len(body) > requestBytesForModel(headCap.Model) {
+			writeAPIError(w, 413, "Request body too large", "invalid_request_error", "request_too_large")
+			return
+		}
+	}
 	fields, ep, stream, err := chatSplitEndpoint(body)
 	if err != nil {
 		writeAPIError(w, 400, err.Error(), "invalid_request_error", "bad_json")
@@ -399,9 +406,13 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 
 	// Non-streaming: the whole upstream body is read before anything
 	// is written, so the stats can travel as headers.
-	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
 	if err != nil {
 		writeAPIError(w, 502, "Failed reading upstream response", "server_error", "upstream_error")
+		return
+	}
+	if len(upstreamBody) > maxUpstreamBodyBytes {
+		writeAPIError(w, 502, "Upstream response body too large", "server_error", "upstream_error")
 		return
 	}
 	if !okStatus {

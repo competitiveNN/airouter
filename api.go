@@ -20,7 +20,44 @@ import (
 	"time"
 )
 
-const maxRequestBytes = 32 << 20 // 32 MiB
+// maxRequestBytes caps how much of a client request body we are willing to
+// buffer by default. Most chat turns are tiny; keeping the default small
+// protects memory from a single misbehaving or hostile client.
+const maxRequestBytes = 8 << 20 // 8 MiB
+
+// maxLargeRequestBytes is the ceiling used for models that are expected to
+// carry very large contexts ("large"). It still bounds the single-buffer
+// memory pinned per request, but lets those uploads through.
+const maxLargeRequestBytes = 32 << 20 // 32 MiB
+
+// maxUpstreamErrorBytes caps how much of a non-2xx upstream body we buffer
+// in order to classify the failure and report it. Error payloads are small;
+// anything bigger is truncated.
+const maxUpstreamErrorBytes = 1 << 20 // 1 MiB
+
+// maxUpstreamBodyBytes caps successful upstream bodies that are buffered
+// whole (non-streaming chat / responses completions). Enough for any
+// real completion while bounding per-request memory.
+const maxUpstreamBodyBytes = 8 << 20 // 8 MiB
+
+// requestBytesForModel picks the request-body cap for a logical model.
+func requestBytesForModel(model string) int {
+	if model == "large" {
+		return maxLargeRequestBytes
+	}
+	return maxRequestBytes
+}
+
+// readUpstreamErrorBody buffers up to maxUpstreamErrorBytes of resp's body
+// and closes it, so neither an unbounded payload nor an unclosed body can
+// pin per-request memory.
+func readUpstreamErrorBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
+}
 
 // proxyCooldown is how long a proxy is cooled down after a transport-layer
 // failure. The endpoint is not penalized for proxy errors -- only the proxy is.
@@ -323,11 +360,35 @@ func (g *GatewayContext) recordFallback(ep ...*ModelEndpoint) {
 	}
 }
 
+// recordMidStreamFallback is the user-visible subset of recordFallback:
+// the last model died after content had already reached the client, so the
+// gateway replayed its partial output on the next model. It lets operators
+// count, independently, how often a customer-visible seam occurs.
+func (g *GatewayContext) recordMidStreamFallback(ep ...*ModelEndpoint) {
+	if g.metrics != nil {
+		if len(ep) > 0 && ep[0] != nil {
+			g.metrics.MidStreamFailover(ep[0].Key())
+		} else {
+			g.metrics.MidStreamFailover("")
+		}
+	}
+}
+
 // recordCooldown increments the cooldown counter. It is a no-op when
 // metrics is nil.
 func (g *GatewayContext) recordCooldown() {
 	if g.metrics != nil {
 		g.metrics.Cooldown()
+	}
+}
+
+// recordTransportDrop counts a request abandoned because the client
+// disconnected mid-flight. Operators use this counter, alongside the fallback
+// and mid-stream series, to separate gateway-side routing pressure from
+// client-side flakes.
+func (g *GatewayContext) recordTransportDrop() {
+	if g.metrics != nil {
+		g.metrics.TransportDrop()
 	}
 }
 
@@ -644,7 +705,7 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, maxLargeRequestBytes)
 	body, err := readRequestBody(r)
 	if err != nil {
 		writeAPIError(w, 400, "Failed to read request body", "invalid_request_error", "bad_request")
@@ -669,6 +730,14 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 	req := &ChatCompletionRequest{Model: head.Model, Stream: head.Stream, MaxTokens: head.MaxTokens}
+
+	// Scope the request-body cap to the model: only "large" traffic
+	// may carry a 32 MiB body; everyone else is held to a realistic ceiling.
+	if len(body) > requestBytesForModel(head.Model) {
+		writeAPIError(w, 413, "Request body too large", "invalid_request_error", "request_too_large")
+		g.recordRequest(head.Model, 413, time.Since(start))
+		return
+	}
 
 	if !IsValidModel(req.Model) {
 		writeAPIError(w, 400, fmt.Sprintf("Unknown model: %s. Available: %s", req.Model, strings.Join(LogicalModels, ", ")), "invalid_request_error", "model_not_found")
@@ -1229,8 +1298,15 @@ const interAttemptBackoff = 250 * time.Millisecond
 // interAttemptWait pauses the request's fallback walk by a small jittered
 // duration before advancing to the next chain entry. It reuses
 // cycleBackSleep's remaining-budget check so a pause never outlasts the walk.
-func (g *GatewayContext) interAttemptWait(walk *budgetState, ceiling time.Duration, ctx context.Context) {
-	wait := interAttemptBackoff + time.Duration(rand.Int64N(int64(interAttemptBackoff/4)))
+func (g *GatewayContext) interAttemptWait(walk *budgetState, ceiling time.Duration, ctx context.Context, statusCode int) {
+	base := interAttemptBackoff
+	if statusCode == 429 {
+		// Rate limits always signal "wait longer": give the provider a
+		// generous jittered pause (double the baseline) so the next attempt
+		// doesn't re-trigger the same throttling limit immediately.
+		base = interAttemptBackoff * 2
+	}
+	wait := base + time.Duration(rand.Int64N(int64(interAttemptBackoff/4)))
 	sleep, ok := cycleBackSleep(wait, walk, ceiling)
 	if !ok || sleep <= 0 {
 		return
@@ -1416,6 +1492,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
 			r, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
 			if err != nil {
+				if errors.Is(err, ErrUpstreamSaturated) {
+					writeAPIError(w, http.StatusServiceUnavailable, "Upstream saturated", "server_error", "upstream_saturated")
+					g.recordRequest(req.Model, 503, time.Since(start))
+					return
+				}
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
 					// Proxy failure: mark the proxy down and try again with a
@@ -1458,8 +1539,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			continue
 		}
 		if resp.StatusCode != 200 {
-			respBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			respBody, _ := readUpstreamErrorBody(resp)
 			cancel()
 
 			// Command Code error statuses are remapped to the
@@ -1527,16 +1607,38 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				nonRetryableAdvanced = true
 			}
 			if isRetryableForChain(resp.StatusCode, string(respBody)) {
-				g.interAttemptWait(walk, g.providerMaxInterruption(ep.Provider), ctx)
+				g.interAttemptWait(walk, g.providerMaxInterruption(ep.Provider), ctx, resp.StatusCode)
 			}
 			g.recordRequest(req.Model, resp.StatusCode, time.Since(start))
 			continue
 		}
 
 		// Read body so we can both copy to client and extract usage for TPS.
-		respBody, _ := io.ReadAll(resp.Body)
+		// Bound the read so one oversized upstream response cannot pin
+		// unbounded per-request memory; an overflow is a fallback trigger.
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
 		resp.Body.Close()
 		cancel()
+		if readErr != nil {
+			g.recordAttempt(ep, time.Since(attemptStart), false)
+			tried[ep.Key()] = true
+			g.recordFallback(ep)
+			g.router.ApplyCooldownForSession(ep, 502, readErr.Error(), sessionID, 0)
+			g.recordCooldown()
+			g.recordRequest(req.Model, 502, time.Since(start))
+			continue
+		}
+		if len(raw) > maxUpstreamBodyBytes {
+			readErr = fmt.Errorf("upstream response body exceeds %d bytes", maxUpstreamBodyBytes)
+			g.recordAttempt(ep, time.Since(attemptStart), false)
+			tried[ep.Key()] = true
+			g.recordFallback(ep)
+			g.router.ApplyCooldownForSession(ep, 502, readErr.Error(), sessionID, 0)
+			g.recordCooldown()
+			g.recordRequest(req.Model, 502, time.Since(start))
+			continue
+		}
+		respBody := raw
 
 		// OpenCode free-tier gate: the body gate in buildRequest forced
 		// `stream:true` upstream even for this non-streaming client, so
@@ -1885,20 +1987,19 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				OnProgress:     walk.markProgress,
 			})
 			if err != nil {
+				if errors.Is(err, ErrUpstreamSaturated) {
+					writeAPIError(w, http.StatusServiceUnavailable, "Upstream saturated", "server_error", "upstream_saturated")
+					g.recordRequest(req.Model, 503, time.Since(start))
+					return
+				}
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
-					// Proxy failure: mark the proxy down and try again with a
-					// different proxy on the same endpoint.
 					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
 					if pErr.MidStream {
-						// Content already reached the client, so re-running this
-						// endpoint would duplicate it. Fall through to the
-						// next-model resume path below instead of retrying.
 						break
 					}
 					continue
 				}
-				// Non-proxy error: endpoint failure.
 				break
 			}
 			break
@@ -1956,7 +2057,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// triedKeys approach, this doesn't leak state to other concurrent
 		// requests that share the same session ID.
 		tried[ep.Key()] = true
-		g.recordFallback(ep)
+		if strings.TrimSpace(partial) != "" || len(toolCalls) > 0 {
+			g.recordMidStreamFallback(ep)
+			log.Printf("[debug] session=%s model=%s -> mid-stream failover from %s (replaying %d chars, %d tool calls); resuming on next model",
+				sessionID, req.Model, ep.Key(), len(partial), len(toolCalls))
+		} else {
+			g.recordFallback(ep)
+		}
 		var pErr *ProxyError
 		if !errors.As(err, &pErr) {
 			// Only cool down the endpoint for non-proxy errors. A proxy failure

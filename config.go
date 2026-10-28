@@ -822,6 +822,21 @@ type Preferences struct {
 	// 0 (the default) disables jitter. Values are clamped to [0, 0.25].
 	CooldownJitter float64 `yaml:"cooldown_jitter,omitempty"`
 
+	// CommandCodeProxyMaxConcurrent is the maximum number of concurrent
+	// Command Code proxy requests. usefulness of pointer: absent means
+	// default/CLI decides; an explicit 0 disables the cap (unlimited).
+	CommandCodeProxyMaxConcurrent *int `yaml:"commandcode_proxy_max_concurrent,omitempty"`
+
+	// Aliases, so configs written using any common spelling are honoured.
+	// All feed the same effective cap.
+	CommandCodeMaxConcurrent *int `yaml:"commandcode_max_concurrent,omitempty"`
+	MaxConcurrent            *int `yaml:"max_concurrent,omitempty"`
+	MaxConcurrentRequests    *int `yaml:"max_concurrent_requests,omitempty"`
+	CommandCodeConcurrency   *int `yaml:"commandcode_concurrency,omitempty"`
+	CCMaxInflight            *int `yaml:"cc_max_inflight,omitempty"`
+	MaxInflight              *int `yaml:"max_inflight,omitempty"`
+	Concurrent               *int `yaml:"concurrent,omitempty"`
+
 	// CircuitBreakerThreshold is the number of consecutive failures that
 	// trip the circuit from Closed to Open. A pointer is used so an explicit
 	// 0 can be distinguished from an absent key: nil (absent) falls back to
@@ -872,6 +887,16 @@ type Preferences struct {
 	// time so the mistake is caught before a restart rather than silently at
 	// load.
 	MaxLabelCardinality *int `yaml:"max_label_cardinality,omitempty"`
+
+	// MaxUpstreamConcurrency caps how many upstream attempts the gateway
+	// runs concurrently. Each Forward/StreamToClient attempt acquires one
+	// slot; when all slots are in use a new attempt fails fast with an
+	// "upstream saturated" error instead of spawning unbounded dial fan-out
+	// against every configured provider. nil = built-in default; explicit 0
+	// disables the cap.
+	MaxUpstreamConcurrency *int `yaml:"max_upstream_concurrency,omitempty"`
+	// Alias key accepted from config headers.
+	MaxConcurrentUpstreams *int `yaml:"max_concurrent_upstreams,omitempty"`
 }
 
 // MaxLabelCardinalityValue returns the effective per-map label cap, clamped to
@@ -886,6 +911,35 @@ func (p *Preferences) MaxLabelCardinalityValue() int {
 	}
 	if n > maxAllowedLabels {
 		return maxAllowedLabels
+	}
+	return n
+}
+
+const defaultMaxUpstreamConcurrency = 128
+const maxAllowedUpstreamConcurrency = 100000
+
+// MaxUpstreamConcurrencyValue returns the effective upstream attempt cap.
+// nil (both keys absent) yields the default; explicit 0 disables the cap
+// (returns 0); out-of-range values fall back to the default.
+func (p *Preferences) MaxUpstreamConcurrencyValue() int {
+	if p == nil {
+		return defaultMaxUpstreamConcurrency
+	}
+	var raw *int
+	if p.MaxUpstreamConcurrency != nil {
+		raw = p.MaxUpstreamConcurrency
+	} else if p.MaxConcurrentUpstreams != nil {
+		raw = p.MaxConcurrentUpstreams
+	}
+	if raw == nil {
+		return defaultMaxUpstreamConcurrency
+	}
+	n := *raw
+	if n == 0 {
+		return 0
+	}
+	if n < 1 || n > maxAllowedUpstreamConcurrency {
+		return defaultMaxUpstreamConcurrency
 	}
 	return n
 }
@@ -921,6 +975,21 @@ func (p *Preferences) CooldownJitterFraction() float64 {
 	return f
 }
 
+// CommandCodeProxyMaxConcurrentValue returns the effective concurrency cap
+// for the Command Code proxy. nil (absent) returns 0, meaning the CLI flag
+// decides; an explicit 0 disables the cap (unlimited). Negative values are
+// clamped to 0 (disabled) so a misconfigured negative cannot silently
+// disable the cap — an explicit 0 is the documented way to opt out.
+func (p *Preferences) CommandCodeProxyMaxConcurrentValue() int {
+	if p == nil || p.CommandCodeProxyMaxConcurrent == nil {
+		return 0
+	}
+	if *p.CommandCodeProxyMaxConcurrent < 0 {
+		return 0
+	}
+	return *p.CommandCodeProxyMaxConcurrent
+}
+
 // DefaultInitialRotationWindow is the window used when preferences omit one.
 const DefaultInitialRotationWindow = 8
 
@@ -936,6 +1005,13 @@ const DefaultCircuitBreakerThreshold = 5
 // DefaultCircuitHalfOpenProbes is the max probes allowed in half-open state
 // when the config omits the key.
 const DefaultCircuitHalfOpenProbes = 1
+
+// DefaultCommandCodeProxyMaxConcurrent is the built-in default cap for
+// concurrent Command Code proxy requests when neither the config nor the
+// CLI flag set one. 4 matches the rate-limit profile of the upstream
+// (4 concurrent, 30 req/min) so the gateway never outpaces what the
+// provider tolerates.
+const DefaultCommandCodeProxyMaxConcurrent = 4
 
 // CircuitBreakerThresholdValue returns the effective threshold. nil (absent)
 // falls back to DefaultCircuitBreakerThreshold; an explicit 0 disables the
@@ -978,6 +1054,10 @@ type Config struct {
 	Providers   map[string]ProviderConfig `yaml:"providers"`
 	Preferences *Preferences              `yaml:"preferences,omitempty"`
 	Models      map[string]ModelConfig    `yaml:"models"`
+	// Top-level convenience aliases for the commandcode-proxy concurrency cap.
+	CommandCodeProxyMaxConcurrent *int `yaml:"commandcode_proxy_max_concurrent,omitempty"`
+	MaxConcurrent                 *int `yaml:"max_concurrent,omitempty"`
+	MaxConcurrentRequests         *int `yaml:"max_concurrent_requests,omitempty"`
 }
 
 var LogicalModels = []string{"smart", "work", "fast", "large"}
@@ -1184,11 +1264,13 @@ func ExtractSSEError(data []byte) error {
 	//
 	// We scan line-by-line so each data: line is examined independently.
 
+	sawData := false
 	for _, raw := range bytes.Split(data, []byte("\n")) {
 		line := bytes.TrimSpace(raw)
 		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
+		sawData = true
 
 		payload := bytes.TrimSpace(line[len("data:"):])
 		if bytes.Equal(payload, []byte("[DONE]")) {
@@ -1208,16 +1290,18 @@ func ExtractSSEError(data []byte) error {
 		}
 	}
 
-	// Fallback: if no data: error was found, check whether the raw body itself
-	// is a JSON error object (some providers return the error as the entire
-	// response body with no SSE framing at all).
-	trimmed := bytes.TrimSpace(data)
-	if bytes.HasPrefix(trimmed, []byte("{")) {
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(trimmed, &obj); err == nil {
-			// Same guard as above: skip null/empty error objects.
-			if errRaw, ok := obj["error"]; ok && len(errRaw) > 2 && string(errRaw) != "null" {
-				return &SSEError{Data: string(errRaw)}
+	// Fallback: only if no "data:" line was seen at all — otherwise the
+	// streaming body was already examined above and re-decoding the whole
+	// event would just repeat work (and risk a false positive from framing).
+	if !sawData {
+		trimmed := bytes.TrimSpace(data)
+		if bytes.HasPrefix(trimmed, []byte("{")) {
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(trimmed, &obj); err == nil {
+				// Same guard as above: skip null/empty error objects.
+				if errRaw, ok := obj["error"]; ok && len(errRaw) > 2 && string(errRaw) != "null" {
+					return &SSEError{Data: string(errRaw)}
+				}
 			}
 		}
 	}
