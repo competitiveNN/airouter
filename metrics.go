@@ -27,7 +27,7 @@ const (
 // dashboardTickSeconds is the granularity of the attempt ring. One minute is
 // coarse enough that a tick never spans a request boundary in a way that
 // matters for a leaderboard (a model measured over 60s vs 59s is noise, not
-// signal) and fine enough that the 1d window is 1440 samples, 7d is 10080,
+// signal) and fine enough that the 1d window is 1440 samples, 7d is 10080, the 30d is 43200 (original),
 // and 30d is 43200 — all cheap to sum at scrape time.
 const dashboardTickSeconds = 60
 
@@ -36,7 +36,7 @@ const dashboardTickSeconds = 60
 // the oldest. It is a fixed allocation: memory is bounded by
 // dashboardRingLen * labelsCap regardless of how long the process lives, which
 // is the property the label cap exists to guarantee for the other maps.
-const dashboardRingLen = 43200 + 1
+const dashboardRingLen = 10080 + 1 // 7-day retention (was 30d)
 
 // Metrics collects Prometheus-style metrics for operational visibility.
 // All counters are atomic for thread-safe updates without locks.
