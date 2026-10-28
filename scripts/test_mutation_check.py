@@ -359,11 +359,31 @@ def _drop_provider_entry(text, profile, provider):
     return text[:m.start(2)] + new_block + text[m.end(2):]
 
 
+def _remove_a_labeled_line(text, field):
+    """Delete the first `field: ...` line from any chain entry.
+
+    Derived from the live chains rather than pinned to one model. The old
+    anchors spelled out `vision: false\n        intelligence: 44.8`, and when a
+    regeneration replaced that model the case planted nothing and reported a
+    pass while testing nothing -- the exact failure this suite exists to catch.
+    """
+    m = re.search(rf"(?m)^        {re.escape(field)}: [^\n]*\n", text)
+    assert m, f"no `{field}:` line in any chain to remove"
+    return text[:m.start()] + text[m.end():]
+
+
 def _score_below_floor(text, profile, floor):
     """Rewrite the first scored entry of `profile` to an intelligence below `floor`.
 
     Picks a real entry out of the live chain instead of naming one, so the case
     keeps planting a violation as the generator's composition changes.
+
+    The planted score is `floor - 0.1`, not a decrement of the current score:
+    the old `current - floor - 0.1` arithmetic only landed below the floor when
+    the entry happened to score under `2 * floor`, so on a regenerated chain
+    with a 31.7 head it wrote 16.6 into `work` (floor 15.0) and planted nothing.
+    The model line's trailing comment is kept in sync so the comment/value rule
+    does not drown out the diagnostic under test.
     """
     pattern = re.compile(rf"(?ms)(^  {re.escape(profile)}:\n    chain:\n)(.*?)(?=^  \w+:|\Z)")
     m = pattern.search(text)
@@ -375,8 +395,15 @@ def _score_below_floor(text, profile, floor):
     )
     m2 = entry.search(block)
     assert m2, f"no scored entry in the {profile} chain to push below {floor}"
-    lowered = float(m2.group(2)) - floor - 0.1
-    new_block = block[:m2.start(2)] + repr(round(lowered, 1)) + block[m2.end(2):]
+    planted = repr(round(floor - 0.1, 1))
+    head = block[:m2.start(2)]
+    lines = head.splitlines(keepends=True)
+    for i in range(len(lines) - 1, -1, -1):
+        mm = re.match(r"^(        model: [^\n]*?  # )([0-9.]+)(\n?)$", lines[i])
+        if mm:
+            lines[i] = mm.group(1) + planted + mm.group(3)
+            break
+    new_block = "".join(lines) + planted + block[m2.end(2):]
     return text[:m.start(2)] + new_block + text[m.end(2):]
 
 
@@ -593,15 +620,12 @@ CHECK_RULE_CASES = [
     ),
     (
         "vision removed",
-        lambda t: t.replace("        vision: false\n        intelligence: 44.8",
-                            "        intelligence: 44.8", 1),
+        lambda t: _remove_a_labeled_line(t, "vision"),
         "rule7/11",
     ),
     (
         "intelligence removed",
-        lambda t: t.replace(
-            "        vision: false\n        intelligence: 44.8\n        context_length: 131072",
-            "        vision: false\n        context_length: 131072", 1),
+        lambda t: _remove_a_labeled_line(t, "intelligence"),
         "no numeric intelligence field",
     ),
     (
@@ -636,12 +660,7 @@ CHECK_RULE_CASES = [
         # The floor is read from the `intelligence:` FIELD, so the field has to
         # move; renaming the model alone changes nothing a rule can see, and the
         # comment is kept in sync so the comment/field check does not fire first.
-        lambda t: _in_profile(
-            t, "work",
-            "        model: gemma-4-26b-a4b-it  # 16.7\n"
-            "        vision: false\n        intelligence: 16.7",
-            "        model: gemma-4-26b-a4b-it  # 9.9\n"
-            "        vision: false\n        intelligence: 9.9"),
+        lambda t: _score_below_floor(t, "work", 15.0),
         "below intelligence 15.0",
     ),
     (

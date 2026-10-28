@@ -86,6 +86,18 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 	// to an image_url chat part, so the standard chat marker is present.
 	sessionID := bodySessionID(body)
 
+	// Same up-front context check as the chat surface: a prompt no reachable
+	// model can hold would otherwise spend the whole interruption budget on
+	// attempts that cannot produce anything. See HandleChatCompletions.
+	if tokens := estimateTokens(chatReq); tokens > 0 {
+		if fits, largest := g.router.ContextCapacity(req.Model, tokens); !fits {
+			msg := fmt.Sprintf("Request is about %d tokens, which exceeds every %s model's context window (largest advertised: %d tokens). Reduce the conversation, or use a model whose window fits it.", tokens, req.Model, largest)
+			writeAPIError(w, 400, msg, "invalid_request_error", "context_length_exceeded")
+			g.recordRequest(req.Model, 400, time.Since(start))
+			return
+		}
+	}
+
 	if req.Stream {
 		g.handleResponsesStream(w, r, body, chatReq, sessionID)
 		return
@@ -99,7 +111,8 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string) {
 	start := time.Now()
 	ctx := r.Context()
-	timeout := requestTimeout(estimateTokens(req))
+	tokens := estimateTokens(req)
+	timeout := requestTimeout(tokens)
 	// Wall-clock budget for this request's fallback walk. Shared policy with
 	// the chat loops: this path was the one that shipped unbounded for a
 	// while, so it must use the same bound rather than its own copy.
@@ -131,7 +144,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		}
 		walk.next()
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(body), tried)
+		ep, wait := g.router.SelectEndpointForTokens(req.Model, sessionID, requestHasVision(body), tried, tokens)
 		if ep == nil {
 			// Every endpoint in the chain is on cooldown (or otherwise
 			// ineligible). Wait out the SHORTEST remaining cooldown and
@@ -342,6 +355,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		maxAttempts = 1
 	}
 	tried := map[string]bool{}
+	tokens := estimateTokens(req)
 
 	// retryBody is the upstream body for the current attempt. After a
 	// mid-stream failure it is rebuilt with the partial assistant output
@@ -373,7 +387,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		}
 		walk.next()
 
-		ep, wait := g.router.SelectEndpoint(req.Model, sessionID, requestHasVision(retryBody), tried)
+		ep, wait := g.router.SelectEndpointForTokens(req.Model, sessionID, requestHasVision(retryBody), tried, tokens)
 		if ep == nil {
 			if wait > 0 {
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
@@ -405,7 +419,6 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		// we can fall back cleanly.
 		var buf strings.Builder
 		var attempt *responsesStreamWriter
-		tokens := estimateTokens(req)
 		// attemptStart times this single upstream attempt; `start` above is
 		// the request-level clock. Sharing them would make the TPS figure a
 		// per-request rather than a per-attempt measurement.

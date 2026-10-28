@@ -946,6 +946,43 @@ var substituteChains = []string{"work", "large", "smart", "fast"}
 // that runs dry is abandoned in turn, so a session keeps moving until it
 // lands on a chain whose models actually work.
 func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bool, tried map[string]bool) (*ModelEndpoint, time.Duration) {
+	return r.SelectEndpointForTokens(logicalModel, sessionID, requireVision, tried, 0)
+}
+
+// contextFits reports whether ep's advertised context window can hold a prompt
+// of promptTokens tokens.
+//
+// An endpoint whose window is unknown (zero) stays eligible. Excluding it would
+// silently remove every model the fetcher has no metadata for -- which is how a
+// working model disappears from a chain without anyone editing the config -- so
+// "unknown" is treated as "cannot be proven too small", the same way a nil
+// Vision flag is treated as "vision supported".
+//
+// A non-positive promptTokens means the request's size is unknown, which fits
+// everywhere. That keeps every caller that does not know the size on the exact
+// pre-existing behaviour.
+func contextFits(ep *ModelEndpoint, promptTokens int) bool {
+	if promptTokens <= 0 {
+		return true
+	}
+	window := ep.ContextWindow()
+	return window <= 0 || window >= promptTokens
+}
+
+// SelectEndpointForTokens is SelectEndpoint with the request's estimated prompt
+// size, so endpoints whose context window cannot hold it are skipped.
+//
+// Without this, a prompt larger than a chain head's window is sent anyway: the
+// upstream accepts the connection and then produces nothing until our attempt
+// timeout fires. Measured 2026-10-28 on `work` (head window 131072) with a
+// ~340k-token conversation: 1-2 attempts consumed the whole 30s interruption
+// budget and the client got an SSE error, while the same chain held nine
+// endpoints whose windows fit the request untouched.
+//
+// When no endpoint anywhere can hold the prompt, the caller should reject the
+// request up front with a context_length_exceeded error rather than walk a
+// chain that cannot succeed; see ContextCapacity.
+func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, requireVision bool, tried map[string]bool, promptTokens int) (*ModelEndpoint, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -1007,7 +1044,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 			// is called exactly once here and the result is reused.
 			inChain := r.endpointInChain(endpoints, ep)
 			available := inChain && r.isAvailableLocked(&ep)
-			if available && r.visionEligible(&ep, requireVision) && !tried[ep.Key()] {
+			if available && r.visionEligible(&ep, requireVision) && contextFits(&ep, promptTokens) && !tried[ep.Key()] {
 				// The client may have moved to a different logical model
 				// while the session stayed on this chain (a failover the
 				// client has not outgrown). Record the model it asks for
@@ -1021,7 +1058,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 			}
 			// The sticky model is out: either cooled, marked no-vision, or
 			// already tried and failed in this request's fallback sequence.
-			capabilityFallback = available && !r.visionEligible(&ep, requireVision)
+			capabilityFallback = available && (!r.visionEligible(&ep, requireVision) || !contextFits(&ep, promptTokens))
 		}
 
 		// A brand new session's FIRST pick is ROTATED across the head of the
@@ -1030,7 +1067,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		// Rotation never applies to a substitute chain: a failover must
 		// escalate in configured order, not jump to an arbitrary depth.
 		if !known && chainName == logicalModel {
-			if ep := r.selectInitialEndpoint(logicalModel, sessionID, &nextChain, requireVision); ep != nil && !tried[ep.Key()] {
+			if ep := r.selectInitialEndpoint(logicalModel, sessionID, &nextChain, requireVision, promptTokens); ep != nil && !tried[ep.Key()] {
 				log.Printf("[debug] session=%s model=%s -> new session -> %s/%s", sessionID, logicalModel, ep.Provider, ep.Model)
 				r.bindSessionLocked(sessionID, *ep, logicalModel, chainName)
 				return ep, 0
@@ -1041,7 +1078,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		// cooldown table, or this request's own walk has ruled out.
 		for i := range endpoints {
 			next := endpoints[i]
-			if r.isEligibleLocked(&next, requireVision) && !tried[next.Key()] {
+			if r.isEligibleLocked(&next, requireVision) && contextFits(&next, promptTokens) && !tried[next.Key()] {
 				if capabilityFallback {
 					log.Printf("[debug] session=%s model=%s -> fallback (no vision) %s/%s -> %s/%s", sessionID, logicalModel, se.ep.Provider, se.ep.Model, next.Provider, next.Model)
 				}
@@ -1086,7 +1123,7 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 		}
 		for i := range nextChain.Chain {
 			next := nextChain.Chain[i]
-			if r.isEligibleLocked(&next, requireVision) {
+			if r.isEligibleLocked(&next, requireVision) && contextFits(&next, promptTokens) {
 				log.Printf("[debug] session=%s model=%s -> retry exhausted, cycling %s -> %s/%s", sessionID, logicalModel, chainName, next.Provider, next.Model)
 				r.bindSessionLocked(sessionID, next, logicalModel, chainName)
 				return &next, 0
@@ -1100,6 +1137,41 @@ func (r *Router) SelectEndpoint(logicalModel, sessionID string, requireVision bo
 	// hammering a cooled model on every iteration (which caused the
 	// "all cooled down, retrying X" spam loop).
 	return nil, r.minCooldownWaitAcrossChains(cfg, chains, requireVision)
+}
+
+// ContextCapacity reports whether any endpoint this request could be routed to
+// can hold promptTokens tokens, and the largest context window among those
+// chains (0 when nothing advertises one).
+//
+// The chain set is the one SelectEndpointForTokens would consult -- the
+// requested chain plus the substitutes -- because the router fails a session
+// over to a substitute chain when the requested one runs dry. Checking only the
+// requested chain would reject a request the gateway could in fact serve.
+//
+// Availability is deliberately NOT part of the answer. This asks whether the
+// request is possible on this gateway at all; a fitting endpoint that happens
+// to be cooling right now is a transient condition the normal walk handles, and
+// a 400 must never be produced for it.
+func (r *Router) ContextCapacity(logicalModel string, promptTokens int) (fits bool, largest int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cfg := r.config.Load()
+	for _, name := range r.chainOrderLocked(cfg, logicalModel, sessionEntry{}, false) {
+		chain, ok := cfg.Models[name]
+		if !ok {
+			continue
+		}
+		for i := range chain.Chain {
+			ep := &chain.Chain[i]
+			if w := ep.ContextWindow(); w > largest {
+				largest = w
+			}
+			if contextFits(ep, promptTokens) {
+				fits = true
+			}
+		}
+	}
+	return fits, largest
 }
 
 // chainOrderLocked returns the ordered chains a selection for logicalModel
@@ -1220,13 +1292,21 @@ func (r *Router) minCooldownWaitAcrossChains(cfg *Config, chains []string, requi
 //
 // The cursor is per logical model and advances by one per new session, so
 // sessions spread across the window and then wrap.
-func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *ModelConfig, requireVision bool) *ModelEndpoint {
+func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *ModelConfig, requireVision bool, promptTokens int) *ModelEndpoint {
 	cfg := r.config.Load()
 	window := cfg.Preferences.RotationWindow()
+	// eligible is the rotation's filter: usable right now, able to accept the
+	// request's images, and able to hold its prompt. A too-small endpoint is
+	// skipped exactly like a cooled one, so the rotation never promotes a model
+	// that would fail on arrival.
+	eligible := func(i int) bool {
+		ep := &chain.Chain[i]
+		return r.isEligibleLocked(ep, requireVision) && contextFits(ep, promptTokens)
+	}
 	if window <= 0 {
 		// Rotation disabled: strict chain order.
 		for i := range chain.Chain {
-			if r.isEligibleLocked(&chain.Chain[i], requireVision) {
+			if eligible(i) {
 				ep := chain.Chain[i]
 				return &ep
 			}
@@ -1246,7 +1326,7 @@ func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *Mo
 		limit = len(chain.Chain)
 	}
 	for i := 0; i < limit; i++ {
-		if r.isEligibleLocked(&chain.Chain[i], requireVision) {
+		if eligible(i) {
 			candidates = append(candidates, i)
 		}
 	}
@@ -1255,7 +1335,7 @@ func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *Mo
 		// (which would make the request wait), continue down the chain: this
 		// is the same escalation the fallback loop performs.
 		for i := limit; i < len(chain.Chain); i++ {
-			if r.isEligibleLocked(&chain.Chain[i], requireVision) {
+			if eligible(i) {
 				ep := chain.Chain[i]
 				return &ep
 			}
