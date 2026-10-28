@@ -183,13 +183,19 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 	}
 
 	sessionID := bodySessionID(body)
-	timeout := requestTimeout(estimateTokensFromBody(body))
 	eps := s.endpoints(model, sessionID)
 	if len(eps) == 0 {
 		writeAPIError(w, 503, "No Command Code provider is configured", "server_error", "provider_not_configured")
 		return
 	}
-
+	timeout := requestTimeout(estimateTokensFromBody(body))
+	providerCfg := s.gateway.config.Load().Providers[eps[0].Provider]
+	if providerCfg.Timeout > 0 && providerCfg.Timeout > timeout {
+		timeout = providerCfg.Timeout
+	}
+	if timeout > maxSessionInterruption {
+		timeout = maxSessionInterruption
+	}
 	if head.Stream {
 		s.stream(w, r, body, model, eps, sessionID, timeout)
 		return
