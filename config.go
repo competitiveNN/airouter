@@ -904,11 +904,16 @@ func (p *Preferences) RotationWindow() int {
 // cooldowns, clamped to [0, 0.25]. Nil preferences or an unset value yields 0.
 func (p *Preferences) CooldownJitterFraction() float64 {
 	if p == nil {
-		return 0
+		// Absent preferences block: built-in default spread so a freshly
+		// loaded / minimal control plane does not land all wakers on the
+		// same wake boundary.
+		return DefaultCooldownJitter
 	}
 	f := p.CooldownJitter
-	if f < 0 {
-		f = 0
+	// Zero (and negative) disable jitter, per the documented semantics
+	// for cooldown_jitter (mirroring initial_rotation_window).
+	if f <= 0 {
+		return 0
 	}
 	if f > 0.25 {
 		f = 0.25
@@ -918,6 +923,11 @@ func (p *Preferences) CooldownJitterFraction() float64 {
 
 // DefaultInitialRotationWindow is the window used when preferences omit one.
 const DefaultInitialRotationWindow = 8
+
+// DefaultCooldownJitter is the fraction used when the operator does not set
+// cooldown_jitter: spread wakers but never zero by default, so a freshly
+// loaded control plane does not land every client on the same wake boundary.
+const DefaultCooldownJitter = 0.1
 
 // DefaultCircuitBreakerThreshold is the number of consecutive failures
 // that trip the circuit from Closed to Open when the config omits the key.

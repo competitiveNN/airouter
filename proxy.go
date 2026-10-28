@@ -236,15 +236,13 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration) (*http.C
 			}
 		}
 	}
-	// The direct path shares one transport across every request, so it is
-	// cloned before this attempt's budget is applied. A clone starts with an
-	// empty connection pool, so the attempt re-dials instead of reusing an idle
-	// connection: that costs one handshake per attempt, which is the same price
-	// the chat streaming path already pays for the same guarantee.
-	if usedProxy == nil && transport != nil && timeout > 0 {
-		tr := transport.Clone()
-		applyAttemptTimeouts(tr, timeout)
-		client = &http.Client{Transport: tr}
+	// The direct path reuses the shared pooled transport. Per-attempt
+	// deadlines are applied via the request context, not per-transport
+	// timeouts (see handleCompletion / handleStream and StreamToClient), so
+	// the shared pool and its idle connections stay intact instead of being
+	// re-dialed on every hop and every fallback attempt.
+	if usedProxy == nil && transport != nil {
+		client = &http.Client{Transport: transport}
 	}
 	return client, usedProxy
 }

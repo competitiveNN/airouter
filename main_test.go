@@ -875,6 +875,7 @@ func TestMinCooldownWaitSkipsNoVision(t *testing.T) {
 		Providers: map[string]ProviderConfig{
 			"p": {URL: "https://example.com/v1"},
 		},
+		Preferences: &Preferences{CooldownJitter: 0},
 		Models: map[string]ModelConfig{
 			"smart": {Chain: []ModelEndpoint{
 				{Provider: "p", Model: "a", Vision: &falseVal}, // text-only
@@ -4900,6 +4901,7 @@ func TestApplyCooldownHonorsRetryAfterFloor(t *testing.T) {
 // value for transient errors (429), and that zero disables it.
 func TestCooldownJitterAppliedOn429(t *testing.T) {
 	cfg := &Config{
+		Preferences: &Preferences{CooldownJitter: 0},
 		Providers: map[string]ProviderConfig{
 			"p1": {URL: "https://p1.example.com/v1", APIKeyEnv: "P1_KEY"},
 		},
@@ -4976,8 +4978,8 @@ func TestApplyCooldownFromErrorCarriesRetryAfter(t *testing.T) {
 // clamps and returns the right value.
 func TestPreferencesCooldownJitterFraction(t *testing.T) {
 	var nilPrefs *Preferences
-	if nilPrefs.CooldownJitterFraction() != 0 {
-		t.Error("nil prefs should yield 0")
+	if nilPrefs.CooldownJitterFraction() != 0.1 {
+		t.Errorf("nil prefs should yield default 0.1, got %v", nilPrefs.CooldownJitterFraction())
 	}
 	p := &Preferences{CooldownJitter: -1}
 	if p.CooldownJitterFraction() != 0 {
