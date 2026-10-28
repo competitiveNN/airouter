@@ -1443,3 +1443,123 @@ def test_forced_aa_refetch_without_a_key_keeps_the_last_snapshot(tmp_path, monke
     monkeypatch.delenv("ARTIFICIAL_ANALYSIS_API_KEY", raising=False)
     data = ff.fetch_artificial_analysis_data(force=True)
     assert "keep-slug" in data
+
+def test_aa_coding_index_falls_back_when_intelligence_index_missing(tmp_path, monkeypatch):
+    """When a model has coding_index but no intelligence_index, the coding
+    index is used as the AA score so the model is not floored at 25.0."""
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "test-key")
+
+    def _fake_urlopen(req, timeout=None):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [
+                    {
+                        "slug": "some-slug",
+                        "evaluations": {
+                            "artificial_analysis_intelligence_index": None,
+                            "artificial_analysis_coding_index": 36.5,
+                        },
+                        "released": "2026-09-18",
+                    },
+                ]}).encode()
+        return _Resp()
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _fake_urlopen)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    assert data["some-slug"]["intelligence"] == 36.5
+    assert data["some-slug"]["intelligence_source"] == "artificial analysis coding index"
+    # Cache should report same
+    cached = ff.load_cache()
+    assert cached["some-slug"]["intelligence"] == 36.5
+
+
+def test_aa_intelligence_index_takes_precedence_over_coding_index(tmp_path, monkeypatch):
+    """When both intelligence and coding index are present, intelligence wins."""
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "test-key")
+
+    def _fake_urlopen(req, timeout=None):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [
+                    {
+                        "slug": "some-slug",
+                        "evaluations": {
+                            "artificial_analysis_intelligence_index": 43.7,
+                            "artificial_analysis_coding_index": 82.0,
+                        },
+                        "released": "2026-09-18",
+                    },
+                ]}).encode()
+        return _Resp()
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _fake_urlopen)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    assert data["some-slug"]["intelligence"] == 43.7
+    assert data["some-slug"]["intelligence_source"] == "artificial analysis intelligence index"
+
+
+def test_aa_handles_null_evaluations(tmp_path, monkeypatch):
+    """Evaluations field may be null; the parser must not crash."""
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "test-key")
+
+    def _fake_urlopen(req, timeout=None):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [
+                    {
+                        "slug": "released-only",
+                        "evaluations": None,
+                        "released": "2026-09-18",
+                    },
+                ]}).encode()
+        return _Resp()
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _fake_urlopen)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    # released-only model should still appear (with release date)
+    assert "released-only" in data
+    assert "intelligence" not in data["released-only"]
+
+
+def test_aa_enrichment_prefers_scored_sibling_over_unscored_base():
+    """When a direct AA entry lacks intelligence but a scored sibling exists
+    via containment (e.g. deepseek-v4-1-flash -> deepseek-v4-1-flash-1017),
+    the model gets the scored entry's intelligence (tested indirectly via
+    fetch)."""
+    # Sanity-check the mechanism: subset with both base and scored.
+    aa = {
+        "deepseek-v4-1-flash": {"released": "2026-09-10"},
+        "deepseek-v4-1-flash-1017": {"intelligence": 32.5, "intelligence_source": "artificial analysis intelligence index"},
+    }
+    # fuzzy_match against the scored-only universe picks the scored one.
+    scored_universe = {k: v for k, v in aa.items() if "intelligence" in v}
+    assert ff.fuzzy_match_slug("deepseek-ai/deepseek-v4.1-flash", scored_universe) == "deepseek-v4-1-flash-1017"
+
+
+def test_aa_enrichment_slash_to_hyphen_matcher_for_arena():
+    """Sanity: fuzzy_match_slug works with hyphenated variants too (variant sanity)."""
+    aa = {"reflection-beam": {"intelligence": 17.7}}
+    assert ff.fuzzy_match_slug("reflection-beam-free", aa) == "reflection-beam"
+    assert ff.fuzzy_match_slug("reflection/beam-free", aa) is None  # raw slash breaks unless dedupe in main
+""

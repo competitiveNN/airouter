@@ -36,7 +36,7 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, maxLargeRequestBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAPIError(w, 400, "Failed to read request body", "invalid_request_error", "bad_request")
@@ -53,6 +53,11 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 	if !IsValidModel(req.Model) {
 		writeAPIError(w, 400, fmt.Sprintf("Unknown model: %s. Available: %s", req.Model, strings.Join(LogicalModels, ", ")), "invalid_request_error", "model_not_found")
 		g.recordRequest("", 400, time.Since(start))
+		return
+	}
+	if len(raw) > requestBytesForModel(req.Model) {
+		writeAPIError(w, 413, "Request body too large", "invalid_request_error", "request_too_large")
+		g.recordRequest(req.Model, 413, time.Since(start))
 		return
 	}
 
@@ -232,6 +237,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			var pErr *ProxyError
 			if !errors.As(lastErr, &pErr) && isClientDisconnect(lastErr) {
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
+				g.recordTransportDrop()
 				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
@@ -249,10 +255,20 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			continue
 		}
 
-		respBody, readErr := io.ReadAll(resp.Body)
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
 		resp.Body.Close()
 		cancel()
 		if readErr != nil {
+			g.recordAttempt(ep, time.Since(attemptStart), false)
+			tried[ep.Key()] = true
+			g.recordFallback(ep)
+			g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
+			g.recordCooldown()
+			g.recordRequest(req.Model, 502, time.Since(start))
+			continue
+		}
+		if len(respBody) > maxUpstreamBodyBytes {
+			readErr = fmt.Errorf("upstream body exceeds %d bytes", maxUpstreamBodyBytes)
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep)
@@ -550,11 +566,11 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
 		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
 		resp.Body.Close()
 		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}

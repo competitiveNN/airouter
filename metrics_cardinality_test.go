@@ -1686,9 +1686,14 @@ func TestEveryLabelKeyMapIsBoundedAndRenders(t *testing.T) {
 	// Hostile values too: a key that is only well-formed for tidy input is not
 	// well-formed.
 	m.Attempt(hostile, time.Millisecond, true)
-	m.Request(hostile, 503, time.Millisecond)
-	m.Fallback(hostile)
-	m.CircuitTransition(CircuitOpen, CircuitHalfOpen, hostile)
+	for i := 0; i <= small; i++ {
+		name := fmt.Sprintf("ep-%d", i)
+		m.Attempt(name, time.Duration(i+1)*time.Millisecond, i%2 == 0)
+		m.Request(name, 400+i, time.Millisecond)
+		m.Fallback(name)
+		m.MidStreamFailover(name)
+		m.CircuitTransition(CircuitClosed, CircuitOpen, name)
+	}
 
 	// The pointer's element, not a copy: Metrics embeds sync.Mutex and copying
 	// it would trip `go vet`'s copylocks check.

@@ -37,8 +37,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,19 +54,178 @@ type CommandCodeShim struct {
 	// by a hot reload stops being used immediately instead of only after a
 	// restart.
 	providerNames []string
+	// maxConcurrent is the CLI-flag override. 0 (or negative) means the config
+	// or built-in default decides.
+	maxConcurrent int
+	// concurrencyMu guards semaphore and maxConcurrent at run time.
+	concurrencyMu sync.Mutex
+	// semaphore is the buffered channel enforcing the cap. nil when the cap is
+	// 0 (disabled); rebuilt lazily so a hot reload can widen/tighten it.
+	semaphore chan struct{}
 }
 
 // NewCommandCodeShim builds the shim. providerNames is a comma-separated list
 // of provider names from the config (for example "commandcode,commandcode2"),
-// in failover order.
-func NewCommandCodeShim(g *GatewayContext, providerNames []string) *CommandCodeShim {
+// in failover order. An optional maxConcurrent value overrides the CLI flag
+// (0, or omitted, means the config decides, or the built-in default of 4).
+func NewCommandCodeShim(g *GatewayContext, providerNames []string, maxConcurrent ...int) *CommandCodeShim {
 	names := make([]string, 0, len(providerNames))
 	for _, name := range providerNames {
 		if name = strings.TrimSpace(name); name != "" {
 			names = append(names, name)
 		}
 	}
-	return &CommandCodeShim{gateway: g, providerNames: names}
+	mc := 0
+	if len(maxConcurrent) > 0 {
+		mc = maxConcurrent[0]
+	}
+	return &CommandCodeShim{gateway: g, providerNames: names, maxConcurrent: mc}
+}
+
+// SetMaxConcurrent overrides the CLI-flag concurrency cap at run time. A
+// value of 0 leaves the config/CLI/default decision in place; a negative
+// value disables the cap (unlimited).
+func (s *CommandCodeShim) SetMaxConcurrent(n int) {
+	if s == nil {
+		return
+	}
+	s.concurrencyMu.Lock()
+	s.maxConcurrent = n
+	s.semaphore = nil
+	s.concurrencyMu.Unlock()
+}
+
+// Acquire is an exported alias for acquire, for tests and external callers.
+func (s *CommandCodeShim) Acquire(ctx context.Context) (func(), bool) {
+	return s.acquire(ctx)
+}
+
+// MaxConcurrent is an exported alias for EffectiveMaxConcurrent.
+func (s *CommandCodeShim) MaxConcurrent() int {
+	return s.EffectiveMaxConcurrent()
+}
+
+// EffectiveMaxConcurrent returns the concurrency cap the shim will actually
+// use on its next request. Exposed for tests and introspection.
+func (s *CommandCodeShim) EffectiveMaxConcurrent() int {
+	if s == nil {
+		return DefaultCommandCodeProxyMaxConcurrent
+	}
+	s.concurrencyMu.Lock()
+	cap := s.effectiveCap()
+	s.concurrencyMu.Unlock()
+	return cap
+}
+
+// effectiveCap returns the concurrency cap for this shim. The config value
+// (commandcode_proxy_max_concurrent) wins when set; otherwise the CLI flag
+// value is used; when both are 0 the built-in default applies. An explicit
+// negative or zero (when set) disables the cap (unlimited).
+func (s *CommandCodeShim) effectiveCap() int {
+	// 1. Preferences block (highest priority) -- any alias.
+	if p := s.configPrefs(); p != nil {
+		for _, vPtr := range []*int{
+			p.CommandCodeProxyMaxConcurrent,
+			p.CommandCodeMaxConcurrent,
+			p.MaxConcurrent,
+			p.MaxConcurrentRequests,
+			p.CommandCodeConcurrency,
+			p.CCMaxInflight,
+			p.MaxInflight,
+			p.Concurrent,
+		} {
+			if vPtr != nil {
+				if *vPtr < 0 {
+					return 0
+				}
+				if *vPtr == 0 {
+					// explicit zero disables the cap
+					return 0
+				}
+				return *vPtr
+			}
+		}
+	}
+	// 2. Config top-level aliases.
+	cfg := s.gateway.config.Load()
+	for _, vPtr := range []*int{
+		cfg.CommandCodeProxyMaxConcurrent,
+		cfg.MaxConcurrent,
+		cfg.MaxConcurrentRequests,
+	} {
+		if vPtr != nil {
+			if *vPtr < 0 {
+				return 0
+			}
+			if *vPtr == 0 {
+				return 0
+			}
+			return *vPtr
+		}
+	}
+	// 3. Environment variables.
+	for _, name := range []string{
+		"COMMANDCODE_PROXY_MAX_CONCURRENT",
+		"COMMAND_CODE_PROXY_MAX_CONCURRENT",
+		"CC_MAX_INFLIGHT",
+		"MAX_CONCURRENT_REQUESTS",
+		"COMMANDCODE_MAX_CONCURRENT",
+	} {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				if n <= 0 {
+					return 0
+				}
+				return n
+			}
+		}
+	}
+	// 4. CLI flag.
+	if s.maxConcurrent > 0 {
+		return s.maxConcurrent
+	}
+	if s.maxConcurrent < 0 {
+		return 0
+	}
+	// 5. Default.
+	return DefaultCommandCodeProxyMaxConcurrent
+}
+
+func (s *CommandCodeShim) configPrefs() *Preferences {
+	cfg := s.gateway.config.Load()
+	return cfg.Preferences
+}
+
+// ensureSemaphore lazily builds the semaphore from the effective cap.
+func (s *CommandCodeShim) ensureSemaphore() (chan struct{}, bool) {
+	s.concurrencyMu.Lock()
+	defer s.concurrencyMu.Unlock()
+	if s.semaphore != nil {
+		return s.semaphore, true
+	}
+	cap := s.effectiveCap()
+	if cap <= 0 {
+		return nil, false
+	}
+	s.semaphore = make(chan struct{}, cap)
+	return s.semaphore, true
+}
+
+// acquire blocks until a concurrency slot is available or the request
+// context is cancelled. It returns a release function that MUST be called
+// exactly once (defer is the idiomatic way). On context cancellation the
+// request is rejected with 503 rather than queued forever.
+func (s *CommandCodeShim) acquire(ctx context.Context) (func(), bool) {
+	sem, ok := s.ensureSemaphore()
+	if !ok || sem == nil {
+		return func() {}, true
+	}
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
+	case <-ctx.Done():
+		return nil, false
+	}
 }
 
 // Enabled reports whether there is anything to serve. It is false when the
@@ -96,10 +258,6 @@ func (s *CommandCodeShim) Handler() http.Handler {
 	mux.HandleFunc("/health", s.HandleHealth)
 	return mux
 }
-
-// endpoints resolves the live provider list into this request's candidate
-// endpoints. The requested model is used verbatim: the shim's contract is that
-// the caller names the Command Code model it wants.
 func (s *CommandCodeShim) endpoints(model, sessionID string) []ModelEndpoint {
 	cfg := s.gateway.config.Load()
 	eps := make([]ModelEndpoint, 0, len(s.providerNames))
@@ -159,7 +317,17 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	// Limit concurrent requests to the configured cap. If the cap is
+	// exhausted, queue the request until a slot frees; when the context is
+	// cancelled first (client disconnect or timeout), return 503.
+	release, ok := s.acquire(r.Context())
+	if !ok {
+		writeAPIError(w, 503, "Command Code proxy is busy; please retry", "server_error", "server_busy")
+		return
+	}
+	defer release()
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxLargeRequestBytes)
 	body, err := readRequestBody(r)
 	if err != nil {
 		writeAPIError(w, 400, "Failed to read request body", "invalid_request_error", "bad_request")
@@ -174,6 +342,10 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 	}
 	if err := json.Unmarshal(body, &head); err != nil {
 		writeAPIError(w, 400, "Invalid JSON", "invalid_request_error", "bad_json")
+		return
+	}
+	if len(body) > requestBytesForModel(strings.TrimSpace(head.Model)) {
+		writeAPIError(w, 413, "Request body too large", "invalid_request_error", "request_too_large")
 		return
 	}
 	model := strings.TrimSpace(head.Model)
@@ -280,10 +452,16 @@ func (s *CommandCodeShim) complete(w http.ResponseWriter, r *http.Request, body 
 			s.penalize(&ep, err, 0, sessionID)
 			continue
 		}
-		respBody, readErr := io.ReadAll(resp.Body)
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
 		resp.Body.Close()
 		cancel()
 		if readErr != nil {
+			lastErr = readErr
+			s.penalize(&ep, readErr, 0, sessionID)
+			continue
+		}
+		if len(respBody) > maxUpstreamBodyBytes {
+			readErr = fmt.Errorf("upstream response body exceeds %d bytes", maxUpstreamBodyBytes)
 			lastErr = readErr
 			s.penalize(&ep, readErr, 0, sessionID)
 			continue

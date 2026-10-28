@@ -201,10 +201,10 @@ const (
 	maxSessionEntries = 5000
 	// Common aliases so a test (or a future caller) using any reasonable
 	// name for the cap resolves to the same value.
-	maxSessions = maxSessionEntries
-	sessionCap = maxSessionEntries
-	sessionsCap = maxSessionEntries
-	sessionMapCap = maxSessionEntries
+	maxSessions     = maxSessionEntries
+	sessionCap      = maxSessionEntries
+	sessionsCap     = maxSessionEntries
+	sessionMapCap   = maxSessionEntries
 	maxSessionCount = maxSessionEntries
 	// cooldownSaveInterval is how long to wait before flushing cooldown state
 	// to disk after a change. A burst of failures coalesces into a single

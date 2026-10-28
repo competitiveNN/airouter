@@ -473,9 +473,6 @@ func (g *GatewayContext) checkAuth(r *http.Request) bool {
 	//
 	// Both spellings are accepted because both are common in the wild;
 	// `api_key` is the one the dashboard page documents.
-	if q := r.URL.Query(); q.Has("api_key") {
-		return apiKeysEqual(g.gatewayAPIKey, q.Get("api_key"))
-	}
 	return false
 }
 

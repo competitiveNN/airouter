@@ -97,15 +97,15 @@ echo "[sync] config.yaml updated successfully"
 # update first-seen-cache.json when a new model appears or a month passes
 # without a listing. Only tracked files are committed; config.yaml and
 # cooldowns.json stay out of the tree by design.
-if git -C "$PROJECT_DIR" diff --quiet -- first-seen-cache.json; then
+if git -C "$PROJECT_DIR" diff --quiet -- first-seen-cache.json blacklisted-models.json; then
     echo "[sync] first-seen-cache.json unchanged, nothing to commit"
 else
-    echo "[sync] committing updated first-seen-cache.json..."
+    echo "[sync] committing updated caches..."
     # Identify ourselves for the commit (systemd units have no user context).
     git -C "$PROJECT_DIR" config user.name "${SYNC_GIT_USER:-airouter-sync}"
     git -C "$PROJECT_DIR" config user.email "${SYNC_GIT_EMAIL:-airouter-sync@localhost}"
-    git -C "$PROJECT_DIR" add first-seen-cache.json
-    git -C "$PROJECT_DIR" commit -m "sync: update first-seen cache from $(date +%F)" >/dev/null
+    git -C "$PROJECT_DIR" add first-seen-cache.json blacklisted-models.json
+    git -C "$PROJECT_DIR" commit -m "sync: update cache state from $(date +%F)" >/dev/null
     echo "[sync] pushing commit..."
     # Refresh the remote-tracking ref so --force-with-lease has a baseline to
     # compare against. This repo has a single operator (the sync service), so

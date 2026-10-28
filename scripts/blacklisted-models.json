@@ -1,0 +1,46 @@
+{
+  "entries": {
+    "gemini:gemma-4-2b-it": {
+      "date": "2026-10-28",
+      "model_id": "gemma-4-2b-it",
+      "provider": "gemini",
+      "reason": "not found (older than 2 weeks)"
+    },
+    "nvidia2:moonshotai/kimi-k2.6": {
+      "date": "2026-10-28",
+      "model_id": "moonshotai/kimi-k2.6",
+      "provider": "nvidia2",
+      "reason": "not found (older than 2 weeks)"
+    },
+    "nvidia2:nvidia/nemotron-3-super-120b-a12b": {
+      "date": "2026-10-28",
+      "model_id": "nvidia/nemotron-3-super-120b-a12b",
+      "provider": "nvidia2",
+      "reason": "not found (older than 2 weeks)"
+    },
+    "nvidia3:moonshotai/kimi-k2.6": {
+      "date": "2026-10-28",
+      "model_id": "moonshotai/kimi-k2.6",
+      "provider": "nvidia3",
+      "reason": "not found (older than 2 weeks)"
+    },
+    "nvidia3:nvidia/nemotron-3-super-120b-a12b": {
+      "date": "2026-10-28",
+      "model_id": "nvidia/nemotron-3-super-120b-a12b",
+      "provider": "nvidia3",
+      "reason": "not found (older than 2 weeks)"
+    },
+    "nvidia:moonshotai/kimi-k2.6": {
+      "date": "2026-10-28",
+      "model_id": "moonshotai/kimi-k2.6",
+      "provider": "nvidia",
+      "reason": "not found (older than 2 weeks)"
+    },
+    "nvidia:nvidia/nemotron-3-super-120b-a12b": {
+      "date": "2026-10-28",
+      "model_id": "nvidia/nemotron-3-super-120b-a12b",
+      "provider": "nvidia",
+      "reason": "not found (older than 2 weeks)"
+    }
+  }
+}
