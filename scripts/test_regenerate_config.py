@@ -30,14 +30,10 @@ GENERATOR = REPO / "regenerate_config.py"
 
 
 def _load_generator():
-    sys.path.insert(0, str(REPO))  # regenerate_config imports model_blacklist
-    try:
-        spec = importlib.util.spec_from_file_location("regenerate_config", GENERATOR)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.path.remove(str(REPO))
+    spec = importlib.util.spec_from_file_location("regenerate_config", GENERATOR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 gen = _load_generator()
@@ -726,14 +722,10 @@ def test_repeated_runs_with_identical_verdicts_are_byte_identical(tmp_path):
 
 
 def _load_checker():
-    sys.path.insert(0, str(REPO))
-    try:
-        spec = importlib.util.spec_from_file_location("check_rules", REPO / "scripts" / "check-rules.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.path.remove(str(REPO))
+    spec = importlib.util.spec_from_file_location("check_rules", REPO / "scripts" / "check-rules.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 cr = _load_checker()

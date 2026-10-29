@@ -776,7 +776,7 @@ def test_checker_passes_the_real_config_through_its_own_cli(tmp_path):
     text = (REPO / "config.yaml").read_text()
     result = _check_cli(REPO / "config.yaml", _model_list_from_config(text, tmp_path))
     assert result.returncode == 0, result.stdout
-    assert "OK: rules 3-14 hold" in result.stdout
+    assert "OK: rules 3-13 hold" in result.stdout
 
     real = Path("/tmp/free-models.json")
     if real.exists():
