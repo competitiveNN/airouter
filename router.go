@@ -1603,7 +1603,17 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 
 // ApplyCooldownWithDuration records a failure for an endpoint with a
 // caller-specified cooldown duration (used by tests to avoid sleeping
-// for hours). Otherwise identical to ApplyCooldownForSession.
+// for hours). It is otherwise identical to ApplyCooldownForSession, except
+// that it does NOT advance the circuit breaker: this method exists solely to
+// pin an endpoint's cooldown expiry to a test-controlled duration, and the
+// circuit escalation ladder would recompute the expiry from the failure
+// count and overwrite the caller's duration. Measured live 2026-10-30: with
+// recordCircuitFailureLocked left in place, a 4th consecutive failure on the
+// same endpoint escalated to the 30s×2^4 = 8m curve and parked the endpoint
+// for the remainder of the test, so the test-cooldown override was never
+// effective. Circuit state is not the subject of any test that uses this
+// method; production paths call applyCooldown/ApplyCooldownForSession
+// directly and still escalate normally.
 func (r *Router) ApplyCooldownWithDuration(ep *ModelEndpoint, statusCode int, errMsg string, sessionID string, duration time.Duration) {
 	r.mu.Lock()
 	key := ep.Key()
@@ -1622,7 +1632,6 @@ func (r *Router) ApplyCooldownWithDuration(ep *ModelEndpoint, statusCode int, er
 	if isVisionUnsupported(errMsg) {
 		r.noVision[key] = true
 	}
-	r.recordCircuitFailureLocked(ep, statusCode, &cd)
 	r.mu.Unlock()
 }
 
@@ -1635,6 +1644,17 @@ func truncateErr(msg string, maxLen int) string {
 		return msg
 	}
 	return string(runes[:maxLen]) + "..."
+}
+
+// errString converts a fallback's error + body into a single string suitable
+// for the [fallback] log line and for classification. Prefers the error's text
+// (which carries the type of failure) and falls back to the body for the
+// status-code path, which arrives with a nil error.
+func errString(err error, body string) string {
+	if err != nil {
+		return err.Error()
+	}
+	return body
 }
 
 // summarizeError reduces a provider error body to a single short line for logs
@@ -2288,6 +2308,19 @@ func (r *Router) MarkNoVision(ep *ModelEndpoint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.noVision[ep.Key()] = true
+}
+
+// ResetAllCooldowns clears every cooldown and circuit-breaker entry. It is a
+// test-only escape hatch: tests that drive a fixed fault sequence need each
+// pass to start from a clean slate, because a leftover cooldown from the
+// previous pass would park the chaos endpoint and the next pass would never
+// exercise its fault type. Production code must not call this; it would erase
+// real backoff state.
+func (r *Router) ResetAllCooldowns() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cooldowns = make(map[string]CooldownEntry)
+	r.circuits = make(map[string]*CircuitBreaker)
 }
 
 // visionEligible reports whether ep can serve a request that requires vision.

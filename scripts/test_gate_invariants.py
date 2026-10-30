@@ -833,6 +833,7 @@ BATCH_ALLOWLIST = {
     "dist-freshness-check",
     "config rules check",
     "test-suite-check",
+    "chaos-load-stability",
 }
 
 # The stages that WRITE into the working tree, and so must run alone. Listed

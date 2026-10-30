@@ -142,7 +142,7 @@ function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.class
 function renderWindowSel(){
   const s=document.getElementById('wsel');
   s.innerHTML='';
-  for(const w of ['1d','7d','30d']){
+  for(const w of ['1d','7d']){
     const b=el('button', 'wsel'+(w===activeWindow?' on':''), w);
     b.onclick=()=>{ activeWindow=w; refresh(); };
     s.appendChild(b);

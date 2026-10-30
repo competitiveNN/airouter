@@ -467,7 +467,11 @@ fmt_ok "gofmt -l . is clean"  gofmt -l .
 # timing and a suite that only ever runs one way has not been run both ways.
 run "go test -count=1"       go test -count=1 ./...
 run "go test -race -count=1" go test -race -count=1 ./...
-
+# Chaotic load tests are timing sensitive — the stall and mid-stream-reset
+# paths rely on per-attempt timeouts that can race with the scheduler under
+# heavy load. Run them five times so a per-run timing-dependent flake is
+# surfaced rather than being smoothed over by a single green pass.
+run "chaos-load-stability"  go test -run 'TestE2EChaotic' -count=5 -timeout=600s ./...
 # ------------------------------------------------------------ self-tests ----
 run "fuzz-gate-selftest"         bash "$REPO/scripts/fuzz-gate-selftest.sh"
 run "dist-freshness-selftest"    bash "$REPO/scripts/dist-freshness-selftest.sh"

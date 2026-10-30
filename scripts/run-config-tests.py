@@ -39,6 +39,10 @@ SUITES = [
     # graded by the gate (here) and counted by the dropped-test guard in
     # mutation-check.py, but not run inside its sweep.
     "scripts/test_gate_invariants.py",
+    # Go-side E2E tests for the failover/hardening paths. These are graded by
+    # the mutation harness (scripts/mutation-check.py) as a Go suite, so they
+    # are counted by the dropped-test guard and run inside the sweep.
+    "scripts/test_go_failover.py",
 ]
 
 # A floor, not an exact count: it should fail only when a suite stops being

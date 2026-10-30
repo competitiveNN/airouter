@@ -927,10 +927,18 @@ func TestDashboardPageRendersPercentiles(t *testing.T) {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"p50", "p95", "p99", "30d"} {
+	// The page advertises exactly the windows the ring can actually serve:
+	// 1d and 7d. The 30d button was removed when retention dropped to 7d
+	// (afc50dc, memory-ceiling audit) — a window the ring cannot hold would
+	// silently return 7d of data and mislead an operator, so it is gone
+	// rather than left as a button that lies.
+	for _, want := range []string{"p50", "p95", "p99", "7d"} {
 		if !contains(body, want) {
-			t.Errorf("dashboard page missing %q — the latency percentile columns or the 30d window selector is gone", want)
+			t.Errorf("dashboard page missing %q — the latency percentile columns or the window selector is gone", want)
 		}
+	}
+	if contains(body, "30d") {
+		t.Error("dashboard page still offers a 30d button the 7d retention ring cannot serve")
 	}
 }
 
@@ -997,12 +1005,13 @@ func TestDashboardPageReadsTheFieldsThePayloadEmits(t *testing.T) {
 	}
 }
 
-// TestDashboardRingLenCovers30d is the memory-bound guarantee for the
-// extended ring: it must hold 43201 slots (30d + 1 spare), not the old
-// 10081 (7d + 1). A ring shorter than its longest window would silently
-// double-count the newest tick in every 30d query.
-func TestDashboardRingLenCovers30d(t *testing.T) {
-	if dashboardRingLen != 30*24*60+1 {
-		t.Fatalf("dashboardRingLen = %d, want %d (30d + 1 spare)", dashboardRingLen, 30*24*60+1)
+// TestDashboardRingLenCovers7d is the memory-bound guarantee for the
+// retained ring: it must hold 10081 slots (7d + 1 spare), matching the
+// retention chosen in afc50dc (memory-ceiling audit). A ring shorter than
+// the longest retained window would silently double-count the newest tick
+// in every 7d query.
+func TestDashboardRingLenCovers7d(t *testing.T) {
+	if dashboardRingLen != 7*24*60+1 {
+		t.Fatalf("dashboardRingLen = %d, want %d (7d + 1 spare)", dashboardRingLen, 7*24*60+1)
 	}
 }

@@ -32,8 +32,8 @@ const (
 const dashboardTickSeconds = 60
 
 // dashboardRingLen is the number of ticks held, which must cover the longest
-// window (30d = 43200 minutes) plus one to keep the current tick distinct from
-// the oldest. It is a fixed allocation: memory is bounded by
+// retained window (7d = 10080 minutes) plus one to keep the current tick
+// distinct from the oldest. It is a fixed allocation: memory is bounded by
 // dashboardRingLen * labelsCap regardless of how long the process lives, which
 // is the property the label cap exists to guarantee for the other maps.
 const dashboardRingLen = 10080 + 1 // 7-day retention (was 30d)
@@ -64,9 +64,13 @@ type Metrics struct {
 	// routing pressure from invisible-to-the-client routing pressure.
 	midstreamFallbacksTotal      atomic.Int64
 	midstreamFallbacksByEndpoint map[labelKey]*atomic.Int64
-	cooldownsApplied             atomic.Int64
-	latencySumNS                 atomic.Int64
-	latencyCount                 atomic.Int64
+	// fallbacksByReason categorizes each fallback by why the chain advanced.
+	// Operators use this to answer "which endpoints are failing and WHY"
+	// without log grepping. Bounded like the other single-label maps.
+	fallbacksByReason map[labelKey]*atomic.Int64
+	cooldownsApplied  atomic.Int64
+	latencySumNS      atomic.Int64
+	latencyCount      atomic.Int64
 	// latencyBuckets[i] is the count of requests whose latency fell at or
 	// below the boundary defined by latencyBoundaries[i]. The last bucket
 	// (+Inf) catches everything above the largest finite boundary.
@@ -185,6 +189,7 @@ const (
 	labelNameModel    labelKey = "model"
 	labelNameStatus   labelKey = "status"
 	labelNameEndpoint labelKey = "endpoint"
+	labelNameReason   labelKey = "reason"
 )
 
 // overflowLabelKey is overflowLabelValue in the form a labelKey map stores: a
@@ -240,6 +245,7 @@ func NewMetrics() *Metrics {
 		failuresByStatus:             make(map[labelKey]*atomic.Int64),
 		fallbacksByFromEndpoint:      make(map[labelKey]*atomic.Int64),
 		midstreamFallbacksByEndpoint: make(map[labelKey]*atomic.Int64),
+		fallbacksByReason:            make(map[labelKey]*atomic.Int64),
 		circuitTransitions:           make(map[labelKey]*atomic.Int64),
 		attemptsByEndpoint:           make(map[labelKey]*atomic.Int64),
 		attemptFailuresByEnd:         make(map[labelKey]*atomic.Int64),
@@ -368,13 +374,19 @@ func (m *Metrics) Request(model string, status int, latency time.Duration) {
 	m.latencyBuckets[len(m.latencyBuckets)-1].Add(1) // +Inf
 }
 
-// Fallback records a model fallback during request processing. The from
-// endpoint is the model that failed and triggered the fail-over; it is
-// used to expose per-endpoint fallback counts so operators can identify
-// the weakest link in a chain.
-func (m *Metrics) Fallback(fromEndpoint string) {
+// FallbackWithReason is Fallback with a classification of why the chain
+// advanced past the endpoint. It increments the reason-bounded series
+// alongside the existing total and per-endpoint counters.
+func (m *Metrics) FallbackWithReason(fromEndpoint string, reason FailoverReason) {
 	m.fallbacksTotal.Add(1)
 	m.counterFallbackFrom(singleLabelKey("endpoint", fromEndpoint)).Add(1)
+	m.recordReasonCounter(reason)
+}
+
+// Fallback is kept for legacy callers; it just records under FailoverUnknown.
+// (Kept so existing tests don't break.)
+func (m *Metrics) Fallback(fromEndpoint string) {
+	m.FallbackWithReason(fromEndpoint, FailoverUnknown)
 }
 
 // counterFallbackFrom returns the atomic counter for the given endpoint,
@@ -390,11 +402,40 @@ func (m *Metrics) counterFallbackFrom(key labelKey) *atomic.Int64 {
 // perceptible to the client as a stream seam, so counting them separately lets
 // operators identify endpoints that fail in a way the user can feel.
 func (m *Metrics) MidStreamFailover(fromEndpoint string) {
+	m.MidStreamFailoverWithReason(fromEndpoint, FailoverUnknown)
+}
+
+// MidStreamFailoverWithReason records a mid-stream failover with the reason
+// the chain advanced past the endpoint.
+func (m *Metrics) MidStreamFailoverWithReason(fromEndpoint string, reason FailoverReason) {
 	m.midstreamFallbacksTotal.Add(1)
 	if fromEndpoint == "" {
+		// still record the reason so reason series stay in sync
+		m.recordReasonCounter(reason)
 		return
 	}
 	m.counterMidStreamFallbackFrom(singleLabelKey("endpoint", fromEndpoint)).Add(1)
+	m.recordReasonCounter(reason)
+}
+
+// recordReasonCounter increments the bounded fallbacksByReason map for the
+// given reason. Used by both the pre-output and mid-stream fallback paths.
+func (m *Metrics) recordReasonCounter(reason FailoverReason) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := singleLabelKey("reason", string(reason))
+	if key == `reason=""` {
+		key = singleLabelKey("reason", string(FailoverUnknown))
+	}
+	if _, ok := m.fallbacksByReason[key]; !ok {
+		if len(m.fallbacksByReason) >= m.labelsCap-1 {
+			key = overflowKeyFor(labelNameReason)
+		}
+		if _, ok := m.fallbacksByReason[key]; !ok {
+			m.fallbacksByReason[key] = &atomic.Int64{}
+		}
+	}
+	m.fallbacksByReason[key].Add(1)
 }
 
 // counterMidStreamFallbackFrom returns the atomic counter for the given
@@ -1056,20 +1097,29 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "airouter_transport_drops_total %d\n", m.transportDropsTotal.Load())
 
 	// -- Mid-stream fallback visibility ----------------------------------
-	// Mid-stream failovers (those that started after content reached the
-	// client) are split out because they are perceptible to the client as a
-	// stream seam, unlike pre-output fallbacks. The total routing pressure is
-	// still captured in airrouter_fallbacks_total; this series isolates the
-	// user-visible subset.
-	fmt.Fprintln(w, "# HELP airrouter_midstream_fallbacks_total Number of mid-stream (post-content) model failovers")
-	fmt.Fprintln(w, "# TYPE airrouter_midstream_fallbacks_total counter")
+	fmt.Fprintln(w, "# HELP airouter_midstream_fallbacks_total Number of mid-stream (post-content) model failovers")
+	fmt.Fprintln(w, "# TYPE airouter_midstream_fallbacks_total counter")
 	fmt.Fprintf(w, "airouter_midstream_fallbacks_total %d\n", m.midstreamFallbacksTotal.Load())
 
-	fmt.Fprintln(w, "# HELP airrouter_midstream_fallbacks_total_by_endpoint Number of mid-stream failovers triggered by each endpoint")
-	fmt.Fprintln(w, "# TYPE airrouter_midstream_fallbacks_total_by_endpoint counter")
+	fmt.Fprintln(w, "# HELP airouter_midstream_fallbacks_total_by_endpoint Number of mid-stream failovers triggered by each endpoint")
+	fmt.Fprintln(w, "# TYPE airouter_midstream_fallbacks_total_by_endpoint counter")
 	m.mu.RLock()
 	for k, c := range m.midstreamFallbacksByEndpoint {
 		writeSample(w, "airrouter_midstream_fallbacks_total_by_endpoint", k, c.Load())
+	}
+	m.mu.RUnlock()
+
+	// Failover reason breakdown: why the chain advanced past an endpoint.
+	// This is the dimension the endpoint series cannot answer -- an operator
+	// can see WHICH upstream failed from the endpoint series, but not WHY
+	// (transport vs timeout vs 429 vs protocol refusal). The reason set is
+	// closed (the FailoverReason constants), so this series is
+	// fixed-cardinality by construction.
+	fmt.Fprintln(w, "# HELP airouter_failovers_total_by_reason Number of model fallbacks by the reason the chain advanced")
+	fmt.Fprintln(w, "# TYPE airouter_failovers_total_by_reason counter")
+	m.mu.RLock()
+	for k, c := range m.fallbacksByReason {
+		writeSample(w, "airouter_failovers_total_by_reason", k, c.Load())
 	}
 	m.mu.RUnlock()
 	// -- end mid-stream ---------------------------------------------------
