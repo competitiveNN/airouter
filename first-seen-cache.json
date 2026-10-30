@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-10-28T05:11:19.004627Z",
+  "fetched_at": "2026-10-30T05:02:20.726738Z",
   "first_seen": {
     "beam": "2026-10-27",
     "beam-free": "2026-10-16",
@@ -40,6 +40,7 @@
     "fledge-alpha-free": "2026-10-08",
     "inclusionai/ling-3.1-flash": "2026-10-14",
     "inclusionai/ling-3.1-flash:free": "2026-10-15",
+    "jev-1.13-free": "2026-10-30",
     "ling-3.1-flash-free": "2026-10-15",
     "ll-alpha-free": "2026-10-16",
     "longcat-2.5-preview-free": "2026-10-22",
