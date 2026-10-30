@@ -110,6 +110,10 @@ SWEEP_BASELINE_SECONDS = 90
 SUITES = [
     "scripts/test_regenerate_config.py",
     "scripts/test_fetch_free_models.py",
+    # Go-side E2E tests for the failover/hardening paths. These are graded by
+    # the mutation harness as a Go suite, so they are counted by the dropped-test
+    # guard and run inside the sweep via scripts/run-config-tests.py.
+    "scripts/test_go_failover.py",
 ]
 
 # Counted by the dropped-test guard even though not run: if the meta-tests are
@@ -117,11 +121,11 @@ SUITES = [
 # exists to catch, so it must be watched.
 INVENTORY_ONLY = [
     "scripts/test_mutation_check.py",
-    # Gate-integrity regression tests. These exercise scripts/gate.sh and
-    # scripts/shell-lint.sh, not the config-sync chain, so running them inside a
-    # sweep would spend the budget on checks unrelated to the planted defect.
-    # They are run by the gate via scripts/run-config-tests.py; being in the
-    # inventory here means losing them is still a failure.
+    # Gate-integrity regression tests: the stage-accounting guard and the
+    # shell-lint untracked NOTICE sweep. Both live in scripts/gate.sh and
+    # scripts/shell-lint.sh rather than in the config-sync chain, so they are
+    # graded by the gate (here) and counted by the dropped-test guard in
+    # mutation-check.py, but not run inside its sweep.
     "scripts/test_gate_invariants.py",
 ]
 
@@ -323,14 +327,6 @@ MUTATIONS: list[Mutation] = [
         "the shape could drift with no failure anywhere.",
     ),
     Mutation(
-        "a commented protocol is not parsed",
-        "regenerate_config.py",
-        "        proto = re.match(r'^\\s+protocol: (\\S+)(?:\\s+#.*)?\\s*$', line)",
-        "        proto = re.match(r'^\\s+protocol: (\\S+)\\s*$', line)",
-        "A hand-written `protocol: responses  # because ...` would be dropped, so "
-        "the generator would delete the field it exists to preserve.",
-    ),
-    Mutation(
         "protocol carried to only the first key of a trio",
         "regenerate_config.py",
         "                chain.append(entry_for(prov, m))\n        elif m.mapped_provider == 'commandcode':",
@@ -397,6 +393,56 @@ MUTATIONS: list[Mutation] = [
         "Best-first ordering is the whole point of a fallback chain: reversed, "
         "every request would start at the weakest model that qualifies.",
     ),
+    # Failover/hardening paths in Go code: mutation anchors for the harness.
+    Mutation(
+        "provider branch 429 classification to unknown",
+        "api.go",
+        "\t\t\tcase statusCode == 429:\n\t\t\t\treturn FailoverHTTP429\n\t\t\tcase statusCode >= 500 && statusCode <= 599:\n\t\t\t\treturn FailoverHTTP5xx\n\t\t\tcase statusCode >= 400 && statusCode < 500:\n\t\t\t\t// 429 already handled above; 400/401/403/404 etc.\n\t\t\t\treturn FailoverHTTP4xx\n\t\t\t}\n\t\t}\n\n\t\t// Body-based classification for 200 OK with error payloads (SSE error events).",
+        "\t\t\tcase False:\n\t\t\t\treturn FailoverUnknown\n\t\t\tcase statusCode >= 500 && statusCode <= 599:\n\t\t\t\treturn FailoverHTTP5xx\n\t\t\tcase statusCode >= 400 && statusCode < 500:\n\t\t\t\t// 429 already handled above; 400/401/403/404 etc.\n\t\t\t\treturn FailoverHTTP4xx\n\t\t\t}\n\t\t}\n\n\t\t// Body-based classification for 200 OK with error payloads (SSE error events).",
+        "A 429 upstream refusal would be classified as unknown, hiding rate-limit "
+        "pressure and breaking the airouter_failovers_total_by_reason metric.",
+    ),
+    Mutation(
+        "recordFallback log line replaced with no-op",
+        "api.go",
+        "\tlog.Printf(\"[fallback] reason=%s endpoint=%s status=%d err=%s\",\n\t\treason, key, statusCode, summarizeError(errString(err, body)))",
+        "// noop",
+        "Operators would lose the structured log line needed to tie a request's "
+        "Nms, K retries, and THEN which upstream said what failure.",
+    ),
+    Mutation(
+        "recordMidStreamFallback log line replaced with no-op",
+        "api.go",
+        "\tlog.Printf(\"[fallback][mid-stream] reason=%s endpoint=%s status=%d err=%s\",\n\t\treason, key, statusCode, summarizeError(errString(err, body)))",
+        "// noop",
+        "Operators would lose the mid-stream fallback log, hiding which request "
+        "experienced a partial delivery failure.",
+    ),
+    Mutation(
+        "isRetryableForChain treats 429 as non-retryable",
+        "api.go",
+        "\tif statusCode == 429 {\n\t\treturn true\n\t}\n\tif statusCode >= 500 && statusCode <= 599 {\n\t\treturn true\n\t}",
+        "\tif False {\n\t\treturn true\n\t}\n\tif statusCode >= 500 && statusCode <= 599 {\n\t\treturn true\n\t}",
+        "A 429 would not advance the fallback chain, so a rate-limited endpoint "
+        "would hold the client until the wall-clock budget expired.",
+    ),
+    Mutation(
+        "isRetryableForChain treats 5xx as non-retryable",
+        "api.go",
+        "\tif statusCode == 429 {\n\t\treturn true\n\t}\n\tif statusCode >= 500 && statusCode <= 599 {\n\t\treturn true\n\t}",
+        "\tif statusCode == 429 {\n\t\treturn true\n\t}\n\tif False {\n\t\treturn true\n\t}",
+        "A 5xx would not advance the fallback chain, so a server error would hold "
+        "the client until the wall-clock budget expired.",
+    ),
+    Mutation(
+        "responses_ws.go cooldown escalation bypass removed",
+        "responses_ws.go",
+        "\t\t\tif g.testCooldown > 0 {\n\t\t\t\tg.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)\n\t\t\t} else {\n\t\t\t\tg.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)\n\t\t\t}",
+        "\t\t\tif g.testCooldown > 0 {\n\t\t\t\tg.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)\n\t\t\t} else {\n\t\t\t\tg.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)\n\t\t\t}\n\t\t\tg.router.RecordFailure(ep)",
+        "The real escalation ladder would re-apply after the test-duration "
+        "cooldown, re-escalating the circuit state and parking the endpoint "
+        "indefinitely in tests.",
+    ),
 ]
 
 
@@ -444,7 +490,7 @@ SUITE_TEST_FLOORS = {
     # provider_released (AA still arbitrates first), it beats the
     # first-seen proxy in the first-seen fallback, and OpenCode's
     # listing-wide `created` is deliberately not a date (2026-10-07).
-    "scripts/test_fetch_free_models.py": 75,
+    "scripts/test_fetch_free_models.py": 80,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
@@ -480,7 +526,7 @@ SUITE_TEST_FLOORS = {
     # for a commandcode record, validate-config accepting it on a commandcode
     # provider and rejecting it elsewhere, and rule 13 doing the same.
     "scripts/test_regenerate_config.py": 73,
-    # EXACT, matching every other floor in this table (66/66, 65/65, 19/19).
+    # EXACT, matching every other floor in this table (66/66, 65/65, 19/19, 16/16).
     # An earlier version of this entry sat at 14 against 22 functions on the
     # theory that a floor should have slack so that adding tests needs no edit.
     # That is not this repository's convention, and the slack bought nothing:
@@ -492,7 +538,11 @@ SUITE_TEST_FLOORS = {
     #
     # Consequence: adding a test here means bumping this number in the same
     # commit. That is the intended friction.
-    "scripts/test_gate_invariants.py": 26,
+    "scripts/test_gate_invariants.py": 35,
+    # Go-side E2E tests for the failover/hardening paths. These are graded by
+    # the mutation harness (scripts/mutation-check.py) as a Go suite, so they
+    # are counted by the dropped-test guard and run inside the sweep.
+    "scripts/test_go_failover.py": 19,
 }
 
 

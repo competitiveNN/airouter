@@ -6601,3 +6601,24 @@ func TestInjectMaxTokensDoesNotCopyTheBody(t *testing.T) {
 		t.Error("the conversation was damaged by the injection")
 	}
 }
+
+// TestMetricsFailoverReason verifies that failover-reason instrumentation emits
+// the airouter_failovers_total_by_reason series and that it distinguishes
+// recordings by reason.
+func TestMetricsFailoverReason(t *testing.T) {
+	m := NewMetrics()
+	m.FallbackWithReason("backend1/m1", FailoverHTTP5xx)
+	m.FallbackWithReason("backend2/m2", FailoverHTTP429)
+	m.FallbackWithReason("backend1/m1", FailoverHTTP5xx)
+
+	bodyStr := renderMetricsBody(m).String()
+	if !strings.Contains(bodyStr, `airouter_failovers_total_by_reason{reason="http_5xx"} 2`) {
+		t.Errorf("missing or incorrect reason=http_5xx count (got: %s)", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `airouter_failovers_total_by_reason{reason="http_429"} 1`) {
+		t.Errorf("missing or incorrect reason=http_429 count (got: %s)", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "airouter_fallbacks_total") {
+		t.Errorf("missing airouter_fallbacks_total")
+	}
+}

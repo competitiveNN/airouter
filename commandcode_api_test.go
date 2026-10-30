@@ -473,3 +473,79 @@ func TestCommandCodeShimSessionAffinityIsStable(t *testing.T) {
 		t.Fatalf("endpoints = %v, want each provider once", first)
 	}
 }
+
+// TestCommandCodeShimStreamTerminatesOnMidStreamFailure pins the contract that
+// makes the client's stream well-formed even when the upstream dies after
+// partial output. The shim's stream() path used to return from that branch
+// with nothing to terminate the response: the client received the partial
+// chunks it had flushed and then a truncated stream — no [DONE], no EOF, no
+// error — and its parser hung waiting for the next event.
+//
+// The fix is a deferred sendDone() that emits [DONE] on every exit path, and
+// a doneSent flag so the success path (StreamToClient already wrote [DONE])
+// does not emit a second sentinel.
+func TestCommandCodeShimStreamTerminatesOnMidStreamFailure(t *testing.T) {
+	// First provider writes a partial chunk then drops the connection.
+	first := &ccShimUpstream{respond: func(w http.ResponseWriter, r *http.Request, gen int) {
+		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(`{"type":"start"}
+{"type":"text-delta","text":"Hello"}`))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		// Abrupt close: no finish event, no [DONE].
+		h, ok := w.(http.Hijacker)
+		if ok {
+			c, _, _ := h.Hijack()
+			c.Close()
+		}
+	}}
+	// Second provider answers cleanly; the shim must not reach it once
+	// bytes are on the wire (the client owns the stream), but the response
+	// must still terminate.
+	second := &ccShimUpstream{respond: func(w http.ResponseWriter, r *http.Request, gen int) {
+		_, _ = w.Write([]byte(ccShimNDJSON))
+	}}
+	shim, srv := ccShimGateway(t, map[string]*ccShimUpstream{
+		"commandcode":  first,
+		"commandcode2": second,
+	}, map[string][]ModelEndpoint{
+		"smart": {
+			{Provider: "commandcode", Model: "cc/one"},
+			{Provider: "commandcode2", Model: "cc/two"},
+		},
+	})
+	_ = shim
+
+	body := `{"model":"cc/one","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	// Session affinity picks the starting key, so find a conversation that
+	// starts on the first provider: otherwise the healthy second key
+	// answers first and the mid-stream failure this test is about never
+	// happens.
+	for i := 1; i <= 512; i++ {
+		candidate := fmt.Sprintf(`{"model":"cc/one","stream":true,"messages":[{"role":"user","content":"hi %d"}]}`, i)
+		if shim.endpoints("cc/one", bodySessionID([]byte(candidate)))[0].Provider == "commandcode" {
+			body = candidate
+			break
+		}
+	}
+	resp := ccShimPost(t, srv, "/v1/chat/completions", body, true)
+	out, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, out)
+	}
+	if !strings.Contains(string(out), `"content":"Hello"`) {
+		t.Fatalf("expected the partial content the client already received, got:\n%s", out)
+	}
+	if !strings.Contains(string(out), "data: [DONE]") {
+		t.Fatalf("client stream was not terminated with [DONE]:\n%s", out)
+	}
+	// The second provider must not have been contacted: once bytes are on
+	// the wire the stream belongs to the client and a restart would
+	// duplicate output.
+	if second.sawGenerate() {
+		t.Error("second provider was contacted after the first flushed partial output; the client's stream must not be restarted")
+	}
+}

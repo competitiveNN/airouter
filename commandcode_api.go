@@ -391,6 +391,29 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 		return
 	}
 
+	// doneSent tracks whether [DONE] has already been written. Every exit
+	// path below must terminate the stream before returning: a client that
+	// never sees [DONE] or a clean EOF hangs waiting for the next chunk, and
+	// a 502 written into an already-started response corrupts the body.
+	//
+	// This is the difference between this path and the gateway's own
+	// handleStream, which has a deferred sendDone(): here the loop is over
+	// PROVIDERS, not a fallback walk with replayed context, so a failure
+	// after partial output is final — the bytes are on the wire and the
+	// client owns the stream. The old code returned from that branch with
+	// nothing to terminate the response, so a client of a provider that
+	// died mid-chunk saw a truncated stream with no [DONE] and no error.
+	doneSent := false
+	sendDone := func() {
+		if doneSent {
+			return
+		}
+		doneSent = true
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
+	defer sendDone()
+
 	var lastErr error
 	for i := range eps {
 		ep := eps[i]
@@ -403,6 +426,9 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 			StreamAttemptOptions{MaxIdleTimeout: timeout},
 		)
 		if err == nil {
+			// StreamToClient emits [DONE] on success; mark as sent so the
+			// deferred sendDone() below does not emit a duplicate.
+			doneSent = true
 			s.gateway.router.RecordSuccess(&ep)
 			s.gateway.recordAttempt(&ep, time.Since(attemptStart), true)
 			return
@@ -411,6 +437,8 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 		lastErr = err
 		if partial != "" {
 			// Bytes are already on the wire; the client owns this stream.
+			// Terminate it cleanly (deferred sendDone) rather than leaving
+			// the client hanging on a truncated stream.
 			log.Printf("[commandcode] session=%s model=%s provider=%s: stream failed after %d bytes: %v",
 				sessionID, model, ep.Provider, len(partial), err)
 			return

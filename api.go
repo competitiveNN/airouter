@@ -40,6 +40,25 @@ const maxUpstreamErrorBytes = 1 << 20 // 1 MiB
 // real completion while bounding per-request memory.
 const maxUpstreamBodyBytes = 8 << 20 // 8 MiB
 
+// FailoverReason categorizes why a fallback chain advanced past an endpoint.
+// It is recorded alongside the endpoint so operators can answer
+// "which endpoints are failing and WHY" without log grepping.
+type FailoverReason string
+
+const (
+	FailoverTransport   FailoverReason = "transport"    // dial/TLS/timeout/EOF before any HTTP response
+	FailoverHTTP5xx     FailoverReason = "http_5xx"     // upstream returned 5xx
+	FailoverHTTP429     FailoverReason = "http_429"     // upstream returned 429 (rate limit)
+	FailoverHTTP4xx     FailoverReason = "http_4xx"     // upstream returned other 4xx (400/401/403/404)
+	FailoverProtocol    FailoverReason = "protocol"     // upstream refused this wire shape (ModelProtocolUnsupported)
+	FailoverQuota       FailoverReason = "quota"        // upstream quota refusal (not rate limit)
+	FailoverTruncation  FailoverReason = "truncation"   // upstream body exceeded maxUpstreamBodyBytes
+	FailoverParse       FailoverReason = "parse"        // 200 response but body not a valid completion
+	FailoverSSEParse    FailoverReason = "sse_parse"    // streaming: SSE event parsing failed mid-stream
+	FailoverIdleTimeout FailoverReason = "idle_timeout" // streaming: upstream stalled past idle timeout
+	FailoverUnknown     FailoverReason = "unknown"      // fallback reason not classified above
+)
+
 // requestBytesForModel picks the request-body cap for a logical model.
 func requestBytesForModel(model string) int {
 	if model == "large" {
@@ -325,6 +344,13 @@ func (g *GatewayContext) SetTestCooldown(d time.Duration) {
 	g.testCooldown = d
 }
 
+// ResetTestCooldowns clears all cooldowns and circuit state. Used by tests to
+// reset the router to a clean state so that each pass starts independent. Normal
+// code should not call this.
+func (g *GatewayContext) ResetTestCooldowns() {
+	g.router.ResetAllCooldowns()
+}
+
 // providerMaxInterruption returns the interruption ceiling for the provider
 // behind the named endpoint, read from the live config and clamped to the
 // global maxSessionInterruption.
@@ -349,29 +375,46 @@ func (g *GatewayContext) recordRequest(model string, status int, latency time.Du
 // recordFallback increments the fallback counter. The optional from
 // endpoint is the model that failed and triggered the fail-over; when
 // provided it is recorded per-endpoint so operators can identify the
-// weakest link in a chain.
-func (g *GatewayContext) recordFallback(ep ...*ModelEndpoint) {
-	if g.metrics != nil {
-		if len(ep) > 0 && ep[0] != nil {
-			g.metrics.Fallback(ep[0].Key())
-		} else {
-			g.metrics.Fallback("")
-		}
+// weakest link in a chain. The error, statusCode, and body are used to
+// classify the FailoverReason for the airouter_failovers_total_by_endpoint metric.
+//
+// A structured log line is emitted on every fallback (even when metrics are
+// nil, as in tests) so operators can tie "this request took Nms with K
+// retries" to "the upstream at step M said 429/timeout/not-found". Without
+// it, the only signal is the metric counter, which says THAT something
+// advanced but not WHICH request or WHEN in the chain.
+func (g *GatewayContext) recordFallback(ep *ModelEndpoint, err error, statusCode int, body string) {
+	reason := failoverReasonOf(err, statusCode, body)
+	key := ""
+	if ep != nil {
+		key = ep.Key()
 	}
+	// Log before the metric so a logged fallback is never dropped just because
+	// the metrics backend hasn't been wired.
+	log.Printf("[fallback] reason=%s endpoint=%s status=%d err=%s",
+		reason, key, statusCode, summarizeError(errString(err, body)))
+	if g.metrics == nil {
+		return
+	}
+	g.metrics.FallbackWithReason(key, reason)
 }
 
 // recordMidStreamFallback is the user-visible subset of recordFallback:
 // the last model died after content had already reached the client, so the
 // gateway replayed its partial output on the next model. It lets operators
 // count, independently, how often a customer-visible seam occurs.
-func (g *GatewayContext) recordMidStreamFallback(ep ...*ModelEndpoint) {
-	if g.metrics != nil {
-		if len(ep) > 0 && ep[0] != nil {
-			g.metrics.MidStreamFailover(ep[0].Key())
-		} else {
-			g.metrics.MidStreamFailover("")
-		}
+func (g *GatewayContext) recordMidStreamFallback(ep *ModelEndpoint, err error, statusCode int, body string) {
+	reason := failoverReasonOf(err, statusCode, body)
+	key := ""
+	if ep != nil {
+		key = ep.Key()
 	}
+	log.Printf("[fallback][mid-stream] reason=%s endpoint=%s status=%d err=%s",
+		reason, key, statusCode, summarizeError(errString(err, body)))
+	if g.metrics == nil {
+		return
+	}
+	g.metrics.MidStreamFailoverWithReason(key, reason)
 }
 
 // recordCooldown increments the cooldown counter. It is a no-op when
@@ -473,6 +516,9 @@ func (g *GatewayContext) checkAuth(r *http.Request) bool {
 	//
 	// Both spellings are accepted because both are common in the wild;
 	// `api_key` is the one the dashboard page documents.
+	if q := r.URL.Query(); q.Has("api_key") {
+		return apiKeysEqual(g.gatewayAPIKey, q.Get("api_key"))
+	}
 	return false
 }
 
@@ -1290,6 +1336,135 @@ func isRetryableForChain(statusCode int, body string) bool {
 	return false
 }
 
+// failoverReasonOf classifies a failed attempt into a FailoverReason.
+// It inspects the error, HTTP status code, and response body to determine
+// why the fallback chain advanced past an endpoint. This classification
+// powers the airouter_failovers_total_by_endpoint metric so operators can
+// see "which endpoints are failing and WHY" without log grepping.
+func failoverReasonOf(err error, statusCode int, body string) FailoverReason {
+	// Client disconnect is not an upstream failure.
+	if errors.Is(err, context.Canceled) {
+		return FailoverTransport
+	}
+
+	// Proxy errors: transport-layer issues with a proxy in the path.
+	var pErr *ProxyError
+	if errors.As(err, &pErr) {
+		if pErr.MidStream {
+			// Mid-stream proxy failure: the proxy died after content flowed.
+			return FailoverSSEParse
+		}
+		return FailoverTransport
+	}
+
+	// Provider errors: endpoint failures wrapped by the gateway.
+	var provErr *ProviderError
+	if errors.As(err, &provErr) {
+		// Idle timeout during streaming (no data for maxIdle window).
+		if errors.Is(err, errStreamIdle) || errors.Is(err, context.DeadlineExceeded) {
+			return FailoverIdleTimeout
+		}
+
+		// HTTP status-based classification takes precedence when available.
+		if statusCode != 0 {
+			switch {
+			case statusCode == 429:
+				return FailoverHTTP429
+			case statusCode >= 500 && statusCode <= 599:
+				return FailoverHTTP5xx
+			case statusCode >= 400 && statusCode < 500:
+				// 429 already handled above; 400/401/403/404 etc.
+				return FailoverHTTP4xx
+			}
+		}
+
+		// Body-based classification for 200 OK with error payloads (SSE error events).
+		if statusCode == 200 && len(body) > 0 {
+			if isQuotaRefusal(statusCode, body) {
+				return FailoverHTTP429
+			}
+			if isProtocolUnsupported(statusCode, body) {
+				return FailoverProtocol
+			}
+			if !isValidCompletion(body) {
+				return FailoverParse
+			}
+			// SSE error events with 200 status but error payload.
+			var sseErr *SSEError
+			if errors.As(err, &sseErr) {
+				return FailoverSSEParse
+			}
+		}
+
+		// Truncation: body exceeded maxUpstreamBodyBytes.
+		if len(body) > maxUpstreamBodyBytes {
+			return FailoverTruncation
+		}
+
+		// Transport-level errors (dial, TLS, EOF) wrapped in ProviderError.Err.
+		if provErr.Err != nil {
+			var netErr net.Error
+			if errors.As(provErr.Err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+				return FailoverTransport
+			}
+			return FailoverTransport
+		}
+
+		return FailoverUnknown
+	}
+
+	// SSE parse errors directly (not wrapped in ProviderError).
+	var sseErr *SSEError
+	if errors.As(err, &sseErr) {
+		return FailoverSSEParse
+	}
+
+	// Idle timeout not wrapped in ProviderError.
+	if errors.Is(err, errStreamIdle) {
+		return FailoverIdleTimeout
+	}
+
+	// Pure HTTP status codes without an error value.
+	if statusCode != 0 {
+		switch {
+		case statusCode == 429:
+			return FailoverHTTP429
+		case statusCode >= 500 && statusCode <= 599:
+			return FailoverHTTP5xx
+		case statusCode >= 400 && statusCode < 500:
+			return FailoverHTTP4xx
+		}
+	}
+
+	// Body-based classification for 200 OK with error payloads (SSE error events).
+	// Network-level failures that arrive bare (no ProviderError wrapper, no status
+	// code) are connection-level dropouts, not application-level refusals.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return FailoverIdleTimeout
+		}
+		return FailoverTransport
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return FailoverTransport
+	}
+
+	return FailoverUnknown
+}
+
+// isValidCompletion does a quick check if body parses as a valid completion.
+func isValidCompletion(body string) bool {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &obj); err != nil {
+		return false
+	}
+	// Minimal shape: choices array or object with id/model.
+	_, hasChoices := obj["choices"]
+	_, hasID := obj["id"]
+	return hasChoices || hasID
+}
+
 const interAttemptBackoff = 250 * time.Millisecond
 
 // interAttemptWait pauses the request's fallback walk by a small jittered
@@ -1490,6 +1665,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			r, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
 			if err != nil {
 				if errors.Is(err, ErrUpstreamSaturated) {
+					cancel()
 					writeAPIError(w, http.StatusServiceUnavailable, "Upstream saturated", "server_error", "upstream_saturated")
 					g.recordRequest(req.Model, 503, time.Since(start))
 					return
@@ -1514,25 +1690,46 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			cancel()
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			var pErr *ProxyError
-			if !errors.As(lastErr, &pErr) && isClientDisconnect(lastErr) {
-				// A ProxyError is excluded first: the reset lands on the leg
-				// between the gateway and the PROXY, so it looks exactly like a
-				// client hangup to the string match, but the client is still
-				// waiting and must be given the next model instead of a 499.
+			if !errors.As(lastErr, &pErr) && errors.Is(lastErr, context.Canceled) {
+				// The client's own request context died. That is the one error
+				// that genuinely means the client went away: the request
+				// context is cancelled by the client's http.Request when its
+				// connection closes, and nothing else in this codebase
+				// cancels it. Every other transport failure -- a proxied
+				// attempt returns a *ProxyError (excluded above), a direct
+				// attempt returns a *ProviderError wrapping the upstream's
+				// TLS reset, EOF, or refused dial -- is an UPSTREAM fault and
+				// falls through to cooldown + continue.
+				//
+				// This used to be a string match over err.Error() for
+				// "connection reset by peer", which caught the upstream's TLS
+				// reset just as often as the client's: the reset lands on the
+				// leg between the gateway and the origin, and its text is
+				// identical to a client hangup. The handler then returned 499
+				// and stopped, so the request never failed over. Measured live
+				// 2026-10-30 against a self-signed TLS backend that hijacks and
+				// closes immediately: the client saw 499 "Client disconnected"
+				// instead of the healthy fallback answer.
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
+			g.recordFallback(ep, lastErr, 0, lastErr.Error())
 			if !errors.As(lastErr, &pErr) {
 				// Only cool down the endpoint for non-proxy errors.
-				g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
+				if g.testCooldown > 0 {
+					// In test mode the caller-specified duration wins and the
+					// real escalation ladder is skipped (see
+					// ApplyCooldownWithDuration): ApplyCooldownFromErrorForSession
+					// would compute a 30s×2^n cooldown and overwrite the test
+					// duration, parking the endpoint for the rest of the run.
+					g.router.ApplyCooldownWithDuration(ep, 0, lastErr.Error(), sessionID, g.testCooldown)
+				} else {
+					g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
+				}
 			}
 			g.recordCooldown()
-			if g.testCooldown > 0 {
-				g.router.ApplyCooldownWithDuration(ep, 0, lastErr.Error(), sessionID, g.testCooldown)
-			}
 			continue
 		}
 		if resp.StatusCode != 200 {
@@ -1582,15 +1779,18 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
-			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, ParseRetryAfter(resp.Header.Get("Retry-After")))
-			g.recordCooldown()
+			g.recordFallback(ep, nil, resp.StatusCode, string(respBody))
 			if g.testCooldown > 0 {
-				// Override the cooldown for testing: force the
-				// endpoint's cooldown expiry to now+testCooldown
-				// so the handler doesn't sleep for hours.
+				// In test mode the caller-specified duration wins and the real
+				// escalation ladder is skipped (see ApplyCooldownWithDuration):
+				// ApplyCooldownForSession would compute a 30s×2^n cooldown and
+				// overwrite the test duration, parking the endpoint for the rest
+				// of the run.
 				g.router.ApplyCooldownWithDuration(ep, resp.StatusCode, string(respBody), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, ParseRetryAfter(resp.Header.Get("Retry-After")))
 			}
+			g.recordCooldown()
 			// retry_scope: 400/401/403/404 (except protocol/quota refusals)
 			// advance the chain at most once, then surface the upstream error.
 			if !isProtocolUnsupported(resp.StatusCode, string(respBody)) &&
@@ -1619,8 +1819,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if readErr != nil {
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
-			g.router.ApplyCooldownForSession(ep, 502, readErr.Error(), sessionID, 0)
+			g.recordFallback(ep, readErr, 502, readErr.Error())
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 502, readErr.Error(), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownForSession(ep, 502, readErr.Error(), sessionID, 0)
+			}
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
 			continue
@@ -1629,8 +1833,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			readErr = fmt.Errorf("upstream response body exceeds %d bytes", maxUpstreamBodyBytes)
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
-			g.router.ApplyCooldownForSession(ep, 502, readErr.Error(), sessionID, 0)
+			g.recordFallback(ep, readErr, 502, readErr.Error())
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 502, readErr.Error(), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownForSession(ep, 502, readErr.Error(), sessionID, 0)
+			}
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
 			continue
@@ -1658,7 +1866,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				if cerr != nil {
 					log.Printf("[debug] session=%s model=%s -> opencode SSE aggregation failed: %v", sessionID, req.Model, cerr)
 					tried[ep.Key()] = true
-					g.router.ApplyCooldownForSession(ep, 502, cerr.Error(), sessionID, 0)
+					if g.testCooldown > 0 {
+						g.router.ApplyCooldownWithDuration(ep, 502, cerr.Error(), sessionID, g.testCooldown)
+					} else {
+						g.router.ApplyCooldownForSession(ep, 502, cerr.Error(), sessionID, 0)
+					}
 					g.recordCooldown()
 					continue
 				}
@@ -1680,7 +1892,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			if cerr != nil {
 				log.Printf("[debug] session=%s model=%s -> responses->chat translation failed: %v", sessionID, req.Model, cerr)
 				tried[ep.Key()] = true
-				g.router.ApplyCooldownForSession(ep, 502, cerr.Error(), sessionID, 0)
+				if g.testCooldown > 0 {
+					g.router.ApplyCooldownWithDuration(ep, 502, cerr.Error(), sessionID, g.testCooldown)
+				} else {
+					g.router.ApplyCooldownForSession(ep, 502, cerr.Error(), sessionID, 0)
+				}
 				g.recordCooldown()
 				continue
 			}
@@ -1698,7 +1914,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			if cerr != nil {
 				log.Printf("[debug] session=%s model=%s -> commandcode aggregation failed: %v", sessionID, req.Model, cerr)
 				tried[ep.Key()] = true
-				g.router.ApplyCooldownFromErrorForSession(ep, cerr, sessionID)
+				if g.testCooldown > 0 {
+					g.router.ApplyCooldownWithDuration(ep, 0, cerr.Error(), sessionID, g.testCooldown)
+				} else {
+					g.router.ApplyCooldownFromErrorForSession(ep, cerr, sessionID)
+				}
 				g.recordCooldown()
 				continue
 			}
@@ -2020,7 +2240,8 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 
 		g.recordAttempt(ep, time.Since(attemptStart), false)
 		var midErr *ProxyError
-		if !errors.As(err, &midErr) && isClientDisconnect(err) {
+		var provErr *ProviderError
+		if !errors.As(err, &midErr) && !errors.As(err, &provErr) && isClientDisconnect(err) {
 			// Client went away; nothing to resume and no point cooling a model.
 			// A ProxyError is excluded first: the reset lands on the leg between
 			// the gateway and the PROXY, so it looks exactly like a client
@@ -2055,11 +2276,11 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// requests that share the same session ID.
 		tried[ep.Key()] = true
 		if strings.TrimSpace(partial) != "" || len(toolCalls) > 0 {
-			g.recordMidStreamFallback(ep)
+			g.recordMidStreamFallback(ep, err, 0, err.Error())
 			log.Printf("[debug] session=%s model=%s -> mid-stream failover from %s (replaying %d chars, %d tool calls); resuming on next model",
 				sessionID, req.Model, ep.Key(), len(partial), len(toolCalls))
 		} else {
-			g.recordFallback(ep)
+			g.recordFallback(ep, err, 0, err.Error())
 		}
 		var pErr *ProxyError
 		if !errors.As(err, &pErr) {

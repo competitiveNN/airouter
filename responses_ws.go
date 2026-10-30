@@ -238,14 +238,15 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt, attemptTimeout)
 		if err != nil {
 			tried[ep.Key()] = true
-			g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			}
 			// ApplyCooldownFromErrorForSession already advances the circuit
 			// breaker state machine; the redundant RecordFailure call would
 			// double-count this failure and trip the circuit at half the
 			// configured threshold.
-			if g.testCooldown > 0 {
-				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
-			}
 			continue
 		}
 

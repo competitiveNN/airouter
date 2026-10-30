@@ -394,7 +394,10 @@ def test_producer_and_consumer_agree_end_to_end_through_json(monkeypatch, tmp_pa
 # "You have insufficient credits to make this request. Please purchase more
 # credit[s]", while it still appeared in work, fast and large on both commandcode
 # providers. Free-ness is now decided by commandcode_probe(), and these tests pin
-# the distinction that makes that work.
+# the distinction that makes that work. The candidate filter itself is rule-based
+# (stealth/ prefix, -free / :free suffix) rather than an enumerated set, so a
+# deal that ends or renames drops out of the candidate set on the next sync
+# without anyone editing this file.
 
 
 class _Resp:
@@ -408,17 +411,21 @@ class _Resp:
         return False
 
 
-def test_commandcode_candidate_heuristic_covers_suffixes_and_seeds():
-    """Candidates come from the provider's own suffix convention plus seeds."""
+def test_commandcode_candidate_heuristic_covers_suffixes_and_stealth_prefix():
+    """Candidates come from the provider's own suffix convention and stealth/ prefix."""
     # Advertised free deals, by suffix.
     assert ff.commandcode_is_free_candidate("poolside/laguna-s-2.1-free")
     assert ff.commandcode_is_free_candidate("inclusionai/ling-3.0-flash-sante:free")
     assert ff.commandcode_is_free_candidate("inclusionai/ling-3.1-flash:free")
-    # A seed with no suffix at all: the stealth preview.
+    # The stealth/ prefix is a free-deal namespace, suffix or not: the preview
+    # used to be stealth/space-bunny-alpha and is now stealth/glyph-cluster:free.
     assert ff.commandcode_is_free_candidate("stealth/space-bunny-alpha")
-    # Paid catalog entries must not be candidates.
+    assert ff.commandcode_is_free_candidate("stealth/glyph-cluster:free")
+    # A paid catalog entry with no free signal is not a candidate, however it
+    # is spelled upstream (casing and underscores must not manufacture one).
     assert not ff.commandcode_is_free_candidate("z-ai/glm-5.3")
     assert not ff.commandcode_is_free_candidate("meituan/LongCat-2.0-foo")
+    assert not ff.commandcode_is_free_candidate("meituan/LongCat-2.0")
     assert not ff.commandcode_is_free_candidate("")
 
 
@@ -583,13 +590,19 @@ def test_fetch_commandcode_drops_paid_and_reports_inconclusive(monkeypatch):
 def test_fetch_commandcode_keeps_candidates_when_the_account_is_dry(monkeypatch):
     """A dry account must not read as every deal ending at once.
 
-    Probed live 2026-10-06: all four free candidates answered the same
+    Probed live 2026-10-06: the free candidates answered the same
     "insufficient credits" error while the deals were still live (one of
     them was serving production traffic at the time). The balance error
     is a fact about the caller, so with no candidate succeeding to prove
     the account can pay, the candidates stay in the list — unverified
     (`verified` unset, which the generator and check-rules read as
     "unknown"), never dropped and never marked dead.
+
+    meituan/LongCat-2.0 is in the catalog as the PAID spelling: its free
+    deal (meituan/longcat-2.0-free) ended and is not listed. The
+    rule-based candidate filter sees no free suffix and no stealth/
+    prefix, so it is not a candidate at all and is never probed — the
+    dry account cannot be blamed for it.
     """
     catalog = {"data": [
         {"id": "meituan/LongCat-2.0"},
@@ -608,7 +621,6 @@ def test_fetch_commandcode_keeps_candidates_when_the_account_is_dry(monkeypatch)
     assert ids == [
         "inclusionai/ling-3.0-flash-sante:free",
         "inclusionai/ling-3.1-flash:free",
-        "meituan/longcat-2.0-free",
         "poolside/laguna-s-2.1-free",
     ], ids
     assert all(m.get("verified") is None for m in out), out

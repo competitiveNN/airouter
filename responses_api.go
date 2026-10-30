@@ -235,23 +235,30 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			cancel()
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			var pErr *ProxyError
-			if !errors.As(lastErr, &pErr) && isClientDisconnect(lastErr) {
+			if !errors.As(lastErr, &pErr) && errors.Is(lastErr, context.Canceled) {
+				// Same contract as the chat-completion path: a proxied attempt
+				// returns a *ProxyError (excluded above), a direct attempt
+				// returns a *ProviderError wrapping the upstream's transport
+				// failure, and only the client's own request-context
+				// cancellation means the client went away. See the matching
+				// comment in api.go's handleCompletion.
 				writeAPIError(w, 499, "Client disconnected", "server_error", "client_disconnected")
 				g.recordTransportDrop()
 				g.recordRequest(req.Model, 499, time.Since(start))
 				return
 			}
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
+			g.recordFallback(ep, lastErr, 0, lastErr.Error())
 			if !errors.As(lastErr, &pErr) {
 				// Only cool down the endpoint for non-proxy errors; a proxy
 				// fault already landed on the proxy via MarkProxyDown above.
-				g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
+				if g.testCooldown > 0 {
+					g.router.ApplyCooldownWithDuration(ep, 0, lastErr.Error(), sessionID, g.testCooldown)
+				} else {
+					g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
+				}
 			}
 			g.recordCooldown()
-			if g.testCooldown > 0 {
-				g.router.ApplyCooldownWithDuration(ep, 0, lastErr.Error(), sessionID, g.testCooldown)
-			}
 			continue
 		}
 
@@ -261,8 +268,12 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		if readErr != nil {
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
-			g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
+			g.recordFallback(ep, readErr, 502, readErr.Error())
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 502, readErr.Error(), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
+			}
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
 			continue
@@ -271,8 +282,12 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			readErr = fmt.Errorf("upstream body exceeds %d bytes", maxUpstreamBodyBytes)
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
-			g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
+			g.recordFallback(ep, readErr, 502, readErr.Error())
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 502, readErr.Error(), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownFromErrorForSession(ep, readErr, sessionID)
+			}
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
 			continue
@@ -281,17 +296,23 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		if resp.StatusCode != 200 {
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
+			g.recordFallback(ep, nil, resp.StatusCode, string(respBody))
 			// ApplyCooldownForSession already advances the circuit breaker
 			// state machine via recordCircuitFailureLocked, so do NOT also
 			// call RecordFailure here — that would double-count the failure
 			// against a separate counter and trip the circuit at half the
 			// configured threshold.
-			g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, 0)
-			g.recordCooldown()
 			if g.testCooldown > 0 {
+				// In test mode the caller-specified duration wins and the
+				// real escalation ladder is skipped (see
+				// ApplyCooldownWithDuration): ApplyCooldownForSession would
+				// compute a 30s×2^n cooldown and overwrite the test duration,
+				// parking the endpoint for the rest of the run.
 				g.router.ApplyCooldownWithDuration(ep, resp.StatusCode, string(respBody), sessionID, g.testCooldown)
+			} else {
+				g.router.ApplyCooldownForSession(ep, resp.StatusCode, string(respBody), sessionID, 0)
 			}
+			g.recordCooldown()
 			g.recordRequest(req.Model, resp.StatusCode, time.Since(start))
 			continue
 		}
@@ -310,7 +331,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			// client error: mark it and fall through to the next model.
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
+			g.recordFallback(ep, err, 200, string(respBody))
 			g.router.ApplyCooldownForSession(ep, 502, err.Error(), sessionID, 0)
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
@@ -476,7 +497,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		}
 		if err != nil {
 			tried[ep.Key()] = true
-			g.recordFallback(ep)
+			g.recordFallback(ep, err, 0, err.Error())
 			var pErr *ProxyError
 			// ApplyCooldownFromErrorForSession already advances the circuit
 			// breaker state machine; the redundant RecordFailure call would
@@ -484,12 +505,13 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			// configured threshold.
 			if !errors.As(err, &pErr) {
 				// Only the endpoint is at fault when no proxy was in the path.
-				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+				if g.testCooldown > 0 {
+					g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+				} else {
+					g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+				}
 			}
 			g.recordCooldown()
-			if g.testCooldown > 0 {
-				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
-			}
 			continue
 		}
 

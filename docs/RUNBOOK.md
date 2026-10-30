@@ -173,6 +173,7 @@ unauthenticated scrape is an information leak, not a health check — use
 | `airouter_endpoint_attempt_failures_total{endpoint}` | counter | Failure ratio per upstream |
 | `airouter_endpoint_attempt_duration_seconds{endpoint}` | histogram | Per-attempt cost per upstream |
 | `airouter_sse_comments_routed_out` | counter | Upstream keepalive chatter filtered out of the event path |
+| `airouter_failovers_total_by_reason{reason}` | counter | Why the chain advanced past an endpoint (see below) |
 | `airouter_metrics_label_overflow_total` | counter | Label observations folded into `__overflow__` because a map was full with nothing recyclable |
 | `airouter_metrics_label_evictions_total` | counter | Endpoint series recycled out of the window into `__overflow__` to make room for a new label |
 | `airouter_evicted_attempts_latency_seconds_sum` | gauge | Latency of attempts whose endpoint was evicted. **Not** a histogram — see below |
@@ -191,6 +192,46 @@ All four request surfaces (chat completions, responses, responses-stream, and
 responses-websocket) record the per-endpoint attempt telemetry, so the series
 cover fallback traffic regardless of which surface the client used.
 
+### Failover reasons
+
+`airouter_failovers_total_by_reason{reason}` breaks down the failover count by
+*why* the chain advanced past an endpoint — the dimension the endpoint series
+cannot answer. The reason set is closed (these are the only values the gateway
+ever emits):
+
+| reason | Meaning |
+|--------|---------|
+| `transport` | Dial/TLS/timeout/EOF before any HTTP response (upstream or proxy) |
+| `http_5xx` | Upstream returned 5xx |
+| `http_429` | Upstream returned 429 (rate limit) |
+| `http_4xx` | Upstream returned other 4xx (400/401/403/404) |
+| `protocol` | Upstream refused this wire shape (`ModelProtocolUnsupported`) |
+| `quota` | Upstream quota/credit refusal (not a rate limit) |
+| `truncation` | Upstream body exceeded `maxUpstreamBodyBytes` |
+| `parse` | 200 response whose body is not a valid completion |
+| `sse_parse` | Streaming: an SSE event parsing failure mid-stream |
+| `idle_timeout` | Streaming: upstream stalled past the idle timeout |
+| `unknown` | Not classified above (should be rare; worth investigating) |
+
+Use it to answer "which endpoints are failing and WHY" without log grepping:
+a high `transport` count points at network/proxy issues, a high `idle_timeout`
+at slow upstreams, a high `http_429` at rate limits. The reason is recorded
+alongside the per-endpoint fallback count, so the two series can be cross-referenced.
+	alongside the per-endpoint fallback count, so the two series can be cross-referenced.
+
+	Every fallback also emits a structured log line (prefix `[fallback]` for
+	non-streaming attempts, `[fallback][mid-stream]` for ones that happened
+	after content had already reached the client) with the classified reason, the
+	failed endpoint, the HTTP status (or 0 for a transport error), and a
+	truncated error/body. These lines are emitted even when no metrics backend
+	is wired (unit tests, degraded deployments), so `grep '\[fallback\]'` is the
+	first-line command for "was there a failover here and why".
+
+	Example:
+	```
+	2026/10/30 13:05:25 [fallback] reason=transport endpoint=bad:m-bad status=0 err=Post "http://127...": connect: connection refused
+	2026/10/30 13:06:27 [fallback][mid-stream] reason=transport endpoint=first:m-first status=0 err=unexpected EOF
+	```
 ### Label cardinality is bounded
 
 Endpoint and model labels are derived from config, and config is **not** fixed

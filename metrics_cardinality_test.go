@@ -1694,6 +1694,13 @@ func TestEveryLabelKeyMapIsBoundedAndRenders(t *testing.T) {
 		m.MidStreamFailover(name)
 		m.CircuitTransition(CircuitClosed, CircuitOpen, name)
 	}
+	// The reason map is driven separately: it is keyed by reason, not by
+	// endpoint, so driving Fallback with the same endpoint names as above
+	// would only ever produce one reason key. Drive it with enough distinct
+	// reasons to force the overflow path.
+	for i := 0; i < small*2; i++ {
+		m.FallbackWithReason(fmt.Sprintf("ep-%d", i), FailoverReason(fmt.Sprintf("reason-%d", i)))
+	}
 
 	// The pointer's element, not a copy: Metrics embeds sync.Mutex and copying
 	// it would trip `go vet`'s copylocks check.

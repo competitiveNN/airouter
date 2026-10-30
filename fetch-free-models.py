@@ -1803,7 +1803,7 @@ def fetch_opencode() -> list[dict[str, Any]]:
     return free_models
 
 
-# CommandCode CANDIDATE free deals — seeds, not the answer.
+# CommandCode CANDIDATE free deals — the filter, not the answer.
 #
 # The provider models list at https://api.commandcode.ai/provider/v1/models is
 # the full catalog and does NOT mark free/paid: every model there is billed at
@@ -1816,60 +1816,51 @@ def fetch_opencode() -> list[dict[str, Any]]:
 #   credits to make this request. Please purchase more credit[s]" -- the
 #   provider's unambiguous statement that the call is BILLED.
 #
-# So this set is now only the SEED list of ids worth probing: deals that do not
-# carry the provider's own free suffix. Free-ness itself is decided by
-# commandcode_probe() below, exactly as it already is for OpenCode, and a seed
-# that stops being free drops out on the next sync without anyone editing this
-# file. The suffix heuristic still catches the deals that advertise themselves
-# (see commandcode_is_free_candidate).
-COMMANDCODE_FREE_SEEDS: set[str] = {
-    "stealth/space-bunny-alpha",   # stealth preview, 1M ctx
-    "meituan/longcat-2.0-free",    # deal ended; probe now rejects it
-}
-
-# Ids that were free seeds historically and must stay probe-able (not silently
-# dropped from the candidate set) so a resurrected deal is picked up again.
-COMMANDCODE_FREE_MODELS = COMMANDCODE_FREE_SEEDS | {
-    "poolside/laguna-s-2.1-free",
-    "inclusionai/ling-3.0-flash-sante:free",
-}
-
-# CommandCode context windows, taken from the live provider list.  The
-# endpoint reports context_length per model; this marklist is the offline
-# fallback used when the API is unreachable so the ctx column is never 0.
-COMMANDCODE_FREE_MODELS_CTX: dict[str, int] = {
-    "stealth/space-bunny-alpha":  1_000_000,
-    "poolside/laguna-s-2.1-free":   256_000,
-    "inclusionai/ling-3.0-flash-sante:free": 262_144,
-    "meituan/longcat-2.0-free":    1_048_576,
-}
+# Free-ness itself is decided by commandcode_probe() below, exactly as it
+# already is for OpenCode. What remains here is the CANDIDATE FILTER: which
+# catalog ids are worth probing at all. It is rule-based, not enumerated --
+# the provider's own naming convention is the rule:
+#
+#   * the free suffix — `-free` (poolside/laguna-s-2.1-free) or `:free`
+#     (inclusionai/ling-3.0-flash-sante:free, stealth/glyph-cluster:free).
+#   * the stealth/ prefix — every deal the provider publishes under that
+#     namespace is a free preview (stealth/space-bunny-alpha, and its
+#     successor stealth/glyph-cluster:free). It carries no suffix, so the
+#     suffix rule cannot see it.
+#
+# A deal that stops being free drops out on the next sync without anyone
+# editing this file, because the probe refuses it and the fetcher excludes it.
+# That is the property the old hardcoded list lacked -- and the reason there is
+# no seed list here at all: a seed is an id someone had to remember, and the
+# moment the deal moves or renames the seed goes stale in the other direction.
+# The stealth/ prefix is the general rule; the suffix is the provider's own
+# signal. Together they cover every free deal the provider has ever published
+# without a single enumerated id.
+COMMANDCODE_FREE_PREFIXES: tuple[str, ...] = ("stealth/",)
 
 
 def canonicalize_commandcode_id(model_id: str) -> str:
-    """Map a CommandCode provider endpoint id to its canonical deal id.
+    """Fold a CommandCode provider endpoint id onto its deal id spelling.
 
     The provider endpoint (https://api.commandcode.ai/provider/v1/models)
     returns the raw catalog ids, which differ from the deal ids published in
-    the CLI docs / pricing page in two ways:
-      - casing:  "meituan/LongCat-2.0" -> "meituan/longcat-2.0-free"
+    the CLI docs / pricing page in casing and, for some deals, in suffix:
+      - casing:  "meituan/LongCat-2.0" -> "meituan/longcat-2.0"
       - suffix:  the endpoint omits the "-free" deal suffix on the LongCat
-        free deal (the other three free models carry it verbatim).
-    This folds the endpoint id onto the canonical form so the curated free
-    set matches regardless of how the upstream spells it.
+        free deal (the other free models carry it verbatim).
+    This lowercases and dashes the id so the candidate filter and the probe
+    see the same spelling the gateway routes to, whatever the upstream
+    returns. It does NOT invent a suffix: LongCat-2.0 is not free, and
+    canonicalizing it to longcat-2.0-free would manufacture a candidate that
+    the probe then has to refuse. Free-ness is the probe's call, not this
+    function's.
     """
     if not model_id:
-        return model_id
-    if model_id in COMMANDCODE_FREE_MODELS:
         return model_id
     org, _, name = model_id.partition("/")
     name = name.lower().replace("_", "-").replace(" ", "-")
     name = re.sub(r"-+", "-", name).strip("-")
-    canonical = f"{org.lower()}/{name}"
-    if canonical in COMMANDCODE_FREE_MODELS:
-        return canonical
-    if canonical + "-free" in COMMANDCODE_FREE_MODELS:
-        return canonical + "-free"
-    return model_id
+    return f"{org.lower()}/{name}" if org else name
 
 
 def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
@@ -1885,7 +1876,7 @@ def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
         "id": model_id,
         "name": model.get("name") or model_id,
         "provider": "commandcode",
-        "context_length": model.get("context_length") or COMMANDCODE_FREE_MODELS_CTX.get(model_id, 0),
+        "context_length": model.get("context_length") or 0,
         "intelligence": None,
         "elo": None,
         "released": None,
@@ -1897,11 +1888,14 @@ def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
         },
         "capabilities": {
             # commandcode's provider endpoint exposes no capability metadata,
-            # so vision is hardcoded: stealth/space-bunny-alpha is Space Bunny
+            # so vision is hardcoded: the stealth/ preview is Space Bunny
             # Alpha, which is multimodal (text+image+video input) per its
-            # provider catalog (kilocode reports vision: true for it).
+            # provider catalog (kilocode reports vision: true for it). The
+            # prefix is the rule, not the id: the deal moved from
+            # stealth/space-bunny-alpha to stealth/glyph-cluster:free and the
+            # capability followed the namespace.
             "reasoning": False,
-            "vision": model_id == "stealth/space-bunny-alpha",
+            "vision": model_id.lower().startswith("stealth/"),
             "open_weights": False,
         },
         "source": "commandcode",
@@ -1976,19 +1970,23 @@ def commandcode_is_free_candidate(model_id: str) -> bool:
     Two ways an id advertises a free deal:
 
       * the free suffix — `-free` (poolside/laguna-s-2.1-free) or `:free`
-        (inclusionai/ling-3.0-flash-sante:free). That is the provider's naming
-        convention for a live free deal, so honour it as a heuristic rather than
-        enumerating ids.
-      * no suffix at all — the stealth preview `stealth/space-bunny-alpha` is
-        free and never carried one. Those are the seeds.
+        (inclusionai/ling-3.0-flash-sante:free, stealth/glyph-cluster:free).
+        That is the provider's naming convention for a live free deal, so
+        honour it as a heuristic rather than enumerating ids.
+      * the stealth/ prefix — every deal the provider publishes under that
+        namespace is a free preview (stealth/space-bunny-alpha and its
+        successor stealth/glyph-cluster:free). It carries no suffix, so the
+        suffix rule alone cannot see it.
 
     This is a CANDIDATE filter. Being a candidate is not being free; only
     commandcode_probe() decides that.
     """
     if not model_id:
         return False
+    if model_id.lower().startswith(COMMANDCODE_FREE_PREFIXES):
+        return True
     name = model_id.rsplit("/", 1)[-1].lower()
-    return name.endswith("-free") or name.endswith(":free") or model_id in COMMANDCODE_FREE_SEEDS
+    return name.endswith("-free") or name.endswith(":free")
 
 
 # Verbs in a provider error body that mean the CALLER's balance is
