@@ -1698,7 +1698,6 @@ def opencode_probe(model_id: str, api_key: str, opener: Any = None) -> tuple[str
 
 
 
-
 def _common_probe_enabled() -> bool:
     return any(os.environ.get(name) == "1" for name in (
         "ENABLE_LIVE_PROBE",
@@ -1787,6 +1786,17 @@ def fetch_opencode() -> list[dict[str, Any]]:
         return _mark_unverified(
             [n for n in (normalize_opencode(m) for m in candidates) if n],
             "SKIP_OPENCODE_PROBE=1",
+        )
+
+    if not _opencode_probe_enabled():
+        print(
+            "OpenCode: live probe disabled by default — "
+            f"emitting {len(candidates)} UNVERIFIED candidates",
+            file=sys.stderr,
+        )
+        return _mark_unverified(
+            [n for n in (normalize_opencode(m) for m in candidates) if n],
+            "OpenCode live probe disabled by default",
         )
 
     if not _opencode_probe_enabled():
@@ -2269,6 +2279,14 @@ def fetch_commandcode() -> list[dict[str, Any]]:
             file=sys.stderr,
         )
         return _mark_unverified(candidates, "SKIP_COMMANDCODE_PROBE=1")
+
+    if not _commandcode_probe_enabled():
+        print(
+            "CommandCode: live probe disabled by default — emitting UNVERIFIED "
+            f"candidates ({len(candidates)})",
+            file=sys.stderr,
+        )
+        return _mark_unverified(candidates, "commandcode live probe disabled by default")
 
     if not _commandcode_probe_enabled():
         print(

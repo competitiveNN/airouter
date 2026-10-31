@@ -357,17 +357,17 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "smart floor lowered",
         "regenerate_config.py",
-        "            if m.score is not None and m.score >= 10 and m.is_chain_candidate]",
-        "            if m.score is not None and m.score >= 5 and m.is_chain_candidate]",
+        "            if m.score is not None and m.score >= 25 and m.is_chain_candidate]",
+        "            if m.score is not None and m.score >= 20 and m.is_chain_candidate]",
         "`smart` is the strongest-generalists tier; a weaker model would take a "
         "top slot in the chain the router treats as best-first.",
     ),
     Mutation(
         "work floor lowered",
         "regenerate_config.py",
-        "            if m.score is not None and m.score >= 10\n"
+        "            if m.score is not None and m.score >= 15\n"
         "            and not m.is_excluded and m.is_chain_candidate]",
-        "            if m.score is not None and m.score >= 10\n"
+        "            if m.score is not None and m.score >= 5\n"
         "            and not m.is_excluded and m.is_chain_candidate]",
         "The tiny-model drop exists so a 9.9 model cannot sit in the coding "
         "workhorse tier ahead of the auto router.",

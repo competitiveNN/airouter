@@ -542,7 +542,7 @@ def auto_fallback_terminator(
         provider, model = available[preferred]
         state = verdict(preferred)
         if state == 'unknown' and previous is not None \
-                and previous[:2] == (provider, model) and previous[2]:
+                and previous[2]:
             return provider, model, previous[2]
         # The probe verdict is stable text, not the probe timestamp: a date here
         # would rewrite every chain on every nightly run for no added signal,
@@ -812,7 +812,9 @@ def format_chain_yaml(chain: list[dict], indent: int = 6) -> str:
         # which is the default every provider understands (config.go
         # protocolFor). Emitting `protocol: chat` on all ~80 endpoints would
         # bury the two that actually need the field.
-        protocol = None
+        protocol = _normalize_protocol(entry.get('protocol'))
+        if protocol and protocol != 'chat':
+            lines.append(f"{' ' * (indent + 2)}protocol: {protocol}")
     return '\n'.join(lines)
 
 
