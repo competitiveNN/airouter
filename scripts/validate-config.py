@@ -158,8 +158,11 @@ def main() -> int:
         # ALL providers in that group (same model id) so rate-limit
         # fallback has a sibling key to fall through to.
         for source, group in provider_groups.items():
+            active = tuple(p for p in group if p in providers)
+            if len(active) <= 1:
+                continue
             # Map provider -> set of model ids used in this chain
-            prov_models: dict[str, set[str]] = {p: set() for p in group}
+            prov_models: dict[str, set[str]] = {p: set() for p in active}
             for ep in chain:
                 prov = ep.get("provider", "")
                 if prov in prov_models:
@@ -172,7 +175,7 @@ def main() -> int:
                 all_models.update(mids)
             if not all_models:
                 continue
-            # Every provider in the group must carry the full set
+            # Every active provider in the group must carry the full set
             for prov, mids in prov_models.items():
                 missing = all_models - mids
                 if missing:

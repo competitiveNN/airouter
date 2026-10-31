@@ -456,10 +456,15 @@ def check(
 
         # rule 3 / 10: every key of a group carries the same model id, in
         # consecutive entries, so a rate-limited key falls through to the next.
+        # A provider disabled in config.yaml (commented out, so absent from
+        # `providers`) must not be scored as "missing" its sibling keys.
         for group, provs in PROVIDER_GROUPS.items():
-            per = {p: [e.get("model") for e in chain if e.get("provider") == p] for p in provs}
+            active = tuple(p for p in provs if p in providers)
+            if len(active) <= 1:
+                continue
+            per = {p: [e.get("model") for e in chain if e.get("provider") == p] for p in active}
             union = {m for mids in per.values() for m in mids} - AUTO_MODELS
-            for p in provs:
+            for p in active:
                 missing = union - set(per[p])
                 if missing:
                     problems.append(
@@ -469,9 +474,9 @@ def check(
             for mid in sorted(union):
                 positions = [
                     i for i, e in enumerate(chain)
-                    if e.get("model") == mid and e.get("provider") in provs
+                    if e.get("model") == mid and e.get("provider") in active
                 ]
-                if positions != list(range(positions[0], positions[0] + len(provs))):
+                if positions != list(range(positions[0], positions[0] + len(active))):
                     problems.append(
                         f"rule3: {profile} {mid} keys are not consecutive (positions {positions})"
                     )
