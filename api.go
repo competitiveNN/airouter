@@ -577,19 +577,69 @@ func bodySessionID(body []byte) string {
 		modelSpan, hasModel := findJSONMember(obj, "model")
 		model, isString := jsonStringValue(body, modelSpan, hasModel)
 		if isString && model != "" {
-			// Build a deterministic byte stream from model + messages. We
-			// include content so different conversations with the same role
-			// layout don't collide.
+			msgsSpan, hasMessages := findJSONMember(obj, "messages")
+
+			var systemSpan, userSpan jsonSpan
+			var sawSystem, sawUser bool
+			if hasMessages {
+				elems, ok := jsonArrayElements(body, msgsSpan)
+				if ok {
+					for _, elem := range elems {
+						m, ok := jsonObjectAt(body, elem)
+						if !ok {
+							elems = nil
+							break
+						}
+						role := ""
+						if roleSpan, found := findJSONMember(m, "role"); found {
+							r, ok := jsonStringValue(body, roleSpan, found)
+							if !ok {
+								elems = nil
+								break
+							}
+							role = r
+						}
+						contentSpan, contentFound := findJSONMember(m, "content")
+						if !contentFound {
+							continue
+						}
+						switch role {
+						case "system":
+							if !sawSystem {
+								systemSpan, sawSystem = contentSpan, true
+							}
+						case "user":
+							if !sawUser {
+								userSpan, sawUser = contentSpan, true
+							}
+						}
+						if sawSystem && sawUser {
+							break
+						}
+					}
+				}
+			}
+
+			if sawSystem || sawUser {
+				h := sha256.New()
+				h.Write([]byte(model))
+				if sawSystem {
+					h.Write([]byte{0})
+					h.Write(jsonLiteralValue(body, systemSpan, true))
+				}
+				if sawUser {
+					h.Write([]byte{0})
+					h.Write(jsonLiteralValue(body, userSpan, true))
+				}
+				return "ctx:" + hex.EncodeToString(h.Sum(nil)[:16])
+			}
+
 			h := sha256.New()
 			h.Write([]byte(model))
 			h.Write([]byte{0})
-			msgSpan, hasMessages := findJSONMember(obj, "messages")
 			if hasMessages {
-				hashJSONValue(h, body[msgSpan.Start:msgSpan.End])
+				hashJSONValue(h, body[msgsSpan.Start:msgsSpan.End])
 			} else {
-				// Keep the shape the decoder produced for a body with no
-				// messages, so such a body fingerprints the same way no
-				// matter which path computed it.
 				h.Write([]byte("null\n"))
 			}
 			return "ctx:" + hex.EncodeToString(h.Sum(nil)[:16])
@@ -623,11 +673,11 @@ func writeSSEError(w http.ResponseWriter, flusher http.Flusher, message string) 
 	errJSON, _ := json.Marshal(ErrorResponse{
 		Error: ErrorDetail{
 			Message: message,
-			Type:    "server_error",
-			Code:    "stream_error",
+			Type:    "service_unavailable_error",
+			Code:    "503",
 		},
 	})
-	fmt.Fprintf(w, "data: %s\n\n", errJSON)
+	fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
 	flusher.Flush()
 }
 
@@ -1982,8 +2032,8 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeAPIError(w, 500, "Streaming not supported", "server_error", "streaming_unsupported")
-		g.recordRequest(req.Model, 500, time.Since(start))
+		writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
+		g.recordRequest(req.Model, http.StatusServiceUnavailable, time.Since(start))
 		return
 	}
 
@@ -2595,7 +2645,7 @@ func (g *GatewayContext) HandleAdminConfig(w http.ResponseWriter, r *http.Reques
 		// Reload in memory
 		newCfg, err := LoadConfig(g.configPath)
 		if err != nil {
-			writeAPIError(w, 500, "Failed to reload config", "server_error", "reload_failed")
+			writeAPIError(w, http.StatusServiceUnavailable, "Failed to reload config", "service_unavailable_error", "reload_failed")
 			return
 		}
 		g.ReloadConfig(newCfg)

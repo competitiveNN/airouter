@@ -103,7 +103,7 @@ func (m *Metrics) attemptTickForLocked() *attemptTick {
 func (m *Metrics) recordRingAttemptLocked(key labelKey, endpoint string, ns int64, ok bool, histIdx int) {
 	t := m.attemptTickForLocked()
 	t.attempts[key] = t.attempts[key] + 1
-	t.activeTicks[key] = t.activeTicks[key] + 1
+	t.activeTicks[key] = 1
 	if !ok {
 		t.failures[key] = t.failures[key] + 1
 	}

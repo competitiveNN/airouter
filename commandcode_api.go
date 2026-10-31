@@ -387,7 +387,7 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeAPIError(w, 500, "Streaming not supported", "server_error", "streaming_unsupported")
+		writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
 		return
 	}
 
@@ -532,6 +532,9 @@ func (s *CommandCodeShim) complete(w http.ResponseWriter, r *http.Request, body 
 
 	if lastStatus != 0 && len(lastBody) > 0 {
 		w.Header().Set("Content-Type", "application/json")
+		if lastStatus >= 500 && lastStatus <= 599 {
+			lastStatus = http.StatusBadGateway
+		}
 		w.WriteHeader(lastStatus)
 		_, _ = w.Write(lastBody)
 		return

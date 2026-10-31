@@ -584,30 +584,75 @@ func TestChatProxyPreservesMessagesBytes(t *testing.T) {
 	}
 }
 
-// TestChatProxyUpstreamErrorPassthrough covers a failing
-// upstream: the status and error body reach the client and no
-// stats are fabricated.
+// TestChatProxyUpstreamErrorPassthrough verifies the webchat proxy maps upstream 500 responses to 502.
+// even when the configured endpoint returns a 500, the gateway exposes it as
+// a 502 upstream failure rather than returning a client-visible 500.
 func TestChatProxyUpstreamErrorPassthrough(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(500)
-		fmt.Fprint(w, `{"error":{"message":"boom","type":"server_error"}}`)
-	}))
-	defer upstream.Close()
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+		ct   string
+	}{
+		{
+			name: "models",
+			path: "/chat/models",
+			body: `{"endpoint":{"url":"%s/v1"}}`,
+			ct:   "application/json",
+		},
+		{
+			name: "completion",
+			path: "/chat/completions",
+			body: `{"endpoint":{"url":"%s/v1"},"model":"smart","messages":[]}`,
+			ct:   "application/json",
+		},
+		{
+			name: "stream",
+			path: "/chat/completions",
+			body: `{"endpoint":{"url":"%s/v1"},"model":"smart","messages":[],"stream":true}`,
+			ct:   "text/event-stream",
+		},
+		{
+			name: "responses",
+			path: "/chat/responses",
+			body: `{"endpoint":{"url":"%s/v1"},"model":"smart","input":"hi"}`,
+			ct:   "application/json",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.ct)
+				w.WriteHeader(http.StatusInternalServerError)
+				if tc.ct == "text/event-stream" {
+					fmt.Fprint(w, "data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n")
+				} else {
+					fmt.Fprint(w, `{"error":{"message":"boom","type":"server_error"}}`)
+				}
+			}))
+			defer upstream.Close()
 
-	g := newChatTestGateway(t)
-	payload := `{"endpoint":{"url":"` + upstream.URL + `/v1"},"model":"smart","messages":[]}`
-	rec := httptest.NewRecorder()
-	g.HandleWebChatCompletions(rec, chatTestRequest(t, http.MethodPost, "/chat/completions", payload))
+			g := newChatTestGateway(t)
+			payload := fmt.Sprintf(tc.body, upstream.URL)
+			rec := httptest.NewRecorder()
+			switch tc.path {
+			case "/chat/models":
+				g.HandleWebChatModels(rec, chatTestRequest(t, http.MethodPost, tc.path, payload))
+			case "/chat/responses":
+				g.HandleWebChatResponses(rec, chatTestRequest(t, http.MethodPost, tc.path, payload))
+			default:
+				g.HandleWebChatCompletions(rec, chatTestRequest(t, http.MethodPost, tc.path, payload))
+			}
 
-	if rec.Code != 500 {
-		t.Fatalf("expected the upstream 500 to pass through, got %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "boom") {
-		t.Errorf("expected the upstream error body, got: %s", rec.Body.String())
-	}
-	if rec.Header().Get(chatHeaderContextTokens) != "" {
-		t.Errorf("expected no stats headers on an error response")
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("expected an upstream 500 to become 502, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "boom") {
+				t.Errorf("expected the upstream error body to remain useful, got: %s", rec.Body.String())
+			}
+			if rec.Header().Get(chatHeaderContextTokens) != "" {
+				t.Errorf("expected no stats headers on an error response")
+			}
+		})
 	}
 }
 

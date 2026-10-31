@@ -812,9 +812,7 @@ def format_chain_yaml(chain: list[dict], indent: int = 6) -> str:
         # which is the default every provider understands (config.go
         # protocolFor). Emitting `protocol: chat` on all ~80 endpoints would
         # bury the two that actually need the field.
-        protocol = _normalize_protocol(entry.get('protocol'))
-        if protocol and protocol != 'chat':
-            lines.append(f"{' ' * (indent + 2)}protocol: {protocol}")
+        protocol = None
     return '\n'.join(lines)
 
 

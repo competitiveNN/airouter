@@ -649,8 +649,8 @@ func TestResponsesStream_UpstreamErrorMidStreamFailsOver(t *testing.T) {
 	if strings.Contains(body, evResponseCompleted) {
 		t.Errorf("upstream error was swallowed into a %s; body:\n%s", evResponseCompleted, body)
 	}
-	if !strings.Contains(body, "server_error") {
-		t.Errorf("expected a terminal error event to reach the client; body:\n%s", body)
+	if !strings.Contains(body, "service_unavailable_error") || !strings.Contains(body, `"code":"503"`) {
+		t.Errorf("expected a terminal service-unavailable error event with code 503 to reach the client; body:\n%s", body)
 	}
 }
 

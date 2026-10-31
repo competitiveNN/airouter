@@ -269,13 +269,20 @@ func (g *GatewayContext) HandleWebChatModels(w http.ResponseWriter, r *http.Requ
 		writeAPIError(w, 502, "Failed reading upstream response", "server_error", "upstream_error")
 		return
 	}
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(chatProxyStatus(resp.StatusCode))
 	w.Write(upstreamBody)
 }
 
 // handleChatProxy is the shared proxy. It authenticates the caller,
 // splits the endpoint reference out of the body, forwards the rest of
 // the request verbatim, and measures the response.
+func chatProxyStatus(status int) int {
+	if status >= http.StatusInternalServerError && status <= 599 {
+		return http.StatusBadGateway
+	}
+	return status
+}
+
 func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request, upstreamPath, protocol string) {
 	if !g.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
@@ -374,10 +381,10 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 	if isStream {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			writeAPIError(w, 500, "Streaming not supported", "server_error", "streaming_unsupported")
+			writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
 			return
 		}
-		w.WriteHeader(resp.StatusCode)
+		w.WriteHeader(chatProxyStatus(resp.StatusCode))
 		res := chatPumpStream(w, flusher, resp.Body)
 		if !okStatus {
 			if res.scanErr != nil && !isClientDisconnect(res.scanErr) {
@@ -416,7 +423,7 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if !okStatus {
-		w.WriteHeader(resp.StatusCode)
+		w.WriteHeader(chatProxyStatus(resp.StatusCode))
 		w.Write(upstreamBody)
 		return
 	}
@@ -436,7 +443,7 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 	if stats.DecodeTPS > 0 {
 		w.Header().Set(chatHeaderDecodeTPS, strconv.FormatFloat(stats.DecodeTPS, 'f', 1, 64))
 	}
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(http.StatusOK)
 	w.Write(upstreamBody)
 }
 

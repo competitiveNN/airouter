@@ -4050,6 +4050,17 @@ func clampCycleBackTestCase(t *testing.T, url, body string, wantInBody string) {
 		t.Fatalf("expected the unavailable-models failure once every endpoint is cooled "+
 			"down past the budget, body:\n%s", out)
 	}
+	if strings.Contains(out, "service_unavailable_error") {
+		if rec.Code != http.StatusOK {
+			t.Errorf("stream error should retain HTTP 200 after SSE begins, got %d", rec.Code)
+		}
+		if !strings.Contains(out, "event: error\n") {
+			t.Errorf("terminal SSE error must use event:error so Responses clients parse it as an error; body:\n%s", out)
+		}
+		if !strings.Contains(out, `"code":"503"`) {
+			t.Errorf("terminal SSE error must carry code 503 so clients can classify the unavailable result; body:\n%s", out)
+		}
+	}
 	// The verdict may not change, only when it arrives: 30s of a client being
 	// told nothing is the defect. Generous ceiling so a loaded CI box does not
 	// turn this red; the unclamped code takes 30s, six times this.
@@ -6121,7 +6132,7 @@ func TestRecoveryMiddlewarePreservesHijacker(t *testing.T) {
 }
 
 // TestRecoveryMiddlewarePanicBeforeOutputReturns500 covers the plain panic
-// path: nothing was sent yet, so the client gets a clean 500.
+// path: nothing was sent yet, so the client gets a retryable 503.
 func TestRecoveryMiddlewarePanicBeforeOutputReturns500(t *testing.T) {
 	handler := recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom")
@@ -6130,8 +6141,11 @@ func TestRecoveryMiddlewarePanicBeforeOutputReturns500(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil))
 
-	if rec.Code != 500 {
-		t.Fatalf("expected 500 for a panic before any output, got %d", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for a panic before any output, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service_unavailable_error") {
+		t.Fatalf("expected service-unavailable error type, got %s", rec.Body.String())
 	}
 }
 
