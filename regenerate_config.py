@@ -542,7 +542,7 @@ def auto_fallback_terminator(
         provider, model = available[preferred]
         state = verdict(preferred)
         if state == 'unknown' and previous is not None \
-                and previous[2]:
+                and previous[:2] == (provider, model) and previous[2]:
             return provider, model, previous[2]
         # The probe verdict is stable text, not the probe timestamp: a date here
         # would rewrite every chain on every nightly run for no added signal,
