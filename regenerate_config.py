@@ -602,6 +602,25 @@ def _normalize_protocol(value: object) -> str | None:
     return v if v in ("responses", "chat") else None
 
 
+def parse_providers_present(config_text: str) -> set[str]:
+    """Return the set of provider names present in config.yaml's providers section.
+
+    Comments (e.g. '#  commandcode2:') are ignored. Only top-level keys under
+    'providers:' are counted, preserving the convention that commandcode2 can be
+    enabled/disabled independently of commandcode.
+    """
+    import yaml  # local import: keeps the module importable without pyyaml
+    problems: list[str] = []
+    try:
+        parsed = yaml.safe_load(config_text)
+    except Exception as exc:  # noqa: BLE001
+        # If the config is broken this early, let validation fail later.
+        return set()
+    providers = parsed.get('providers')
+    if not isinstance(providers, dict):
+        return set()
+    return set(providers.keys())
+
 def parse_protocols(config_text: str) -> dict[tuple[str, str], str]:
     """Every (provider, model) -> protocol the current config declares.
 
@@ -682,6 +701,7 @@ def build_chain(
     records: dict[tuple[str, str], Model] | None = None,
     previous: tuple[str, str, str] | None = None,
     protocols: dict[tuple[str, str], str] | None = None,
+    providers_present: set[str] | None = None,
 ) -> list[dict]:
     """Build fallback chain for a profile.
 
@@ -693,11 +713,19 @@ def build_chain(
     being regenerated. It is the fallback for a record that carries no protocol
     of its own, which is the only case where this function would otherwise
     delete a field a human or an earlier run put there.
+
+    `providers_present` is the set of provider names declared (and not commented
+    out) in config.yaml. The generator only expands a key-group model
+    (nvidia->nvidia2/nvidia3, commandcode->commandcode2) onto the secondary
+    providers that actually exist, so disabling a key in the config is honored
+    instead of being silently re-emitted and then rejected by validation.
     """
     if records is None:
         records = {}
     if protocols is None:
         protocols = {}
+    if providers_present is None:
+        providers_present = set()
 
     def entry_for(provider: str, m: Model) -> dict:
         """One emitted endpoint.
@@ -727,14 +755,18 @@ def build_chain(
 
     for m in models:
         if m.mapped_provider == 'nvidia':
-            # Emit trio: nvidia, nvidia2, nvidia3
-            for prov in ['nvidia', 'nvidia2', 'nvidia3']:
-                chain.append(entry_for(prov, m))
+            # Emit trio: nvidia, nvidia2, nvidia3, but only for keys that exist.
+            for prov in ('nvidia', 'nvidia2', 'nvidia3'):
+                if prov in providers_present:
+                    chain.append(entry_for(prov, m))
         elif m.mapped_provider == 'commandcode':
             # Emit pair: commandcode, commandcode2 (two API keys on the same
             # upstream proxy) so a rate-limited key falls through to the next.
-            for prov in ['commandcode', 'commandcode2']:
-                chain.append(entry_for(prov, m))
+            # Emit commandcode2 only when it is actually configured: commenting
+            # a provider out in config.yaml must be respected by regeneration.
+            for prov in ('commandcode', 'commandcode2'):
+                if prov in providers_present:
+                    chain.append(entry_for(prov, m))
         else:
             chain.append(entry_for(m.mapped_provider, m))
 
@@ -1056,10 +1088,11 @@ def main(argv: list[str] | None = None):
     if protocols:
         print(f"Preserving {len(protocols)} configured protocol(s) for unprobed "
               f"records: {', '.join(f'{p}/{m}={v}' for (p, m), v in sorted(protocols.items()))}")
-    smart_chain = build_chain(smart_models, 'smart', records, previous.get('smart'), protocols)
-    work_chain = build_chain(work_models, 'work', records, previous.get('work'), protocols)
-    fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'), protocols)
-    large_chain = build_chain(large_models, 'large', records, previous.get('large'), protocols)
+    providers_present = parse_providers_present(config)
+    smart_chain = build_chain(smart_models, 'smart', records, previous.get('smart'), protocols, providers_present)
+    work_chain = build_chain(work_models, 'work', records, previous.get('work'), protocols, providers_present)
+    fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'), protocols, providers_present)
+    large_chain = build_chain(large_models, 'large', records, previous.get('large'), protocols, providers_present)
     
     # Generate new models section
     new_models = f"""models:
