@@ -2327,7 +2327,11 @@ def fetch_commandcode() -> list[dict[str, Any]]:
     for models_with_state, label in ((exhausted, "account credit exhausted"),):
         if not models_with_state:
             continue
-        if free_models or unknown or dropped:
+        if free_models or dropped:
+            # An "ok" model proves the account can pay; a "paid" model
+            # proves the provider is willing to bill. Either way the account
+            # can discriminate, so a credit-exhausted verdict on THIS model is
+            # per-model evidence that it is billed.
             dropped.extend(f"{m['id']}(paid)" for m in models_with_state)
         else:
             for m in models_with_state:
