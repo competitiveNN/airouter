@@ -725,7 +725,9 @@ def build_chain(
     if protocols is None:
         protocols = {}
     if providers_present is None:
-        providers_present = set()
+        providers_present = set(
+            ("nvidia", "nvidia2", "nvidia3", "commandcode", "commandcode2")
+        )
 
     def entry_for(provider: str, m: Model) -> dict:
         """One emitted endpoint.

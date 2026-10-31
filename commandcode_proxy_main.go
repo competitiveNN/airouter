@@ -64,19 +64,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Only Command Code providers are reachable through this binary, but a
-	// proxy-enabled provider still needs the proxy pool, so mirror the
-	// gateway's conditional service startup.
-	proxySourcesPath := filepath.Join(filepath.Dir(*configPath), "proxy_sources.txt")
-	proxySvc := NewProxyService(proxySourcesPath, 15*time.Minute)
-	if proxyEnabled(cfg) {
-		proxy.SetProxyService(proxySvc)
-		proxy.UpdateRequiredReady()
-		go proxySvc.Start(ctx)
-		log.Printf("Proxy service enabled (pool refresh every 15 min, %d proxies must be ready)",
-			proxySvc.RequiredReady())
-	}
-
+	// Only Command Code providers are reachable through this binary, and
+	// Command Code upstreams never use the proxy pool (they always dial
+	// direct), so the proxy service is not started at all here.
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
 	router.SetMetrics(gateway.metrics)
 	proxy.SetMetrics(gateway.metrics)
@@ -93,10 +83,10 @@ func main() {
 	server := &http.Server{
 		Addr:              ":" + *port,
 		Handler:           recoveryMiddleware(shim.Handler()),
-		ReadTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      300 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		ReadHeaderTimeout: 60 * time.Second,
+		WriteTimeout:      30 * time.Minute,
+		IdleTimeout:       10 * time.Minute,
 	}
 
 	go func() {

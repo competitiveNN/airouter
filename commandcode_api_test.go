@@ -33,12 +33,19 @@ type ccShimUpstream struct {
 	paths   []string
 	gen     int
 	respond func(w http.ResponseWriter, r *http.Request, gen int)
+	catalog string // JSON body for /provider/v1/models
 }
 
 func (u *ccShimUpstream) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u.mu.Lock()
 		u.paths = append(u.paths, r.URL.Path)
+		if r.URL.Path == "/provider/v1/models" && u.catalog != "" {
+			u.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(u.catalog))
+			return
+		}
 		if r.URL.Path != "/alpha/generate" {
 			u.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
@@ -76,12 +83,14 @@ func (u *ccShimUpstream) sawGenerate() bool {
 // point at the given fake upstream servers.
 func ccShimGateway(t *testing.T, ups map[string]*ccShimUpstream, chains map[string][]ModelEndpoint) (*CommandCodeShim, *httptest.Server) {
 	t.Helper()
+	// The catalog fetch requires a provider API key; give every fake provider one.
+	t.Setenv("testGatewayKey", testGatewayKey)
 	providers := map[string]ProviderConfig{}
 	names := make([]string, 0, len(ups))
 	for name, u := range ups {
 		srv := httptest.NewServer(u.handler())
 		t.Cleanup(srv.Close)
-		providers[name] = ProviderConfig{URL: srv.URL}
+		providers[name] = ProviderConfig{URL: srv.URL, APIKeyEnv: "testGatewayKey"}
 		names = append(names, name)
 	}
 	// Keep the declared order stable: commandcode before commandcode2.
@@ -547,5 +556,121 @@ func TestCommandCodeShimStreamTerminatesOnMidStreamFailure(t *testing.T) {
 	// duplicate output.
 	if second.sawGenerate() {
 		t.Error("second provider was contacted after the first flushed partial output; the client's stream must not be restarted")
+	}
+}
+
+// When the provider advertises its full catalog on /provider/v1/models, the
+// shim serves that catalog verbatim instead of the chain-derived fallback.
+// The full catalog includes models that are not part of any fallback chain.
+func TestCommandCodeShimListsFullCatalog(t *testing.T) {
+	catalog := `{"object":"list","data":[` +
+		`{"id":"claude-sonnet-5","name":"Claude Sonnet 5","owned_by":"commandcode","context_length":200000},` +
+		`{"id":"cc/one","name":"One","owned_by":"commandcode","context_length":100000},` +
+		`{"id":"inclusionai/ling-3.1-flash-1019:free","name":"Free Tier","owned_by":"commandcode","context_length":8000}` +
+		`]}`
+	up := &ccShimUpstream{
+		respond: func(w http.ResponseWriter, r *http.Request, gen int) { _, _ = w.Write([]byte(ccShimNDJSON)) },
+		catalog: catalog,
+	}
+	_, srv := ccShimGateway(t, map[string]*ccShimUpstream{
+		"commandcode":  up,
+		"commandcode2": up,
+	}, map[string][]ModelEndpoint{
+		"smart": {
+			{Provider: "commandcode", Model: "cc/one"},
+			{Provider: "commandcode2", Model: "cc/two"},
+		},
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+
+	var listed struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &listed); err != nil {
+		t.Fatalf("decode models: %v\n%s", err, body)
+	}
+	if listed.Object != "list" {
+		t.Fatalf("object = %q, want list", listed.Object)
+	}
+	ids := map[string]string{}
+	for _, m := range listed.Data {
+		ids[m.ID] = m.OwnedBy
+	}
+	// The full catalog (including models absent from any fallback chain) must
+	// be served verbatim.
+	if len(ids) != 3 {
+		t.Fatalf("listed %d models, want 3: %v", len(ids), ids)
+	}
+	want := map[string]string{
+		"claude-sonnet-5":                      "commandcode",
+		"cc/one":                               "commandcode",
+		"inclusionai/ling-3.1-flash-1019:free": "commandcode",
+	}
+	for id, owner := range want {
+		if ids[id] != owner {
+			t.Errorf("model %q owned_by = %q, want %q (listed=%v)", id, ids[id], owner, ids)
+		}
+	}
+	if !containsString(up.paths, "/provider/v1/models") {
+		t.Fatalf("upstream was not asked for its catalog: %v", up.paths)
+	}
+}
+
+// When the provider's catalog endpoint errors (404, timeout, malformed, etc.),
+// the shim falls back to the chain-derived list so clients always see a sane
+// model list.
+func TestCommandCodeShimListsFallbackOnCatalogError(t *testing.T) {
+	up := &ccShimUpstream{
+		respond: func(w http.ResponseWriter, r *http.Request, gen int) { _, _ = w.Write([]byte(ccShimNDJSON)) },
+	}
+	_, srv := ccShimGateway(t, map[string]*ccShimUpstream{
+		"commandcode":  up,
+		"commandcode2": up,
+	}, map[string][]ModelEndpoint{
+		"smart": {
+			{Provider: "commandcode", Model: "cc/one"},
+			{Provider: "commandcode2", Model: "cc/two"},
+		},
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var listed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, m := range listed.Data {
+		ids[m.ID] = true
+	}
+	if len(ids) != 2 || !ids["cc/one"] || !ids["cc/two"] {
+		t.Fatalf("listed = %v, want exactly cc/one and cc/two (fallback)", ids)
 	}
 }

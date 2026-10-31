@@ -363,22 +363,53 @@ def _parse_ollama_ctx(raw: str) -> int | None:
     except ValueError:
         return None
 
+# OpenCode models that are free but do NOT carry the "-free" suffix.
+# The listing exposes free-ness via its `cost` field (zero price on text
+# input and output), so these need not be enumerated: `big-pickle` is now
+# detected by `opencode_is_free_candidate()` below rather than curated.
+# Anything with a nonzero price is treated as METERED.
+OPENCODE_FREE_MODELS: set[str] = set()
+
+# Context-length marklist.  OpenCode's /models now exposes `limit.context`
+# per model, so this is only the offline fallback used when the API is
+# unreachable and the listing lacks context data.
 OPENCODE_FREE_MODELS_CTX: dict[str, int] = {
-    "deepseek-v4-flash-free":   131_072,
-    "laguna-s-2.1-free":        131_072,
-    "ling-3.0-flash-free":      131_072,
-    "mimo-v2.5-free":           131_072,
-    "nemotron-3-ultra-free":  1_000_000,
-    "north-mini-code-free":     131_072,
     "big-pickle":               131_072,
+    "beam-free":                1_048_576,
+    "flint-40b-free":           262_144,
+    "glm-5.3-flash-free":       200_000,
+    "mimo-v2.6-flash-free":     200_000,
+    "nemotron-3.5-lightning-free": 262_144,
+    "nemotron-3.5-super-vl-free":  1_048_576,
+    "deepseek-v4.1-flash-free":  200_000,
+    "nemotron-3-ultra-free":   1_000_000,
 }
 
-# OpenCode models that are free but do NOT carry the "-free" suffix.
-# The API exposes no free flag, so these must be user-curated.  Add new
-# free-but-un-suffixed models here.  Anything else is treated as METERED.
-OPENCODE_FREE_MODELS: set[str] = {
-    "big-pickle",
-}
+
+def opencode_is_free_candidate(model: dict[str, Any]) -> bool:
+    """Whether an OpenCode listing entry advertises a free deal.
+
+    Two ways an id advertises a free deal, and either is enough:
+
+      * the free suffix — `-free` or `:free` (deepseek-v4.1-flash-free,
+        reflection/beam:free). That is the provider's naming convention for a
+        live free deal.
+      * a zero price on both text input and output in the listing's `cost`
+        field. `big-pickle` (the chain terminator) is not suffixed `-free` but
+        is free, so this catches it via cost rather than enumeration.
+
+    This is a CANDIDATE filter. Being a candidate is not being free; only
+    opencode_probe() decides that.
+    """
+    model_id = model.get("id", "")
+    name = model_id.rsplit("/", 1)[-1].lower()
+    if name.endswith("-free") or name.endswith(":free") or model_id in OPENCODE_FREE_MODELS:
+        return True
+    cost = model.get("cost") or {}
+    text = cost.get("text") or {}
+    inp = text.get("input") or {}
+    out = text.get("output") or {}
+    return inp.get("price", 0) == 0 and out.get("price", 0) == 0
 
 GOOGLE_AI_STUDIO_FREE_MODELS_CTX: dict[str, int] = {
     "gemini-flash-lite-latest":   1_048_576,
@@ -640,11 +671,13 @@ def normalize_opencode(model: dict[str, Any]) -> dict[str, Any] | None:
     the real release date when available.
     """
     model_id = model.get("id", "")
+    limit = model.get("limit") or {}
+    ctx = limit.get("context") if isinstance(limit.get("context"), int) else None
     return {
         "id": model_id,
         "name": model_id,
         "provider": "opencode",
-        "context_length": OPENCODE_FREE_MODELS_CTX.get(model_id, 0),
+        "context_length": ctx or OPENCODE_FREE_MODELS_CTX.get(model_id, 0),
         "intelligence": None,
         "elo": None,
         "released": None,
@@ -1351,28 +1384,32 @@ OPENCODE_PROBE_TIMEOUT = 20
 # sweep must stay inside — the first exhausted 429 aborts the whole
 # sweep and leaves the rest UNVERIFIED.
 #
-# So a model is live-probed ONCE, EVER. The verdict lands in
-# OPENCODE_PROBE_CACHE_FILE and never expires, in either direction:
-#   - a stale `ok` costs one 403 round trip, and the daemon's cooldown
-#     (cooldowns.json, recorded from real client traffic) backs the
-#     endpoint off at request time — sync-time re-probing is not what
-#     recovers a refused endpoint;
-#   - a stale negative keeps a model out of the chains, but re-probing
-#     it on every sync is exactly the per-model live cost this cache
-#     exists to remove. REFRESH_OPENCODE_PROBE=1 is the deliberate
-#     override.
+# A model is live-probed ONCE, EVER. Permanent verdicts (`ok`, `freetier`,
+# `error`) never expire: re-probing on every sync is exactly the per-model
+# live cost this cache exists to remove. REFRESH_OPENCODE_PROBE=1 is the
+# deliberate override.
 #
-# The cache is keyed by model id alone, so a model that vanishes from
-# the listing and returns later still owns its old verdict and is not
-# re-probed.
+# `rate_limited` is the exception: it is a fact about the CREDENTIAL, not the
+# model, and it is temporary. A rate-limited run records every candidate it
+# could not reach as `rate_limited` with a `checked_at` timestamp; on later
+# runs the entry is dropped once OPENCODE_RATE_LIMITED_WINDOW_MINUTES have
+# elapsed so the sweep can try again. This keeps one rate-limited sync from
+# forcing a live probe of every model on every subsequent sync — the
+# "always verifying" defect — while still letting the cache recover when the
+# bucket refills.
 OPENCODE_PROBE_CACHE_FILE = Path(__file__).resolve().parent / "opencode-probe-cache.json"
+OPENCODE_RATE_LIMITED_WINDOW_MINUTES = 60
+
+# Verdicts that are permanent per-model facts once recorded in the cache.
+OPENCODE_PERMANENT_VERDICTS = frozenset({"ok", "freetier", "error"})
 
 
 def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
-    """Read the probe cache, dropping malformed entries.
+    """Read the probe cache, dropping malformed or expired entries.
 
-    Nothing expires: a model is probed once, ever, so every well-formed
-    entry in the file is a permanent fact about that model, however old.
+    Permanent verdicts (`ok`, `freetier`, `error`) are trusted forever.
+    `rate_limited` entries are kept only while their window has not elapsed,
+    so a rate-limited sync stops re-probing until the bucket refills.
     Never raises: a corrupt cache must cost one live probe round, not the
     model list. Anything unusable is discarded rather than repaired,
     because the whole point is that a cache miss is always safe.
@@ -1387,20 +1424,25 @@ def load_opencode_probe_cache() -> dict[str, dict[str, Any]]:
     except (json.JSONDecodeError, OSError):
         return {}
     live: dict[str, dict[str, Any]] = {}
+    now = datetime.now(UTC)
     for model_id, entry in probes.items():
         if not isinstance(entry, dict):
             continue
         verdict = entry.get("verdict")
-        if verdict not in ("ok", "freetier", "error"):
-            continue
         try:
-            # Parsed as validation only: an entry with no usable
-            # timestamp is malformed, not old. Age is deliberately not
-            # consulted — the verdict is permanent (see the notes above).
-            datetime.fromisoformat(str(entry.get("checked_at", "")).replace("Z", "+00:00"))
+            checked_at = datetime.fromisoformat(
+                str(entry.get("checked_at", "")).replace("Z", "+00:00")
+            )
         except ValueError:
             continue
-        live[model_id] = entry
+        if verdict in OPENCODE_PERMANENT_VERDICTS:
+            # Permanent: never expires, regardless of age.
+            live[model_id] = entry
+        elif verdict == "rate_limited":
+            # Temporary: drop once the window has elapsed so the next sweep
+            # can try again.
+            if (now - checked_at).total_seconds() < OPENCODE_RATE_LIMITED_WINDOW_MINUTES * 60:
+                live[model_id] = entry
     return live
 
 
@@ -1656,7 +1698,8 @@ def opencode_probe(model_id: str, api_key: str, opener: Any = None) -> tuple[str
 
 
 def fetch_opencode() -> list[dict[str, Any]]:
-    """Fetch OpenCode models; free ones end in -free or are in OPENCODE_FREE_MODELS.
+    """Fetch OpenCode models; free ones are detected by a zero price on text
+    input and output in the listing's `cost` field (see opencode_is_free_candidate).
 
     Every candidate is then verified with a real call that satisfies the
     gateway's free-tier gate (see the OPENCODE gate notes above), so we only
@@ -1684,7 +1727,11 @@ def fetch_opencode() -> list[dict[str, Any]]:
     candidates = []
     for model in data.get("data", []):
         model_id = model.get("id", "")
-        if model_id.endswith("-free") or model_id in OPENCODE_FREE_MODELS:
+        # big-pickle is advertised nowhere as free (no suffix), but the cost
+        # field marks it free. opencode_is_free_candidate catches it there,
+        # so we rely solely on the provider's cost signal rather than a
+        # hardcoded id list or the -free suffix.
+        if opencode_is_free_candidate(model):
             candidates.append(model)
 
     api_key = os.environ.get("OPENCODE_API_KEY", "")
@@ -1739,12 +1786,26 @@ def fetch_opencode() -> list[dict[str, Any]]:
             try:
                 verdict, detail = opencode_probe(model_id, api_key)
             except OpenCodeRateLimited:
-                # Includes the current candidate: it was never actually answered.
+                # The key's bucket is exhausted: mark this candidate and every
+                # remaining one `rate_limited` so the next sync does not re-probe
+                # them until the window elapses, then abort the sweep. The 429
+                # is a fact about the credential, never about any model, so none
+                # of these models is treated as dead.
+                for m in candidates[index:]:
+                    mid = m.get("id", "")
+                    cache[mid] = {
+                        "verdict": "rate_limited",
+                        "detail": "opencode key rate-limited (429); bucket exhausted",
+                        "checked_at": datetime.now(UTC).isoformat().replace("Z", "+00:00"),
+                    }
                 untried.extend(candidates[index:])
                 print(
                     f"OpenCode: key is rate limited (429) after {index} candidates; "
-                    f"{len(untried)} left UNVERIFIED. A 429 says nothing about whether "
-                    "those models work, so they are NOT treated as dead.",
+                    f"{len(untried)} left UNVERIFIED. Verdicts are cached as "
+                    f"rate_limited (window {OPENCODE_RATE_LIMITED_WINDOW_MINUTES} min) "
+                    "so they are not re-probed until the bucket refills. A 429 says "
+                    "nothing about whether the models work, so they are NOT treated "
+                    "as dead.",
                     file=sys.stderr,
                 )
                 break
@@ -1957,7 +2018,38 @@ def commandcode_base_url() -> str:
 
 
 def commandcode_models_url() -> str:
-    return commandcode_probe_base() + "/models"
+    """The catalog listing the candidate filter reads.
+
+    The provider's own catalog endpoint (https://api.commandcode.ai/
+    provider/v1/models), NOT the probe front end. The local proxy at
+    127.0.0.1:3050 only lists models already in config.yaml — an empty list
+    when none are configured — and it authenticates on the GATEWAY key
+    (admin), not the provider key, so pointing the listing at it produced
+    "no data or unexpected format" on every run and the CommandCode chain
+    stayed empty. The catalog is public to the provider key; only the
+    completion probe has to go through the front end the gateway routes to.
+    """
+    return COMMANDCODE_ENDPOINT
+
+
+def commandcode_probe_api_key() -> str:
+    """The key the CommandCode probe authenticates to the front end with.
+
+    The front end (the gateway's commandcode shim, or the standalone
+    commandcode-proxy) is authenticated with the GATEWAY key — `admin` on
+    this host — not with the provider key. The provider key (COMMANDCODE_API_KEY)
+    is what the upstream call needs and is sent separately by the shim; sending
+    it to the front end is what produced the "Invalid API key" that made every
+    probe answer `unknown` and left the chain empty. The gateway key is read
+    from the same variables the daemon reads it from (GATEWAY_API_KEY, then
+    AIROUTER_API_KEY), defaulting to `admin` because that is what the running
+    service was started with.
+    """
+    for name in ("GATEWAY_API_KEY", "AIROUTER_API_KEY"):
+        val = os.environ.get(name, "").strip()
+        if val:
+            return val
+    return "admin"
 
 
 def commandcode_chat_url() -> str:
@@ -2144,7 +2236,7 @@ def fetch_commandcode() -> list[dict[str, Any]]:
     unknown = []
     exhausted = []
     for model in candidates:
-        verdict = commandcode_probe(model["id"], cc_key)
+        verdict = commandcode_probe(model["id"], commandcode_probe_api_key())
         if verdict == "ok":
             model["verified"] = True
             free_models.append(model)
@@ -2153,44 +2245,51 @@ def fetch_commandcode() -> list[dict[str, Any]]:
         elif verdict == "paid":
             dropped.append(f"{model['id']}(paid)")
         else:
-            # Inconclusive. Excluded from the emit (we cannot route to a model
-            # we have not seen succeed) but reported, so a capacity blip is
-            # visible instead of silently shrinking the chain.
-            unknown.append(f"{model['id']}({verdict})")
+            # Inconclusive. We cannot route to a model we have not seen
+            # succeed, but we also cannot treat a transient blip as "paid".
+            # The model dict is retained (alongside the string label used for
+            # the diagnostics) so the caller can keep it as unverified when
+            # nothing else gives evidence about the deal.
+            unknown.append(model)
 
-    if exhausted:
+    # A balance error describes the CALLER, not the model: on a dry account
+    # every free and paid model alike answers "insufficient credits". If
+    # something else got a verdict that is about the model (live, dead, or a
+    # different transient), the account can discriminate and the balance error
+    # is per-model evidence that THIS model is billed. Otherwise the account
+    # cannot tell a live deal from an ended one, so dropping on it would wipe
+    # the whole chain on account state — keep them, unverified.
+    for models_with_state, label in ((exhausted, "account credit exhausted"),):
+        if not models_with_state:
+            continue
         if free_models or unknown or dropped:
-            # Some candidate got a verdict that is not about the caller's
-            # balance, so the account CAN discriminate: it can pay, and
-            # these models specifically cannot. That is the 2026-10-01
-            # longcat case — per-model evidence the deal is billed, and
-            # definitive.
-            dropped.extend(f"{m['id']}(paid)" for m in exhausted)
+            dropped.extend(f"{m['id']}(paid)" for m in models_with_state)
         else:
-            # Every candidate answered with the same balance error. A dry
-            # account gets that for free and paid models alike, so it cannot
-            # separate a live deal from an ended one — and dropping on it
-            # would empty the whole CommandCode chain on account state,
-            # which is not a property of any model. Keep the candidates,
-            # unverified: `verified` stays unset, which the generator and
-            # check-rules read as "unknown" — never "dead" — so the chains
-            # are untouched. Recharging re-verifies them on the next sync,
-            # and a model that is genuinely dead is backed off at request
-            # time by the daemon's cooldowns. Known limit, accepted
-            # deliberately: an account that can pay while EVERY deal has
-            # ended also looks like this, and is kept rather than wiped —
-            # the safe direction of the two mistakes.
-            for m in exhausted:
+            for m in models_with_state:
                 m.pop("verified", None)
-                m["unverified_reason"] = "commandcode probe: account credit exhausted"
+                m["unverified_reason"] = f"commandcode probe: {label}"
                 free_models.append(m)
             print(
-                "CommandCode: account credit exhausted — the provider refused "
-                "every candidate with the same balance error, which is not "
-                f"evidence that a deal ended; keeping {len(exhausted)} "
-                "unverified",
+                f"CommandCode: {label} — the provider refused every candidate "
+                "with the same balance error, which is not evidence that a deal "
+                f"ended; keeping {len(models_with_state)} unverified",
                 file=sys.stderr,
             )
+
+    # Unknown (transient) verdicts are handled the same way as the balance
+    # error above: if any model resolved one way or another, an unknown one is
+    # treated as likely-paid; if EVERYTHING came back transient, keep the lot
+    # unverified rather than shrinking the chain on a flaky run.
+    if unknown:
+        unknown_labels = [m["id"] for m in unknown]
+        if free_models or dropped:
+            # We have a real signal somewhere; treat the transients as paid.
+            dropped.extend(f"{m['id']}(paid)" for m in unknown)
+        else:
+            for m in unknown:
+                m.pop("verified", None)
+                m["unverified_reason"] = "commandcode probe: inconclusive upstream error"
+                free_models.append(m)
 
     if dropped:
         print(
@@ -2200,7 +2299,7 @@ def fetch_commandcode() -> list[dict[str, Any]]:
     if unknown:
         print(
             "CommandCode: inconclusive, excluded this run (transient, NOT a "
-            "verdict that the deal ended) — " + ", ".join(unknown),
+            "verdict that the deal ended) — " + ", ".join(unknown_labels),
             file=sys.stderr,
         )
     print(

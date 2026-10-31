@@ -106,10 +106,27 @@ func TestRealConfigChainInvariants(t *testing.T) {
 	}
 
 	// A key-group source: the same model id on every key of the group, so a
-	// rate-limited key has a sibling to fall through to.
+	// rate-limited key has a sibling to fall through to. Both keys must be
+	// ACTIVE for the invariant to apply: an operator who comments out
+	// commandcode2 (or nvidia3) is deliberately disabling a key, and the
+	// generator correctly emits only the keys that exist, so demanding the
+	// full group there would be wrong.
 	groups := map[string][]string{
 		"nvidia-nim":  {"nvidia", "nvidia2", "nvidia3"},
 		"commandcode": {"commandcode", "commandcode2"},
+	}
+	activeGroups := map[string][]string{}
+	for src, provs := range groups {
+		present := make([]string, 0, len(provs))
+		for _, p := range provs {
+		    if _, ok := cfg.Providers[p]; ok {
+		        present = append(present, p)
+		    }
+		}
+		if len(present) < 2 {
+		    continue
+		}
+		activeGroups[src] = present
 	}
 
 	for _, name := range LogicalModels {
@@ -169,7 +186,7 @@ func TestRealConfigChainInvariants(t *testing.T) {
 			}
 		}
 
-		for source, provs := range groups {
+		for source, provs := range activeGroups {
 			per := map[string]map[string]bool{}
 			for _, p := range provs {
 				per[p] = map[string]bool{}
@@ -199,4 +216,4 @@ func TestRealConfigChainInvariants(t *testing.T) {
 			}
 		}
 	}
-}
+	}
