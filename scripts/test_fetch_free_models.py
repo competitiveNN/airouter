@@ -491,6 +491,7 @@ def test_longcat_is_not_free(monkeypatch):
     ]}
     monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
     monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_COMMANDCODE_PROBE", "0")
 
     def fake_probe(model_id, key):
         return "ok" if "space-bunny" in model_id else "credit_exhausted"
@@ -569,6 +570,7 @@ def test_fetch_commandcode_drops_paid_and_reports_inconclusive(monkeypatch):
     ]}
     monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
     monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_COMMANDCODE_PROBE", "0")
 
     def fake_probe(model_id, key):
         if "longcat" in model_id.lower():
@@ -612,6 +614,7 @@ def test_fetch_commandcode_keeps_candidates_when_the_account_is_dry(monkeypatch)
     ]}
     monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
     monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_COMMANDCODE_PROBE", "0")
     monkeypatch.setattr(
         ff, "commandcode_probe",
         lambda model_id, key: "credit_exhausted",
@@ -643,6 +646,7 @@ def test_credit_exhaustion_is_paid_when_another_candidate_succeeds(monkeypatch):
     ]}
     monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: catalog)
     monkeypatch.setenv("COMMANDCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_COMMANDCODE_PROBE", "0")
 
     def fake_probe(model_id, key):
         if "longcat" in model_id.lower():
@@ -803,6 +807,7 @@ def test_rate_limited_sweep_keeps_models_unverified_not_dead(monkeypatch, capsys
         "data": [{"id": f"m{i}-free"} for i in range(6)],
     })
     monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_OPENCODE_PROBE", "0")
     monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
 
     def _always_429(model_id, key, opener=None):
@@ -826,6 +831,7 @@ def test_sweep_stops_at_the_probe_budget(monkeypatch, capsys):
         "data": [{"id": f"m{i}-free"} for i in range(5)],
     })
     monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_OPENCODE_PROBE", "0")
     monkeypatch.setattr(ff, "OPENCODE_PROBE_BUDGET", -1.0)
     monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
     monkeypatch.setattr(ff, "opencode_probe",
@@ -977,6 +983,7 @@ def test_probe_cache_round_trips(tmp_path, monkeypatch):
         "data": [{"id": "m1-free"}, {"id": "m2-free"}],
     })
     monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_OPENCODE_PROBE", "0")
     monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
 
     probed = []
@@ -1043,6 +1050,7 @@ def test_refresh_env_forces_a_live_probe(tmp_path, monkeypatch):
     }}))
     monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {"data": [{"id": "m1-free"}]})
     monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_OPENCODE_PROBE", "0")
     monkeypatch.setenv("REFRESH_OPENCODE_PROBE", "1")
     monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
 
@@ -1076,6 +1084,7 @@ def test_rate_limited_run_keeps_every_verdict_it_knows(tmp_path, monkeypatch):
         "data": [{"id": "m1-free"}, {"id": "m2-free"}, {"id": "m3-free"}],
     })
     monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_OPENCODE_PROBE", "0")
     monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
 
     def _first_only(model_id, key, opener=None):
@@ -1130,6 +1139,7 @@ def test_verified_opencode_record_carries_the_protocol_that_answered(tmp_path, m
         "data": [{"id": "resp-only-free"}, {"id": "chat-only-free"}],
     })
     monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_OPENCODE_PROBE", "0")
     monkeypatch.setattr(ff.time, "sleep", lambda *_: None)
     monkeypatch.setattr(ff, "opencode_probe", lambda m, k, opener=None: (
         "ok", "/responses 200" if m == "resp-only-free" else "/chat/completions 200"))
@@ -1151,6 +1161,7 @@ def test_an_unprobed_opencode_record_claims_no_protocol(tmp_path, monkeypatch):
         "data": [{"id": "untried-free"}],
     })
     monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("SKIP_OPENCODE_PROBE", "0")
 
     def _limited(model_id, key, opener=None):
         raise ff.OpenCodeRateLimited("429")

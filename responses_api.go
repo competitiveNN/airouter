@@ -72,8 +72,8 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 	// concrete model id, so it must be the translated form, not the original.
 	body, err := buildChatBody(chatReq)
 	if err != nil {
-		writeAPIError(w, 500, "Failed to encode upstream request", "server_error", "encode_failed")
-		g.recordRequest(req.Model, 500, time.Since(start))
+		writeAPIError(w, http.StatusServiceUnavailable, "Failed to encode upstream request", "service_unavailable_error", "encode_failed")
+		g.recordRequest(req.Model, http.StatusServiceUnavailable, time.Since(start))
 		return
 	}
 
@@ -129,6 +129,11 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		maxAttempts = 1
 	}
 	tried := map[string]bool{}
+
+	// The session is inflight for the lifetime of the request, mirroring
+	// handleCompletion: the deferred untrack covers every exit path.
+	g.inflight.Track(sessionID, req.Model, "")
+	defer g.inflight.Untrack(sessionID)
 
 	for {
 		if ctx.Err() != nil {
@@ -188,6 +193,11 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
 		}
+
+		// Refresh which endpoint is generating for this session before
+		// the upstream call, so a mid-request fallback shows the
+		// correct endpoint in the dashboard's inflight panel.
+		g.inflight.UpdateEndpoint(sessionID, ep.Key())
 
 		// attemptStart times this single upstream call; `start` above is the
 		// request-level clock every recordRequest below measures against.
@@ -375,8 +385,8 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeAPIError(w, 500, "Streaming not supported", "server_error", "streaming_unsupported")
-		g.recordRequest(req.Model, 500, time.Since(start))
+		writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
+		g.recordRequest(req.Model, http.StatusServiceUnavailable, time.Since(start))
 		return
 	}
 
@@ -393,6 +403,12 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 	}
 	tried := map[string]bool{}
 	tokens := estimateTokens(req)
+
+	// The session is inflight for the lifetime of the request, mirroring
+	// the chat streaming path. The deferred untrack covers every exit,
+	// including the buffered-replay fallback path.
+	g.inflight.Track(sessionID, req.Model, "")
+	defer g.inflight.Untrack(sessionID)
 
 	// retryBody is the upstream body for the current attempt. After a
 	// mid-stream failure it is rebuilt with the partial assistant output
@@ -454,6 +470,10 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		// Instead we translate into an in-memory buffer first: if the
 		// attempt fails before producing anything, nothing has been sent and
 		// we can fall back cleanly.
+		// Refresh which endpoint is generating for this session before
+		// the attempt, mirroring the completion path.
+		g.inflight.UpdateEndpoint(sessionID, ep.Key())
+
 		var buf strings.Builder
 		var attempt *responsesStreamWriter
 		// attemptStart times this single upstream attempt; `start` above is

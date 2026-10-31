@@ -90,7 +90,7 @@ func recoveryMiddleware(h http.Handler) http.Handler {
 			if rec := recover(); rec != nil {
 				log.Printf("[panic] %s %s: %v", r.Method, r.URL.Path, rec)
 				if !tw.started {
-					writeAPIError(w, 500, "Internal server error", "server_error", "internal_error")
+					writeAPIError(w, http.StatusServiceUnavailable, "Internal server error", "service_unavailable_error", "internal_error")
 				}
 			}
 		}()
