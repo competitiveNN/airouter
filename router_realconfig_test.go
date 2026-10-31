@@ -119,12 +119,12 @@ func TestRealConfigChainInvariants(t *testing.T) {
 	for src, provs := range groups {
 		present := make([]string, 0, len(provs))
 		for _, p := range provs {
-		    if _, ok := cfg.Providers[p]; ok {
-		        present = append(present, p)
-		    }
+			if _, ok := cfg.Providers[p]; ok {
+				present = append(present, p)
+			}
 		}
 		if len(present) < 2 {
-		    continue
+			continue
 		}
 		activeGroups[src] = present
 	}
@@ -216,4 +216,4 @@ func TestRealConfigChainInvariants(t *testing.T) {
 			}
 		}
 	}
-	}
+}
