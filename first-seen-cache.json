@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-10-31T08:47:06.293651Z",
+  "fetched_at": "2026-10-31T09:05:38.907199Z",
   "first_seen": {
     "beam": "2026-10-27",
     "beam-free": "2026-10-16",
@@ -49,10 +49,8 @@
     "mimo-v2.5-free": "2026-10-08",
     "mimo-v2.6-flash-free": "2026-10-31",
     "poolside/laguna-s-2.1-free": "2026-10-28",
-    "reflection/beam:free": "2026-10-31",
     "space-bunny-free": "2026-10-20",
     "stealth/cat-jam:free": "2026-10-19",
-    "stealth/glyph-cluster:free": "2026-10-31",
     "stealth/space-bunny-alpha": "2026-10-08",
     "step-5-preview-free": "2026-10-16"
   }
