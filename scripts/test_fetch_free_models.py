@@ -588,7 +588,13 @@ def test_fetch_commandcode_drops_paid_and_reports_inconclusive(monkeypatch):
     assert "stealth/space-bunny-alpha" in ids, ids
     # glm-5.3 is paid catalog noise and was never a candidate.
     assert not any("glm" in i for i in ids), ids
-    assert all(m.get("verified") is True for m in out), out
+    # longcat is definitively paid; laguna is inconclusive (unknown) so it is
+    # kept unverified rather than dropped on a transient blip.
+    assert any("laguna" in i for i in ids), ids
+    assert all(m.get("verified") is True or "laguna" in m["id"] for m in out), out
+    laguna = next(m for m in out if "laguna" in m["id"])
+    assert laguna.get("verified") is None
+    assert laguna.get("unverified_reason")
 
 
 def test_fetch_commandcode_keeps_candidates_when_the_account_is_dry(monkeypatch):
