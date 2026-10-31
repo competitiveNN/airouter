@@ -790,12 +790,15 @@ def test_opencode_probe_aborts_the_sweep_on_429(monkeypatch):
     assert len(slept) == ff.OPENCODE_429_RETRIES - 1, slept
 
 
-def test_rate_limited_sweep_keeps_models_unverified_not_dead(monkeypatch, capsys):
+def test_rate_limited_sweep_keeps_models_unverified_not_dead(monkeypatch, capsys, tmp_path):
     """The dangerous failure is a throttled run silently deleting models.
 
     That is exactly the regression this probe was rebuilt to undo, so a 429 has
-    to leave the untried candidates in the list marked unverified.
+    to leave the untried candidates in the list marked unverified. A fresh
+    cache file is used so the test does not read the real opencode-probe-cache
+    (which carries live rate-limited verdicts from a real run).
     """
+    monkeypatch.setattr(ff, "OPENCODE_PROBE_CACHE_FILE", tmp_path / "c.json")
     monkeypatch.setattr(ff, "fetch_json", lambda url, headers=None: {
         "data": [{"id": f"m{i}-free"} for i in range(6)],
     })
@@ -1053,10 +1056,15 @@ def test_refresh_env_forces_a_live_probe(tmp_path, monkeypatch):
 def test_rate_limited_run_keeps_every_verdict_it_knows(tmp_path, monkeypatch):
     """An interrupted sweep persists exactly what it knows, no more.
 
-    Verdicts are permanent, so a sweep that stops early must keep the
-    verdicts earlier sweeps recorded too — dropping one would mean
-    live-probing that model again, the one thing the cache prevents.
-    It must not, however, invent verdicts for models it never reached.
+    Permanent verdicts (`ok`, `freetier`, `error`) are kept forever, so a
+    sweep that stops early must keep the verdicts earlier sweeps recorded too
+    — dropping one would mean live-probing that model again, the one thing
+    the cache prevents. It must not invent per-model verdicts for models it
+    never reached; instead it records the rate limit as `rate_limited`
+    credential state on every untried candidate so the next sweep does not
+    re-probe them until the window elapses — that is why the persisted set
+    contains m0-free (pre-existing `ok`) plus m1-free/m2-free/m3-free
+    (`rate_limited`).
     """
     cache_file = tmp_path / "c.json"
     cache_file.write_text(json.dumps({"probes": {
@@ -1079,7 +1087,11 @@ def test_rate_limited_run_keeps_every_verdict_it_knows(tmp_path, monkeypatch):
     out = ff.fetch_opencode()
     assert len(out) == 3, [m["id"] for m in out]
     saved = json.loads(cache_file.read_text())["probes"]
-    assert set(saved) == {"m0-free", "m1-free"}, saved
+    assert set(saved) == {"m0-free", "m1-free", "m2-free", "m3-free"}, saved
+    assert saved["m0-free"]["verdict"] == "ok"
+    assert saved["m1-free"]["verdict"] == "ok", saved  # probed successfully
+    for mid in ("m2-free", "m3-free"):
+        assert saved[mid]["verdict"] == "rate_limited", saved
 
 
 # ── Which wire shape a model speaks ───────────────────────────────────────────

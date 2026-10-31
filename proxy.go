@@ -130,13 +130,12 @@ func (p *Proxy) effectiveProtocol(ep *ModelEndpoint) protocol {
 // proxyTries resolves this endpoint's proxy budget: the maximum number of
 // different proxies to try before the endpoint gives up. 0 means a direct
 // connection (no proxy).
-//
-// The endpoint's own value wins when it is non-zero (a per-model override);
-// otherwise the provider's provider-wide setting applies, and when the
-// provider does not set one the connection stays direct. A provider missing
-// from the config also resolves to direct: buildRequest turns that into an
-// error later, and there is nothing to proxy through.
 func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
+	// Command Code upstreams never route through the proxy pool: the
+	// protocol has its own auth model and the proxy pool is not used.
+	if p != nil && p.effectiveProtocol(ep) == protocolCommandCode {
+		return 0
+	}
 	if ep.Proxy > 0 {
 		return ep.Proxy
 	}
@@ -387,24 +386,8 @@ func NewProxy(cfg *Config) *Proxy {
 		p.upstreamSlots = make(chan struct{}, maxUp)
 	}
 
-	// Command Code upstream proxy. http.Transport.Proxy issues CONNECT
-	// for https targets on its own, so the tunnel carries end-to-end
-	// TLS to the Command Code API and only the Command Code upstream
-	// is affected -- every other provider keeps the direct transport.
-	// A malformed URL is logged and ignored rather than fatal: the
-	// gateway serves many providers and one bad env var must not take
-	// the daemon down (the direct path keeps working).
-	if raw := ccUpstreamProxyURL(); raw != "" {
-		if pu, err := url.Parse(raw); err == nil && pu.Scheme != "" && pu.Host != "" {
-			tr := p.baseTransport.Clone()
-			tr.Proxy = http.ProxyURL(pu)
-			p.ccTransport = tr
-			p.ccClient = &http.Client{Transport: tr}
-			log.Printf("[commandcode] upstream requests routed through proxy %s", redactProxyURL(raw))
-		} else {
-			log.Printf("[commandcode] invalid CC_UPSTREAM_PROXY %q, using direct connection", raw)
-		}
-	}
+	// Command Code upstreams never use an HTTP CONNECT proxy: they always
+	// go direct, ignoring CC_UPSTREAM_PROXY.
 	p.config = &atomic.Pointer[Config]{}
 	p.config.Store(cfg)
 	return p

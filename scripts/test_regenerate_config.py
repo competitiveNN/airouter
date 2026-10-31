@@ -1771,7 +1771,7 @@ def test_protocol_injection_is_real_when_the_entry_already_has_one():
 def test_the_validate_config_harness_has_teeth_beyond_the_protocol_rule(tmp_path):
     """Otherwise "the protocol rule is enforced" could pass because the harness
     never rejects anything at all."""
-    unknown_provider = CONFIG.read_text().replace("      - provider: opencode",
+    unknown_provider = CONFIG.read_text().replace("      - provider: kilocode",
                                                   "      - provider: notaprovider", 1)
     assert _validate_config(tmp_path, unknown_provider).returncode == 1
 

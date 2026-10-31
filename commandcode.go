@@ -95,17 +95,6 @@ func ccCliMode() string        { return ccStrEnv("CC_CLI_MODE", "agent") }
 func ccCliSessionMode() string { return ccStrEnv("CC_CLI_SESSION_MODE", "interactive") }
 func ccZDR() bool              { return ccBoolEnv("CMD_ZDR", false) }
 
-// ccUpstreamProxyURL names the HTTP CONNECT proxy every Command Code
-// upstream request (generation, fingerprint record, lifecycle event)
-// is routed through. Empty means a direct connection. It is the
-// gateway equivalent of commandcode-proxy's CC_UPSTREAM_PROXY
-// (issue #18): the Node proxy implements the CONNECT tunnel by hand
-// because Node's fetch ignores proxy env vars; Go's net/http issues
-// CONNECT for https targets through http.Transport.Proxy natively.
-func ccUpstreamProxyURL() string {
-	return os.Getenv("CC_UPSTREAM_PROXY")
-}
-
 // ccEmptySystemPlaceholder sends a single space when there is no system
 // prompt, so the upstream does not inject its ~7.5K-token default
 // prompt (commandcode-proxy issue #17).

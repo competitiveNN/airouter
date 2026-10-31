@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -517,14 +518,10 @@ func TestCCStreamZeroOutputGuard(t *testing.T) {
 	}
 }
 
-// TestCCUpstreamProxyRouting pins CC_UPSTREAM_PROXY: when set,
-// every Command Code upstream request dials the proxy with
-// CONNECT instead of going direct, and the proxy-routed client is
-// the one the request path uses (Forward, StreamToClient and the
-// fingerprint/lifecycle pre-requests all share it).
+// TestCCUpstreamProxyRouting pins that Command Code upstreams never use
+// an HTTP CONNECT proxy: CC_UPSTREAM_PROXY is ignored, and the accessors
+// return the shared direct client/transport even when the env var is set.
 func TestCCUpstreamProxyRouting(t *testing.T) {
-	// Without the env var the commandcode accessors fall back to
-	// the direct client/transport.
 	direct := NewProxy(&Config{})
 	if direct.ccClient != nil || direct.ccTransport != nil {
 		t.Fatal("no proxy configured, yet a proxied client was built")
@@ -536,11 +533,7 @@ func TestCCUpstreamProxyRouting(t *testing.T) {
 		t.Fatal("commandCodeTransport() must fall back to the shared transport")
 	}
 
-	// With the env var set, the generation request must arrive at
-	// the proxy as a CONNECT for the Command Code API host. The
-	// fake proxy cannot complete the TLS handshake that follows
-	// its 200, so Forward returns an error -- the CONNECT itself
-	// is the assertion.
+	// With the env var set, Command Code traffic must STILL go direct.
 	var mu sync.Mutex
 	var connects []string
 	fakeProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -551,35 +544,47 @@ func TestCCUpstreamProxyRouting(t *testing.T) {
 	}))
 	defer fakeProxy.Close()
 
+	// A local upstream proves the request went direct instead of through
+	// the proxy (which cannot complete a CONNECT tunnel anyway).
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		io.WriteString(w, ccShimNDJSON)
+	}))
+	defer upstream.Close()
+
 	t.Setenv("CC_UPSTREAM_PROXY", fakeProxy.URL)
 	cfg := &Config{Providers: map[string]ProviderConfig{
-		"commandcode": {URL: "https://api.commandcode.ai"},
+		"commandcode": {URL: upstream.URL},
 	}}
 	p := NewProxy(cfg)
-	if p.ccClient == nil || p.ccTransport == nil {
-		t.Fatal("CC_UPSTREAM_PROXY did not build the proxied client/transport")
+	if p.ccClient != nil || p.ccTransport != nil {
+		t.Fatal("CC_UPSTREAM_PROXY must not build a proxied client/transport")
 	}
-	if p.commandCodeClient() == p.client {
-		t.Fatal("commandCodeClient() must return the proxied client")
+	if p.commandCodeClient() != p.client {
+		t.Fatal("commandCodeClient() must return the shared client even with CC_UPSTREAM_PROXY set")
+	}
+	if p.commandCodeTransport() != p.baseTransport {
+		t.Fatal("commandCodeTransport() must return the shared transport even with CC_UPSTREAM_PROXY set")
 	}
 
 	_, err := p.Forward(context.Background(),
 		[]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`),
 		ModelEndpoint{Provider: "commandcode", Model: "m", Protocol: "commandcode"}, "s")
 	if err == nil {
-		t.Log("note: Forward unexpectedly succeeded through the fake proxy")
+		t.Log("note: Forward unexpectedly succeeded")
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	found := false
 	for _, c := range connects {
-		if c == "CONNECT api.commandcode.ai:443" {
-			found = true
+		if strings.HasPrefix(c, "CONNECT") {
+			t.Fatalf("commandcode request went through the proxy (%q) despite the direct-only policy", c)
 		}
 	}
-	if !found {
-		t.Fatalf("no CONNECT to api.commandcode.ai:443 reached the proxy; saw %v", connects)
+	if !upstreamHit.Load() {
+		t.Fatal("the request never reached the upstream directly")
 	}
 }
 

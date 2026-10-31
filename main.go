@@ -162,10 +162,10 @@ func main() {
 			commandCodeServer = &http.Server{
 				Addr:              ":" + *commandCodePort,
 				Handler:           recoveryMiddleware(shim.Handler()),
-				ReadTimeout:       30 * time.Second,
-				ReadHeaderTimeout: 10 * time.Second,
-				WriteTimeout:      300 * time.Second,
-				IdleTimeout:       120 * time.Second,
+				ReadTimeout:       5 * time.Minute,
+				ReadHeaderTimeout: 60 * time.Second,
+				WriteTimeout:      30 * time.Minute,
+				IdleTimeout:       10 * time.Minute,
 			}
 			go func() {
 				log.Printf("Command Code API on port %s (providers: %s)", *commandCodePort, *commandCodeProviders)

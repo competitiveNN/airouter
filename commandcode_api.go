@@ -560,16 +560,89 @@ func (s *CommandCodeShim) penalize(ep *ModelEndpoint, err error, status int, ses
 	s.gateway.recordCooldown()
 }
 
-// HandleModels lists the Command Code models the gateway knows about: the
-// endpoints of the shim's providers that appear in the configured chains. It is
-// not a catalogue -- Command Code models are not enumerated anywhere in this
-// repo -- but it gives a client a list to choose from. A model outside it still
-// works, because the requested id is passed through verbatim.
+// HandleModels lists the Command Code models the gateway knows about.
 func (s *CommandCodeShim) HandleModels(w http.ResponseWriter, r *http.Request) {
 	if !s.gateway.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
 		return
 	}
+
+	// Try to fetch the full catalog from the provider's catalog endpoint.
+	// Fall back to chain-derived list on any error.
+	catalog := s.fetchProviderCatalog(r.Context())
+	if catalog != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(catalog)
+		return
+	}
+
+	// Fallback: models from configured chains.
+	s.handleModelsFallback(w, r)
+}
+
+// fetchProviderCatalog fetches the full model catalog from the Command Code
+// provider's /provider/v1/models endpoint. Returns nil on any error.
+func (s *CommandCodeShim) fetchProviderCatalog(ctx context.Context) map[string]any {
+	cfg := s.gateway.config.Load()
+	for _, name := range s.providerNames {
+		provider, ok := cfg.Providers[name]
+		if !ok {
+			continue
+		}
+		apiKey := provider.APIKey()
+		if apiKey == "" {
+			continue
+		}
+		catalog, ok := s.fetchProviderCatalogFrom(name, provider, apiKey, ctx)
+		if ok {
+			return catalog
+		}
+	}
+	return nil
+}
+
+// fetchProviderCatalogFrom does a single attempt against one provider's
+// /provider/v1/models endpoint and closes the response body per-attempt so a
+// failure does not leak connections across provider iterations.
+func (s *CommandCodeShim) fetchProviderCatalogFrom(name string, provider ProviderConfig, apiKey string, ctx context.Context) (map[string]any, bool) {
+	base := strings.TrimRight(provider.URL, "/")
+	catalogURL := base + "/provider/v1/models"
+
+	req, err := http.NewRequestWithContext(ctx, "GET", catalogURL, nil)
+	if err != nil {
+		return nil, false
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("User-Agent", "cli")
+
+	// Use a short timeout for the catalog fetch.
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+
+	var catalog map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		return nil, false
+	}
+	if catalog["object"] != "list" {
+		return nil, false
+	}
+	data, ok := catalog["data"].([]any)
+	if !ok || len(data) == 0 {
+		return nil, false
+	}
+	return catalog, true
+}
+
+// handleModelsFallback is the original chain-derived models list.
+func (s *CommandCodeShim) handleModelsFallback(w http.ResponseWriter, r *http.Request) {
 	cfg := s.gateway.config.Load()
 	served := make(map[string]bool, len(s.providerNames))
 	for _, name := range s.providerNames {
