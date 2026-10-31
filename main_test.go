@@ -6131,9 +6131,9 @@ func TestRecoveryMiddlewarePreservesHijacker(t *testing.T) {
 	}
 }
 
-// TestRecoveryMiddlewarePanicBeforeOutputReturns500 covers the plain panic
+// TestRecoveryMiddlewarePanicBeforeOutputReturns503 covers the plain panic
 // path: nothing was sent yet, so the client gets a retryable 503.
-func TestRecoveryMiddlewarePanicBeforeOutputReturns500(t *testing.T) {
+func TestRecoveryMiddlewarePanicBeforeOutputReturns503(t *testing.T) {
 	handler := recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom")
 	}))

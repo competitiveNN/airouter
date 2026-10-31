@@ -584,9 +584,7 @@ func TestChatProxyPreservesMessagesBytes(t *testing.T) {
 	}
 }
 
-// TestChatProxyUpstreamErrorPassthrough verifies the webchat proxy maps upstream 500 responses to 502.
-// even when the configured endpoint returns a 500, the gateway exposes it as
-// a 502 upstream failure rather than returning a client-visible 500.
+// TestChatProxyUpstreamErrorPassthrough verifies webchat endpoints normalize upstream 5xx errors.
 func TestChatProxyUpstreamErrorPassthrough(t *testing.T) {
 	for _, tc := range []struct {
 		name string
