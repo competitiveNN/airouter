@@ -2341,20 +2341,17 @@ def fetch_commandcode() -> list[dict[str, Any]]:
                 file=sys.stderr,
             )
 
-    # Unknown (transient) verdicts are handled the same way as the balance
-    # error above: if any model resolved one way or another, an unknown one is
-    # treated as likely-paid; if EVERYTHING came back transient, keep the lot
-    # unverified rather than shrinking the chain on a flaky run.
+    # Unknown (transient) verdicts are never evidence that a deal ended: a 502,
+    # 429, or timeout through the proxy is infrastructure, not billing. They are
+    # always kept unverified rather than dropped on a flaky run — the account
+    # being able to pay for one model says nothing about whether another model's
+    # proxy request failed transiently.
     if unknown:
         unknown_labels = [m["id"] for m in unknown]
-        if free_models or dropped:
-            # We have a real signal somewhere; treat the transients as paid.
-            dropped.extend(f"{m['id']}(paid)" for m in unknown)
-        else:
-            for m in unknown:
-                m.pop("verified", None)
-                m["unverified_reason"] = "commandcode probe: inconclusive upstream error"
-                free_models.append(m)
+        for m in unknown:
+            m.pop("verified", None)
+            m["unverified_reason"] = "commandcode probe: inconclusive upstream error"
+            free_models.append(m)
 
     if dropped:
         print(
@@ -2363,8 +2360,8 @@ def fetch_commandcode() -> list[dict[str, Any]]:
         )
     if unknown:
         print(
-            "CommandCode: inconclusive, excluded this run (transient, NOT a "
-            "verdict that the deal ended) — " + ", ".join(unknown_labels),
+            "CommandCode: inconclusive, kept unverified this run (transient, "
+            "NOT a verdict that the deal ended) — " + ", ".join(unknown_labels),
             file=sys.stderr,
         )
     print(
