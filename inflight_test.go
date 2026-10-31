@@ -58,8 +58,8 @@ func TestInflightTrackerCountsSessionsNotRequests(t *testing.T) {
 		t.Fatalf("after one of two requests finished: %+v, want the session still tracked", snap)
 	}
 	tr.Untrack("s1")
-	if snap = tr.Snapshot(); len(snap) != 0 {
-		t.Fatalf("after both requests finished: %+v, want an empty panel", snap)
+	if snap = tr.Snapshot(); len(snap) != 1 || snap[0].Sessions != 1 {
+		t.Fatalf("after both requests finished: %+v, want the session still alive until TTL", snap)
 	}
 }
 
@@ -71,8 +71,8 @@ func TestInflightTrackerUntrackIsIdempotent(t *testing.T) {
 	// untrack for a session that is gone must be a no-op.
 	tr.Untrack("s1")
 	tr.Untrack("never-tracked")
-	if snap := tr.Snapshot(); len(snap) != 0 {
-		t.Fatalf("snapshot = %+v, want empty", snap)
+	if snap := tr.Snapshot(); len(snap) != 1 {
+		t.Fatalf("snapshot = %+v, want the session still alive until TTL", snap)
 	}
 }
 
@@ -125,8 +125,15 @@ func TestInflightTrackerConcurrentAccess(t *testing.T) {
 	// be empty: a non-empty result means Track and Untrack are
 	// not symmetric, which is the leak that would make the
 	// dashboard accumulate dead sessions forever.
+	// Sessions stay alive for sessionTTL, so age them past it before
+	// checking they are gone.
+	tr.mu.Lock()
+	for _, se := range tr.sessions {
+		se.lastUsed = time.Now().Add(-tr.ttl - time.Hour)
+	}
+	tr.mu.Unlock()
 	if snap := tr.Snapshot(); len(snap) != 0 {
-		t.Fatalf("after paired track/untrack: %+v, want empty", snap)
+		t.Fatalf("after expiry: %+v, want empty", snap)
 	}
 }
 
@@ -169,6 +176,12 @@ func TestHandleAdminDashboardDataServesInflight(t *testing.T) {
 	g.inflight.Untrack("session-1")
 	g.inflight.Untrack("session-2")
 	g.inflight.Untrack("session-3")
+	// Age them past the TTL so the panel empties.
+	g.inflight.mu.Lock()
+	for _, se := range g.inflight.sessions {
+		se.lastUsed = time.Now().Add(-g.inflight.ttl - time.Hour)
+	}
+	g.inflight.mu.Unlock()
 	w = httptest.NewRecorder()
 	g.HandleAdminDashboardData(w, req)
 	var after struct {
@@ -178,7 +191,7 @@ func TestHandleAdminDashboardDataServesInflight(t *testing.T) {
 		t.Fatalf("second payload is not JSON: %v", err)
 	}
 	if len(after.Inflight) != 0 {
-		t.Fatalf("inflight after all sessions completed = %+v, want empty", after.Inflight)
+		t.Fatalf("inflight after all sessions expired = %+v, want empty", after.Inflight)
 	}
 }
 
