@@ -241,12 +241,20 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration) (*http.C
 			}
 		}
 	}
+<<<<<<< Updated upstream
 	// The direct path reuses the shared pooled transport. Per-attempt
 	// deadlines are applied via the request context, not per-transport
 	// timeouts (see handleCompletion / handleStream and StreamToClient), so
 	// the shared pool and its idle connections stay intact instead of being
 	// re-dialed on every hop and every fallback attempt.
 	if usedProxy == nil && transport != nil {
+=======
+	// The direct path uses the shared transport with per-attempt deadlines
+	// applied via the request context (see HandleChatCompletions / handleStream).
+	// This avoids the cost of a fresh connection pool per attempt while still
+	// bounding each phase (dial, TLS, response headers) by the attempt timeout.
+	if usedProxy == nil && transport != nil && timeout > 0 {
+>>>>>>> Stashed changes
 		client = &http.Client{Transport: transport}
 	}
 	return client, usedProxy

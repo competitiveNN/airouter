@@ -471,9 +471,10 @@ func (s *CommandCodeShim) complete(w http.ResponseWriter, r *http.Request, body 
 			continue
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
-		resp, err := s.gateway.proxy.Forward(ctx, body, ep, sessionID)
+		resp, fwdCancel, err := s.gateway.proxy.Forward(ctx, body, ep, sessionID)
 		if err != nil {
 			cancel()
+			fwdCancel()
 			lastErr = err
 			log.Printf("[commandcode] session=%s model=%s provider=%s: forward failed: %v",
 				sessionID, model, ep.Provider, err)
@@ -527,6 +528,7 @@ func (s *CommandCodeShim) complete(w http.ResponseWriter, r *http.Request, body 
 			log.Printf("[commandcode] session=%s model=%s: write error (client likely disconnected): %v",
 				sessionID, model, err)
 		}
+		fwdCancel()
 		return
 	}
 

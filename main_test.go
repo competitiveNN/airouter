@@ -1027,7 +1027,7 @@ func TestProviderProxyForward(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1048,6 +1048,46 @@ func TestProviderProxyForward(t *testing.T) {
 	if result.Model != "gpt-4" {
 		t.Errorf("expected response model gpt-4, got %s", result.Model)
 	}
+}
+
+// TestProviderProxyForwardCancelDoesNotPrematurelyCancelBody is a regression
+// guard for the context-lifetime contract: Forward() must not cancel its inner
+// provider-timeout context on return, otherwise io.ReadAll(resp.Body) races
+// into "context canceled" and poisons healthy fallback endpoints. The body must
+// remain readable after Forward returns, and the caller cancels afterwards.
+func TestProviderProxyForwardCancelDoesNotPrematurelyCancelBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer backend.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"p": {URL: backend.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "p", Model: "m"}}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	ep, _ := router.SelectEndpoint("smart", "sess", false, nil)
+
+	resp, cancel, err := proxy.Forward(context.Background(), []byte(`{"model":"smart","messages":[{"role":"user","content":"hi"}]}`), *ep, "sess")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("body read failed after Forward returned: %v", readErr)
+	}
+	if !strings.Contains(string(body), `"ok"`) {
+		t.Fatalf("unexpected body: %s", string(body))
+	}
+	cancel()
 }
 
 func TestProviderProxyStreaming(t *testing.T) {
@@ -1140,7 +1180,7 @@ func TestOpencodeHeadersInjected(t *testing.T) {
 	router := NewRouter(cfg, "")
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "test-session")
+	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "test-session")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1202,7 +1242,7 @@ func TestOpencodeHeadersNotInjectedForNonOpencode(t *testing.T) {
 	router := NewRouter(cfg, "")
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1251,7 +1291,7 @@ func TestOpencodeProviderHeaderOverride(t *testing.T) {
 	router := NewRouter(cfg, "")
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -6634,5 +6674,61 @@ func TestMetricsFailoverReason(t *testing.T) {
 	}
 	if !strings.Contains(bodyStr, "airouter_fallbacks_total") {
 		t.Errorf("missing airouter_fallbacks_total")
+	}
+}
+
+
+
+func TestIdleTimeoutMidStreamFailsOverWithout500(t *testing.T) {
+	stalling := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"part \"},\"finish_reason\":null}]}\n\n"))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		time.Sleep(10 * time.Second)
+	}))
+	defer stalling.Close()
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n"))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}))
+	defer healthy.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"stall":   {URL: stalling.URL},
+			"healthy": {URL: healthy.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "stall", Model: "m-stall"},
+				{Provider: "healthy", Model: "m-healthy"},
+			}},
+		},
+	}
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	proxy.SetStreamIdleTimeout(50 * time.Millisecond)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	rec := httptest.NewRecorder()
+	gateway.HandleChatCompletions(rec, req)
+
+	if rec.Code == http.StatusInternalServerError {
+		t.Fatalf("client saw 500 on idle-timeout mid-stream: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("client never got a terminal sentinel: %s", rec.Body.String())
 	}
 }

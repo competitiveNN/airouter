@@ -13,6 +13,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net"
+	"math/rand/v2"
 	"net/http"
 	"sort"
 	"strings"
@@ -1361,6 +1362,7 @@ func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration
 	return sleep, true
 }
 
+<<<<<<< Updated upstream
 // isRetryableForChain classifies whether a failed upstream attempt warrants
 // retrying on the next chain entry. 429/5xx/timeouts and protocol/quota
 // refusals are (the refusal is endpoint-specific and the other endpoint may
@@ -1529,6 +1531,44 @@ func (g *GatewayContext) interAttemptWait(walk *budgetState, ceiling time.Durati
 		base = interAttemptBackoff * 2
 	}
 	wait := base + time.Duration(rand.Int64N(int64(interAttemptBackoff/4)))
+=======
+// interAttemptBackoff is the pause the fallback walk takes between one
+// endpoint's failure and the next endpoint's attempt. It exists because a
+// chain that hits the next endpoint the instant the previous one failed
+// produces a synchronized stampede: every client that hit the same rate
+// limit walks the chain at the same instant and re-hammers the provider
+// the moment it recovers. A small jittered pause lets the provider's own
+// backoff settle and spreads the retries out.
+//
+// Only retryable failures (429/5xx/timeout) pay the pause. A 400/401/403/
+// 404 is not transient -- the request is unacceptable or the endpoint is
+// misconfigured -- and pausing before it would only delay surfacing the
+// real error to the client (see retry_scope).
+const interAttemptBackoff = 250 * time.Millisecond
+
+func interAttemptSleep(walk *budgetState, ceiling time.Duration) (time.Duration, bool) {
+	// Full jitter: pick anywhere in [0, interAttemptBackoff). A fixed
+	// duration would have every client wake at the same instant; a ceiling
+	// shorter than the budget keeps the pause from outlasting the walk.
+	sleep := time.Duration(rand.Int64N(int64(interAttemptBackoff)))
+	if sleep <= 0 {
+		sleep = interAttemptBackoff / 2
+	}
+	if ceiling > 0 && sleep > ceiling {
+		sleep = ceiling
+	}
+	if remaining := walk.remaining(); sleep >= remaining {
+		return 0, false
+	}
+	return sleep, true
+}
+
+// interAttemptWait pauses the request's fallback walk by the computed
+// sleep duration, bounded by the context cancellation. It reuses
+// cycleBackSleep's remaining-budget check so a pause never outlasts the walk.
+func (g *GatewayContext) interAttemptWait(walk *budgetState, ceiling time.Duration, ctx context.Context) {
+	wait := interAttemptBackoff + time.Duration(rand.Int64N(int64(interAttemptBackoff/4)))
+>>>>>>> Stashed changes
 	sleep, ok := cycleBackSleep(wait, walk, ceiling)
 	if !ok || sleep <= 0 {
 		return
@@ -1780,6 +1820,13 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				}
 			}
 			g.recordCooldown()
+<<<<<<< Updated upstream
+=======
+			if g.testCooldown > 0 {
+				g.router.ApplyCooldownWithDuration(ep, 0, lastErr.Error(), sessionID, g.testCooldown)
+			}
+			g.interAttemptWait(walk, g.providerMaxInterruption(ep.Provider), ctx)
+>>>>>>> Stashed changes
 			continue
 		}
 		if resp.StatusCode != 200 {
@@ -2054,7 +2101,11 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	// request. Without it, an endpoint that refuses both shapes would bounce
 	// between them forever inside the fallback budget.
 	protocolFlips := map[string]bool{}
+<<<<<<< Updated upstream
 	_ = protocolFlips
+=======
+	nonRetryableAdvanced := false
+>>>>>>> Stashed changes
 
 	// doneSent tracks whether we've already written the [DONE] sentinel to
 	// the client. We must always send it before returning so the client
