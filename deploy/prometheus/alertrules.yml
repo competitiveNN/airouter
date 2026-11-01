@@ -1,0 +1,36 @@
+groups:
+- name: airouter.cooldown
+  rules:
+  # Alert when cooldowns are being applied at a high rate — indicates a
+  # provider or chain is in distress and clients are being bounced between
+  # models.
+  - alert: AirouterHighCooldownRate
+    expr: rate(airouter_cooldowns_applied_total[5m]) > 2
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High cooldown application rate on {{ $labels.instance }}"
+      description: "More than 2 cooldowns per second over the last 5 minutes. An endpoint (or several) is failing repeatedly and being cooled down. Check /admin/cooldowns for the affected models."
+
+  # Alert when cooldown durations are escalating into the long tail — the
+  # escalation curve is parking endpoints for extended periods.
+  - alert: AirouterLongCooldownDuration
+    expr: histogram_quantile(0.95, rate(airouter_cooldown_duration_seconds_bucket[1h])) > 300
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "P95 cooldown duration exceeding 5 minutes on {{ $labels.instance }}"
+      description: "The 95th percentile cooldown duration over the last hour exceeds 300s. Endpoints are being parked for extended periods. Review the escalation curve and the health of the affected providers."
+
+  # Alert when the +Inf bucket dominates — most cooldowns exceed the largest
+  # bucket boundary (10s), indicating severe or persistent failures.
+  - alert: AirouterSevereCooldownEscalation
+    expr: rate(airouter_cooldown_duration_seconds_bucket{le="+Inf"}[15m]) / rate(airouter_cooldown_duration_seconds_count[15m]) > 0.8
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Severe cooldown escalation on {{ $labels.instance }}"
+      description: "More than 80% of cooldowns over the last 15 minutes exceed the 10s bucket boundary. This indicates persistent upstream failures — providers may be down or severely rate-limited. Check /admin/cooldowns and /admin/dashboard/data for the affected chains."

@@ -1,0 +1,486 @@
+{
+  "cooldowns": {
+    "commandcode2:Qwen/Qwen3.8-27B": {
+      "expiry": "2026-11-07T18:13:15.970184371+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "commandcode2:deepseek/deepseek-v4.1-flash": {
+      "expiry": "2026-11-07T18:13:36.185629301+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "commandcode2:inclusionai/ling-3.1-flash-1019:free": {
+      "expiry": "2026-11-07T13:01:43.978097141+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "commandcode2:poolside/laguna-s-2.1-free": {
+      "expiry": "2026-11-07T17:41:33.737791727+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": ""
+    },
+    "commandcode2:reflection/beam:free": {
+      "expiry": "2026-11-07T18:13:30.944877244+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": ""
+    },
+    "commandcode2:stealth/glyph-cluster:free": {
+      "expiry": "2026-11-07T18:13:30.940821906+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": ""
+    },
+    "commandcode2:zai-org/GLM-5.2": {
+      "expiry": "2026-11-07T18:13:29.31889578+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "commandcode:Qwen/Qwen3.8-27B": {
+      "expiry": "2026-11-07T18:13:15.968278108+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "commandcode:deepseek/deepseek-v4.1-flash": {
+      "expiry": "2026-11-07T18:13:36.192015295+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "commandcode:inclusionai/ling-3.1-flash-1019:free": {
+      "expiry": "2026-11-07T13:31:20.133261451+01:00",
+      "status_code": 404,
+      "error_count": 8,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "commandcode:poolside/laguna-s-2.1-free": {
+      "expiry": "2026-11-07T17:41:33.73893887+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": ""
+    },
+    "commandcode:reflection/beam:free": {
+      "expiry": "2026-11-07T18:13:30.944287313+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": ""
+    },
+    "commandcode:stealth/glyph-cluster:free": {
+      "expiry": "2026-11-07T18:13:30.941650966+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": ""
+    },
+    "commandcode:zai-org/GLM-5.2": {
+      "expiry": "2026-11-07T18:13:29.32083233+01:00",
+      "status_code": 404,
+      "error_count": 1,
+      "last_error": "{\"error\":{\"message\":\"404 page not found\\n\",\"type\":\"not_found\"}}"
+    },
+    "gemini:gemini-flash-lite-latest": {
+      "expiry": "2026-10-31T19:02:45.029377829+01:00",
+      "status_code": 0,
+      "error_count": 16,
+      "last_error": "upstream attempt timed out after 9s: context deadline exceeded"
+    },
+    "kilocode:cohere/north-mini-code:free": {
+      "expiry": "2026-10-31T18:42:10.491510936+01:00",
+      "status_code": 429,
+      "error_count": 3,
+      "last_error": "{\"error\":\"Rate limit exceeded\",\"error_type\":\"rate_limit_exceeded\",\"message\":\"Free model usage limit reached. Please try again later, or switch to a paid model or your own API key.\"}"
+    },
+    "kilocode:dots-studio/dots-3-note-preview:free": {
+      "expiry": "2026-10-31T18:48:30.569476791+01:00",
+      "status_code": 0,
+      "error_count": 7,
+      "last_error": "upstream attempt timed out after 7s: context deadline exceeded"
+    },
+    "kilocode:inclusionai/ling-3.1-flash-1019-free": {
+      "expiry": "2026-10-31T18:46:58.270846138+01:00",
+      "status_code": 0,
+      "error_count": 5,
+      "last_error": "upstream attempt timed out after 25s: context deadline exceeded"
+    },
+    "kilocode:kilo-auto/free": {
+      "expiry": "2026-10-31T18:48:25.486225593+01:00",
+      "status_code": 429,
+      "error_count": 5,
+      "last_error": "{\"error\":\"Rate limit exceeded\",\"error_type\":\"rate_limit_exceeded\",\"message\":\"Free model usage limit reached. Please try again later, or switch to a paid model or your own API key.\"}"
+    },
+    "kilocode:nvidia/nemotron-3-ultra-550b-a55b:free": {
+      "expiry": "2026-10-31T18:45:24.055105649+01:00",
+      "status_code": 0,
+      "error_count": 6,
+      "last_error": "upstream attempt timed out after 6s: context deadline exceeded"
+    },
+    "kilocode:nvidia/nemotron-3.5-lightning:free": {
+      "expiry": "2026-10-31T18:52:08.753878688+01:00",
+      "status_code": 0,
+      "error_count": 6,
+      "last_error": "stream idle timeout: no data within the configured window"
+    },
+    "kilocode:nvidia/nemotron-3.5-super-vl:free": {
+      "expiry": "2026-10-31T18:45:18.054409445+01:00",
+      "status_code": 0,
+      "error_count": 6,
+      "last_error": "upstream attempt timed out after 6s: context deadline exceeded"
+    },
+    "kilocode:poolside/laguna-s-2.1:free": {
+      "expiry": "2026-11-07T17:48:48.693948819+01:00",
+      "status_code": 404,
+      "error_count": 5,
+      "last_error": "{\"error\":\"The requested model 'poolside/laguna-s-2.1:free' does not exist. Please use an exact model id as listed on /api/gateway/models. If this is a newly released model, please try again in a few m..."
+    },
+    "kilocode:poolside/laguna-xs-2.1:free": {
+      "expiry": "2026-11-07T17:48:49.101370097+01:00",
+      "status_code": 404,
+      "error_count": 6,
+      "last_error": "{\"error\":\"The requested model 'poolside/laguna-xs-2.1:free' does not exist. Please use an exact model id as listed on /api/gateway/models. If this is a newly released model, please try again in a few ..."
+    },
+    "kilocode:recursive/flint-v1.0:free": {
+      "expiry": "2026-10-31T19:16:13.81950157+01:00",
+      "status_code": 429,
+      "error_count": 7,
+      "last_error": "{\"error\":\"Rate limit exceeded\",\"error_type\":\"rate_limit_exceeded\",\"message\":\"Free model usage limit reached. Please try again later, or switch to a paid model or your own API key.\"}"
+    },
+    "kilocode:reflection/beam-free": {
+      "expiry": "2026-10-31T18:50:40.652781329+01:00",
+      "status_code": 429,
+      "error_count": 5,
+      "last_error": "{\"error\":\"Rate limit exceeded\",\"error_type\":\"rate_limit_exceeded\",\"message\":\"Free model usage limit reached. Please try again later, or switch to a paid model or your own API key.\"}"
+    },
+    "kilocode:xingchen-agi/xing4.0-29b-a4b:free": {
+      "expiry": "2026-10-31T19:16:13.954849367+01:00",
+      "status_code": 429,
+      "error_count": 7,
+      "last_error": "{\"error\":\"Rate limit exceeded\",\"error_type\":\"rate_limit_exceeded\",\"message\":\"Free model usage limit reached. Please try again later, or switch to a paid model or your own API key.\"}"
+    },
+    "nvidia2:deepseek-ai/deepseek-v4.1-flash": {
+      "expiry": "2026-10-31T19:06:58.79836662+01:00",
+      "status_code": 0,
+      "error_count": 5,
+      "last_error": "upstream attempt timed out after 6s: context deadline exceeded"
+    },
+    "nvidia2:mistralai/mistral-large-4-1t-a52b": {
+      "expiry": "2026-10-31T18:42:50.670799001+01:00",
+      "status_code": 0,
+      "error_count": 7,
+      "last_error": "upstream attempt timed out after 5.997640212s: context deadline exceeded"
+    },
+    "nvidia2:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+      "expiry": "2026-10-31T18:42:23.867629186+01:00",
+      "status_code": 0,
+      "error_count": 2,
+      "last_error": "upstream attempt timed out after 1.997759525s: context deadline exceeded"
+    },
+    "nvidia2:nvidia/nemotron-3-ultra-550b-a55b": {
+      "expiry": "2026-10-31T18:54:21.869372245+01:00",
+      "status_code": 0,
+      "error_count": 4,
+      "last_error": "upstream attempt timed out after 6s: context deadline exceeded"
+    },
+    "nvidia2:nvidia/nemotron-3.5-super-vl-120b-a12b": {
+      "expiry": "2026-10-31T18:43:26.010303636+01:00",
+      "status_code": 0,
+      "error_count": 2,
+      "last_error": "upstream attempt timed out after 25s: context deadline exceeded"
+    },
+    "nvidia2:stepfun-ai/step-5-preview": {
+      "expiry": "2026-10-31T18:41:43.52479302+01:00",
+      "status_code": 0,
+      "error_count": 12,
+      "last_error": "upstream attempt timed out after 5.997697144s: context deadline exceeded"
+    },
+    "nvidia2:z-ai/glm-5.3-flash": {
+      "expiry": "2026-10-31T18:42:16.087764069+01:00",
+      "status_code": 0,
+      "error_count": 12,
+      "last_error": "upstream attempt timed out after 5.997214413s: context deadline exceeded"
+    },
+    "nvidia3:minimaxai/minimax-m3.1-flash": {
+      "expiry": "2026-10-31T18:41:12.377053424+01:00",
+      "status_code": 0,
+      "error_count": 12,
+      "last_error": "upstream attempt timed out after 5.441397909s: context deadline exceeded"
+    },
+    "nvidia3:mistralai/mistral-large-4-1t-a52b": {
+      "expiry": "2026-10-31T18:43:09.03615582+01:00",
+      "status_code": 0,
+      "error_count": 8,
+      "last_error": "upstream attempt timed out after 12s: context deadline exceeded"
+    },
+    "nvidia3:nvidia/nemotron-3-ultra-550b-a55b": {
+      "expiry": "2026-10-31T18:48:15.12840565+01:00",
+      "status_code": 0,
+      "error_count": 5,
+      "last_error": "upstream attempt timed out after 5.998324864s: context deadline exceeded"
+    },
+    "nvidia3:nvidia/nemotron-3.5-super-vl-120b-a12b": {
+      "expiry": "2026-10-31T18:42:43.488075254+01:00",
+      "status_code": 0,
+      "error_count": 2,
+      "last_error": "upstream attempt timed out after 6s: context deadline exceeded"
+    },
+    "nvidia3:stepfun-ai/step-5-preview": {
+      "expiry": "2026-10-31T18:41:58.088661925+01:00",
+      "status_code": 0,
+      "error_count": 12,
+      "last_error": "upstream attempt timed out after 12s: context deadline exceeded"
+    },
+    "nvidia3:z-ai/glm-5.3-flash": {
+      "expiry": "2026-10-31T18:42:32.670581105+01:00",
+      "status_code": 0,
+      "error_count": 12,
+      "last_error": "upstream attempt timed out after 12s: context deadline exceeded"
+    },
+    "nvidia:minimaxai/minimax-m3.1-flash": {
+      "expiry": "2026-10-31T18:41:37.525999635+01:00",
+      "status_code": 0,
+      "error_count": 5,
+      "last_error": "upstream attempt timed out after 12s: context deadline exceeded"
+    },
+    "nvidia:mistralai/mistral-large-4-1t-a52b": {
+      "expiry": "2026-10-31T18:42:44.671927933+01:00",
+      "status_code": 0,
+      "error_count": 6,
+      "last_error": "upstream attempt timed out after 12s: context deadline exceeded"
+    },
+    "nvidia:nvidia/nemotron-3-ultra-550b-a55b": {
+      "expiry": "2026-10-31T18:45:07.05381376+01:00",
+      "status_code": 0,
+      "error_count": 2,
+      "last_error": "upstream attempt timed out after 25s: context deadline exceeded"
+    },
+    "nvidia:stepfun-ai/step-5-preview": {
+      "expiry": "2026-10-31T18:41:25.524712359+01:00",
+      "status_code": 0,
+      "error_count": 10,
+      "last_error": "upstream attempt timed out after 12s: context deadline exceeded"
+    },
+    "nvidia:z-ai/glm-5.3-flash": {
+      "expiry": "2026-10-31T18:42:10.089744014+01:00",
+      "status_code": 0,
+      "error_count": 12,
+      "last_error": "upstream attempt timed out after 12s: context deadline exceeded"
+    },
+    "ollama:gemma4:31b": {
+      "expiry": "2026-10-31T18:56:03.220494305+01:00",
+      "status_code": 429,
+      "error_count": 7,
+      "last_error": "{\"error\":{\"message\":\"you (bassobassista) have reached your monthly usage limit, upgrade for higher limits: https://ollama.com/upgrade or add usage credits: https://ollama.com/settings (ref: de656415-4..."
+    },
+    "ollama:nemotron-3-super": {
+      "expiry": "2026-10-31T19:16:13.700940926+01:00",
+      "status_code": 429,
+      "error_count": 7,
+      "last_error": "{\"error\":{\"message\":\"you (bassobassista) have reached your monthly usage limit, upgrade for higher limits: https://ollama.com/upgrade or add usage credits: https://ollama.com/settings (ref: 9c9711e1-4..."
+    },
+    "ollama:nemotron-3-ultra": {
+      "expiry": "2026-10-31T18:52:54.345386123+01:00",
+      "status_code": 429,
+      "error_count": 8,
+      "last_error": "{\"error\":{\"message\":\"you (bassobassista) have reached your monthly usage limit, upgrade for higher limits: https://ollama.com/upgrade or add usage credits: https://ollama.com/settings (ref: 4294ff40-e..."
+    },
+    "opencode:beam-free": {
+      "expiry": "2026-11-01T04:01:18.663182739+01:00",
+      "status_code": 429,
+      "error_count": 1,
+      "last_error": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode...."
+    },
+    "opencode:deepseek-v4.1-flash-free": {
+      "expiry": "2026-11-01T04:06:48.139984345+01:00",
+      "status_code": 429,
+      "error_count": 1,
+      "last_error": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode...."
+    },
+    "opencode:flint-40b-free": {
+      "expiry": "2026-11-01T03:52:35.643525053+01:00",
+      "status_code": 429,
+      "error_count": 1,
+      "last_error": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode...."
+    },
+    "opencode:glm-5.3-flash-free": {
+      "expiry": "2026-11-01T04:06:48.349931216+01:00",
+      "status_code": 429,
+      "error_count": 1,
+      "last_error": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode...."
+    },
+    "opencode:mimo-v2.6-flash-free": {
+      "expiry": "2026-11-01T04:06:48.553955818+01:00",
+      "status_code": 429,
+      "error_count": 1,
+      "last_error": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode...."
+    },
+    "opencode:nemotron-3.5-lightning-free": {
+      "expiry": "2026-11-01T02:48:11.740101967+01:00",
+      "status_code": 429,
+      "error_count": 1,
+      "last_error": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode...."
+    },
+    "opencode:nemotron-3.5-super-vl-free": {
+      "expiry": "2026-11-01T04:06:24.906113776+01:00",
+      "status_code": 429,
+      "error_count": 1,
+      "last_error": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode...."
+    }
+  },
+  "circuits": {
+    "gemini:gemma-4-31b-it": {
+      "state": 2,
+      "opened_at": "2026-10-31T18:18:35.432022132+01:00",
+      "probes_sent": 1
+    },
+    "kilocode:dots-studio/dots-3-note-preview:free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:18:30.569488112+01:00",
+      "probes_sent": 2
+    },
+    "kilocode:inclusionai/ling-3.1-flash-1019-free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:16:58.27085666+01:00",
+      "probes_sent": 5
+    },
+    "kilocode:kilo-auto/free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:38:25.48624037+01:00",
+      "probes_sent": 5
+    },
+    "kilocode:nvidia/nemotron-3-ultra-550b-a55b:free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:15:24.055116032+01:00",
+      "probes_sent": 2
+    },
+    "kilocode:nvidia/nemotron-3.5-lightning:free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:22:08.753883382+01:00",
+      "probes_sent": 2
+    },
+    "kilocode:nvidia/nemotron-3.5-super-vl:free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:15:18.05441602+01:00",
+      "probes_sent": 2
+    },
+    "kilocode:recursive/flint-v1.0:free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:38:43.819506254+01:00",
+      "probes_sent": 2
+    },
+    "kilocode:reflection/beam-free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:40:40.652799434+01:00",
+      "probes_sent": 5
+    },
+    "kilocode:xingchen-agi/xing4.0-29b-a4b:free": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:38:43.954854486+01:00",
+      "probes_sent": 2
+    },
+    "nvidia2:deepseek-ai/deepseek-v4.1-flash": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:36:58.798374168+01:00",
+      "probes_sent": 2
+    },
+    "nvidia2:minimaxai/minimax-m3.1-flash": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:11:06.934652664+01:00",
+      "probes_sent": 2
+    },
+    "nvidia2:mistralai/mistral-large-4-1t-a52b": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:12:50.67080887+01:00",
+      "probes_sent": 2
+    },
+    "nvidia2:stepfun-ai/step-5-preview": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:11:43.52480337+01:00",
+      "probes_sent": 2
+    },
+    "nvidia2:z-ai/glm-5.3-flash": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:12:16.087774141+01:00",
+      "probes_sent": 2
+    },
+    "nvidia3:deepseek-ai/deepseek-v4.1-flash": {
+      "state": 2,
+      "opened_at": "2026-10-31T18:10:42.376590455+01:00",
+      "probes_sent": 1
+    },
+    "nvidia3:minimaxai/minimax-m3.1-flash": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:11:12.377064001+01:00",
+      "probes_sent": 2
+    },
+    "nvidia3:mistralai/mistral-large-4-1t-a52b": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:13:09.036161096+01:00",
+      "probes_sent": 2
+    },
+    "nvidia3:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+      "state": 2,
+      "opened_at": "2026-10-31T18:18:35.432047123+01:00",
+      "probes_sent": 1
+    },
+    "nvidia3:nvidia/nemotron-3-ultra-550b-a55b": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:18:15.128408234+01:00",
+      "probes_sent": 5
+    },
+    "nvidia3:z-ai/glm-5.3-flash": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:12:32.670584254+01:00",
+      "probes_sent": 2
+    },
+    "nvidia:deepseek-ai/deepseek-v4.1-flash": {
+      "state": 2,
+      "opened_at": "2026-10-31T18:10:42.376571495+01:00",
+      "probes_sent": 1
+    },
+    "nvidia:minimaxai/minimax-m3.1-flash": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:11:37.526009726+01:00",
+      "probes_sent": 2
+    },
+    "nvidia:mistralai/mistral-large-4-1t-a52b": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:12:44.67193774+01:00",
+      "probes_sent": 2
+    },
+    "nvidia:nvidia/nemotron-3-ultra-550b-a55b": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:41:07.053817119+01:00",
+      "probes_sent": 2
+    },
+    "nvidia:stepfun-ai/step-5-preview": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:11:25.524720117+01:00",
+      "probes_sent": 2
+    },
+    "nvidia:z-ai/glm-5.3-flash": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:12:10.089753826+01:00",
+      "probes_sent": 2
+    },
+    "ollama:gemma4:31b": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:18:33.220515211+01:00",
+      "probes_sent": 2
+    },
+    "ollama:nemotron-3-super": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:38:43.700951947+01:00",
+      "probes_sent": 2
+    },
+    "ollama:nemotron-3-ultra": {
+      "state": 1,
+      "opened_at": "2026-10-31T18:15:24.345405681+01:00",
+      "probes_sent": 2
+    }
+  }
+}

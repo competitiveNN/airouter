@@ -1191,7 +1191,7 @@ func TestAPoolProxyIsActuallyUsed(t *testing.T) {
 	}
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
-	resp, err := p.Forward(context.Background(), []byte(body), *ep, "")
+	resp, _, err := p.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("Forward: %v", err)
 	}

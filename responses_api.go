@@ -219,12 +219,14 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		var lastErr error
 		var resp *http.Response
 		gotResp := false
+		fwdCancel := func() {}
 		maxProxyTries := g.proxy.proxyTries(ep)
 		if maxProxyTries <= 0 {
 			maxProxyTries = 1
 		}
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
-			r, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
+			r, fc, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
+			fwdCancel = fc
 			if err != nil {
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
@@ -243,6 +245,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		}
 		if !gotResp {
 			cancel()
+			fwdCancel()
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			var pErr *ProxyError
 			if !errors.As(lastErr, &pErr) && errors.Is(lastErr, context.Canceled) {
@@ -275,6 +278,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
 		resp.Body.Close()
 		cancel()
+		fwdCancel()
 		if readErr != nil {
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
@@ -360,6 +364,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(env)
+		fwdCancel()
 		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
