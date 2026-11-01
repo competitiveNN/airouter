@@ -365,6 +365,13 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 	if providerCfg.Timeout > 0 && providerCfg.Timeout > timeout {
 		timeout = providerCfg.Timeout
 	}
+	// Command Code prefill is slower than the default 1s/10k estimate assumes;
+	// floor the per-attempt budget at the provider's max_interruption so a
+	// moderately large context does not time out (and then poison the provider
+	// with a cooldown that fails every subsequent request).
+	if providerCfg.MaxInterruption > 0 && providerCfg.MaxInterruption > timeout {
+		timeout = providerCfg.MaxInterruption
+	}
 	if timeout > maxSessionInterruption {
 		timeout = maxSessionInterruption
 	}
@@ -473,6 +480,7 @@ func (s *CommandCodeShim) complete(w http.ResponseWriter, r *http.Request, body 
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		resp, fwdCancel, err := s.gateway.proxy.Forward(ctx, body, ep, sessionID)
 		if err != nil {
+			fwdCancel()
 			cancel()
 			fwdCancel()
 			lastErr = err
@@ -483,6 +491,7 @@ func (s *CommandCodeShim) complete(w http.ResponseWriter, r *http.Request, body 
 		}
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
 		resp.Body.Close()
+		fwdCancel()
 		cancel()
 		if readErr != nil {
 			lastErr = readErr

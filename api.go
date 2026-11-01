@@ -1722,7 +1722,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// the ceiling and what the fallback walk has left, so a provider
 		// configured for a short window (a local endpoint that answers in
 		// milliseconds) does not hold a client open for 30s on its cooldown.
-		attemptTimeout := walk.attemptTimeout(minDuration(timeout, g.providerMaxInterruption(ep.Provider)))
+		perAttemptBase := timeout
+if g.proxy.effectiveProtocol(ep) == protocolCommandCode && g.providerMaxInterruption(ep.Provider) > perAttemptBase {
+    perAttemptBase = g.providerMaxInterruption(ep.Provider)
+}
+attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
@@ -1747,15 +1751,18 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		var lastErr error
 		var resp *http.Response
 		gotResp := false
+		var fwdCancel context.CancelFunc = func() {}
 		maxProxyTries := g.proxy.proxyTries(ep)
 		if maxProxyTries <= 0 {
 			maxProxyTries = 1
 		}
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
-			r, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
+			r, fc, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
+			fwdCancel = fc
 			if err != nil {
 				if errors.Is(err, ErrUpstreamSaturated) {
 					cancel()
+					fwdCancel()
 					writeAPIError(w, http.StatusServiceUnavailable, "Upstream saturated", "server_error", "upstream_saturated")
 					g.recordRequest(req.Model, 503, time.Since(start))
 					return
@@ -1765,10 +1772,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					// Proxy failure: mark the proxy down and try again with a
 					// different proxy on the same endpoint.
 					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					fwdCancel()
 					lastErr = err
 					continue
 				}
 				// Non-proxy error: endpoint failure.
+				fwdCancel()
 				lastErr = err
 				break
 			}
@@ -1778,6 +1787,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 		if !gotResp {
 			cancel()
+			fwdCancel()
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			var pErr *ProxyError
 			if !errors.As(lastErr, &pErr) && errors.Is(lastErr, context.Canceled) {
@@ -1832,6 +1842,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if resp.StatusCode != 200 {
 			respBody, _ := readUpstreamErrorBody(resp)
 			cancel()
+			fwdCancel()
 
 			// Command Code error statuses are remapped to the
 			// OpenAI-equivalent the client and the cooldown
@@ -1913,6 +1924,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
 		resp.Body.Close()
 		cancel()
+		fwdCancel()
 		if readErr != nil {
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
@@ -2262,7 +2274,11 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// for a short window (a local endpoint that answers in milliseconds)
 		// does not hold a client open for 30s on its cooldown.
 		ceiling := g.providerMaxInterruption(ep.Provider)
-		attemptTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+		perAttemptBase := timeout
+if g.proxy.effectiveProtocol(ep) == protocolCommandCode && ceiling > perAttemptBase {
+    perAttemptBase = ceiling
+}
+attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			if accumulatedContent == "" {

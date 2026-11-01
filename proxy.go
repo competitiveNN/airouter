@@ -809,25 +809,27 @@ func tlsIntercepted(err error) bool {
 	return errors.As(err, &record)
 }
 
-func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, error) {
+func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, context.CancelFunc, error) {
 	release, err := p.acquireUpstream(ctx)
 	if err != nil {
-		return nil, err
+		return nil, func() {}, err
 	}
 	defer release()
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
-		return nil, fmt.Errorf("unknown provider: %s", endpoint.Provider)
+		return nil, func() {}, fmt.Errorf("unknown provider: %s", endpoint.Provider)
 	}
+	cancel := func() {}
 	if providerCfg.Timeout > 0 {
-		timeoutCtx, cancel := context.WithTimeout(ctx, providerCfg.Timeout)
+		timeoutCtx, c := context.WithTimeout(ctx, providerCfg.Timeout)
 		ctx = timeoutCtx
-		defer cancel()
+		cancel = c
 	}
 
 	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, false, sessionID)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, func() {}, err
 	}
 
 	// Select the client: Command Code upstreams use the command-code client,
@@ -884,9 +886,11 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 		// the proxy -- including the CONNECT status-text rejection proxyFault
 		// cannot see (which used to land on the endpoint's cooldown instead).
 		if proxyAttribution(err, usedProxy != nil) {
-			return nil, &ProxyError{Proxy: usedProxy, Err: err}
+			cancel()
+			return nil, func() {}, &ProxyError{Proxy: usedProxy, Err: err}
 		}
-		return nil, &ProviderError{Err: err}
+		cancel()
+		return nil, func() {}, &ProviderError{Err: err}
 	}
 	// The proxy carried this request as far as a response header. That is the
 	// strongest evidence of usability we ever get for a proxy, so it renews the
@@ -894,7 +898,7 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	if usedProxy != nil {
 		p.MarkProxyReady(usedProxy.URL)
 	}
-	return resp, nil
+	return resp, cancel, nil
 }
 
 func (p *Proxy) Warmup(ctx context.Context) {
@@ -950,14 +954,17 @@ func (p *Proxy) Warmup(ctx context.Context) {
 						return
 					}
 					warmupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-					resp, err := p.Forward(warmupCtx, body, s.ep, "")
-					cancel()
+					resp, fwdCancel, err := p.Forward(warmupCtx, body, s.ep, "")
 					if err != nil {
+						fwdCancel()
+						cancel()
 						log.Printf("[warmup] %s/%s depth=%.2f round=%d: %v", s.ep.Provider, s.ep.Model, s.depth, round, err)
 						continue
 					}
 					io.Copy(io.Discard, resp.Body)
 					resp.Body.Close()
+					fwdCancel()
+					cancel()
 					if resp.StatusCode != 200 {
 						log.Printf("[warmup] %s/%s depth=%.2f round=%d: status %d", s.ep.Provider, s.ep.Model, s.depth, round, resp.StatusCode)
 						continue
@@ -1023,6 +1030,9 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	}
 	if providerCfg.Timeout > 0 && providerCfg.Timeout > timeout {
 		timeout = providerCfg.Timeout
+	}
+	if p.effectiveProtocol(&endpoint) == protocolCommandCode && providerCfg.MaxInterruption > timeout {
+		timeout = providerCfg.MaxInterruption
 	}
 	if timeout > maxSessionInterruption {
 		timeout = maxSessionInterruption
