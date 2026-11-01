@@ -155,7 +155,7 @@ def test_dry_run_is_the_default():
     like a dry run; that is what destroyed the config with no safety net.
     """
     text = CONFIG.read_text()
-    tmp = REPO / "config.yaml.testwrite"
+    tmp = tmp_path / "config.yaml.testwrite"
     original_path = gen.CONFIG_PATH
     try:
         gen.CONFIG_PATH = str(tmp)
