@@ -148,7 +148,7 @@ def test_validator_accepts_the_real_config():
     assert gen.validate_config_text(CONFIG.read_text()) == []
 
 
-def test_dry_run_is_the_default():
+def test_dry_run_is_the_default(tmp_path):
     """Without --write the generator must not touch the file.
 
     The original script wrote unconditionally while printing output that read
