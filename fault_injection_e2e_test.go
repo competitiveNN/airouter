@@ -519,6 +519,16 @@ func TestE2EStreamStallPastTimeoutFailsOverNeverReturns500(t *testing.T) {
 // small `work` request gets a 6s attempt budget and a 20s fallback budget, and
 // the silent upstream held the client for the full 20s before failing over to
 // nothing. Observed in the live daemon log on 2026-11-02.
+// strictChainOrder disables initial-session rotation so a test that needs the
+// chain walked from position 0 is deterministic. With the default window (8)
+// a 2-4 entry chain is entirely inside the rotation window and the head is
+// chosen by hashing the session ID, so which endpoint is tried first is not
+// under the test's control.
+func strictChainOrder() *Preferences {
+	zero := 0
+	return &Preferences{InitialRotationWindow: &zero}
+}
+
 func TestE2EProviderTimeoutCannotOutlastTheFallbackBudget(t *testing.T) {
 	stall := silentStallBackend(t)
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -545,6 +555,7 @@ func TestE2EProviderTimeoutCannotOutlastTheFallbackBudget(t *testing.T) {
 				{Provider: "healthy", Model: "m-healthy"},
 			}},
 		},
+		Preferences: strictChainOrder(),
 	}
 	gw := faultGateway(t, cfg)
 
@@ -559,6 +570,71 @@ func TestE2EProviderTimeoutCannotOutlastTheFallbackBudget(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "world") || !strings.Contains(rec.Body.String(), "[DONE]") {
 		t.Fatalf("silent stall did not fail over to the healthy model: %s", rec.Body.String())
+	}
+}
+
+// TestE2EHostOutageSkipsSiblingKeysWithinTheBudget is the live 503 of
+// 2026-11-02 in miniature. Three provider entries on the SAME dead host (the
+// nvidia/nvidia2/nvidia3 shape) sit ahead of a healthy provider. Each stalled
+// attempt costs the full per-attempt timeout, so walking all three spends more
+// than the small-request fallback budget and the client gets a 503 with the
+// healthy model never tried.
+//
+// The gateway must retire the whole host for this request after the first
+// attempt fails without an HTTP response, and reach the healthy provider.
+func TestE2EHostOutageSkipsSiblingKeysWithinTheBudget(t *testing.T) {
+	stall := silentStallBackend(t)
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"id\":\"2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer healthy.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			// Same URL, different keys: one host, three chances to waste the
+			// request's budget on the same silence.
+			"nv1":     {URL: stall.URL},
+			"nv2":     {URL: stall.URL},
+			"nv3":     {URL: stall.URL + "/"},
+			"healthy": {URL: healthy.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "nv1", Model: "m"},
+				{Provider: "nv2", Model: "m"},
+				{Provider: "nv3", Model: "m"},
+				{Provider: "healthy", Model: "m"},
+			}},
+		},
+		// Strict order: the walk must start on the dead host, not on a
+		// rotation-hash pick of the healthy endpoint.
+		Preferences: strictChainOrder(),
+	}
+	gw := faultGateway(t, cfg)
+
+	start := time.Now()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	rec := httptest.NewRecorder()
+	gw.HandleChatCompletions(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a host-wide stall turned a recoverable request into %d after %v: %s",
+			rec.Code, elapsed.Round(time.Millisecond), rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "world") || !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("healthy provider was never reached: %s", rec.Body.String())
+	}
+	// Three sequential stalls would be 15s; the skip makes this one attempt.
+	if elapsed > 10*time.Second {
+		t.Fatalf("request took %v: sibling keys on the dead host were walked instead of skipped",
+			elapsed.Round(time.Millisecond))
 	}
 }
 

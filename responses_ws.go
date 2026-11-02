@@ -243,6 +243,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 			} else {
 				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			}
+			g.skipSameHostOnTransportFailure(ep, err, tried)
 			// ApplyCooldownFromErrorForSession already advances the circuit
 			// breaker state machine; the redundant RecordFailure call would
 			// double-count this failure and trip the circuit at half the

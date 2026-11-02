@@ -273,6 +273,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 					g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
 				}
 			}
+			g.skipSameHostOnTransportFailure(ep, lastErr, tried)
 			g.recordCooldown()
 			continue
 		}
@@ -538,6 +539,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 					g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 				}
 			}
+			g.skipSameHostOnTransportFailure(ep, err, tried)
 			g.recordCooldown()
 			continue
 		}
