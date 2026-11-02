@@ -59,7 +59,9 @@ HIDE_MODELS: set[str] = {
 }
 
 # Minimum intelligence score for a model to be considered usable without recency check.
-MIN_INTELLIGENCE_SCORE = 10.0
+# 5.0 is the fetch-time floor (fast tier); smart/work/large enforce stricter
+# floors in regenerate_config.py.
+MIN_INTELLIGENCE_SCORE = 5.0
 
 # Maximum model age in months for models without an explicit tier.
 MAX_MODEL_AGE_MONTHS = 12

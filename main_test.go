@@ -6681,8 +6681,6 @@ func TestMetricsFailoverReason(t *testing.T) {
 	}
 }
 
-
-
 func TestIdleTimeoutMidStreamFailsOverWithout500(t *testing.T) {
 	stalling := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
