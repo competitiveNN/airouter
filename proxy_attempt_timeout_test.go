@@ -158,12 +158,6 @@ func TestApplyAttemptTimeoutsIgnoresANonPositiveTimeout(t *testing.T) {
 	}
 }
 
-<<<<<<< Updated upstream
-// TestAttemptClientBoundsTheAttemptWithoutMutatingTheSharedTransport proves
-// the shared transport is never mutated: its timeouts are global, so a
-// per-attempt budget applied to it would change every other in-flight
-// request. The attempt gets its own transport instead.
-=======
 // TestAttemptClientReusesTheSharedTransport proves the direct attempt path
 // reuses the shared transport instead of cloning a fresh one per attempt.
 //
@@ -177,7 +171,6 @@ func TestApplyAttemptTimeoutsIgnoresANonPositiveTimeout(t *testing.T) {
 // The per-attempt deadline is now applied via the request context (see
 // HandleChatCompletions / handleStream), not via transport settings, so the
 // shared transport is reused and its global timeouts are left alone.
->>>>>>> Stashed changes
 func TestAttemptClientReusesTheSharedTransport(t *testing.T) {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
@@ -205,14 +198,9 @@ func TestAttemptClientReusesTheSharedTransport(t *testing.T) {
 	if shared.ResponseHeaderTimeout != before {
 		t.Fatalf("the shared transport was mutated: %v -> %v", before, shared.ResponseHeaderTimeout)
 	}
-<<<<<<< Updated upstream
-	if shared.TLSHandshakeTimeout != beforeTLS {
-		t.Fatalf("the shared transport was mutated: %v -> %v", beforeTLS, shared.TLSHandshakeTimeout)
-=======
 	// The per-attempt deadline is applied via the request context, so the
 	// shared transport's timeouts are unchanged by this call.
 	if shared.TLSHandshakeTimeout != beforeTLS {
 		t.Fatalf("the shared transport's TLS handshake timeout was changed: %v -> %v", beforeTLS, shared.TLSHandshakeTimeout)
->>>>>>> Stashed changes
 	}
 }
