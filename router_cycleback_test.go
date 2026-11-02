@@ -101,14 +101,14 @@ func TestFallbackSkipsUnavailableHeadToReachTail(t *testing.T) {
 	}
 }
 
-// TestSelectEndpointCyclesBackFromLastModelToFirst pins the cycle-back
-// itself: a session pinned to the LAST model in the chain, having tried
-// every endpoint, still gets the FIRST one back once its cooldown has
-// expired -- the walk does not stop at the end of the chain.
-func TestSelectEndpointCyclesBackFromLastModelToFirst(t *testing.T) {
+// TestSelectEndpointFailsFastAfterAllEndpointsTried pins the
+// one-attempt-per-model policy: a session pinned to the LAST model
+// in the chain, having tried every endpoint, gets nil (no cycle-back)
+// instead of re-trying the first one.
+func TestSelectEndpointFailsFastAfterAllEndpointsTried(t *testing.T) {
 	chain := rrChain(3)
 	r := rrRouter(t, chain, 0)
-	sessionID := "cycle-back"
+	sessionID := "no-cycle-back"
 	// The session is pinned to the last model in the chain.
 	pinSession(r, sessionID, chain[2])
 
@@ -118,16 +118,16 @@ func TestSelectEndpointCyclesBackFromLastModelToFirst(t *testing.T) {
 		tried[chain[i].Key()] = true
 	}
 	// The deeper models are still on cooldown; the head's has expired,
-	// so it is eligible again.
+	// so it WOULD be eligible again under the old cycle-back behavior.
 	coolFor(r, &chain[1], sessionID)
 	coolFor(r, &chain[2], sessionID)
 
-	ep, _ := r.SelectEndpoint("work", sessionID, false, tried)
-	if ep == nil {
-		t.Fatal("expected the cycle-back to return the recovered head, got nil")
+	ep, wait := r.SelectEndpoint("work", sessionID, false, tried)
+	if ep != nil {
+		t.Fatalf("expected nil (no cycle-back), got %s", ep.Key())
 	}
-	if ep.Key() != chain[0].Key() {
-		t.Fatalf("expected the cycle-back to return the first model %s, got %s", chain[0].Key(), ep.Key())
+	if wait != 0 {
+		t.Fatalf("expected wait=0 (no cycle-back wait), got %v", wait)
 	}
 }
 
@@ -158,11 +158,9 @@ func TestNewSessionSurvivesFullyUnavailableRotationWindow(t *testing.T) {
 }
 
 // TestSelectEndpointFullyUnavailableChainIsBounded pins the failure mode
-// when NO endpoint in the chain is eligible: the router reports the
-// shortest remaining cooldown rather than an endpoint. Every fallback
-// loop bounds its retries by that wait, the wall-clock budget, and the
-// attempt counter, so a request can fail cleanly but never spins
-// forever hammering cooled models.
+// when NO endpoint in the chain is eligible: the router returns nil and
+// zero wait (no cycle-back) so the handler fails fast rather than
+// hammering cooled models.
 func TestSelectEndpointFullyUnavailableChainIsBounded(t *testing.T) {
 	chain := rrChain(3)
 	r := rrRouter(t, chain, 2)
@@ -179,7 +177,7 @@ func TestSelectEndpointFullyUnavailableChainIsBounded(t *testing.T) {
 	if ep != nil {
 		t.Fatalf("expected no endpoint when the whole chain is on cooldown, got %s", ep.Key())
 	}
-	if wait <= 0 {
-		t.Fatal("expected a non-zero wait so the handler backs off instead of hammering cooled models")
+	if wait != 0 {
+		t.Fatalf("expected wait=0 (no cycle-back wait), got %v", wait)
 	}
 }

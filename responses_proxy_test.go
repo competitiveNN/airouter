@@ -47,10 +47,10 @@ func deadProxyInfo(t *testing.T) *ProxyInfo {
 // is a healthy direct endpoint the request must resume on.
 //
 // The two endpoints are what makes the endpoint-cooldown assertion meaningful.
-// With one endpoint, SelectEndpoint's "retry exhausted" path re-picks it, the
-// pool is then empty (the only proxy is in cooldown), the attempt goes direct,
-// and the endpoint legitimately fails on its own merits -- so asserting it
-// stays cool would be asserting behaviour the code does not promise.
+// With one endpoint, SelectEndpoint would return nil after it is tried and
+// the pool is then empty (the only proxy is in cooldown), the attempt goes
+// direct, and the endpoint legitimately fails on its own merits -- so asserting
+// it stays cool would be asserting behaviour the code does not promise.
 func responsesProxyFixture(t *testing.T, first http.HandlerFunc, second http.HandlerFunc) (*httptest.Server, *Router, *ProxyService, *ProxyInfo) {
 	t.Helper()
 	dead := deadProxyInfo(t)

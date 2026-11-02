@@ -1149,33 +1149,12 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 		// chains rather than spin inside one.
 	}
 
-	// No chain has an untried usable endpoint. Cycle back to the first eligible
-	// endpoint of ANY chain — the last model of one chain leads back to the
-	// first of the next — so a model that recovers mid-request still serves
-	// this request instead of a guaranteed 503. The cycle-back across chains
-	// is the "keep swapping until you find one that works" guarantee expressed
-	// at request time.
-	for _, chainName := range chains {
-		nextChain, hasChain := cfg.Models[chainName]
-		if !hasChain || len(nextChain.Chain) == 0 {
-			continue
-		}
-		for i := range nextChain.Chain {
-			next := nextChain.Chain[i]
-			if r.isEligibleLocked(&next, requireVision) && contextFits(&next, promptTokens) {
-				log.Printf("[debug] session=%s model=%s -> retry exhausted, cycling %s -> %s/%s", sessionID, logicalModel, chainName, next.Provider, next.Model)
-				r.bindSessionLocked(sessionID, next, logicalModel, chainName)
-				return &next, 0
-			}
-		}
-	}
-
-	// Nothing is usable anywhere: every chain is in cooldown or otherwise
-	// ineligible. Return the SHORTEST remaining cooldown across all of them
-	// so the handler waits for whichever chain recovers first, rather than
-	// hammering a cooled model on every iteration (which caused the
-	// "all cooled down, retrying X" spam loop).
-	return nil, r.minCooldownWaitAcrossChains(cfg, chains, requireVision)
+	// No chain has an untried usable endpoint. Per the one-attempt-per-model
+	// policy we do NOT cycle back to already-tried endpoints; instead we
+	// fail fast so the request chain's wall-clock budget stays low.
+	// If the caller wants to wait for a cooldown to expire, it can do so
+	// on the next request.
+	return nil, 0
 }
 
 // ContextCapacity reports whether any endpoint this request could be routed to
