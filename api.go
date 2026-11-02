@@ -450,6 +450,49 @@ func (g *GatewayContext) recordAttempt(ep *ModelEndpoint, d time.Duration, ok bo
 	}
 }
 
+// skipSameHostOnTransportFailure retires, for THIS request only, every endpoint
+// behind the same upstream as the one that just failed without an HTTP
+// response.
+//
+// The key-group chains place sibling keys adjacently on purpose: a 429 on one
+// key must fall through to the next key immediately. That locality is
+// expensive when the HOST is down, because every sibling fails the same way.
+// nvidia/nvidia2/nvidia3 all point at integrate.api.nvidia.com, so a
+// host-level stall costs one full attempt per key; three of them exhaust a
+// small request's 20s interruption budget before the walk reaches a provider
+// that answers. Measured 2026-11-02 in the live daemon: every `work` request in
+// the outage tried nvidia, nvidia2, nvidia and then returned 503, with the
+// kilocode/commandcode entries further down the chain never reached (105
+// requests, 8 of them 503).
+//
+// Only an attempt with NO HTTP response qualifies:
+//   - a *ProviderError carrying a real status (StatusCode > 0) is a response
+//     from this endpoint, so the group is demonstrably reachable and the next
+//     sibling key is exactly what should be tried (a 429 or a free-tier
+//     refusal is per key). A ProviderError with StatusCode 0 is the proxy's
+//     wrapper around a transport failure before any header arrived -- that is
+//     exactly the host-level case this exists for;
+//   - a *ProxyError is charged to the proxy and says nothing about the
+//     endpoint, so other paths to it may still work.
+//
+// The skip is deliberately per-request. A single slow model must not take a
+// whole group out of rotation for every client; the per-endpoint cooldown
+// ladder still handles repeated failures.
+func (g *GatewayContext) skipSameHostOnTransportFailure(ep *ModelEndpoint, err error, tried map[string]bool) {
+	if ep == nil || err == nil || tried == nil || g.router == nil {
+		return
+	}
+	var provErr *ProviderError
+	if errors.As(err, &provErr) && provErr.StatusCode > 0 {
+		return
+	}
+	var pErr *ProxyError
+	if errors.As(err, &pErr) {
+		return
+	}
+	g.router.SkipSameHost(*ep, tried)
+}
+
 // HandleMetrics serves the Prometheus text-format metrics endpoint.
 //
 // Authenticated like the admin surface, not like the health check. The metric
@@ -1789,6 +1832,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
 				}
 			}
+			g.skipSameHostOnTransportFailure(ep, lastErr, tried)
 			g.recordCooldown()
 			continue
 		}
@@ -1887,6 +1931,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			} else {
 				g.router.ApplyCooldownForSession(ep, 502, readErr.Error(), sessionID, 0)
 			}
+			g.skipSameHostOnTransportFailure(ep, readErr, tried)
 			g.recordCooldown()
 			g.recordRequest(req.Model, 502, time.Since(start))
 			continue
@@ -2364,6 +2409,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			}
 		}
+		g.skipSameHostOnTransportFailure(ep, err, tried)
 		g.recordCooldown()
 		// Mid-stream failure after we already flushed content to the client:
 		// resume on the next model by replaying what the client already received

@@ -1157,6 +1157,56 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 	return nil, 0
 }
 
+// SkipSameHost marks, in the caller's per-request tried set, every endpoint on
+// every chain whose provider points at the same upstream as ep.
+//
+// The unit of a host-level failure is the upstream URL, not the provider name:
+// nvidia/nvidia2/nvidia3 are three keys to one host, and a single provider can
+// carry several models. Marking only the provider (and not its other models) is
+// how the first version of this let a dead nvidia2 send a request straight from
+// nvidia2/minimax to nvidia2/glm and burn the rest of the budget on the same
+// silence.
+func (r *Router) SkipSameHost(ep ModelEndpoint, tried map[string]bool) {
+	cfg := r.config.Load()
+	if cfg == nil {
+		return
+	}
+	pc, ok := cfg.Providers[ep.Provider]
+	if !ok {
+		return
+	}
+	url := normalizeUpstreamURL(pc.URL)
+	if url == "" {
+		return
+	}
+	tried[ep.Key()] = true
+	for _, mc := range cfg.Models {
+		for i := range mc.Chain {
+			cand := mc.Chain[i]
+			other, ok := cfg.Providers[cand.Provider]
+			if !ok {
+				continue
+			}
+			if normalizeUpstreamURL(other.URL) == url {
+				tried[cand.Key()] = true
+			}
+		}
+	}
+}
+
+// normalizeUpstreamURL reduces a provider URL to the thing two providers share
+// when they are the same upstream: scheme, host and path, with a trailing
+// slash and surrounding whitespace removed. A query or fragment is not part of
+// provider URLs here.
+func normalizeUpstreamURL(raw string) string {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return ""
+	}
+	u = strings.TrimRight(u, "/")
+	return strings.ToLower(u)
+}
+
 // ContextCapacity reports whether any endpoint this request could be routed to
 // can hold promptTokens tokens, and the largest context window among those
 // chains (0 when nothing advertises one).
