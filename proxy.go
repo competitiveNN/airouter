@@ -1020,7 +1020,17 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	if providerCfg.Timeout > 0 && providerCfg.Timeout > timeout {
+	// The provider's configured timeout is a CEILING on how long one call to it
+	// may take, never a floor. Raising the caller's timeout to it let one
+	// stalled attempt outlast the request's fallback budget, so the walk gave
+	// up with "budget exhausted after 1 attempts" instead of trying the next
+	// model. Measured 2026-11-02: a 9.9k-token `work` request had a 6s attempt
+	// budget, the nvidia2 provider's configured `timeout: 20s` raised the
+	// attempt to 20s, the upstream stayed silent, and the client got a 503 with
+	// a healthy model still untried in the chain. The Command Code floor below
+	// is deliberate and stays: prefill there is genuinely slower than the
+	// size-derived estimate (see commandcode_api.go).
+	if providerCfg.Timeout > 0 && (timeout <= 0 || providerCfg.Timeout < timeout) {
 		timeout = providerCfg.Timeout
 	}
 	if p.effectiveProtocol(&endpoint) == protocolCommandCode && providerCfg.MaxInterruption > timeout {

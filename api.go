@@ -2266,7 +2266,12 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				break
 			}
 			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, proxyTimeout, sessionID, StreamAttemptOptions{
-				MaxIdleTimeout: minDuration(ceiling, walk.budget),
+				// The client-visible silence allowed on this attempt is
+				// bounded by what the walk has LEFT, not by its original
+				// budget: the watchdog firing after the budget is spent turns
+				// a recoverable stall into the 503 it was going to return
+				// anyway, with no time to try another model.
+				MaxIdleTimeout: minDuration(ceiling, walk.remaining()),
 				OnProgress:     walk.markProgress,
 			})
 			if err != nil {

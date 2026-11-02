@@ -689,13 +689,13 @@ func TestRouterSelectEndpointAllInCooldown(t *testing.T) {
 		}
 	}
 
-	// Should return nil + wait duration
+	// Should return nil + zero wait (no cycle-back; fail fast).
 	ep, wait := router.SelectEndpoint("smart", sessionID, false, nil)
 	if ep != nil {
 		t.Error("expected nil endpoint when all chains are in cooldown")
 	}
-	if wait <= 0 {
-		t.Error("expected positive wait duration")
+	if wait != 0 {
+		t.Errorf("expected zero wait (no cycle-back wait), got %v", wait)
 	}
 }
 
@@ -3765,14 +3765,11 @@ func TestSessionSkipsTriedEndpoints(t *testing.T) {
 	tried[ep.Key()] = true
 	router.ApplyCooldownForSession(ep, 429, "rate limited", sessionID, 0)
 
-	// Third call: both have been tried and cooled. SelectEndpoint returns
-	// nil + wait; the handler no longer waits for the long cooldowns (30m+
-	// for auth / rate-limit errors) since the request would fail again
-	// anyway, so it fails fast instead. Failures are bounded by the budget,
-	// so this never loops.
+	// Third call: both have been tried and cooled. With one-attempt-per-model,
+	// SelectEndpoint returns nil + zero wait (fail fast; no cycle-back).
 	_, wait := router.SelectEndpoint("smart", sessionID, false, tried)
-	if wait == 0 {
-		t.Fatal("expected a non-zero wait when all endpoints are cooled")
+	if wait != 0 {
+		t.Fatalf("expected zero wait (no cycle-back wait), got %v", wait)
 	}
 }
 
@@ -3879,116 +3876,15 @@ func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 	}
 }
 
-// TestHandleChatCompletions_CycleBackRecoversMidRequest pins the
-// chain cycle-back at the handler level: when every endpoint in the
-// chain has failed and is on cooldown, the request does not fail
-// outright -- it waits out the SHORTEST remaining cooldown, the walk
-// restarts at the head of the chain (the last model leads back to
-// the first), and a model that recovers mid-request serves the
-// request.
+// TestHandleChatCompletions_FailsFastAfterAllEndpointsTried pins the
+// one-attempt-per-model policy at the handler level: when every
+// endpoint in the chain has failed, the request fails fast with 503
+// instead of waiting for a cooldown and cycling back.
 //
-// The backend 429s the first two hits (one per chain endpoint, in
-// either order -- the rotation hash may start the session at either
-// depth) and answers the third with a real completion. With the
-// cycle-back in place the third hit is the head endpoint answering
-// again; with the old fail-fast behaviour the handler would have
-// returned 503 after two attempts in ~milliseconds.
-func TestHandleChatCompletions_CycleBackRecoversMidRequest(t *testing.T) {
-	var mu sync.Mutex
-	hits := 0
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		hits++
-		n := hits
-		mu.Unlock()
-		if n <= 2 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(429)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error": map[string]string{"message": "rate limited"},
-			})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ChatCompletionResponse{
-			ID:      "cycle-back",
-			Object:  "chat.completion",
-			Created: 1234567890,
-			Model:   "m1",
-			Choices: []ChatCompletionChoice{
-				{Index: 0, Message: ChatCompletionMessage{Role: "assistant", Content: "recovered"}},
-			},
-		})
-	}))
-	defer backend.Close()
-
-	cfg := &Config{
-		Providers: map[string]ProviderConfig{
-			"b": {URL: backend.URL},
-		},
-		Models: map[string]ModelConfig{
-			"smart": {Chain: []ModelEndpoint{
-				{Provider: "b", Model: "m1"},
-				{Provider: "b", Model: "m2"},
-			}},
-		},
-	}
-	router := NewRouter(cfg, "")
-	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
-	// Short cooldowns so the cycle-back wait is a fraction of a
-	// second rather than the production 30s+.
-	gateway.SetTestCooldown(200 * time.Millisecond)
-
-	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	started := time.Now()
-	gateway.HandleChatCompletions(rec, req)
-	elapsed := time.Since(started)
-
-	if rec.Code != 200 {
-		t.Fatalf("expected the cycle-back to recover the request (200), got %d after %v; body: %s",
-			rec.Code, elapsed.Round(time.Millisecond), rec.Body.String())
-	}
-	// The cycle-back restarts the walk at the head, so the model that
-	// finally answers must be the FIRST one in the chain.
-	var result ChatCompletionResponse
-	json.NewDecoder(rec.Body).Decode(&result)
-	if result.Model != "m1" {
-		t.Errorf("expected the cycle-back to reach the head model m1, got %s", result.Model)
-	}
-	mu.Lock()
-	n := hits
-	mu.Unlock()
-	if n != 3 {
-		t.Errorf("expected 3 backend hits (2 failed + 1 cycle-back), got %d", n)
-	}
-	// The handler must have waited out the cooldown rather than
-	// failing fast: the cycle-back only fires after the shortest
-	// cooldown (200ms) has been waited out.
-	if elapsed < 100*time.Millisecond {
-		t.Errorf("expected the handler to wait out the cooldown (>=100ms), it finished in %v -- the cycle-back wait is missing", elapsed)
-	}
-}
-
-// TestHandleChatCompletions_CycleBackWaitIsClampedToTheBudget is the other half
-// of the same wait, and it pins a defect that was measured, not hypothesised:
-// the cycle-back wait was capped at 30s but was NOT clamped to what was left of
-// the request's own fallback budget, so a request whose budget was 12s could be
-// held open for 30.201s before returning the very 503 it would have returned
-// immediately. Measured against a dead upstream (connection refused in
-// microseconds) in scripts/opencode-routing-selftest.sh case 9: 63s for two
-// attempts, where the two attempts themselves cost 6s of that. The wait bought
-// nothing, because the loop re-checks exhaustedNow the instant it ends.
-//
-// The clamp is the same arithmetic the budget comment in handleCompletion
-// promises ("a client never waits longer than the budget allows"). This test
-// fails on the unclamped code by taking 30s instead of milliseconds, so it is
-// the ticking-bomb direction rather than the tautology: 30s is long enough that
-// a regressions-check run turns visibly red.
-func TestHandleChatCompletions_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
+// With the new policy the cycle-back wait is removed, so the clamp
+// is no longer needed: the handler returns 503 immediately after
+// all endpoints have been tried once.
+func TestHandleChatCompletions_FailsFastAfterAllEndpointsTried(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(429)
@@ -4026,30 +3922,23 @@ func TestHandleChatCompletions_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
 	elapsed := time.Since(started)
 
 	if rec.Code != 503 {
-		t.Fatalf("expected 503 once every endpoint is cooled down past the budget, got %d (body: %s)",
+		t.Fatalf("expected 503 once every endpoint is tried once, got %d (body: %s)",
 			rec.Code, rec.Body.String())
 	}
-	// The verdict may not change, only when it arrives: 30s of a client being
-	// told nothing is the defect. Generous ceiling so a loaded CI box does not
-	// turn this red; the unclamped code takes 30s, an order of magnitude above.
+	// With one-attempt-per-model, the handler fails fast without waiting
+	// for the 30s cooldown: no cycle-back wait.
 	if elapsed > 5*time.Second {
-		t.Errorf("the cycle-back wait was not clamped to the request budget: a 503 took %v, "+
-			"which is the full 30s cooldown rather than the %v budget it had left "+
-			"(see the clamp at the cycle-back waiter)",
-			elapsed.Round(time.Millisecond), fallbackBudget(requestTimeout(estimateTokens(&ChatCompletionRequest{
-				Model:    "smart",
-				Messages: []ChatCompletionMessage{{Role: "user", Content: "hi"}},
-			}))).Round(time.Millisecond))
+		t.Errorf("the request took %v, expected fast fail since cycle-back is disabled "+
+			"(the %v cooldown is never waited out)",
+			elapsed.Round(time.Millisecond), 30*time.Second)
 	}
 }
 
-// clampCycleBackTestCase is the shared setup behind the three clamp tests
+// failFastTestCase is the shared setup behind the three fail-fast tests
 // below. The chat path, the chat streaming path and both Responses paths each
-// have their OWN cycle-back waiter, and each has to be proven to clamp on its
-// own: one test on the non-streaming chat path would stay green while the
-// other three waiters lost the clamp, which is the shape the budgetState
-// doc comment already records happening once.
-func clampCycleBackTestCase(t *testing.T, url, body string, wantInBody string) {
+// have their own fail-fast behavior, and each has to be proven to fail fast
+// when all endpoints have been tried once.
+func failFastTestCase(t *testing.T, url, body string, wantInBody string) {
 	t.Helper()
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4074,8 +3963,8 @@ func clampCycleBackTestCase(t *testing.T, url, body string, wantInBody string) {
 	proxy := NewProxy(cfg)
 	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
 	// A cooldown far longer than any request budget, so the clamp is the only
-	// thing that can keep this fast: the exact shape of a real 30s transport
-	// cooldown against a 12s small-request budget.
+	// thing that can keep this fast. This is not decoration: it is the exact
+	// shape of a real 30s transport cooldown against a 12s small-request budget.
 	gateway.SetTestCooldown(30 * time.Second)
 
 	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
@@ -4091,8 +3980,8 @@ func clampCycleBackTestCase(t *testing.T, url, body string, wantInBody string) {
 
 	out := rec.Body.String()
 	if !strings.Contains(out, wantInBody) {
-		t.Fatalf("expected the unavailable-models failure once every endpoint is cooled "+
-			"down past the budget, body:\n%s", out)
+		t.Fatalf("expected the unavailable-models failure once every endpoint is tried "+
+			"once past the budget, body:\n%s", out)
 	}
 	if strings.Contains(out, "service_unavailable_error") {
 		if rec.Code != http.StatusOK {
@@ -4105,127 +3994,39 @@ func clampCycleBackTestCase(t *testing.T, url, body string, wantInBody string) {
 			t.Errorf("terminal SSE error must carry code 503 so clients can classify the unavailable result; body:\n%s", out)
 		}
 	}
-	// The verdict may not change, only when it arrives: 30s of a client being
-	// told nothing is the defect. Generous ceiling so a loaded CI box does not
-	// turn this red; the unclamped code takes 30s, six times this.
+	// With one-attempt-per-model, the handler fails fast without waiting
+	// for the 30s cooldown: no cycle-back wait.
 	if elapsed > 5*time.Second {
-		t.Errorf("the cycle-back wait was not clamped to the request budget: the request "+
-			"took %v, which is the full 30s cooldown rather than the %v budget it had left "+
-			"(see the clamp at the cycle-back waiter)",
-			elapsed.Round(time.Millisecond), fallbackBudget(requestTimeout(estimateTokens(&ChatCompletionRequest{
-				Model:    "smart",
-				Messages: []ChatCompletionMessage{{Role: "user", Content: "hi"}},
-			}))).Round(time.Millisecond))
+		t.Errorf("the request took %v, expected fast fail since cycle-back is disabled "+
+			"(the %v cooldown is never waited out)",
+			elapsed.Round(time.Millisecond), 30*time.Second)
 	}
 }
 
-// TestHandleChatCompletionsStreaming_CycleBackWaitIsClampedToTheBudget is the
-// streaming twin of the chat clamp test. An SSE client holds the connection
-// open, so an unclamped wait is worse here, not better.
-func TestHandleChatCompletionsStreaming_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
-	clampCycleBackTestCase(t, "/v1/chat/completions",
+// TestHandleChatCompletionsStreaming_FailsFastAfterAllEndpointsTried is the
+// streaming twin: with one-attempt-per-model, the stream terminates with
+// an error event instead of waiting for a cooldown and cycling back.
+func TestHandleChatCompletionsStreaming_FailsFastAfterAllEndpointsTired(t *testing.T) {
+	failFastTestCase(t, "/v1/chat/completions",
 		`{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`,
 		"All models are currently unavailable")
 }
 
-// TestHandleResponses_CycleBackWaitIsClampedToTheBudget pins the clamp on the
-// non-streaming Responses loop. This path shipped unbounded once -- see the
+// TestHandleResponses_FailsFastAfterAllEndpointsTired pins the fail-fast
+// behavior on the non-streaming Responses loop. This path shipped unbounded once -- see the
 // budgetState comment -- so it gets its own pin.
-func TestHandleResponses_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
-	clampCycleBackTestCase(t, "/v1/responses",
+func TestHandleResponses_FailsFastAfterAllEndpointsTired(t *testing.T) {
+	failFastTestCase(t, "/v1/responses",
 		`{"model":"smart","input":"hi"}`,
 		"All models are currently unavailable")
 }
 
-// TestHandleResponsesStreaming_CycleBackWaitIsClampedToTheBudget pins the clamp
-// on the streaming Responses loop, the fourth and last waiter.
-func TestHandleResponsesStreaming_CycleBackWaitIsClampedToTheBudget(t *testing.T) {
-	clampCycleBackTestCase(t, "/v1/responses",
+// TestHandleResponsesStreaming_FailsFastAfterAllEndpointsTired pins the
+// fail-fast behavior on the streaming Responses loop, the fourth and last waiter.
+func TestHandleResponsesStreaming_FailsFastAfterAllEndpointsTired(t *testing.T) {
+	failFastTestCase(t, "/v1/responses",
 		`{"model":"smart","input":"hi","stream":true}`,
 		"All models are currently unavailable")
-}
-
-// TestHandleChatCompletionsStreaming_CycleBackRecoversMidRequest is
-// the streaming twin: while the chain is on cooldown the stream stays
-// alive with a `: reconnecting` comment, the request waits out the
-// shortest cooldown, and the resumed attempt -- the head of the chain
-// again -- delivers the content.
-func TestHandleChatCompletionsStreaming_CycleBackRecoversMidRequest(t *testing.T) {
-	var mu sync.Mutex
-	hits := 0
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		hits++
-		n := hits
-		mu.Unlock()
-		if n <= 2 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(429)
-			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		flusher := w.(http.Flusher)
-		events := []string{
-			`data: {"id":"cb","object":"chat.completion.chunk","created":123,"model":"m1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}`,
-			`data: {"id":"cb","object":"chat.completion.chunk","created":123,"model":"m1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
-			`data: [DONE]`,
-		}
-		for _, e := range events {
-			fmt.Fprint(w, e+"\n\n")
-			flusher.Flush()
-		}
-	}))
-	defer backend.Close()
-
-	cfg := &Config{
-		Providers: map[string]ProviderConfig{
-			"b": {URL: backend.URL},
-		},
-		Models: map[string]ModelConfig{
-			"smart": {Chain: []ModelEndpoint{
-				{Provider: "b", Model: "m1"},
-				{Provider: "b", Model: "m2"},
-			}},
-		},
-	}
-	router := NewRouter(cfg, "")
-	proxy := NewProxy(cfg)
-	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
-	gateway.SetTestCooldown(200 * time.Millisecond)
-
-	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	started := time.Now()
-	gateway.HandleChatCompletions(rec, req)
-	elapsed := time.Since(started)
-
-	if rec.Code != 200 {
-		t.Fatalf("expected the cycle-back to recover the stream (200), got %d after %v; body: %s",
-			rec.Code, elapsed.Round(time.Millisecond), rec.Body.String())
-	}
-	out := rec.Body.String()
-	if !strings.Contains(out, "Hello") {
-		t.Errorf("expected the resumed stream to carry content, got:\n%s", out)
-	}
-	// The wait must be visible to the streaming client as a comment
-	// that keeps the connection alive.
-	if !strings.Contains(out, ": reconnecting in") {
-		t.Errorf("expected a ': reconnecting' SSE comment during the cooldown wait, got:\n%s", out)
-	}
-	assertSSEWellFormed(t, out)
-	mu.Lock()
-	n := hits
-	mu.Unlock()
-	if n != 3 {
-		t.Errorf("expected 3 backend hits (2 failed + 1 cycle-back), got %d", n)
-	}
-	if elapsed < 100*time.Millisecond {
-		t.Errorf("expected the handler to wait out the cooldown (>=100ms), it finished in %v -- the cycle-back wait is missing", elapsed)
-	}
 }
 
 // TestConcurrentStreamingSameSession verifies that multiple concurrent streaming

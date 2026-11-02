@@ -248,11 +248,10 @@ func TestAllChainsExhaustedReportsTheShortestWait(t *testing.T) {
 	if ep != nil {
 		t.Fatalf("expected no endpoint when every chain is down, got %s", ep.Key())
 	}
-	if wait <= 0 {
-		t.Fatal("expected a positive wait so the handler backs off")
-	}
-	if wait > 2*time.Minute {
-		t.Fatalf("expected the shortest cooldown across the chains (~1m), got %v", wait)
+	// With one-attempt-per-model, when all endpoints are in cooldown,
+	// SelectEndpoint returns nil + zero wait (no cycle-back wait).
+	if wait != 0 {
+		t.Fatalf("expected zero wait (no cycle-back wait), got %v", wait)
 	}
 }
 

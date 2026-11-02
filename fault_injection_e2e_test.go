@@ -508,6 +508,60 @@ func TestE2EStreamStallPastTimeoutFailsOverNeverReturns500(t *testing.T) {
 	}
 }
 
+// TestE2EProviderTimeoutCannotOutlastTheFallbackBudget pins the difference
+// between a per-provider timeout and the request's fallback budget. The
+// provider setting is a ceiling on one call to that provider; it must not be
+// allowed to raise the attempt above what the walk has left, because the
+// attempt then consumes the whole budget and the client sees a 503 with an
+// untried model still in the chain.
+//
+// This is not hypothetical: nvidia/nvidia2/nvidia3 ship `timeout: 20s`, a
+// small `work` request gets a 6s attempt budget and a 20s fallback budget, and
+// the silent upstream held the client for the full 20s before failing over to
+// nothing. Observed in the live daemon log on 2026-11-02.
+func TestE2EProviderTimeoutCannotOutlastTheFallbackBudget(t *testing.T) {
+	stall := silentStallBackend(t)
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"id\":\"2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer healthy.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			// Deliberately far larger than the request's 5s attempt timeout and
+			// 12s fallback budget: this is the shape of the shipped nvidia
+			// entries, scaled down only in wall-clock cost.
+			"stalled": {URL: stall.URL, Timeout: 30 * time.Second, MaxInterruption: 30 * time.Second},
+			"healthy": {URL: healthy.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "stalled", Model: "m-stalled"},
+				{Provider: "healthy", Model: "m-healthy"},
+			}},
+		},
+	}
+	gw := faultGateway(t, cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	rec := httptest.NewRecorder()
+	gw.HandleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a provider timeout larger than the fallback budget turned a recoverable stall into %d: %s",
+			rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "world") || !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("silent stall did not fail over to the healthy model: %s", rec.Body.String())
+	}
+}
+
 // TestE2ENonStreamingStallPastTimeoutFailsOverNeverReturns500 mirrors the
 // silent-stall case on the non-streaming surface: the upstream accepts the
 // connection and then never answers, so the per-attempt timeout fires and the
