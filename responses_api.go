@@ -233,9 +233,11 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 					// Proxy failure: mark the proxy down and try again with a
 					// different proxy on the same endpoint.
 					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					fwdCancel()
 					lastErr = err
 					continue
 				}
+				fwdCancel()
 				lastErr = err
 				break
 			}

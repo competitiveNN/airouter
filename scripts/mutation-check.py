@@ -542,7 +542,14 @@ SUITE_TEST_FLOORS = {
     # Go-side E2E tests for the failover/hardening paths. These are graded by
     # the mutation harness (scripts/mutation-check.py) as a Go suite, so they
     # are counted by the dropped-test guard and run inside the sweep.
-    "scripts/test_go_failover.py": 19,
+    #
+    # 20 -- the 19 E2E wrappers plus TestIsRetryableForChainClassifies5xxRetryable:
+    # the "5xx as non-retryable" mutation was MISSED because every existing
+    # 500 test used a two-entry chain, where the non-retryable one-advance
+    # allowance still reached the healthy model. The direct classification test
+    # pins the branch the defect removed (2026-11-01).
+    "scripts/test_go_failover.py": 20,
+
 }
 
 

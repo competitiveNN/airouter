@@ -1191,10 +1191,11 @@ func TestAPoolProxyIsActuallyUsed(t *testing.T) {
 	}
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
-	resp, _, err := p.Forward(context.Background(), []byte(body), *ep, "")
+	resp, cancel, err := p.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {

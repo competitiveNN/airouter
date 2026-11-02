@@ -268,10 +268,11 @@ func TestOpencodeGateOnWire(t *testing.T) {
 	router := NewRouter(cfg, "")
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "test-session")
+	resp, cancel, err := proxy.Forward(context.Background(), []byte(body), *ep, "test-session")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	if string(gotBody["stream"]) != "true" {
