@@ -96,3 +96,8 @@ def test_E2EFallbackLogLinePresent():
 
 def test_E2EMidStreamFallbackLogLinePresent():
     _run("TestE2EMidStreamFallbackLogLinePresent")
+
+
+def test_IsRetryableForChainClassifies5xxRetryable():
+    _run("TestIsRetryableForChainClassifies5xxRetryable")
+

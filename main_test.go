@@ -1027,10 +1027,11 @@ func TestProviderProxyForward(t *testing.T) {
 
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	resp, cancel, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
@@ -1180,10 +1181,11 @@ func TestOpencodeHeadersInjected(t *testing.T) {
 	router := NewRouter(cfg, "")
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "test-session")
+	resp, cancel, err := proxy.Forward(context.Background(), []byte(body), *ep, "test-session")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	if gotUA == "" {
@@ -1242,10 +1244,11 @@ func TestOpencodeHeadersNotInjectedForNonOpencode(t *testing.T) {
 	router := NewRouter(cfg, "")
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	resp, cancel, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	for _, h := range []string{"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project"} {
@@ -1291,10 +1294,11 @@ func TestOpencodeProviderHeaderOverride(t *testing.T) {
 	router := NewRouter(cfg, "")
 	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}]}`
 	ep, _ := router.SelectEndpoint("smart", "test-session", false, nil)
-	resp, _, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
+	resp, cancel, err := proxy.Forward(context.Background(), []byte(body), *ep, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	if gotUA != "airouter/1.0" {

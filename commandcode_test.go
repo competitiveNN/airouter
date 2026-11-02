@@ -569,9 +569,10 @@ func TestCCUpstreamProxyRouting(t *testing.T) {
 		t.Fatal("commandCodeTransport() must return the shared transport even with CC_UPSTREAM_PROXY set")
 	}
 
-	_, _, err := p.Forward(context.Background(),
+	_, cancel, err := p.Forward(context.Background(),
 		[]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`),
 		ModelEndpoint{Provider: "commandcode", Model: "m", Protocol: "commandcode"}, "s")
+	defer cancel()
 	if err == nil {
 		t.Log("note: Forward unexpectedly succeeded")
 	}
