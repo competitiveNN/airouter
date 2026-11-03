@@ -543,6 +543,8 @@ type ccClientMessage struct {
 	Role             string          `json:"role"`
 	Content          json.RawMessage `json:"content"`
 	ReasoningContent string          `json:"reasoning_content"`
+	Reasoning        string          `json:"reasoning"`
+	ReasoningText    string          `json:"reasoning_text"`
 	ToolCalls        []struct {
 		ID       string `json:"id"`
 		Function struct {
@@ -796,19 +798,65 @@ func ccSystemBlocks(m ccClientMessage) []map[string]any {
 	return blocks
 }
 
+// ccReasoningFromContent returns the text of a reasoning part carried inside
+// an assistant message's content array, if any. Some clients send thinking as
+// a part instead of the reasoning_content field; that text is the turn's real
+// reasoning and must be preferred over the placeholder.
+func ccReasoningFromContent(content json.RawMessage) string {
+	var parts []map[string]any
+	if err := json.Unmarshal(content, &parts); err != nil {
+		return ""
+	}
+	for _, p := range parts {
+		if t, _ := p["type"].(string); t == "reasoning" {
+			if s, _ := p["text"].(string); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// ccMissingReasoning is sent for an assistant turn whose reasoning the client
+// did not (or could not) echo. CC's thinking models require the field on every
+// earlier assistant message, and an empty string does not satisfy the check --
+// any text does (verified live 2026-11-03).
+const ccMissingReasoning = "(no reasoning recorded)"
+
 // ccConvertMessage converts one non-system message to CC wire format.
 func ccConvertMessage(m ccClientMessage, toolNameMap map[string]string) map[string]any {
 	switch m.Role {
 	case "user":
 		return map[string]any{"role": "user", "content": ccUserContent(m.Content)}
 	case "assistant":
+		// Reasoning may arrive under any of the spellings providers use;
+		// treat the first non-empty one as the turn's thinking.
+		reasoning := m.ReasoningContent
+		if reasoning == "" {
+			reasoning = m.Reasoning
+		}
+		if reasoning == "" {
+			reasoning = m.ReasoningText
+		}
+		// The requirement is on EVERY earlier assistant message, not just
+		// tool-call turns. Verified live 2026-11-03: the same conversation is
+		// rejected with "Missing required parameter:
+		// 'messages[N].reasoning_content'. This model needs the reasoning of
+		// every earlier assistant message" without one, and accepted with any
+		// reasoning text. Prefer a reasoning part already carried in the
+		// content array; a client that never got any reasoning at all gets a
+		// placeholder rather than failing the whole request.
+		if reasoning == "" {
+			reasoning = ccReasoningFromContent(m.Content)
+		}
+		if reasoning == "" {
+			reasoning = ccMissingReasoning
+		}
 		parts := []any{}
 		// Reasoning comes first: CC validates that thinking mode's
 		// reasoning is echoed back in the history.
-		if m.ReasoningContent != "" {
-			parts = append(parts, map[string]any{"type": "reasoning", "text": m.ReasoningContent})
-		}
-		if content, ok := ccAssistantContent(m.Content, m.ReasoningContent != ""); ok {
+		parts = append(parts, map[string]any{"type": "reasoning", "text": reasoning})
+		if content, ok := ccAssistantContent(m.Content, true); ok {
 			parts = append(parts, content...)
 		}
 		for _, tc := range m.ToolCalls {
