@@ -255,13 +255,15 @@ func TestCCBuildEnvelopeAssistantToolCallAndToolResult(t *testing.T) {
 		t.Fatalf("messages = %d, want 3", len(env.Params.Messages))
 	}
 	asm := env.Params.Messages[1]
-	if asm.Role != "assistant" || len(asm.Content) != 1 || asm.Content[0].Type != "tool-call" {
+	// CC requires every earlier assistant message to carry reasoning, so the
+	// placeholder comes before the tool call (the client sent none).
+	if asm.Role != "assistant" || len(asm.Content) != 2 || asm.Content[0].Type != "reasoning" || asm.Content[1].Type != "tool-call" {
 		t.Fatalf("assistant message = %+v", asm)
 	}
-	if asm.Content[0].ToolName != "get_weather" {
-		t.Fatalf("tool-call toolName = %q", asm.Content[0].ToolName)
+	if asm.Content[1].ToolName != "get_weather" {
+		t.Fatalf("tool-call toolName = %q", asm.Content[1].ToolName)
 	}
-	input, _ := json.Marshal(asm.Content[0].Input)
+	input, _ := json.Marshal(asm.Content[1].Input)
 	if !strings.Contains(string(input), "Paris") {
 		t.Fatalf("tool-call input = %s", input)
 	}
