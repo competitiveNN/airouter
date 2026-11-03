@@ -491,6 +491,18 @@ func (g *GatewayContext) skipSameHostOnTransportFailure(ep *ModelEndpoint, err e
 		return
 	}
 	g.router.SkipSameHost(*ep, tried)
+	// SkipSameHost only helps THIS request. Without the persistent host
+	// backoff the next request's session hash can land on the same silent
+	// upstream and spend its whole budget on one attempt again.
+	//
+	// Only a TIMEOUT earns the host-wide backoff. It is the failure that costs
+	// the whole attempt budget; an EOF or a refused connection fails in
+	// milliseconds and the per-endpoint cooldown is enough, while cooling the
+	// host for it would also strangle sibling models that share a local test
+	// or a multi-model gateway.
+	if isTimeoutFailure(err) {
+		g.router.PenalizeHost(*ep, err.Error())
+	}
 }
 
 // HandleMetrics serves the Prometheus text-format metrics endpoint.

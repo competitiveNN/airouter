@@ -74,3 +74,53 @@ func TestRouterSkipSameHostIsANoOpForUnknownProviders(t *testing.T) {
 		t.Fatalf("an unknown provider must not skip anything, got %v", tried)
 	}
 }
+
+// TestRouterPenalizeHostBacksOffTheWholeUpstream pins the persistent half of
+// the host-level backoff. SkipSameHost only retires an upstream for the request
+// that saw the failure; a NEW request would otherwise pick the same silent host
+// again (session rotation) and spend its whole budget on one attempt timeout.
+func TestRouterPenalizeHostBacksOffTheWholeUpstream(t *testing.T) {
+	zero := 0
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &zero},
+		Providers: map[string]ProviderConfig{
+			"nv1":   {URL: "https://integrate.api.nvidia.com/v1"},
+			"nv2":   {URL: "https://integrate.api.nvidia.com/v1/"},
+			"other": {URL: "https://api.kilo.ai/v1"},
+		},
+		Models: map[string]ModelConfig{
+			"work": {Chain: []ModelEndpoint{
+				{Provider: "nv1", Model: "a"},
+				{Provider: "nv2", Model: "b"},
+				{Provider: "other", Model: "c"},
+			}},
+		},
+	}
+	r := NewRouter(cfg, "")
+	defer r.Close()
+
+	pick := func(session string, tried map[string]bool) string {
+		ep, _ := r.SelectEndpoint("work", session, false, tried)
+		if ep == nil {
+			return ""
+		}
+		return ep.Key()
+	}
+
+	// Without the host backoff, the adjacent sibling key is the next pick.
+	if got := pick("s1", map[string]bool{"nv1:a": true}); got != "nv2:b" {
+		t.Fatalf("want the sibling key nv2:b, got %q", got)
+	}
+
+	r.PenalizeHost(ModelEndpoint{Provider: "nv1", Model: "a"},
+		"upstream attempt timed out after 25s: context deadline exceeded")
+	if got := pick("s2", map[string]bool{"nv1:a": true}); got != "other:c" {
+		t.Fatalf("a host-level timeout must retire every key on that upstream, got %q", got)
+	}
+
+	// Any success on the host lifts the backoff at once.
+	r.RecordSuccess(&ModelEndpoint{Provider: "nv2", Model: "b"})
+	if got := pick("s3", map[string]bool{"nv1:a": true}); got != "nv2:b" {
+		t.Fatalf("a success on the host must clear its backoff, got %q", got)
+	}
+}
