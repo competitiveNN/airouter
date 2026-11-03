@@ -446,7 +446,7 @@ data: [DONE]
 			p := &Proxy{}
 			p.SetToolCalls(tc.toolCalls)
 
-			if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(reasoningOnly), ""); err != nil {
+			if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(reasoningOnly), "", nil); err != nil {
 				t.Fatalf("streamSSE returned error: %v", err)
 			}
 
@@ -490,7 +490,7 @@ func TestStreamSSE_EmitsDoneWhenUpstreamOmitsIt(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(false)
 
-	if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(noSentinel), ""); err != nil {
+	if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(noSentinel), "", nil); err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
 	out := buf.String()
@@ -535,7 +535,7 @@ data: [DONE]
 		p := &Proxy{}
 		p.SetToolCalls(toolCalls)
 
-		acc, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(withKeepalives), "")
+		acc, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(withKeepalives), "", nil)
 		if err != nil {
 			t.Fatalf("toolCalls=%v: streamSSE returned error: %v", toolCalls, err)
 		}
@@ -587,7 +587,7 @@ data: [DONE]
 
 	buf := &bytes.Buffer{}
 	flusher := &testFlusher{buf}
-	if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(withKeepalives), ""); err != nil {
+	if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(withKeepalives), "", nil); err != nil {
 		t.Fatalf("streamSSE: %v", err)
 	}
 	if got := m.sseCommentsRoutedOut.Load(); got != 3 {
@@ -596,7 +596,7 @@ data: [DONE]
 
 	// A stream with no comments must not move the counter.
 	if _, _, _, err := p.streamSSE(flusher, flusher,
-		strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n"), ""); err != nil {
+		strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n"), "", nil); err != nil {
 		t.Fatalf("streamSSE (no comments): %v", err)
 	}
 	if got := m.sseCommentsRoutedOut.Load(); got != 3 {
@@ -609,7 +609,7 @@ data: [DONE]
 	p2 := &Proxy{}
 	p2.SetMetrics(m2)
 	errStream := ": keepalive\n\ndata: {\"error\":{\"message\":\"boom\"}}\n\n"
-	if _, _, _, err := p2.streamSSE(flusher, flusher, strings.NewReader(errStream), ""); err == nil {
+	if _, _, _, err := p2.streamSSE(flusher, flusher, strings.NewReader(errStream), "", nil); err == nil {
 		t.Fatal("want an error from an upstream SSE error event")
 	}
 	if got := m2.sseCommentsRoutedOut.Load(); got != 1 {
@@ -645,7 +645,7 @@ data: [DONE]
 		p := &Proxy{}
 		p.SetToolCalls(toolCalls)
 
-		if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(roleFirst), ""); err != nil {
+		if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(roleFirst), "", nil); err != nil {
 			t.Fatalf("toolCalls=%v: streamSSE: %v", toolCalls, err)
 		}
 		out := buf.String()
@@ -753,7 +753,7 @@ data: [DONE]
 		p := &Proxy{}
 		p.SetToolCalls(toolCalls)
 
-		if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(upstream), ""); err != nil {
+		if _, _, _, err := p.streamSSE(flusher, flusher, strings.NewReader(upstream), "", nil); err != nil {
 			t.Fatalf("toolCalls=%v: streamSSE: %v", toolCalls, err)
 		}
 		kinds := parseSSEKinds(t, buf.String())
