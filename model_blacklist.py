@@ -145,6 +145,14 @@ def update_blacklist_from_cooldowns(models, cooldowns_path=None, blacklist_path=
         # permanent.
         if m.get("verified") is True:
             continue
+        # A model currently in the catalog with free indicators (-free suffix,
+        # stealth/ prefix for commandcode) should not be blacklisted based on
+        # stale cooldowns. The current catalog presence overrides historical
+        # 404s — the provider has re-listed it as free.
+        if m.get("provider") == "commandcode":
+            mid = m.get("id", "")
+            if mid.lower().startswith("stealth/") or mid.lower().endswith("-free") or mid.lower().endswith(":free"):
+                continue
         # parse release date
         released = _parse_release_date(m.get("released") or m.get("provider_released"))
         if released is None:
