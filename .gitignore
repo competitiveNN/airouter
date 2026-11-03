@@ -24,8 +24,14 @@ aa-enrichment-cache.json
 opencode-probe-cache.json
 
 # Runtime state (regenerated on startup)
+cooldowns.db
+cooldowns.db-wal
+cooldowns.db-shm
+# Legacy JSON state, still listed so a migration backup cannot be committed.
 cooldowns.json
+cooldowns.json.migrated
 cooldowns.priority.json
+cooldowns.priority.json.migrated
 # The dashboard stats journal is append-only runtime state:
 # it grows every minute the gateway serves traffic, so it
 # must stay out of the tree fingerprint (and out of git).

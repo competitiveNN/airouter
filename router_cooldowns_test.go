@@ -1137,3 +1137,126 @@ func TestBudgetProgressStartsAFreshInterruptionWindow(t *testing.T) {
 		t.Fatalf("remaining after progress = %v, want a fresh ~30s window", remaining)
 	}
 }
+
+// --- SQLite state store -----------------------------------------------------
+
+// TestCooldownDBPragmas pins the durability/throughput settings. They are the
+// difference between a busy gateway that rewrites a JSON file on every failure
+// and one that appends a few WAL frames: journal_mode=WAL keeps readers
+// (the model-sync job, a dashboard query) from blocking the writer,
+// synchronous=NORMAL avoids an fsync per commit, and the checkpoint threshold
+// keeps checkpoints from interfering with request-path writes.
+func TestCooldownDBPragmas(t *testing.T) {
+	store, err := openCooldownStore(filepath.Join(t.TempDir(), defaultCooldownDBName))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.close()
+
+	cases := []struct {
+		pragma string
+		want   string
+	}{
+		{"journal_mode", "wal"},
+		{"synchronous", "1"}, // NORMAL
+		{"wal_autocheckpoint", "4000"},
+		{"journal_size_limit", "16777216"},
+		{"cache_size", "-8000"}, // 8MB, in KiB units
+		{"temp_store", "1"},     // FILE
+	}
+	for _, tc := range cases {
+		var got string
+		if err := store.db.QueryRow("PRAGMA " + tc.pragma).Scan(&got); err != nil {
+			t.Fatalf("PRAGMA %s: %v", tc.pragma, err)
+		}
+		if got != tc.want {
+			t.Errorf("PRAGMA %s = %q, want %q", tc.pragma, got, tc.want)
+		}
+	}
+}
+
+// TestCooldownDBMigratesLegacyJSONAndPriorities proves an upgrade keeps the
+// backoff and the observed TPS instead of starting cold. The legacy files are
+// imported once and renamed, so a later start cannot re-import a stale ban.
+func TestCooldownDBMigratesLegacyJSONAndPriorities(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, defaultCooldownDBName)
+	ep := &ModelEndpoint{Provider: "test", Model: "m1"}
+	expiry := time.Now().Add(time.Hour)
+
+	cooldowns := map[string]CooldownEntry{
+		ep.Key(): {Expiry: expiry, StatusCode: 429, ErrorCount: 2, LastError: "rate limited"},
+	}
+	cdData, err := json.Marshal(map[string]any{
+		"cooldowns": cooldowns,
+		"circuits": map[string]CircuitBreaker{
+			ep.Key(): {State: CircuitOpen, OpenedAt: time.Now(), ProbesSent: 1},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cooldowns.json"), cdData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cooldowns.priority.json"),
+		[]byte(`{"`+ep.Key()+`":42.5}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	router := NewRouter(loadCooldownsTestConfig(t), dbPath)
+	defer router.Close()
+
+	if _, ok := router.GetAllCooldowns()[ep.Key()]; !ok {
+		t.Fatal("legacy cooldown was not imported")
+	}
+	if got := router.GetCircuitState(ep); got != CircuitOpen {
+		t.Errorf("legacy circuit state = %v, want open", got)
+	}
+	router.mu.RLock()
+	gotTPS := router.tps[ep.Key()]
+	router.mu.RUnlock()
+	if gotTPS != 42.5 {
+		t.Errorf("legacy TPS = %v, want 42.5", gotTPS)
+	}
+
+	for _, name := range []string{"cooldowns.json", "cooldowns.priority.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("legacy %s was not archived after import (err=%v)", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, name+".migrated")); err != nil {
+			t.Errorf("legacy %s.migrated missing: %v", name, err)
+		}
+	}
+}
+
+// TestCooldownDBCloseCheckpointsWAL verifies that shutdown folds the WAL into
+// the database. A large -wal left behind is the state a naive backup copies
+// without the newest rows; truncating on close makes the database file a
+// complete snapshot again.
+func TestCooldownDBCloseCheckpointsWAL(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, defaultCooldownDBName)
+	router := NewRouter(loadCooldownsTestConfig(t), dbPath)
+	router.ApplyCooldown(&ModelEndpoint{Provider: "test", Model: "m1"}, 429, "rate limited")
+	router.saveCooldowns()
+	router.Close()
+
+	wal := dbPath + "-wal"
+	if fi, err := os.Stat(wal); err == nil && fi.Size() > 0 {
+		t.Errorf("WAL still holds %d bytes after Close; checkpoint did not run", fi.Size())
+	}
+	// The committed row must still be readable without any -wal sidecar.
+	store, err := openCooldownStore(dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.close()
+	cds, _, err := store.loadCooldowns(time.Now())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cds) != 1 {
+		t.Errorf("expected 1 cooldown after checkpointed close, got %d", len(cds))
+	}
+}

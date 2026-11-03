@@ -645,7 +645,7 @@ run "recovery-check (full)" bash "$REPO/scripts/recovery-check.sh"
 # opencode, and reads the routing back off /admin/sessions.
 #
 # It does not perturb the tree: the fixture is copied into a temp dir before
-# startup (airouter writes cooldowns.json beside its config), and the binary it
+# startup (airouter writes cooldowns.db beside its config), and the binary it
 # may build is gitignored. The fingerprint comparison below is what would catch
 # it if that ever stopped being true.
 #

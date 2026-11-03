@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -9,8 +8,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -107,11 +104,13 @@ type CooldownEntry struct {
 	LastError  string    `json:"last_error"`
 }
 
-// cooldownsState is the on-disk envelope for cooldowns.json. Cooldowns and
+// cooldownsState is the legacy on-disk envelope from cooldowns.json. It is
+// still decoded once by the SQLite migration. Cooldowns and
 // circuits are stored together so a restart reconstructs both the backoff
 // windows and the circuit breaker state machine from a single file. The
-// legacy bare map[string]CooldownEntry shape is still accepted on load (see
-// loadCooldowns) so upgrades from older releases don't lose backoff state.
+// legacy bare map[string]CooldownEntry shape is still accepted by the
+// migration (see parseLegacyCooldownState) so upgrades from older releases
+// don't lose backoff state.
 type cooldownsState struct {
 	Cooldowns map[string]CooldownEntry  `json:"cooldowns"`
 	Circuits  map[string]CircuitBreaker `json:"circuits"`
@@ -298,14 +297,26 @@ type Router struct {
 	// 503. The host is the unit because tokens and models are shared per host.
 	//
 	// Deliberately in-memory: a restart re-learns in one request, and the
-	// on-disk schema stays about endpoints (cooldowns.json).
+	// on-disk schema stays about endpoints (now the SQLite cooldowns table).
 	hostCooldowns map[string]CooldownEntry
 	cooldownPath  string
-	priorityPath  string
-	mu            sync.RWMutex
-	sessionsDone  chan struct{}
-	sessionsWG    sync.WaitGroup
-	cooldownSave  *cooldownSaveState
+	// store is the SQLite database that replaced cooldowns.json and
+	// cooldowns.priority.json. Persisted snapshots mirror exactly what has
+	// been written, so saveCooldowns can diff instead of rewriting every row.
+	store               *cooldownStore
+	persistedCooldowns  map[string]CooldownEntry
+	persistedCircuits   map[string]CircuitBreaker
+	persistedPriorities map[string]float64
+	// stateSaveMu serializes whole flushes. The per-store write mutex only
+	// serializes transactions; two flushes computing snapshots concurrently
+	// could otherwise commit an older snapshot after a newer one and leave
+	// the persisted cursor ahead of the database (which the next diff would
+	// then consider already-written).
+	stateSaveMu  sync.Mutex
+	mu           sync.RWMutex
+	sessionsDone chan struct{}
+	sessionsWG   sync.WaitGroup
+	cooldownSave *cooldownSaveState
 	// cooldownJitter is the random fraction (0..0.25) added to transient
 	// cooldowns to break thundering herds. It is set via SetCooldownJitter;
 	// zero (the default) disables jitter entirely.
@@ -405,20 +416,34 @@ func (r *Router) CircuitHalfOpenProbes() int {
 
 func NewRouter(cfg *Config, cooldownPath string) *Router {
 	r := &Router{
-		sessions:        make(map[string]sessionEntry),
-		cooldowns:       make(map[string]CooldownEntry),
-		noVision:        make(map[string]bool),
-		learnedProtocol: make(map[string]protocol),
-		tps:             make(map[string]float64),
-		circuits:        make(map[string]*CircuitBreaker),
-		hostCooldowns:   make(map[string]CooldownEntry),
-		cooldownPath:    cooldownPath,
-		priorityPath:    strings.TrimSuffix(cooldownPath, ".json") + ".priority.json",
-		sessionsDone:    make(chan struct{}),
-		cooldownSave:    &cooldownSaveState{},
+		sessions:            make(map[string]sessionEntry),
+		cooldowns:           make(map[string]CooldownEntry),
+		noVision:            make(map[string]bool),
+		learnedProtocol:     make(map[string]protocol),
+		tps:                 make(map[string]float64),
+		circuits:            make(map[string]*CircuitBreaker),
+		hostCooldowns:       make(map[string]CooldownEntry),
+		cooldownPath:        cooldownPath,
+		persistedCooldowns:  make(map[string]CooldownEntry),
+		persistedCircuits:   make(map[string]CircuitBreaker),
+		persistedPriorities: make(map[string]float64),
+		sessionsDone:        make(chan struct{}),
+		cooldownSave:        &cooldownSaveState{},
 	}
 	r.config = &atomic.Pointer[Config]{}
 	r.config.Store(cfg)
+	if cooldownPath != "" {
+		store, err := openCooldownStore(cooldownPath)
+		if err != nil {
+			// Persistence is an optimization, not a routing prerequisite. A
+			// read-only config directory or a locked database must not stop the
+			// gateway from serving traffic; it runs in-memory and retries the
+			// open only on the next process start.
+			log.Printf("[warn] cooldown database unavailable, continuing in-memory: %v", err)
+		} else {
+			r.store = store
+		}
+	}
 	r.loadCooldowns()
 	r.loadPriorities()
 	r.SetCooldownJitter(cfg.Preferences.CooldownJitterFraction())
@@ -502,6 +527,12 @@ func (r *Router) sweepSessions() {
 		case <-ticker.C:
 			r.evictStaleSessions()
 			r.cleanupStaleEntries()
+			// The sweep can delete endpoints that were removed from the
+			// config. Schedule a flush so those rows leave the database too
+			// instead of waiting for the next failure to trigger a save.
+			if r.store != nil {
+				r.cooldownSave.trigger(r.saveCooldowns, cooldownSaveInterval)
+			}
 		}
 	}
 }
@@ -544,87 +575,38 @@ func (r *Router) Close() {
 	close(r.sessionsDone)
 	r.sessionsWG.Wait()
 	r.saveCooldowns()
+	if r.store != nil {
+		if err := r.store.close(); err != nil {
+			log.Printf("[warn] closing cooldown database: %v", err)
+		}
+		// Deliberately leave the pointer in place: a request that was already
+		// in flight when shutdown began can still trigger a final flush, and
+		// writing to a closed *sql.DB returns an error instead of racing a
+		// write to this field. sql.DB.Close is idempotent.
+	}
 }
 
 func (r *Router) loadCooldowns() {
-	if r.cooldownPath == "" {
+	if r.store == nil {
 		return
 	}
-	data, err := os.ReadFile(r.cooldownPath)
+	cooldowns, circuits, err := r.store.loadCooldowns(time.Now())
 	if err != nil {
-		if os.IsNotExist(err) {
-			return
-		}
-		log.Printf("[warn] failed to load cooldowns: %v", err)
+		// A read failure is not fatal: the router keeps working with an empty
+		// in-memory map and will overwrite the offending row on the next
+		// successful save. Losing backoff state is recoverable; refusing to
+		// start is not.
+		log.Printf("[warn] failed to load cooldowns from state database: %v", err)
 		return
 	}
-	// Two on-disk shapes are supported:
-	//  1. The current merged envelope: {"cooldowns":{...},"circuits":{...}}.
-	//  2. Legacy: a bare map[string]CooldownEntry (older releases). We detect
-	//     the shape by peeking at the first non-whitespace byte: '{' followed
-	//     by '"'cooldowns"'"' is the envelope; '{' followed by anything else
-	//     is the legacy bare map. This lets an upgrade from an older binary
-	//     keep its existing cooldowns.json without losing backoff state.
-	trimmed := strings.TrimLeft(string(data), " \t\r\n")
-	if strings.HasPrefix(trimmed, "{") && !strings.Contains(trimmed[:min(len(trimmed), 200)], "\"cooldowns\"") {
-		var loaded map[string]CooldownEntry
-		if err := json.Unmarshal(data, &loaded); err != nil {
-			log.Printf("[warn] failed to parse legacy cooldowns (state reset): %v", err)
-			return
-		}
-		now := time.Now()
-		for k, v := range loaded {
-			if v.Expiry.After(now) {
-				r.cooldowns[k] = v
-			}
-		}
-		log.Printf("[debug] loaded %d active cooldowns (legacy format)", len(r.cooldowns))
-		return
-	}
-	// Decode the two sections independently. A single json.Unmarshal into the
-	// merged envelope is all-or-nothing: one malformed value anywhere — most
-	// easily a hand-edited circuits entry whose "state" is the string "open"
-	// rather than the numeric CircuitState — aborts the whole parse and every
-	// cooldown is dropped, so one bad byte silently discards all backoff state
-	// and the daemon re-hammers every failing endpoint from scratch. Parsing
-	// each section on its own means a bad circuit costs only that circuit.
-	var state cooldownsState
-	if err := json.Unmarshal(data, &state); err != nil {
-		log.Printf("[warn] failed to parse cooldowns envelope (recovering sections): %v", err)
-		// Recover the cooldowns even though the envelope failed to decode.
-		var cooldownsOnly struct {
-			Cooldowns map[string]CooldownEntry `json:"cooldowns"`
-		}
-		if err := json.Unmarshal(data, &cooldownsOnly); err != nil {
-			log.Printf("[warn] failed to parse cooldowns (state reset): %v", err)
-			return
-		}
-		state.Cooldowns = cooldownsOnly.Cooldowns
-	}
+
 	now := time.Now()
-	for k, v := range state.Cooldowns {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	loadedCircuits := make(map[string]CircuitBreaker)
+	for k, v := range cooldowns {
 		if v.Expiry.After(now) {
 			r.cooldowns[k] = v
-		}
-	}
-	// Reconstruct circuit state. A circuit is only meaningful if it is Open
-	// or HalfOpen with a still-active window; Closed circuits carry no
-	// information and are omitted. We restore Open only when the cooldown is
-	// still active (otherwise the cooldown-expiry path in isAvailableLocked
-	// would re-open it on the next request anyway). HalfOpen is restored as
-	// written — a half-open circuit with an expired cooldown will immediately
-	// admit a probe, which is the desired behaviour.
-	// Same independent-decode treatment for circuits: a malformed circuit
-	// must not cost us the cooldowns recovered above.
-	circuits := state.Circuits
-	if circuits == nil {
-		var circuitsOnly struct {
-			Circuits map[string]CircuitBreaker `json:"circuits"`
-		}
-		if err := json.Unmarshal(data, &circuitsOnly); err != nil {
-			log.Printf("[warn] failed to parse circuits (cooldowns kept): %v", err)
-		} else {
-			circuits = circuitsOnly.Circuits
 		}
 	}
 	for k, v := range circuits {
@@ -636,131 +618,147 @@ func (r *Router) loadCooldowns() {
 			// the first request will close it.
 			if cd, ok := r.cooldowns[k]; ok && cd.Expiry.After(now) {
 				r.circuits[k] = &cb
+				loadedCircuits[k] = cb
 			}
 		case CircuitHalfOpen:
 			r.circuits[k] = &cb
+			loadedCircuits[k] = cb
 		}
 	}
-	log.Printf("[debug] loaded %d active cooldowns, %d circuits", len(r.cooldowns), len(r.circuits))
+	// Snapshot exactly what the database now holds. Every later save compares
+	// the live maps against these, so only rows that actually changed are
+	// written.
+	r.persistedCooldowns = copyCooldownMap(r.cooldowns)
+	r.persistedCircuits = loadedCircuits
+	log.Printf("[debug] loaded %d active cooldowns, %d circuits from SQLite", len(r.cooldowns), len(loadedCircuits))
 }
 
-func (r *Router) saveCooldowns() {
-	if r.cooldownPath == "" {
-		return
+func copyCooldownMap(src map[string]CooldownEntry) map[string]CooldownEntry {
+	out := make(map[string]CooldownEntry, len(src))
+	for k, v := range src {
+		out[k] = v
 	}
-	// Copy active cooldowns and open/half-open circuits under RLock to avoid
-	// blocking all routing during disk I/O. Closed circuits carry no state
-	// worth persisting (they'd be reconstructed as Closed on load anyway).
-	r.mu.RLock()
-	now := time.Now()
-	state := cooldownsState{
-		Cooldowns: make(map[string]CooldownEntry),
-		Circuits:  make(map[string]CircuitBreaker),
-	}
-	for k, v := range r.cooldowns {
-		if v.Expiry.After(now) {
-			state.Cooldowns[k] = v
-		}
-	}
-	for k, v := range r.circuits {
-		if v.State == CircuitOpen || v.State == CircuitHalfOpen {
-			cp := *v
-			state.Circuits[k] = cp
-		}
-	}
-	r.mu.RUnlock()
+	return out
+}
 
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		log.Printf("[debug] failed to marshal cooldowns: %v", err)
-		return
+func copyTPSMap(src map[string]float64) map[string]float64 {
+	out := make(map[string]float64, len(src))
+	for k, v := range src {
+		out[k] = v
 	}
-	// Atomic write: a temp file in the same directory followed by rename, so a
-	// crash mid-write can't leave a truncated cooldowns.json (which would
-	// otherwise be silently dropped on next start, losing all backoff state).
-	dir := filepath.Dir(r.cooldownPath)
-	tmp, err := os.CreateTemp(dir, ".cooldowns-*.tmp")
-	if err != nil {
-		log.Printf("[debug] failed to create cooldowns temp file: %v", err)
-		return
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		log.Printf("[debug] failed to write cooldowns temp file: %v", err)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		log.Printf("[debug] failed to close cooldowns temp file: %v", err)
-		return
-	}
-	if err := os.Chmod(tmpName, 0600); err != nil {
-		log.Printf("[debug] failed to chmod cooldowns temp file: %v", err)
-	}
-	if err := os.Rename(tmpName, r.cooldownPath); err != nil {
-		os.Remove(tmpName)
-		log.Printf("[debug] failed to rename cooldowns file: %v", err)
-	}
+	return out
 }
 
 func (r *Router) loadPriorities() {
-	if r.priorityPath == "" {
+	if r.store == nil {
 		return
 	}
-	data, err := os.ReadFile(r.priorityPath)
+	priorities, err := r.store.loadPriorities()
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[debug] failed to load priorities: %v", err)
-		}
-		return
-	}
-	var loaded map[string]float64
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		log.Printf("[debug] failed to parse priorities: %v", err)
+		log.Printf("[warn] failed to load TPS priorities from state database: %v", err)
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for k, v := range loaded {
+	for k, v := range priorities {
 		r.tps[k] = v
 	}
+	r.persistedPriorities = copyTPSMap(priorities)
 }
 
-func (r *Router) savePriorities() {
-	if r.priorityPath == "" || r.cooldownPath == "" {
+// saveCooldowns flushes the difference between the router's live maps and the
+// last successfully written snapshot. The old implementation marshalled every
+// entry into JSON, wrote a temp file, and renamed it on every burst; this one
+// issues an upsert per changed row inside a single transaction, so a fleet of
+// healthy endpoints costs nothing to persist.
+func (r *Router) saveCooldowns() {
+	if r.store == nil {
 		return
 	}
+	r.stateSaveMu.Lock()
+	defer r.stateSaveMu.Unlock()
+	now := time.Now()
+
 	r.mu.RLock()
-	data, err := json.MarshalIndent(r.tps, "", "  ")
+	currentCooldowns := make(map[string]CooldownEntry, len(r.cooldowns))
+	for k, v := range r.cooldowns {
+		if v.Expiry.After(now) {
+			currentCooldowns[k] = v
+		}
+	}
+	currentCircuits := make(map[string]CircuitBreaker)
+	for k, v := range r.circuits {
+		if v.State == CircuitOpen || v.State == CircuitHalfOpen {
+			currentCircuits[k] = *v
+		}
+	}
+	currentPriorities := copyTPSMap(r.tps)
+	previousCooldowns := r.persistedCooldowns
+	previousCircuits := r.persistedCircuits
+	previousPriorities := r.persistedPriorities
 	r.mu.RUnlock()
-	if err != nil {
-		log.Printf("[debug] failed to marshal priorities: %v", err)
+
+	diff := cooldownDiff{
+		upsertCooldowns:  make(map[string]CooldownEntry),
+		upsertCircuits:   make(map[string]CircuitBreaker),
+		upsertPriorities: make(map[string]float64),
+	}
+	for k, v := range currentCooldowns {
+		if old, ok := previousCooldowns[k]; !ok || old != v {
+			diff.upsertCooldowns[k] = v
+		}
+	}
+	for k := range previousCooldowns {
+		if _, ok := currentCooldowns[k]; !ok {
+			diff.deleteCooldowns = append(diff.deleteCooldowns, k)
+		}
+	}
+	for k, v := range currentCircuits {
+		if old, ok := previousCircuits[k]; !ok || old != v {
+			diff.upsertCircuits[k] = v
+		}
+	}
+	for k := range previousCircuits {
+		if _, ok := currentCircuits[k]; !ok {
+			diff.deleteCircuits = append(diff.deleteCircuits, k)
+		}
+	}
+	for k, v := range currentPriorities {
+		if old, ok := previousPriorities[k]; !ok || old != v {
+			diff.upsertPriorities[k] = v
+		}
+	}
+	for k := range previousPriorities {
+		if _, ok := currentPriorities[k]; !ok {
+			diff.deletePriorities = append(diff.deletePriorities, k)
+		}
+	}
+	if diff.empty() {
 		return
 	}
-	dir := filepath.Dir(r.priorityPath)
-	tmp, err := os.CreateTemp(dir, ".priority-*.tmp")
-	if err != nil {
-		log.Printf("[debug] failed to create priorities temp file: %v", err)
+
+	if err := r.store.apply(diff, now); err != nil {
+		// Keep the old snapshot on failure: the next flush re-computes the
+		// same diff and retries it. The in-memory state is still authoritative.
+		log.Printf("[warn] failed to persist cooldown state to SQLite: %v", err)
 		return
 	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		log.Printf("[debug] failed to write priorities temp file: %v", err)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		log.Printf("[debug] failed to close priorities temp file: %v", err)
-		return
-	}
-	if err := os.Rename(tmpName, r.priorityPath); err != nil {
-		os.Remove(tmpName)
-		log.Printf("[debug] failed to rename priorities file: %v", err)
-	}
+
+	r.mu.Lock()
+	// These snapshots are what we actually wrote. A change that landed while
+	// the transaction was in flight leaves the live map different from the
+	// snapshot, so the next save picks it up instead of being lost.
+	r.persistedCooldowns = currentCooldowns
+	r.persistedCircuits = currentCircuits
+	r.persistedPriorities = currentPriorities
+	r.mu.Unlock()
+}
+
+// savePriorities is kept as a name for callers that want an immediate flush of
+// the whole state. With SQLite the priority rows are part of the same diffed
+// save, so there is nothing separate to write.
+func (r *Router) savePriorities() {
+	r.saveCooldowns()
 }
 
 func (r *Router) RecordTPS(ep ModelEndpoint, tps float64) {
@@ -768,7 +766,13 @@ func (r *Router) RecordTPS(ep ModelEndpoint, tps float64) {
 	key := ep.Key()
 	r.tps[key] = (r.tps[key] * 0.8) + (tps * 0.2)
 	r.mu.Unlock()
-	r.savePriorities()
+	if r.store == nil {
+		return
+	}
+	// TPS is an estimate used for ordering, not durability-critical state.
+	// Coalesce it with the cooldown flush instead of issuing one write per
+	// completed response (which is what the old JSON priority file did).
+	r.cooldownSave.trigger(r.saveCooldowns, cooldownSaveInterval)
 }
 
 // isAvailableLocked reports whether ep can accept a request, considering both
@@ -1650,7 +1654,7 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 	// cooldown -> the endpoint never leaves rotation. Every request paid a
 	// full round trip to a model that cannot answer (708 requests in 90
 	// minutes, 100% failure), and because a 0s cooldown is already expired
-	// when saveCooldowns runs, the entry never reached cooldowns.json at all.
+	// when saveCooldowns runs, the entry never reached persistent state at all.
 	// The refusal is a statement about the ENDPOINT's balance, not the
 	// request: the identical request succeeds the moment the balance is
 	// topped up or the quota window resets. It belongs on the transient
@@ -1688,7 +1692,7 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 	cd.Expiry = time.Now().Add(duration)
 	cd.StatusCode = statusCode
 	// Truncate the error message so a verbose provider error body (e.g.
-	// Gemini's multi-kilabyte JSON) doesn't bloat cooldowns.json on every
+	// Gemini's multi-kilobyte JSON) doesn't bloat the state database on every
 	// retry. Keep it short; the full detail is in the log line below.
 	cd.LastError = truncateErr(errMsg, 200)
 	r.cooldowns[key] = cd
@@ -1935,7 +1939,6 @@ func (r *Router) RecordFailure(ep *ModelEndpoint, statusCode int) {
 // after a successful response from a half-open endpoint.
 func (r *Router) RecordProbeSuccess(ep *ModelEndpoint) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	key := ep.Key()
 	if cb, ok := r.circuits[key]; ok && cb.State == CircuitHalfOpen {
 		r.emitCircuitTransition(CircuitHalfOpen, CircuitClosed, key)
@@ -1943,6 +1946,10 @@ func (r *Router) RecordProbeSuccess(ep *ModelEndpoint) {
 		cb.ProbesSent = 0
 		cb.OpenedAt = time.Time{}
 		log.Printf("[debug] circuit %s: half-open probe succeeded -> closed", key)
+	}
+	r.mu.Unlock()
+	if r.store != nil {
+		r.cooldownSave.trigger(r.saveCooldowns, cooldownSaveInterval)
 	}
 }
 
@@ -1982,11 +1989,16 @@ func (r *Router) GetAllCircuits() map[string]*CircuitBreaker {
 // operators to force an endpoint back into rotation after a transient outage.
 func (r *Router) ResetCircuit(ep *ModelEndpoint) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cb, ok := r.circuits[ep.Key()]; ok {
+	key := ep.Key()
+	if cb, ok := r.circuits[key]; ok {
 		cb.State = CircuitClosed
 		cb.ProbesSent = 0
 		cb.OpenedAt = time.Time{}
+		r.circuits[key] = cb
+	}
+	r.mu.Unlock()
+	if r.store != nil {
+		r.saveCooldowns()
 	}
 }
 
@@ -1995,7 +2007,7 @@ func (r *Router) ResetCircuit(ep *ModelEndpoint) {
 // only the named endpoint is reset. It returns the number of entries removed.
 //
 // This exists because the only other way to clear backoff state was to stop
-// the daemon, hand-edit cooldowns.json, and start it again. That is a
+// the daemon, hand-edit a state file, and start it again. That is a
 // footgun: the router holds the authoritative copy in memory and rewrites the
 // whole file from it on the next failure, so an edit made while the daemon is
 // running is silently reverted (and, if the file is left malformed, the
@@ -2170,7 +2182,7 @@ func isProtocolUnsupported(statusCode int, body string) bool {
 // request: 708 failed round trips in 90 minutes, each burning 1-6s
 // of the caller's latency budget before the chain walked on, and the
 // 0s entry was already expired by the time saveCooldowns ran, so the
-// failure was invisible in cooldowns.json. The message list is
+// failure was invisible in the persisted cooldowns. The message list is
 // deliberately narrow: an ordinary 400 (a validation error, a
 // token minimum, an unsupported parameter) must keep its no-cooldown
 // treatment, or a healthy endpoint gets parked over a bad request.

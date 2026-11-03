@@ -2568,7 +2568,7 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 		return
 	}
 	// DELETE clears backoff state. Without it the only way to clear a
-	// cooldown is to stop the daemon, edit cooldowns.json by hand, and start
+	// cooldown is to stop the daemon, edit the state database by hand, and start
 	// it again — and that hand-edit is silently reverted by the running
 	// router, which rewrites the file from its in-memory copy.
 	//

@@ -59,7 +59,7 @@ echo "[sync] regenerating config.yaml..."
 # What the fetcher cannot know is whether the GATEWAY can still use an endpoint:
 # a provider listing says a model is free while real traffic is refused (a 402
 # billing response, a 403 free-tier error, a 404 on a deleted function). No
-# provider API reports that class of failure. It is recorded in cooldowns.json,
+# provider API reports that class of failure. It is recorded in cooldowns.db,
 # which the daemon owns and acts on at request time -- the cooldown is the
 # backoff, and the sync does not second-guess it.
 if ! python3 "$PROJECT_DIR/regenerate_config.py" --write; then
@@ -96,7 +96,7 @@ echo "[sync] config.yaml updated successfully"
 # regenerates config.yaml (which is gitignored and never committed) and may
 # update first-seen-cache.json when a new model appears or a month passes
 # without a listing. Only tracked files are committed; config.yaml and
-# cooldowns.json stay out of the tree by design.
+# cooldowns.db stay out of the tree by design.
 if git -C "$PROJECT_DIR" diff --quiet -- first-seen-cache.json blacklisted-models.json; then
     echo "[sync] first-seen-cache.json unchanged, nothing to commit"
 else

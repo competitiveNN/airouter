@@ -66,9 +66,9 @@ func main() {
 	// small for operator deployments on constrained hosts.)
 	debug.SetMemoryLimit(50 * 1024 * 1024)
 
-	cooldownPath := filepath.Join(filepath.Dir(*configPath), "cooldowns.json")
+	cooldownPath := filepath.Join(filepath.Dir(*configPath), defaultCooldownDBName)
 	// The dashboard journal lives beside the config for the same
-	// reason cooldowns.json does: it is state the gateway owns, and
+	// reason cooldowns.db does: it is state the gateway owns, and
 	// the config's directory is the one place the operator already
 	// associates with the gateway's data.
 	journalPath := filepath.Join(filepath.Dir(*configPath), "metrics-ring.jsonl")
@@ -87,7 +87,7 @@ func main() {
 	// an optional file that can add further sources (see docs/proxy_sources.txt
 	// for the reference copy of the built-in list).
 	//
-	// It resolves beside the config, like cooldowns.json and the journal:
+	// It resolves beside the config, like cooldowns.db and the journal:
 	// resolving it against the process CWD meant the daemon only ever found
 	// the file when started from the directory that holds it, so an operator
 	// running it with -config /etc/airouter/config.yaml silently lost every

@@ -462,7 +462,7 @@ MUTATIONS: list[Mutation] = [
 # test_every_test_suite_has_a_floor() fails if a new suite is added without one.
 SUITE_TEST_FLOORS = {
     # 66: 47 through the opencode UA tests, plus the 16 covering the runtime
-    # free-tier veto (the cooldowns.json pass): a 402 vetoes a curated model
+    # free-tier veto (the cooldown-store pass): a 402 vetoes a curated model
     # without editing the curated list, a 429/5xx/timeout never vetoes, one 403
     # is not a verdict but three are, a 403 without free-tier wording is not one
     # either, a 404 needs no repetition, an expired cooldown is not evidence, one
@@ -479,7 +479,7 @@ SUITE_TEST_FLOORS = {
     # countdown starts on first absence, a partial fetch never prunes, and the
     # record/reuse/no-override/meta-router rules (2026-10-06); minus
     # the 16 that covered the runtime free-tier veto, removed together
-    # with the veto itself (2026-10-06) -- cooldowns.json, owned and
+    # with the veto itself (2026-10-06) -- cooldowns.db, owned and
     # updated by the daemon, is now the only refusal record; plus the 3
     # covering the commandcode credit-exhaustion split: the balance
     # family is an account-state verdict, not a per-model "paid" one,

@@ -1,19 +1,72 @@
 #!/usr/bin/env python3
 """Permanent blacklist: models gone upstream never reappear.
 
-A cooldowns.json entry 404 / "not found" with a release date older than
-two weeks => model is permanently blacklisted. They never appear in
-fetch-free-models.py output and never make it into config.yaml.
+A cooldown row (404 / "not found") with a release date older than two weeks
+=> model is permanently blacklisted. They never appear in fetch-free-models.py
+output and never make it into config.yaml.
+
+The gateway records runtime refusals in cooldowns.db (SQLite). It used to
+write cooldowns.json, so the reader below accepts both: an existing JSON file
+is still parsed (and is what the first daemon start migrates away from).
 """
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 BLACKLIST_FILE = REPO / "blacklisted-models.json"
-COOLDOWNS_FILE = REPO / "cooldowns.json"
+# Current state store. The constant keeps its historical name so the fetcher's
+# import does not need a second spelling.
+COOLDOWNS_FILE = REPO / "cooldowns.db"
+LEGACY_COOLDOWNS_FILE = REPO / "cooldowns.json"
 RUNTIME_MIN_AGE_DAYS = 14
+
+
+def load_cooldown_entries(path=None):
+    """Read cooldown rows from the SQLite state database, or a legacy JSON file.
+
+    Returns {"provider:model": {"status_code": int|None, "last_error": str}}.
+    A missing or unreadable store is "no evidence" (empty dict), never an
+    exception: the sync is a read-only consumer of state the daemon owns.
+    """
+    p = Path(path or COOLDOWNS_FILE)
+    if not p.exists() and p == COOLDOWNS_FILE and LEGACY_COOLDOWNS_FILE.exists():
+        p = LEGACY_COOLDOWNS_FILE
+    if not p.exists():
+        return {}
+    try:
+        with p.open("rb") as fh:
+            header = fh.read(16)
+    except OSError:
+        return {}
+
+    if not header.startswith(b"SQLite format 3\x00"):
+        # Legacy JSON: either {"cooldowns": {...}, "circuits": {...}} or a
+        # bare map written by releases that predate circuits.
+        try:
+            raw = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if isinstance(raw, dict) and "cooldowns" in raw:
+            raw = raw["cooldowns"]
+        return raw if isinstance(raw, dict) else {}
+
+    try:
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT key, status_code, last_error FROM cooldowns"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {
+        str(key): {"status_code": code, "last_error": err or ""}
+        for key, code, err in rows
+    }
 
 
 def load_blacklist(path=None):
@@ -77,26 +130,13 @@ def _find_model(models_by_id, model_id):
 
 
 def update_blacklist_from_cooldowns(models, cooldowns_path=None, blacklist_path=None):
-    """Scan cooldowns.json, add 404/not-found models older than 2 weeks to blacklist.
+    """Scan the cooldown store, add 404/not-found models older than 2 weeks.
 
     Returns the list of newly blacklisted keys.
     """
-    # ---- read cooldowns.json ----
-    cp = Path(cooldowns_path or COOLDOWNS_FILE)
-    if not cp.exists():
+    cooldowns = load_cooldown_entries(cooldowns_path)
+    if not cooldowns:
         return []
-    try:
-        raw = json.load(cp.open())
-    except (json.JSONDecodeError, OSError):
-        return []
-    # two possible shapes:
-    # { "provider:model": {...}, ... }
-    # { "cooldowns": { "provider:model": {...}, ... }, "circuits": {...} }
-    if isinstance(raw, dict) and "cooldowns" in raw:
-        raw = raw["cooldowns"]
-    if not isinstance(raw, dict):
-        return []
-    cooldowns = raw
 
     # ---- read existing blacklist ----
     bp = Path(blacklist_path or BLACKLIST_FILE)

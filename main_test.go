@@ -3704,13 +3704,11 @@ func TestCloseFlushesCooldownSave(t *testing.T) {
 	// Close should flush
 	router.Close()
 
-	// Verify the file was written
-	data, err := readFile(cooldownPath)
-	if err != nil {
-		t.Fatalf("cooldowns.json not written after Close: %v", err)
-	}
-	if len(data) == 0 {
-		t.Fatal("cooldowns.json is empty after Close")
+	// Reopen the database: Close must have committed the pending cooldown.
+	reopened := NewRouter(cfg, cooldownPath)
+	defer reopened.Close()
+	if _, ok := reopened.GetAllCooldowns()[ep.Key()]; !ok {
+		t.Fatalf("cooldown for %s was not persisted by Close", ep.Key())
 	}
 }
 
@@ -4165,12 +4163,10 @@ func TestConcurrentCooldownSave(t *testing.T) {
 	// debounced save via saveCooldowns().
 	router.Close()
 
-	data, err := os.ReadFile(cooldownPath)
-	if err != nil {
-		t.Fatalf("expected cooldowns.json to exist: %v", err)
-	}
-	if len(data) == 0 {
-		t.Fatal("cooldowns.json is empty")
+	reopened := NewRouter(cfg, cooldownPath)
+	defer reopened.Close()
+	if _, ok := reopened.GetAllCooldowns()[ep.Key()]; !ok {
+		t.Fatalf("expected cooldown for %s to be durable after Close", ep.Key())
 	}
 }
 
@@ -5326,22 +5322,22 @@ func TestCooldownPersistenceAudit(t *testing.T) {
 	// Force an immediate flush (the 5s batch timer would otherwise delay it).
 	routerA.saveCooldowns()
 
-	// The persisted file must exist and contain the cooldown. The on-disk
-	// shape is the merged envelope {"cooldowns":...,"circuits":...}; try that
-	// first and fall back to the legacy bare map.
-	data, err := os.ReadFile(cooldownPath)
+	// The persisted database must contain the cooldown. Read it through a
+	// fresh store so the assertion is about the committed row, not the
+	// in-memory map of a new router.
+	store, err := openCooldownStore(cooldownPath)
 	if err != nil {
-		t.Fatalf("cooldown file not written: %v", err)
+		t.Fatalf("reopen cooldown database: %v", err)
 	}
-	var loaded map[string]CooldownEntry
-	var env cooldownsState
-	if json.Unmarshal(data, &env) == nil && len(env.Cooldowns) > 0 {
-		loaded = env.Cooldowns
-	} else if err := json.Unmarshal(data, &loaded); err != nil {
-		t.Fatalf("cooldown file not valid JSON: %v", err)
+	persisted, _, loadErr := store.loadCooldowns(time.Now())
+	if closeErr := store.close(); closeErr != nil {
+		t.Fatalf("close cooldown database: %v", closeErr)
 	}
-	if _, ok := loaded[ep.Key()]; !ok {
-		t.Fatalf("cooldown for %s not persisted: %s", ep.Key(), string(data))
+	if loadErr != nil {
+		t.Fatalf("load cooldowns: %v", loadErr)
+	}
+	if _, ok := persisted[ep.Key()]; !ok {
+		t.Fatalf("cooldown for %s not persisted to SQLite", ep.Key())
 	}
 
 	// Router B: freshly constructed from the same file must load the cooldown.
@@ -5383,29 +5379,29 @@ func TestCooldownPersistenceAtomicWrite(t *testing.T) {
 		},
 	}
 
+	ep := &ModelEndpoint{Provider: "p", Model: "m1"}
 	router := NewRouter(cfg, cooldownPath)
-	router.ApplyCooldownForSession(&ModelEndpoint{Provider: "p", Model: "m1"}, 429, "rl", "sess", 0)
+	router.ApplyCooldownForSession(ep, 429, "rl", "sess", 0)
 	router.saveCooldowns()
 
-	// The file must be valid JSON (atomic rename guarantees this). The shape is
-	// the merged envelope {"cooldowns":...,"circuits":...}; accept the legacy
-	// bare map too so the assertion works regardless of format.
+	// A committed save must leave a real SQLite database behind, not a
+	// half-written temp file from the old JSON path. Reopening it is the
+	// durability check: a fresh connection reads exactly what the next
+	// process start would see.
 	data, err := os.ReadFile(cooldownPath)
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("read state database: %v", err)
 	}
-	var loaded map[string]CooldownEntry
-	var env cooldownsState
-	if json.Unmarshal(data, &env) == nil && len(env.Cooldowns) > 0 {
-		loaded = env.Cooldowns
-	} else if err := json.Unmarshal(data, &loaded); err != nil {
-		t.Fatalf("cooldowns.json is not valid JSON after atomic write: %v", err)
+	if !isSQLiteFile(data) {
+		t.Fatalf("state file is not a SQLite database after save")
 	}
-	if len(loaded) == 0 {
+	reopened := NewRouter(cfg, cooldownPath)
+	defer reopened.Close()
+	if _, ok := reopened.GetAllCooldowns()[ep.Key()]; !ok {
 		t.Fatalf("expected at least one persisted cooldown")
 	}
 
-	// No leftover temp files should exist.
+	// No leftover temp files from the retired JSON writer should exist.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
@@ -5847,9 +5843,9 @@ func TestCircuitBreakerMetricTransition(t *testing.T) {
 
 // TestCircuitBreakerPersistenceLegacyFormat verifies that a legacy
 // cooldowns.json written as a bare map[string]CooldownEntry (the shape used
-// by older releases before circuits were persisted) is still loaded
-// correctly, and that a subsequent save upgrades the file to the merged
-// envelope without losing the backoff state.
+// by older releases before circuits were persisted) is imported into the
+// SQLite database on first open, and that a subsequent save keeps both the
+// cooldown and the circuit without losing backoff state.
 func TestCircuitBreakerPersistenceLegacyFormat(t *testing.T) {
 	dir := t.TempDir()
 	cooldownPath := filepath.Join(dir, "cooldowns.json")
@@ -5895,8 +5891,8 @@ func TestCircuitBreakerPersistenceLegacyFormat(t *testing.T) {
 		t.Errorf("expected circuit Closed after legacy load (no circuit persisted), got %v", routerB.GetCircuitState(ep))
 	}
 
-	// Trigger a failure to open the circuit, then save — the file must now
-	// be the merged envelope and reload must reconstruct the Open state.
+	// Trigger a failure to open the circuit, then save — reloading the
+	// database must reconstruct the Open state.
 	routerB.ApplyCooldown(ep, 500, "server error")
 	routerB.ApplyCooldown(ep, 500, "server error")
 	routerB.ApplyCooldown(ep, 500, "server error")
@@ -5907,20 +5903,25 @@ func TestCircuitBreakerPersistenceLegacyFormat(t *testing.T) {
 		t.Errorf("expected circuit Open after save+reload, got %v", routerC.GetCircuitState(ep))
 	}
 
-	// The file must be the merged envelope, not the legacy bare map.
-	raw, err := os.ReadFile(cooldownPath)
+	// The committed SQLite rows must hold both the cooldown and the open
+	// circuit. Read them through a fresh store, not through routerC's
+	// in-memory maps.
+	store, err := openCooldownStore(cooldownPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reopen cooldown database: %v", err)
 	}
-	var env cooldownsState
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatalf("expected merged envelope after save, got non-envelope JSON: %v", err)
+	persisted, persistedCircuits, loadErr := store.loadCooldowns(time.Now())
+	if closeErr := store.close(); closeErr != nil {
+		t.Fatalf("close cooldown database: %v", closeErr)
 	}
-	if len(env.Cooldowns) == 0 {
-		t.Error("expected cooldowns in merged envelope")
+	if loadErr != nil {
+		t.Fatalf("load cooldowns: %v", loadErr)
 	}
-	if _, ok := env.Circuits[ep.Key()]; !ok {
-		t.Error("expected circuit in merged envelope")
+	if len(persisted) == 0 {
+		t.Error("expected cooldowns in the SQLite database")
+	}
+	if _, ok := persistedCircuits[ep.Key()]; !ok {
+		t.Error("expected circuit in the SQLite database")
 	}
 }
 

@@ -116,8 +116,9 @@ shipping unbounded, bound only by a loose 10-minute timeout.
 
 ### Cooldowns
 
-Cooldowns are persisted to `cooldowns.json` (atomic tmp+rename) next to the
-config file. `ErrorCount` is the number of CONSECUTIVE failures: it is reset by
+Cooldowns are persisted to `cooldowns.db` (SQLite, WAL mode) next to the
+config file. The router keeps the authoritative maps in memory and flushes
+only changed rows in a debounced transaction. `ErrorCount` is the number of CONSECUTIVE failures: it is reset by
 `RecordSuccess` (any successful response deletes the entry) and capped at 100.
 With a 30 s base the transient ladder is 30 s, 1 m, 2 m, 4 m, 8 m, 16 m, and
 then the 30-minute ceiling for every failure after the sixth.
@@ -423,16 +424,17 @@ config, sessions, cooldowns, provider URLs, or keys — safe for load balancers.
 
   Returns `{"cleared":N,"model":...}`, 404 if the named model has no cooldown.
 
-  **Do not hand-edit `cooldowns.json` while the daemon is running.** The router
-  holds the authoritative state in memory and rewrites the whole file from it on
-  the next failure, so your edit is reverted within seconds. If you must edit,
-  stop the service first. Note `circuits.*.state` is an **int** (0 closed, 1
-  open, 2 half-open), not a string — a bad value there used to abort the whole
-  file parse and silently reset every cooldown.
+  **Use the admin endpoint, not a hand edit, while the daemon is running.** The
+  router holds the authoritative state in memory and rewrites changed rows from
+  it on the next flush, so a direct edit to `cooldowns.db` is reverted within
+  seconds. If you must inspect or repair the database, stop the service first
+  and back up `cooldowns.db` (plus `-wal`/`-shm` if present).
 - **Sticky session pinned to a dead model:** the session ID is derived from the
   request body, so changing the messages or model moves to a new session.
-- **Cooldowns not expiring:** verify `cooldowns.json` is writable; the router
-  debounces writes (one per 500 ms) and uses atomic tmp+rename, so a crash
-  mid-write cannot corrupt the file.
+- **Cooldowns not expiring:** verify the config directory and `cooldowns.db`
+  are writable and that no process holds the database lock. The router
+  debounces writes (5 s bursts), commits each flush as one SQLite transaction,
+  and uses WAL, so a crash cannot leave a half-written state file. Expired rows
+  are deleted at startup and on every flush.
 - **Provider 429 with Retry-After ignored:** the header is parsed in
   `ParseRetryAfter` (delta-seconds and HTTP-date) and honored as a floor.

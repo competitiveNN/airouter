@@ -98,12 +98,12 @@ make commandcode-proxy   # ./commandcode-proxy, the standalone shim
 package with the `commandcode_proxy` build tag, which swaps the gateway entry
 point for the shim-only one: the result serves `/v1/chat/completions`,
 `/v1/models` and `/health` on port 3050 and nothing else. It reads the same
-config and shares `cooldowns.json`, so it can run instead of the gateway's
+config and shares `cooldowns.db`, so it can run instead of the gateway's
 built-in endpoint, or alongside it on a different port.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `-config` | `config.yaml` | Config path; `cooldowns.json` is read/written next to it |
+| `-config` | `config.yaml` | Config path; `cooldowns.db` is read/written next to it |
 | `-port` | `8080` | Listen port |
 | `-api-key` | — | Bearer token clients present. Also read from `GATEWAY_API_KEY`. Required unless `-allow-no-auth` |
 | `-allow-no-auth` | `false` | Run unauthenticated (insecure: every endpoint, admin included) |
@@ -171,10 +171,10 @@ allowlisted key names into the systemd user manager for interactive
 The sync unit is deliberately a good citizen: `Type=oneshot`,
 `TimeoutStartSec=30min`, `Nice=10`, `IOSchedulingClass=idle`, because
 it issues a few dozen API calls and rewrites caches while the daemon
-serves. It reads `cooldowns.json` while the daemon may be writing it —
-safe by construction, since cooldown saves are atomic tmp-file renames,
-so the sync sees either the old envelope or the new one, never a
-half-written one.
+serves. It reads `cooldowns.db` while the daemon may be writing it —
+safe by construction: SQLite in WAL mode gives a reader a consistent
+committed snapshot, so the sync sees either the state before a write or
+the state after it, never a half-written row.
 
 ## Configuration
 
@@ -338,8 +338,12 @@ fixture runs).
 
 ## Cooldowns
 
-Cooldowns persist to `cooldowns.json` (atomic tmp+rename) next to the
-config, so they survive restarts. `ErrorCount` is the number of
+Cooldowns persist to the `cooldowns.db` SQLite database next to the
+config, so they survive restarts. The file is opened in WAL mode with
+`synchronous=NORMAL`, one connection, and row-scoped upserts, so a burst
+of failures updates only the affected rows instead of rewriting a JSON
+file. A legacy `cooldowns.json`/`cooldowns.priority.json` is imported
+once and renamed to `*.migrated`. `ErrorCount` is the number of
 *consecutive* failures — reset by any success, capped at 100.
 
 | Status | Base cooldown | Escalation | Ceiling |
