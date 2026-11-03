@@ -167,7 +167,13 @@ func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 // request went through 165.154.162.73:8888, timed out after 25s of a 30s
 // budget, and the request 503'd. The same body DIRECT to the same kilocode
 // model answered in ~1s at 134KB and ~3s at 600KB.
-const maxProxiedBodyBytes = 256 << 10
+//
+// 64KB, not 256KB: the second live failure (14:19, 116k tokens) had a body
+// just under the old limit and still lost 12.5s of a 30s budget to
+// 165.154.162.73:8888. Token counts and body bytes diverge (dense code/tool
+// JSON is ~2 bytes per token), so the cut has to be low enough to catch a
+// prefill-sized upload in either unit.
+const maxProxiedBodyBytes = 64 << 10
 
 // proxyAllowedForBody reports whether an attempt carrying a body of n bytes
 // may use the proxy pool. Large prefill uploads go direct.
