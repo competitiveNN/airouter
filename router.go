@@ -286,14 +286,26 @@ type Router struct {
 	// actually asking for.
 	learnedProtocol map[string]protocol
 
-	tps          map[string]float64
-	circuits     map[string]*CircuitBreaker
-	cooldownPath string
-	priorityPath string
-	mu           sync.RWMutex
-	sessionsDone chan struct{}
-	sessionsWG   sync.WaitGroup
-	cooldownSave *cooldownSaveState
+	tps      map[string]float64
+	circuits map[string]*CircuitBreaker
+	// hostCooldowns backs off a whole UPSTREAM (provider URL), not an
+	// endpoint, after an attempt fails with no HTTP response. Key groups make
+	// nvidia/nvidia2/nvidia3 adjacent so a 429 falls through to the sibling
+	// key; when the HOST is unreachable instead, every sibling burns another
+	// full attempt timeout. Measured 2026-11-03: a 276k-token `work` request
+	// picked nvidia first, sat out its 25s attempt timeout, and had 5s left
+	// for six more providers -- the healthy gemini got 2s and the client got a
+	// 503. The host is the unit because tokens and models are shared per host.
+	//
+	// Deliberately in-memory: a restart re-learns in one request, and the
+	// on-disk schema stays about endpoints (cooldowns.json).
+	hostCooldowns map[string]CooldownEntry
+	cooldownPath  string
+	priorityPath  string
+	mu            sync.RWMutex
+	sessionsDone  chan struct{}
+	sessionsWG    sync.WaitGroup
+	cooldownSave  *cooldownSaveState
 	// cooldownJitter is the random fraction (0..0.25) added to transient
 	// cooldowns to break thundering herds. It is set via SetCooldownJitter;
 	// zero (the default) disables jitter entirely.
@@ -399,6 +411,7 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 		learnedProtocol: make(map[string]protocol),
 		tps:             make(map[string]float64),
 		circuits:        make(map[string]*CircuitBreaker),
+		hostCooldowns:   make(map[string]CooldownEntry),
 		cooldownPath:    cooldownPath,
 		priorityPath:    strings.TrimSuffix(cooldownPath, ".json") + ".priority.json",
 		sessionsDone:    make(chan struct{}),
@@ -444,6 +457,15 @@ func (r *Router) cleanupStaleEntries() {
 		if cd := r.cooldowns[k]; cd.ErrorCount > 100 {
 			cd.ErrorCount = 100
 			r.cooldowns[k] = cd
+		}
+	}
+	// Host backoffs are not tied to a config entry, so they are pruned by
+	// expiry alone. An expired one is harmless, but the map would otherwise
+	// keep a string per upstream forever.
+	now := time.Now()
+	for k, hc := range r.hostCooldowns {
+		if now.After(hc.Expiry) {
+			delete(r.hostCooldowns, k)
 		}
 	}
 	for k := range r.noVision {
@@ -762,6 +784,15 @@ func (r *Router) RecordTPS(ep ModelEndpoint, tps float64) {
 //     enters half-open as a probe.
 func (r *Router) isAvailableLocked(ep *ModelEndpoint) bool {
 	key := ep.Key()
+	// A host-level backoff outranks every per-endpoint signal: the endpoint
+	// cannot be reached regardless of its own cooldown or circuit state, so
+	// admitting a half-open probe here would spend another attempt timeout on
+	// a host that is already known to be silent.
+	if hk := r.hostKeyForProviderLocked(ep.Provider); hk != "" {
+		if hc, ok := r.hostCooldowns[hk]; ok && time.Now().Before(hc.Expiry) {
+			return false
+		}
+	}
 	cd, hasCooldown := r.cooldowns[key]
 	cb := r.circuits[key]
 
@@ -1192,6 +1223,51 @@ func (r *Router) SkipSameHost(ep ModelEndpoint, tried map[string]bool) {
 			}
 		}
 	}
+}
+
+// hostKeyForProviderLocked is the cooldown key for the upstream behind a
+// provider, or "" when the provider has no URL (a built-in that is not
+// configured). Callers hold r.mu (or accept the atomic config read).
+func (r *Router) hostKeyForProviderLocked(provider string) string {
+	cfg := r.config.Load()
+	if cfg == nil {
+		return ""
+	}
+	pc, ok := cfg.Providers[provider]
+	if !ok {
+		return ""
+	}
+	url := normalizeUpstreamURL(pc.URL)
+	if url == "" {
+		return ""
+	}
+	return "host:" + url
+}
+
+// PenalizeHost backs off the whole upstream behind ep after an attempt that
+// produced no HTTP response. The escalation matches the endpoint timeout
+// curve (2m, 4m, 8m ... capped at 30m), and any success on the host clears it
+// immediately (see RecordSuccess), so a single slow model cannot keep a
+// healthy host out of rotation for long.
+func (r *Router) PenalizeHost(ep ModelEndpoint, errMsg string) {
+	r.mu.Lock()
+	hk := r.hostKeyForProviderLocked(ep.Provider)
+	if hk == "" {
+		r.mu.Unlock()
+		return
+	}
+	hc := r.hostCooldowns[hk]
+	hc.ErrorCount++
+	if hc.ErrorCount > 100 {
+		hc.ErrorCount = 100
+	}
+	hc.StatusCode = 0
+	hc.LastError = truncateErr(errMsg, 200)
+	hc.Expiry = time.Now().Add(escalateCooldown(timeoutCooldownBase, hc.ErrorCount))
+	r.hostCooldowns[hk] = hc
+	r.mu.Unlock()
+	log.Printf("[debug] host cooldown %s errors=%d for %v: %s",
+		hk, hc.ErrorCount, time.Until(hc.Expiry).Round(time.Second), truncateErr(errMsg, 120))
 }
 
 // normalizeUpstreamURL reduces a provider URL to the thing two providers share
@@ -1726,6 +1802,9 @@ func (r *Router) RecordSuccess(ep *ModelEndpoint) {
 		cb.OpenedAt = time.Time{}
 		r.circuits[key] = cb
 	}
+	// The host answered: whatever kept it out of rotation was either wrong or
+	// over, and leaving the backoff in place would keep healthy siblings dark.
+	delete(r.hostCooldowns, r.hostKeyForProviderLocked(ep.Provider))
 	r.mu.Unlock()
 	if deleted {
 		r.saveCooldowns()
