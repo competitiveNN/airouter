@@ -184,7 +184,7 @@ func TestAttemptClientReusesTheSharedTransport(t *testing.T) {
 
 	const timeout = 3 * time.Second
 	ep := ModelEndpoint{Provider: "p", Model: "m"}
-	client, usedProxy := p.attemptClient(&ep, timeout)
+	client, usedProxy := p.attemptClient(&ep, timeout, true)
 	if usedProxy != nil {
 		t.Fatal("expected a direct attempt: the provider configures no proxy")
 	}

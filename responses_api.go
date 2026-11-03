@@ -632,7 +632,12 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	if err != nil {
 		return "", nil, err
 	}
-	client, usedProxy := g.proxy.attemptClient(&ep, timeout)
+	allowProxy := proxyAllowedForBody(len(body))
+	if !allowProxy && g.proxy.proxyTries(&ep) > 0 {
+		log.Printf("[proxy] body %d bytes exceeds %d; sending %s/%s direct",
+			len(body), maxProxiedBodyBytes, ep.Provider, ep.Model)
+	}
+	client, usedProxy := g.proxy.attemptClient(&ep, timeout, allowProxy)
 	resp, err := client.Do(req)
 	if err != nil {
 		// proxyAttribution, not proxyFault: a bare CONNECT status-text rejection
