@@ -316,7 +316,7 @@ func TestStreamSSE_DotsThinkingOnlyStream(t *testing.T) {
 			p := &Proxy{}
 			p.SetToolCalls(toolCalls)
 
-			acc, tcs, _, err := p.streamSSE(flusher, flusher, strings.NewReader(input), "dots-studio/dots-3-note-preview:free")
+			acc, tcs, _, err := p.streamSSE(flusher, flusher, strings.NewReader(input), "dots-studio/dots-3-note-preview:free", nil)
 			if err != nil {
 				t.Fatalf("streamSSE returned error: %v", err)
 			}
@@ -359,7 +359,7 @@ func TestStreamSSE_DotsStreamWithContent(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, strings.NewReader(input), "dots-studio/dots-3-note-preview:free")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, strings.NewReader(input), "dots-studio/dots-3-note-preview:free", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestStreamSSE_NonDotsModelUntouched(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, strings.NewReader(input), "opencode/big-pickle-free")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, strings.NewReader(input), "opencode/big-pickle-free", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}

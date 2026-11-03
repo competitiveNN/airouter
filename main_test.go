@@ -1462,7 +1462,7 @@ func TestProviderProxyStreamingMidStreamResume(t *testing.T) {
 		}
 		router.ApplyCooldownFromError(ep, err)
 		if strings.TrimSpace(partial) != "" {
-			body = string(appendAssistantMessage([]byte(body), partial, nil))
+			body = string(appendAssistantMessage([]byte(body), partial, nil, ""))
 		}
 	}
 
@@ -2302,7 +2302,7 @@ func TestStreamSSE_CoalescesToolCallDeltas(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	acc, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	acc, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2376,7 +2376,7 @@ func TestStreamSSE_IncompleteToolCallDropped(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2409,7 +2409,7 @@ func TestStreamSSE_EmptyArgsToolCallEmitted(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2454,7 +2454,7 @@ func TestStreamSSE_MultipleToolCalls(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2510,7 +2510,7 @@ func TestStreamSSE_ToolCallWithContent(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2575,7 +2575,7 @@ func TestStreamSSE_NameArrivesLate(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2633,7 +2633,7 @@ func TestStreamSSE_PartialArgumentsAcrossChunks(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2685,7 +2685,7 @@ func TestStreamSSE_SameIndexOverwrite(t *testing.T) {
 	p := &Proxy{}
 	p.SetToolCalls(true)
 
-	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, tcs, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -2725,7 +2725,7 @@ func TestAppendAssistantMessage_FiltersIncompleteToolCalls(t *testing.T) {
 		{Index: 2, ID: "complete_2", Type: "function", Name: "write_file", Arguments: `{"path":"/z"}`},
 	}
 
-	body := appendAssistantMessage([]byte(base), "partial content", tcs)
+	body := appendAssistantMessage([]byte(base), "partial content", tcs, "")
 
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -3041,7 +3041,7 @@ func TestStreamSSE_BoundedBodyGrowth(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		partial := fmt.Sprintf("partial%d ", i)
 		toolCalls := []streamToolCall{{Index: 0, ID: fmt.Sprintf("call_%d", i), Name: "fn", Arguments: "{}"}}
-		body = appendAssistantMessage(body, partial, toolCalls)
+		body = appendAssistantMessage(body, partial, toolCalls, "")
 	}
 
 	// Count assistant messages in the body. Should be exactly 5 (one per attempt).
@@ -3148,7 +3148,7 @@ func TestStreamSSE_FinalEventNoTrailingBlankLine(t *testing.T) {
 	flusher := &testFlusher{buf}
 	p := &Proxy{}
 
-	_, _, _, err := p.streamSSE(flusher, flusher, body, "")
+	_, _, _, err := p.streamSSE(flusher, flusher, body, "", nil)
 	if err != nil {
 		t.Fatalf("streamSSE returned error: %v", err)
 	}
@@ -6203,7 +6203,7 @@ func TestAppendAssistantMessageMatchesDecoderRoundTrip(t *testing.T) {
 	}
 	for _, body := range rewriteCorpus {
 		want := refAppendAssistantMessage([]byte(body), "partial", tcs)
-		got := appendAssistantMessage([]byte(body), "partial", tcs)
+		got := appendAssistantMessage([]byte(body), "partial", tcs, "")
 		if !sameJSONResult(t, got, want) {
 			t.Errorf("body %q: splice produced %s, decoder produced %s", body, got, want)
 		}

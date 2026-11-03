@@ -35,6 +35,13 @@ type StreamAttemptOptions struct {
 	// it to start a fresh interruption window and to release the attempt's
 	// connection/first-output deadline once output has started.
 	OnProgress func()
+	// Reasoning, when non-nil, receives the reasoning content of this attempt.
+	// The chat fallback replays it as `reasoning_content` on the assistant
+	// message it appends: Command Code's thinking models reject a replayed
+	// assistant message without it ("Missing required parameter:
+	// 'messages[N].reasoning_content'"), so a mid-stream failover died on
+	// arrival at the one provider that could have continued the answer.
+	Reasoning *strings.Builder
 }
 
 // progressWriter observes successful writes to the client. It is deliberately
@@ -1210,7 +1217,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	streamOut := io.Writer(w)
 	streamOut = &progressWriter{w: streamOut, progress: progress}
 
-	partial, toolCalls, completionTokens, sErr := p.streamSSE(streamOut, flusher, idle, endpoint.Model)
+	partial, toolCalls, completionTokens, sErr := p.streamSSE(streamOut, flusher, idle, endpoint.Model, opts.Reasoning)
 	if sErr != nil && errors.Is(context.Cause(attemptCtx), attemptTimeoutCause) {
 		sErr = fmt.Errorf("upstream attempt timed out after %v: %w", timeout, context.DeadlineExceeded)
 	}
@@ -1473,7 +1480,7 @@ func (i *idleTimeoutReader) Close() error {
 	return nil
 }
 
-func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, upstreamModel string) (string, []streamToolCall, int, error) {
+func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, upstreamModel string, reasoning *strings.Builder) (string, []streamToolCall, int, error) {
 	var eventBuf bytes.Buffer
 	scanner := bufio.NewScanner(body)
 	buf := make([]byte, 0, 64*1024)
@@ -1532,7 +1539,7 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, ups
 		if buffered.Len() == 0 {
 			return nil
 		}
-		accumulateDelta(&acc, &tcs, buffered.Bytes())
+		accumulateDelta(&acc, &tcs, buffered.Bytes(), reasoning)
 		if _, err := w.Write(buffered.Bytes()); err != nil {
 			return err
 		}
@@ -1700,7 +1707,7 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, ups
 				// parsing at [DONE], so a tool call after it would be dropped.
 				mergeToolCallDeltas(raw, pendingToolCalls)
 				if !sseEventIsToolDeltaOnly(raw) {
-					accumulateDelta(&acc, &tcs, raw)
+					accumulateDelta(&acc, &tcs, raw, reasoning)
 					// If this content-bearing event also carries tool call
 					// deltas, strip them before forwarding. The client would
 					// otherwise see a partial delta (e.g. empty arguments)
@@ -1718,14 +1725,14 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, ups
 					}
 					flusher.Flush()
 				} else {
-					accumulateDelta(&acc, &tcs, raw)
+					accumulateDelta(&acc, &tcs, raw, reasoning)
 				}
 			} else {
 				// Tool calls disabled: forward all events verbatim to the client.
 				// "Verbatim" still normalizes the one field strict clients
 				// require and some upstreams omit (tool_calls[].index).
 				forwarded := normalizeToolCallIndices(raw)
-				accumulateDelta(&acc, &tcs, forwarded)
+				accumulateDelta(&acc, &tcs, forwarded, reasoning)
 				if _, err := w.Write(forwarded); err != nil {
 					return err
 				}
@@ -1882,6 +1889,21 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, ups
 	}
 	flusher.Flush()
 	return acc.String(), tcs, completionTokens, nil
+}
+
+// rawReasoningText extracts a reasoning delta that is a JSON string, and
+// ignores the object shapes some routers send (they carry no text we can
+// replay, and a typed string field would fail the whole event's decode,
+// dropping the content and tool calls that share it).
+func rawReasoningText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // normalizeToolCallIndices makes every tool-call delta carry an explicit
@@ -2041,7 +2063,7 @@ type pendingTC struct {
 // events and appends them to acc / tcs, so a mid-stream fallback can resume on
 // the next model by replaying what the client already received as an assistant
 // message. It safely ignores [DONE] sentinels and unparseable events.
-func accumulateDelta(acc *strings.Builder, tcs *[]streamToolCall, raw []byte) {
+func accumulateDelta(acc *strings.Builder, tcs *[]streamToolCall, raw []byte, reasoning *strings.Builder) {
 	for _, ev := range bytes.Split(raw, []byte("\n\n")) {
 		if len(bytes.TrimSpace(ev)) == 0 {
 			continue
@@ -2053,8 +2075,10 @@ func accumulateDelta(acc *strings.Builder, tcs *[]streamToolCall, raw []byte) {
 		var obj struct {
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
+					Content          string          `json:"content"`
+					ReasoningContent json.RawMessage `json:"reasoning_content"`
+					Reasoning        json.RawMessage `json:"reasoning"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Type     string `json:"type"`
@@ -2072,6 +2096,10 @@ func accumulateDelta(acc *strings.Builder, tcs *[]streamToolCall, raw []byte) {
 		for _, ch := range obj.Choices {
 			if ch.Delta.Content != "" {
 				acc.WriteString(ch.Delta.Content)
+			}
+			if reasoning != nil {
+				reasoning.WriteString(rawReasoningText(ch.Delta.ReasoningContent))
+				reasoning.WriteString(rawReasoningText(ch.Delta.Reasoning))
 			}
 			for _, tc := range ch.Delta.ToolCalls {
 				var target *streamToolCall

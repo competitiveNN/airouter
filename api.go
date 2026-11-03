@@ -1068,7 +1068,7 @@ func injectMaxTokens(body []byte, maxTokens int) []byte {
 // represent deltas where only the id arrived but the name never did, and
 // replaying them as `{"function":{"arguments":...}}` with no name would produce
 // a malformed tool call that breaks the next model's parser.
-func appendAssistantMessage(body []byte, content string, toolCalls []streamToolCall) []byte {
+func appendAssistantMessage(body []byte, content string, toolCalls []streamToolCall, reasoning string) []byte {
 	obj, ok := scanJSONObject(body)
 	if !ok {
 		return body
@@ -1076,6 +1076,13 @@ func appendAssistantMessage(body []byte, content string, toolCalls []streamToolC
 	msg := map[string]interface{}{
 		"role":    "assistant",
 		"content": content,
+	}
+	// Command Code's thinking models require the reasoning that produced an
+	// assistant turn to be echoed back; without it the replayed turn is
+	// rejected with "Missing required parameter: 'messages[N].reasoning_content'"
+	// and the failover dies on arrival.
+	if reasoning != "" {
+		msg["reasoning_content"] = reasoning
 	}
 	if len(toolCalls) > 0 {
 		atcs := make([]map[string]interface{}, 0, len(toolCalls))
@@ -2312,7 +2319,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		if maxProxyTries <= 0 {
 			maxProxyTries = 1
 		}
+		// The reasoning this attempt produced. It is replayed on the assistant
+		// message the fallback appends, because Command Code's thinking models
+		// refuse a replayed turn that does not echo it. Reset per proxy try so
+		// a failed transport does not concatenate two attempts' thinking.
+		var attemptReasoning strings.Builder
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+			attemptReasoning.Reset()
 			// Each proxy retry gets only what is left of the interruption
 			// budget. Recomputing here matters: without it, three long proxy
 			// attempts on one endpoint could hold the client silent for
@@ -2330,6 +2343,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				// anyway, with no time to try another model.
 				MaxIdleTimeout: minDuration(ceiling, walk.remaining()),
 				OnProgress:     walk.markProgress,
+				Reasoning:      &attemptReasoning,
 			})
 			if err != nil {
 				if errors.Is(err, ErrUpstreamSaturated) {
@@ -2467,7 +2481,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 					accumulatedTCs = append(accumulatedTCs, tc)
 				}
 			}
-			body = appendAssistantMessage(body, contentDelta, accumulatedTCs)
+			body = appendAssistantMessage(body, contentDelta, accumulatedTCs, attemptReasoning.String())
 			accumulatedContent = partial
 		}
 		continue
