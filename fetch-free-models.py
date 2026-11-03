@@ -3205,23 +3205,22 @@ def main() -> None:
     print(summary_line, file=sys.stderr)
 
     # Apply permanent blacklist. Now that release dates are fully populated
-    # (AA + first-seen cache), scan cooldowns.json for models that have
-    # been marked "not found" (404) and are older than two weeks. Those go
-    # into the persistent blacklist. Then filter the current fetch through
-    # whatever ended up in the file — the set only ever grows.
+    # (AA + first-seen cache), scan the gateway's cooldown store for models
+    # that have been marked "not found" (404) and are older than two weeks.
+    # Those go into the persistent blacklist. Then filter the current fetch
+    # through whatever ended up in the file — the set only ever grows.
     if not args.no_blacklist:
         cooldowns_path = Path(COOLDOWNS_FILE)
-        if cooldowns_path.exists():
-            newly = update_blacklist_from_cooldowns(
-                all_models, cooldowns_path=cooldowns_path,
-                blacklist_path=args.blacklist,
-            )
-            if newly:
-                print(f"Blacklist: permanently blacklisted {len(newly)} new model(s) "
-                      f"from cooldowns.json (not found >= 2 weeks old)",
-                      file=sys.stderr)
-                for entry in newly:
-                    print(f"  {entry}", file=sys.stderr)
+        newly = update_blacklist_from_cooldowns(
+            all_models, cooldowns_path=cooldowns_path,
+            blacklist_path=args.blacklist,
+        )
+        if newly:
+            print(f"Blacklist: permanently blacklisted {len(newly)} new model(s) "
+                  f"from cooldowns.db (not found >= 2 weeks old)",
+                  file=sys.stderr)
+            for entry in newly:
+                print(f"  {entry}", file=sys.stderr)
         blacklist = load_blacklist(args.blacklist)
         before_blacklist = len(all_models)
         # A model the live probe just confirmed free is never dropped by a stale blacklist entry: the probe is the authority on liveness, and a blacklisted-but-live model is exactly the 'did not output all commandcode free models' regression. Keep verified models regardless of blacklist.

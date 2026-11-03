@@ -56,7 +56,7 @@ func main() {
 	// GOMEMLIMIT keeps the process compact on constrained hosts.
 	debug.SetMemoryLimit(50 * 1024 * 1024)
 
-	cooldownPath := filepath.Join(filepath.Dir(*configPath), "cooldowns.json")
+	cooldownPath := filepath.Join(filepath.Dir(*configPath), defaultCooldownDBName)
 	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
 	proxy.SetProtocolResolver(router.ProtocolFor)

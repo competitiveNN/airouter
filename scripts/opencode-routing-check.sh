@@ -163,7 +163,7 @@ set +a
 # turn a routing failure into a pass, because a broken router is not what this
 # probe measures.
 #
-# It deliberately does NOT write to cooldowns.json. That file is the daemon's
+# It deliberately does NOT write to cooldowns.db. That file is the daemon's
 # memory of real refusals, carried across restarts; a check that wrote to it
 # would poison the backoff policy from a cron job. The refusal is recorded in
 # the routing log instead, which is the file that already exists to explain why
@@ -303,7 +303,7 @@ if [[ -n "$EXPECT_MODEL_OVERRIDE" ]]; then
 fi
 echo ""
 
-# cooldowns.json is written next to the config file, so the fixture is copied
+# cooldowns.db is written next to the config file, so the fixture is copied
 # into a temp dir: running against testdata/ would drop a state file into the repo.
 WORK="$(mktemp -d)"
 cp "$FIXTURE" "$WORK/config.yaml"
@@ -365,7 +365,7 @@ case "$PREFLIGHT_STATUS" in
       echo "SKIP: OpenCode answered the preflight ${PREFLIGHT_STATUS}: ${PREFLIGHT_BODY}" >&2
       echo "  The gateway is not in that path, so this is a verdict about the" >&2
       echo "  provider's willingness to serve, not about routing. Re-run once the" >&2
-      echo "  free-tier limit resets (observed cooldown 12h40m; see cooldowns.json" >&2
+      echo "  free-tier limit resets (observed cooldown 12h40m; see cooldowns.db" >&2
       echo "  in a live deployment for the real backoff). Recorded in $ROUTING_LOG." >&2
       exit 77
     fi

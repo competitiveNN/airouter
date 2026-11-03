@@ -19,9 +19,8 @@ TimeoutStartSec=30min
 # cooldowns-independent caches, so run it strictly below the daemon.
 Nice=10
 IOSchedulingClass=idle
-# The sync reads cooldowns.json while the daemon is writing it. That is safe by
-# construction, not by luck: loadCooldowns/saveCooldowns rename a temp file into
-# place (router.go), so this sees either the old envelope or the new one, never a
-# half-written one — which is why scripts/sync-models.sh can treat an unreadable
-# file as "no evidence" instead of failing the sync.
+# The sync reads cooldowns.db while the daemon is writing it. That is safe by
+# construction, not by luck: SQLite in WAL mode gives a reader a committed
+# snapshot, never a half-written row — which is why scripts/sync-models.sh can
+# treat an unreadable store as "no evidence" instead of failing the sync.
 SyslogIdentifier=airouter-model-sync
