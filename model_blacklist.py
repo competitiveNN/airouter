@@ -138,6 +138,13 @@ def update_blacklist_from_cooldowns(models, cooldowns_path=None, blacklist_path=
                     break
         if m is None:
             continue
+        # A model the live probe just confirmed free is never permanently
+        # blacklisted: the probe is the authority on liveness, and blacklisting
+        # a verified-live deal is what dropped commandcode free models from the
+        # output (the regression). Transient 404s on a live deal must not become
+        # permanent.
+        if m.get("verified") is True:
+            continue
         # parse release date
         released = _parse_release_date(m.get("released") or m.get("provider_released"))
         if released is None:
