@@ -535,7 +535,7 @@ def test_real_config_matches_the_pinned_shapes():
     the file the daemon actually loads drifts.
     """
     cfg = yaml.safe_load(CONFIG.read_text())
-    assert set(cfg["models"]) == {"smart", "work", "fast", "large"}
+    assert set(cfg["models"]) == {"smart", "work", "fast", "large", "decision"}
     for name, body in cfg["models"].items():
         chain = body["chain"]
         assert chain, f"{name} chain is empty"
@@ -951,7 +951,7 @@ def test_parse_terminators_round_trips_the_comment_including_its_hash():
     the first time this was introduced.
     """
     parsed = gen.parse_terminators(CONFIG.read_text())
-    assert set(parsed) == {"smart", "work", "fast", "large"}
+    assert set(parsed) == {"smart", "work", "fast", "large", "decision"}
     for profile, (provider, model, comment) in parsed.items():
         assert provider in ("kilocode", "opencode")
         assert model in ("kilo-auto/free", "big-pickle")
@@ -1084,10 +1084,10 @@ def test_checker_demands_the_rescue_when_the_list_says_kilocode_is_refused(tmp_p
         f"      - provider: opencode\n        model: {want[1]}  {want[2]}",
         CONFIG.read_text(),
     )
-    assert rescued.count(f"model: {want[1]}  {want[2]}") == 4
+    assert rescued.count(f"model: {want[1]}  {want[2]}") == 5
     assert _rule6(_check_with(rescued, dead_kilo)) == []
     problems = _rule6(_check_with(CONFIG.read_text(), dead_kilo))
-    assert len([p for p in problems if "expected opencode/big-pickle" in p]) == 4, problems
+    assert len([p for p in problems if "expected opencode/big-pickle" in p]) == 5, problems
 
 
 # Comment shapes the generator must be able to read back and write out
@@ -1127,7 +1127,7 @@ def test_any_comment_survives_a_parse_emit_validate_round_trip(tmp_path, shape):
     substituted = re.findall(
         rf"(?m)^        model: kilo-auto/free  {re.escape(shape)}$", shaped
     )
-    assert len(substituted) == 4, "the substitution did not reach every chain"
+    assert len(substituted) == 5, "the substitution did not reach every chain"
 
     parsed = gen.parse_terminators(shaped)
     assert {p: v[2] for p, v in parsed.items()} == {p: shape for p in parsed}
@@ -1138,7 +1138,7 @@ def test_any_comment_survives_a_parse_emit_validate_round_trip(tmp_path, shape):
     # file-level comparison would only prove that.
     out = _run_cli(tmp_path, {}, runs=2, base=shaped)
     assert gen.validate_config_text(out) == []
-    for profile in ("smart", "work", "fast", "large"):
+    for profile in ("smart", "work", "fast", "large", "decision"):
         assert _terminator_in(out, profile) == f"kilo-auto/free  {shape}", (
             f"{profile} terminator comment did not survive: "
             f"{_terminator_in(out, profile)!r}"
@@ -1156,7 +1156,7 @@ def test_a_terminator_with_no_comment_gets_one_rather_than_being_left_bare(tmp_p
     assert all(v[2] == "" for v in parsed.values()), parsed
     out = _run_cli(tmp_path, {}, runs=2, base=bare)
     assert gen.validate_config_text(out) == []
-    for profile in ("smart", "work", "fast", "large"):
+    for profile in ("smart", "work", "fast", "large", "decision"):
         assert _terminator_in(out, profile).split("#", 1)[1].strip(), (
             f"{profile} terminator was left without a comment"
         )
@@ -1548,6 +1548,11 @@ def test_rule13_fires_when_the_config_drops_a_proved_protocol(tmp_path):
       - provider: kilocode
         model: kilo-auto/free
         vision: true
+  decision:
+    chain:
+      - provider: kilocode
+        model: kilo-auto/free
+        vision: true
 """
     problems = _checker_problems(config, models_path)
     assert [p for p in problems if p.startswith("rule13")], problems
@@ -1665,6 +1670,8 @@ def _a_commandcode_config():
         "  fast:\n"
         "    chain:\n" + chain +
         "  large:\n"
+        "    chain:\n" + chain +
+        "  decision:\n"
         "    chain:\n" + chain
     )
 

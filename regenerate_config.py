@@ -430,6 +430,13 @@ def filter_large(models: list[Model]) -> list[Model]:
     return candidates
 
 
+def filter_decision(models: list[Model]) -> list[Model]:
+    """decision: models suited for decision-making tasks (intelligence >= 25)."""
+    return [m for m in models
+            if m.score is not None and m.score >= 25
+            and m.is_chain_candidate]
+
+
 def auto_fallback_terminator(
     providers_present: set[str],
     catalog: dict[tuple[str, str], Model] | None = None,
@@ -670,7 +677,7 @@ def parse_terminators(config_text: str) -> dict[str, tuple[str, str, str]]:
     auto_fallback_terminator).
     """
     out: dict[str, tuple[str, str, str]] = {}
-    for profile in ('smart', 'work', 'fast', 'large'):
+    for profile in ('smart', 'work', 'fast', 'large', 'decision'):
         m = re.search(
             rf'(?ms)^  {profile}:\n    chain:\n(.*?)(?=^  \w+:|\Z)', config_text
         )
@@ -1047,6 +1054,7 @@ def main(argv: list[str] | None = None):
     work_models = filter_work(model_list)
     fast_models = filter_fast(model_list)
     large_models = filter_large(model_list)
+    decision_models = filter_decision(model_list)
 
     # Sort each, applying the configured tie-break.
     smart_models = sort_models(smart_models, newest_first)
@@ -1059,6 +1067,7 @@ def main(argv: list[str] | None = None):
         newest_first,
         context_first=True,
     )
+    decision_models = sort_models(decision_models, newest_first)
     
     print(f"\nSmart candidates ({len(smart_models)}):")
     for m in smart_models:
@@ -1074,6 +1083,10 @@ def main(argv: list[str] | None = None):
     
     print(f"\nLarge candidates ({len(large_models)}):")
     for m in large_models:
+        print(f"  {m.mapped_provider:12s} {m.id:50s} score={m.score} ctx={m.context_length} vision={m.vision}")
+
+    print(f"\nDecision candidates ({len(decision_models)}):")
+    for m in decision_models:
         print(f"  {m.mapped_provider:12s} {m.id:50s} score={m.score} ctx={m.context_length} vision={m.vision}")
     
     # Build chains. The full catalog is passed so the terminator can be checked
@@ -1095,6 +1108,7 @@ def main(argv: list[str] | None = None):
     work_chain = build_chain(work_models, 'work', records, previous.get('work'), protocols, providers_present)
     fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'), protocols, providers_present)
     large_chain = build_chain(large_models, 'large', records, previous.get('large'), protocols, providers_present)
+    decision_chain = build_chain(decision_models, 'decision', records, previous.get('decision'), protocols, providers_present)
     
     # Generate new models section
     new_models = f"""models:
@@ -1110,13 +1124,16 @@ def main(argv: list[str] | None = None):
   large:
     chain:
 {format_chain_yaml(large_chain)}
+  decision:
+    chain:
+{format_chain_yaml(decision_chain)}
 """
     
     # Replace the models section, preserving everything else byte-for-byte.
     new_config = merge_models_section(config, new_models)
 
     print("\n=== SUMMARY ===")
-    for name, chain in [('smart', smart_chain), ('work', work_chain), ('fast', fast_chain), ('large', large_chain)]:
+    for name, chain in [('smart', smart_chain), ('work', work_chain), ('fast', fast_chain), ('large', large_chain), ('decision', decision_chain)]:
         concrete = [e for e in chain if not e['model'].startswith('kilo-auto') and e['model'] != 'big-pickle']
         print(f"{name:6s}: {len(chain)} entries ({len(concrete)} concrete), head={concrete[0]['model'] if concrete else 'N/A'}, tail={chain[-1]['model']}")
 

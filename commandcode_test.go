@@ -391,6 +391,27 @@ func TestCCAggregateStreamGuards(t *testing.T) {
 	} else if pe, ok := err.(*ProviderError); !ok || pe.StatusCode != 429 {
 		t.Fatalf("zero-output error = %#v", err)
 	}
+	// Upstream error event with statusCode 402 (payment required) -> remapped to 429.
+	ccErr402 := `{"type":"error","error":{"message":"insufficient credits","code":"PAYMENT_REQUIRED","statusCode":402}}`
+	if _, err := ccAggregateStream([]byte(ccErr402), "m", 1); err == nil {
+		t.Fatal("error event must fail")
+	} else if pe, ok := err.(*ProviderError); !ok || pe.StatusCode != 429 {
+		t.Fatalf("402 error event remapped to %d, want 429: %#v", pe.StatusCode, err)
+	}
+	// Upstream error event with Go-style 404 page not found -> remapped to 502 (transient).
+	ccErr404Go := `{"type":"error","error":{"message":"404 page not found\n","code":"NOT_FOUND","statusCode":404}}`
+	if _, err := ccAggregateStream([]byte(ccErr404Go), "m", 1); err == nil {
+		t.Fatal("error event must fail")
+	} else if pe, ok := err.(*ProviderError); !ok || pe.StatusCode != 502 {
+		t.Fatalf("Go 404 error event remapped to %d, want 502: %#v", pe.StatusCode, err)
+	}
+	// Genuine Command Code 404 (JSON, no Go text) -> stays 404.
+	ccErr404Real := `{"type":"error","error":{"message":"Model 'x' not found.","code":"NOT_FOUND","statusCode":404}}`
+	if _, err := ccAggregateStream([]byte(ccErr404Real), "m", 1); err == nil {
+		t.Fatal("error event must fail")
+	} else if pe, ok := err.(*ProviderError); !ok || pe.StatusCode != 404 {
+		t.Fatalf("genuine 404 error event remapped to %d, want 404: %#v", pe.StatusCode, err)
+	}
 }
 
 func TestCCMapError(t *testing.T) {
@@ -438,6 +459,26 @@ func TestCCMapErrorQuotaRefusal(t *testing.T) {
 	pe = ccMapError(400, []byte(`{"error":{"message":"max_tokens is not supported","code":"BAD_REQUEST"}}`))
 	if pe.StatusCode != 400 {
 		t.Fatalf("an ordinary 400 mapped to %d, want 400", pe.StatusCode)
+	}
+}
+
+// TestCCMapErrorGoPageNotFound pins the body-aware 404 refinement: a
+// Go-style "404 page not found" is not a Command Code model-not-found
+// verdict, it is the upstream host answering with its default 404 for a
+// route it does not know -- the signature of a command-code request
+// misrouted to a host that speaks plain chat. Mapping it to the
+// transient 502 family keeps the cooldown short so the endpoint is
+// retried instead of being banned for the 7 days a real 404 earns.
+// A genuine Command Code 404 (JSON body, no Go text) keeps the raw
+// mapping.
+func TestCCMapErrorGoPageNotFound(t *testing.T) {
+	pe := ccMapError(404, []byte("404 page not found\n"))
+	if pe.StatusCode != 502 {
+		t.Fatalf("Go page-not-found 404 mapped to %d, want 502 (transient)", pe.StatusCode)
+	}
+	pe = ccMapError(404, []byte(`{"error":{"message":"Model 'x' not found.","code":"NOT_FOUND"}}`))
+	if pe.StatusCode != 404 {
+		t.Fatalf("a genuine commandcode 404 mapped to %d, want 404 (permanent)", pe.StatusCode)
 	}
 }
 

@@ -514,7 +514,7 @@ func (s *CommandCodeShim) complete(w http.ResponseWriter, r *http.Request, body 
 				status, payload = mapped.StatusCode, mapped.Body
 			}
 			lastStatus, lastBody = status, payload
-			s.penalize(&ep, nil, resp.StatusCode, sessionID)
+			s.penalize(&ep, nil, status, sessionID)
 			continue
 		}
 
