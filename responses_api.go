@@ -207,8 +207,18 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		// of the ceiling and what the fallback walk has left, so a provider
 		// configured for a short window (a local endpoint that answers in
 		// milliseconds) does not hold a client open for 30s on its cooldown.
+		// Command Code prefill is slower than the size-derived estimate;
+		// floor the per-attempt budget at max_interruption (see api.go).
+		perAttemptBase := timeout
 		ceiling := g.providerMaxInterruption(ep.Provider)
-		attemptTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+		if g.proxy.effectiveProtocol(ep) == protocolCommandCode {
+			if ceiling > perAttemptBase {
+				perAttemptBase = ceiling
+			}
+		} else {
+			perAttemptBase = minDuration(timeout, ceiling)
+		}
+		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
@@ -311,6 +321,19 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		}
 
 		if resp.StatusCode != 200 {
+			// Command Code error statuses are remapped to the
+			// OpenAI-equivalent the client and the cooldown
+			// classifier expect: 402 payment-required is a rate
+			// limit, 5xx is a retryable upstream error, and an
+			// unlisted status becomes a 502 rather than a generic
+			// failure.
+			if ep.UpstreamProtocol() == protocolCommandCode {
+				if mapped := ccMapError(resp.StatusCode, respBody); mapped != nil {
+					resp.StatusCode = mapped.StatusCode
+					respBody = mapped.Body
+				}
+			}
+
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
 			g.recordFallback(ep, nil, resp.StatusCode, string(respBody))
@@ -504,9 +527,19 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		// of the ceiling and what the fallback walk has left, so a provider
 		// configured for a short window (a local endpoint that answers in
 		// milliseconds) does not hold a client open for 30s on its cooldown.
+		// Command Code prefill is slower than the size-derived estimate;
+		// floor the per-attempt budget at max_interruption (see api.go).
+		perAttemptBase := timeout
 		ceiling := g.providerMaxInterruption(ep.Provider)
+		if g.proxy.effectiveProtocol(ep) == protocolCommandCode {
+			if ceiling > perAttemptBase {
+				perAttemptBase = ceiling
+			}
+		} else {
+			perAttemptBase = minDuration(timeout, ceiling)
+		}
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
-			proxyTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+			proxyTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
 			if proxyTimeout <= 0 {
 				err = context.DeadlineExceeded
 				break
@@ -618,9 +651,17 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
+		// Command Code error statuses are remapped to the
+		// OpenAI-equivalent the client and the cooldown
+		// classifier expect.
+		if ep.UpstreamProtocol() == protocolCommandCode {
+			if mapped := ccMapError(resp.StatusCode, b); mapped != nil {
+				return "", nil, mapped
+			}
+		}
 		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") && ep.UpstreamProtocol() != protocolCommandCode {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
 		resp.Body.Close()
 		return "", nil, &ProviderError{StatusCode: resp.StatusCode, Body: b, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}

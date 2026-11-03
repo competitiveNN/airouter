@@ -1060,7 +1060,7 @@ type Config struct {
 	MaxConcurrentRequests         *int `yaml:"max_concurrent_requests,omitempty"`
 }
 
-var LogicalModels = []string{"smart", "work", "fast", "large"}
+var LogicalModels = []string{"smart", "work", "fast", "large", "decision"}
 
 func LoadConfig(path string) (*Config, error) {
 	// Bound file size to prevent OOM from malformed/malicious config

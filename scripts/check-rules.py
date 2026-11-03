@@ -52,7 +52,7 @@ DEFAULT_MODELS = "/tmp/free-models.json"
 BLACKLIST_DEFAULT = REPO / "blacklisted-models.json"
 
 AUTO_MODELS = {"kilo-auto/free", "big-pickle"}
-ROUTABLE_PROFILES = ["smart", "work", "fast", "large"]
+ROUTABLE_PROFILES = ["smart", "work", "fast", "large", "decision"]
 BANNED_ID = re.compile(r"content-safety|x-preview-f-free")
 
 # CommandCode free-ness is NOT enumerated here.
@@ -122,6 +122,7 @@ PROFILE_RULES = {
     "fast": {"max_distinct_models": 10},
     # large: context_length >= 200000 only, sorted by ctx desc then score desc.
     "large": {"min_context": 200000},
+    "decision": {"min_intelligence": 25.0},
 }
 
 

@@ -227,8 +227,17 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		// ceiling and what the fallback walk has left, so a provider configured
 		// for a short window (a local endpoint that answers in milliseconds)
 		// does not hold a client open for 30s on its cooldown.
-		ceiling := g.providerMaxInterruption(ep.Provider)
-		attemptTimeout := walk.attemptTimeout(minDuration(timeout, ceiling))
+		// Command Code prefill is slower than the size-derived estimate;
+		// floor the per-attempt budget at max_interruption (see api.go).
+		perAttemptBase := timeout
+		if g.proxy.effectiveProtocol(ep) == protocolCommandCode {
+			if ceiling := g.providerMaxInterruption(ep.Provider); ceiling > perAttemptBase {
+				perAttemptBase = ceiling
+			}
+		} else {
+			perAttemptBase = minDuration(timeout, g.providerMaxInterruption(ep.Provider))
+		}
+		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
 		if attemptTimeout <= 0 {
 			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			return

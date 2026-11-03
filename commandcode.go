@@ -1543,13 +1543,14 @@ func (r *ccStreamToChatReader) errorChunk(message string) []byte {
 // so the caller treats the attempt as failed and falls back.
 func ccAggregateStream(body []byte, model string, created int64) ([]byte, error) {
 	var (
-		fullText      strings.Builder
-		reasoningText strings.Builder
-		toolCalls     []map[string]any
-		sawFinish     bool
-		finishReason  = "stop"
-		usage         *ccUsage
-		upstreamError string
+		fullText            strings.Builder
+		reasoningText       strings.Builder
+		toolCalls           []map[string]any
+		sawFinish           bool
+		finishReason        = "stop"
+		usage               *ccUsage
+		upstreamError       string
+		upstreamErrorStatus int
 	)
 
 	scanner := bufio.NewScanner(bytes.NewReader(body))
@@ -1606,13 +1607,18 @@ func ccAggregateStream(body []byte, model string, created int64) ([]byte, error)
 			}
 		case "error":
 			msg := ev.Message
-			if ev.Error != nil && ev.Error.Message != "" {
-				msg = ev.Error.Message
+			var errStatus int
+			if ev.Error != nil {
+				if ev.Error.Message != "" {
+					msg = ev.Error.Message
+				}
+				errStatus = ev.Error.StatusCode
 			}
 			if msg == "" {
 				msg = "Unknown CC error"
 			}
 			upstreamError = msg
+			upstreamErrorStatus = errStatus
 		}
 	}
 
@@ -1621,6 +1627,15 @@ func ccAggregateStream(body []byte, model string, created int64) ([]byte, error)
 		return nil, &ProviderError{StatusCode: 502, Body: []byte(`{"error":{"message":"Upstream stream ended without a completion finish (no finish event) — response was truncated","type":"upstream_error"}}`), RetryAfter: 10 * time.Second}
 	}
 	if upstreamError != "" {
+		// Remap the upstream status code so the cooldown classifier
+		// sees the OpenAI-equivalent (402->429, 404 page-not-found->502, etc.)
+		status := upstreamErrorStatus
+		if status == 0 {
+			status = 502
+		}
+		if mapped := ccMapError(status, []byte(upstreamError)); mapped != nil {
+			return nil, mapped
+		}
 		return nil, &ProviderError{StatusCode: 502, Body: []byte(`{"error":{"message":"` + jsonEscape(upstreamError) + `","type":"upstream_error"}}`), RetryAfter: 10 * time.Second}
 	}
 
@@ -1738,6 +1753,15 @@ func ccMapError(status int, body []byte) *ProviderError {
 // gives it the transient cooldown curve and lets the circuit
 // breaker count it.
 func ccStatusMap(status int, body []byte) (int, string) {
+	// A Go-style "404 page not found" is NOT a real model-not-found decision:
+	// it is the upstream host answering with its default 404 for a route it
+	// does not know (typically because a command-code request was misrouted to
+	// a host that speaks plain chat). Treating it as a permanent 404 misban
+	// blocks the endpoint for 7 days. Surface it as a transient upstream
+	// failure so the cooldown stays short and the endpoint gets retried.
+	if status == 404 && strings.Contains(string(body), "page not found") {
+		return 502, "upstream_error"
+	}
 	switch status {
 	case 400:
 		if isQuotaRefusal(400, string(body)) {
