@@ -160,6 +160,19 @@ func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 	return provider.Proxy
 }
 
+// maxProxiedBodyBytes is the largest request body an attempt may send through
+// a pool proxy. Rotation exists to change the source IP for rate limits; a
+// free proxy that cannot carry a prefill-sized upload costs the whole attempt
+// budget and returns nothing. Measured 2026-11-03: a 331k-token `smart`
+// request went through 165.154.162.73:8888, timed out after 25s of a 30s
+// budget, and the request 503'd. The same body DIRECT to the same kilocode
+// model answered in ~1s at 134KB and ~3s at 600KB.
+const maxProxiedBodyBytes = 256 << 10
+
+// proxyAllowedForBody reports whether an attempt carrying a body of n bytes
+// may use the proxy pool. Large prefill uploads go direct.
+func proxyAllowedForBody(n int) bool { return n <= maxProxiedBodyBytes }
+
 // SetProxyService wires the proxy pool into the Proxy. Endpoints whose
 // resolved proxy budget is greater than 0 route upstream traffic through a
 // proxy from the pool, where that budget comes from the endpoint's own proxy
@@ -210,7 +223,7 @@ func (p *Proxy) MarkProxyReady(proxyURL string) {
 // failure a per-attempt budget exists to prevent. The timeouts are applied to a
 // CLONE rather than to the shared transport, because mutating the shared one
 // would change every other in-flight request.
-func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration) (*http.Client, *ProxyInfo) {
+func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration, allowProxy bool) (*http.Client, *ProxyInfo) {
 	client := p.client
 	transport := p.baseTransport
 	if p.effectiveProtocol(ep) == protocolCommandCode {
@@ -218,7 +231,7 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration) (*http.C
 		transport = p.commandCodeTransport()
 	}
 	var usedProxy *ProxyInfo
-	if p.proxyTries(ep) > 0 {
+	if allowProxy && p.proxyTries(ep) > 0 {
 		p.proxyMu.RLock()
 		svc := p.proxySvc
 		p.proxyMu.RUnlock()
@@ -843,7 +856,12 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	// as ProxyError so the router can cool down the proxy instead of the
 	// endpoint and retry with a different proxy.
 	var usedProxy *ProxyInfo
-	if p.proxyTries(&endpoint) > 0 {
+	allowProxy := proxyAllowedForBody(len(body))
+	if !allowProxy && p.proxyTries(&endpoint) > 0 {
+		log.Printf("[proxy] body %d bytes exceeds %d; sending %s/%s direct",
+			len(body), maxProxiedBodyBytes, endpoint.Provider, endpoint.Model)
+	}
+	if allowProxy && p.proxyTries(&endpoint) > 0 {
 		p.proxyMu.RLock()
 		svc := p.proxySvc
 		p.proxyMu.RUnlock()
@@ -1121,7 +1139,14 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// headers only.
 	//
 	// Select the transport and client for this attempt; see attemptClient.
-	client, usedProxy := p.attemptClient(&endpoint, timeout)
+	// A prefill-sized body goes direct: the pool exists to rotate source IPs
+	// for rate limits, not to carry megabytes through a free proxy.
+	allowProxy := proxyAllowedForBody(len(body))
+	if !allowProxy && p.proxyTries(&endpoint) > 0 {
+		log.Printf("[proxy] body %d bytes exceeds %d; sending %s/%s direct",
+			len(body), maxProxiedBodyBytes, endpoint.Provider, endpoint.Model)
+	}
+	client, usedProxy := p.attemptClient(&endpoint, timeout, allowProxy)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -2078,6 +2103,7 @@ func accumulateDelta(acc *strings.Builder, tcs *[]streamToolCall, raw []byte, re
 					Content          string          `json:"content"`
 					ReasoningContent json.RawMessage `json:"reasoning_content"`
 					Reasoning        json.RawMessage `json:"reasoning"`
+					ReasoningText    json.RawMessage `json:"reasoning_text"`
 					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
@@ -2100,6 +2126,7 @@ func accumulateDelta(acc *strings.Builder, tcs *[]streamToolCall, raw []byte, re
 			if reasoning != nil {
 				reasoning.WriteString(rawReasoningText(ch.Delta.ReasoningContent))
 				reasoning.WriteString(rawReasoningText(ch.Delta.Reasoning))
+				reasoning.WriteString(rawReasoningText(ch.Delta.ReasoningText))
 			}
 			for _, tc := range ch.Delta.ToolCalls {
 				var target *streamToolCall
