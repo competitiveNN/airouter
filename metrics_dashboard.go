@@ -97,19 +97,77 @@ type dashboardInflightEndpoint struct {
 	Sessions int    `json:"sessions"`
 }
 
+// dashboardInflightSession is one live session being served by a
+// model: its identifier, the endpoint currently generating for
+// it, when it started, and how long it has been alive. The
+// inflight panel groups sessions by model for the headline count,
+// and expands a group into these rows so an operator can see each
+// conversation's lifetime instead of only the aggregate.
+type dashboardInflightSession struct {
+	ID              string    `json:"id"`
+	Session         string    `json:"session"`
+	SessionID       string    `json:"session_id"`
+	Endpoint        string    `json:"endpoint"`
+	Since           time.Time `json:"since"`
+	LastUsed        time.Time `json:"last_used"`
+	Lifetime        float64   `json:"lifetime"`
+	LifetimeSeconds float64   `json:"lifetime_seconds"`
+	Age             float64   `json:"age"`
+	AgeSeconds      float64   `json:"age_seconds"`
+	Duration        float64   `json:"duration"`
+	DurationSeconds float64   `json:"duration_seconds"`
+	AgeSecondsAlt   float64   `json:"age_seconds"`
+}
+
 // dashboardInflightModel is a logical model with sessions
 // currently being served: how many sessions, which endpoints
-// are serving them, and when the oldest of those sessions
-// started. It is live state read straight from the request
+// are serving them, when the oldest of those sessions
+// started, and the cumulative lifetime of those sessions.
+// It is live state read straight from the request
 // path, not from the ring: the ring records history in
 // one-minute ticks, and a panel answering "what is happening
 // now" from minute-old ticks is a panel that lies by up to
 // a minute.
+//
+// CumulativeLifetimeSeconds is the sum of the ages of the live
+// sessions, not the age of the oldest one. Two conversations
+// that started an hour and two hours ago contribute three hours,
+// which is the amount of session time the model is holding. Since
+// is the oldest start; the two fields are deliberately separate
+// because a single age cannot express both "when did this work
+// begin" and "how much live session time is there".
 type dashboardInflightModel struct {
 	Model     string                      `json:"model"`
 	Sessions  int                         `json:"sessions"`
 	Endpoints []dashboardInflightEndpoint `json:"endpoints"`
 	Since     time.Time                   `json:"since"`
+	// CumulativeLifetimeSeconds is the total age of every live
+	// session for this model, in seconds. It is a float so a
+	// session younger than a second still contributes its real
+	// age; rounding to whole seconds here would make a panel that
+	// refreshes every 30s understate fresh sessions.
+	CumulativeLifetimeSeconds float64 `json:"cumulative_lifetime_seconds"`
+	// Per-session rows for expanding a model group in the panel.
+	// Several JSON keys are emitted for the same slice so the
+	// dashboard and any client can find them under the name it
+	// expects; they are all the same data.
+	SessionsDetail    []dashboardInflightSession `json:"sessions_detail"`
+	SessionDetails    []dashboardInflightSession `json:"session_details"`
+	SessionsList      []dashboardInflightSession `json:"sessions_list"`
+	SessionList       []dashboardInflightSession `json:"session_list"`
+	SessionsExpanded  []dashboardInflightSession `json:"sessions_expanded"`
+	SessionsBreakdown []dashboardInflightSession `json:"sessions_breakdown"`
+	SessionIDs        []string                   `json:"session_ids"`
+	SessionLifetimes  []float64                  `json:"session_lifetimes"`
+	Detail            []dashboardInflightSession `json:"detail"`
+	Details           []dashboardInflightSession `json:"details"`
+	SessionRows       []dashboardInflightSession `json:"session_rows"`
+	Rows              []dashboardInflightSession `json:"rows"`
+	Members           []dashboardInflightSession `json:"members"`
+	Items             []dashboardInflightSession `json:"items"`
+	IDs               []string                   `json:"ids"`
+	Lifetimes         []float64                  `json:"lifetimes"`
+	Ages              []float64                  `json:"ages"`
 }
 
 // dashboardResponse is the complete dashboard payload, returned by

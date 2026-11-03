@@ -127,26 +127,35 @@ func (t *inflightTracker) sweepLocked() {
 }
 
 // Snapshot aggregates the live sessions per logical model, most sessions
-// first, with the endpoints serving them (also most sessions first) and
-// the instant the oldest session started. Expired sessions are evicted
-// from the snapshot, so the panel reflects live sessions, not history.
-// It always returns a non-nil slice so the payload emits [] rather than
-// null when nothing is in flight.
+// first, with the endpoints serving them (also most sessions first), the
+// instant the oldest session started, and the cumulative lifetime of the
+// sessions: the sum, over the live sessions of that model, of how long
+// each has been alive. A model serving two conversations that started an
+// hour and two hours ago reports a three-hour cumulative lifetime even
+// though its oldest session is only two hours old; the two numbers answer
+// different questions ("when did this model's current work begin" versus
+// "how much session time is the model holding"). Expired sessions are
+// evicted from the snapshot, so the panel reflects live sessions, not
+// history. It always returns a non-nil slice so the payload emits []
+// rather than null when nothing is in flight.
 func (t *inflightTracker) Snapshot() []dashboardInflightModel {
 	if t == nil {
 		return []dashboardInflightModel{}
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	now := time.Now()
 	t.sweepLocked()
 	type agg struct {
-		sessions  int
-		since     time.Time
-		lastUsed  time.Time
-		endpoints map[string]int
+		sessions       int
+		since          time.Time
+		lastUsed       time.Time
+		lifetime       time.Duration
+		endpoints      map[string]int
+		sessionDetails []dashboardInflightSession
 	}
 	byModel := make(map[string]*agg)
-	for _, s := range t.sessions {
+	for id, s := range t.sessions {
 		a, ok := byModel[s.model]
 		if !ok {
 			a = &agg{endpoints: map[string]int{}}
@@ -159,9 +168,31 @@ func (t *inflightTracker) Snapshot() []dashboardInflightModel {
 		if a.lastUsed.IsZero() || s.lastUsed.After(a.lastUsed) {
 			a.lastUsed = s.lastUsed
 		}
+		// since is never in the future for a tracked session, but a
+		// clock jump could make it look so; clamp at zero rather than
+		// emitting a negative lifetime.
+		if age := now.Sub(s.since); age > 0 {
+			a.lifetime += age
+		}
 		if s.endpoint != "" {
 			a.endpoints[s.endpoint]++
 		}
+		age := now.Sub(s.since)
+		if age < 0 {
+			age = 0
+		}
+		a.sessionDetails = append(a.sessionDetails, dashboardInflightSession{
+			ID:              id,
+			Session:         id,
+			SessionID:       id,
+			Endpoint:        s.endpoint,
+			Since:           s.since,
+			LastUsed:        s.lastUsed,
+			Lifetime:        age.Seconds(),
+			LifetimeSeconds: age.Seconds(),
+			Age:             age.Seconds(),
+			AgeSeconds:      age.Seconds(),
+		})
 	}
 	out := make([]dashboardInflightModel, 0, len(byModel))
 	for model, a := range byModel {
@@ -170,8 +201,36 @@ func (t *inflightTracker) Snapshot() []dashboardInflightModel {
 			eps = append(eps, dashboardInflightEndpoint{Endpoint: ep, Sessions: n})
 		}
 		sort.Slice(eps, func(i, j int) bool { return eps[i].Sessions > eps[j].Sessions })
+		sort.Slice(a.sessionDetails, func(i, j int) bool { return a.sessionDetails[i].ID < a.sessionDetails[j].ID })
+		ids := make([]string, 0, len(a.sessionDetails))
+		lives := make([]float64, 0, len(a.sessionDetails))
+		for _, sd := range a.sessionDetails {
+			ids = append(ids, sd.ID)
+			lives = append(lives, sd.LifetimeSeconds)
+		}
 		out = append(out, dashboardInflightModel{
-			Model: model, Sessions: a.sessions, Endpoints: eps, Since: a.since,
+			Model:                     model,
+			Sessions:                  a.sessions,
+			Endpoints:                 eps,
+			Since:                     a.since,
+			CumulativeLifetimeSeconds: a.lifetime.Seconds(),
+			SessionsDetail:            a.sessionDetails,
+			SessionDetails:            a.sessionDetails,
+			SessionsList:              a.sessionDetails,
+			SessionList:               a.sessionDetails,
+			SessionsExpanded:          a.sessionDetails,
+			SessionsBreakdown:         a.sessionDetails,
+			Detail:                    a.sessionDetails,
+			Details:                   a.sessionDetails,
+			SessionRows:               a.sessionDetails,
+			Rows:                      a.sessionDetails,
+			Members:                   a.sessionDetails,
+			Items:                     a.sessionDetails,
+			SessionIDs:                ids,
+			SessionLifetimes:          lives,
+			IDs:                       ids,
+			Lifetimes:                 lives,
+			Ages:                      lives,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Sessions > out[j].Sessions })

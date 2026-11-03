@@ -65,6 +65,15 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .pill.cooldown{background:#fef9c3;color:#854d0e}
 .pill.circuit{background:#f3e8ff;color:#6b21a8}
 .sum{color:#64748b;font-size:.85rem;margin-left:auto}
+/* Cumulative session lifetime is a secondary measurement: it explains
+   how much live session time the model is holding, not how many
+   requests it has served, so it sits beside the count in a quieter
+   weight. */
+.life{color:#475569;font-size:.8rem}
+.sessions{margin:.4rem 0 .8rem 1rem;padding-left:.75rem;border-left:2px solid #e2e8f0;display:none}
+.session{display:flex;gap:.5rem;align-items:baseline;padding:.1rem 0;font-size:.78rem}
+.session .sid{font-family:ui-monospace,monospace;color:#334155;min-width:6rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.session .ep{color:#64748b;min-width:8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 .rate{font-variant-numeric:tabular-nums;font-weight:600}
@@ -80,7 +89,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 </div>
 <div class="card">
 <h2>Inflight</h2>
-<p>Models currently serving sessions, and how many sessions each is generating tokens for right now.</p>
+<p>Models currently serving sessions, how many sessions each is generating tokens for right now, and the cumulative lifetime of those live sessions.</p>
 <div id="inflight"></div>
 </div>
 <div class="card">
@@ -226,6 +235,30 @@ function renderChains(chains, breaker){
 // as already expired. "now" is the server's notion of the moment the payload
 // was generated, and the countdown advances from it.
 let serverNow = Date.now();
+// inflightAnchor is the gateway clock at the moment the inflight panel was
+// rendered. Cumulative lifetime advances with the server clock (each live
+// session ages one second per second), so the panel can keep the number
+// moving between the 30-second payload refreshes instead of freezing it.
+let inflightAnchor = serverNow;
+function humanLifetime(sec){
+  sec=Math.max(0,Math.floor(sec));
+  const d=Math.floor(sec/86400), h=Math.floor((sec%86400)/3600),
+        m=Math.floor((sec%3600)/60), s=sec%60;
+  if(d>0) return d+'d '+h+'h';
+  if(h>0) return h+'h '+m+'m';
+  if(m>0) return m+'m '+s+'s';
+  return s+'s';
+}
+
+// renderSessions / toggleSessions: expand a model group into its single sessions.
+// sessionRows extracts the per-session rows of an inflight group,
+// accepting every key the payload may carry them under so the panel
+// keeps working if the server renames the field.
+function sessionRows(m){
+  return m.sessions_detail || m.session_details || m.sessions_list ||
+    m.session_list || m.sessions_expanded || m.sessions_breakdown || [];
+}
+
 function cooldownLabel(untilMs, atMs){
   const diff=Math.max(0, untilMs-atMs);
   const m=Math.floor(diff/60000), s=Math.floor((diff%60000)/1000);
@@ -247,6 +280,15 @@ setInterval(()=>{
     const ct=p.querySelector('.pct');
     if(Number.isFinite(t)&&ct) ct.textContent='cooldown '+cooldownLabel(t, serverNow);
   });
+  // Cumulative lifetime is the sum of live session ages, so it grows by
+  // one second per live session per second. Rewrite only the labels the
+  // inflight panel tagged with their baseline, the same way the cooldown
+  // pills are kept live.
+  document.querySelectorAll('.life[data-base]').forEach(l=>{
+    const base=Number(l.dataset.base), n=Number(l.dataset.sessions);
+    if(!Number.isFinite(base)||!Number.isFinite(n)) return;
+    l.textContent='cumulative '+humanLifetime(base+Math.max(0,(serverNow-inflightAnchor)/1000)*n);
+  });
 }, 1000);
 // renderInflight draws the live panel: one row per model that
 // has sessions being served right now, with the endpoints
@@ -261,11 +303,27 @@ function renderInflight(rows){
   const c=document.getElementById('inflight');
   c.innerHTML='';
   if(!rows || !rows.length){ c.textContent='No sessions in flight.'; return; }
+  // Anchor the live lifetime ticker to the clock the payload was rendered
+  // against; refresh() has already advanced serverNow to the gateway's now.
+  inflightAnchor=serverNow;
   for(const m of rows){
     const row=el('div','chain');
     const head=el('div','chainhead');
     head.appendChild(el('b',null,m.model));
     const n=m.sessions;
+    // Cumulative lifetime is the total age of the live sessions, not the
+    // age of the oldest one: two conversations that started an hour and
+    // two hours ago are three hours of session time. It is a separate
+    // span from the count so the count still reads as a count, and the
+    // title spells out the definition rather than leaving an ambiguous
+    // "cumulative" label.
+    if(typeof m.cumulative_lifetime_seconds==='number'){
+      const life=el('span','life','cumulative '+humanLifetime(m.cumulative_lifetime_seconds));
+      life.title='total age of the '+n+' live session'+(n===1?'':'s');
+      life.dataset.base=m.cumulative_lifetime_seconds;
+      life.dataset.sessions=n;
+      head.appendChild(life);
+    }
     const sum=el('span','sum', n+(n===1?' session':' sessions')+' in flight');
     if(m.since) sum.title='oldest session since '+m.since;
     head.appendChild(sum);
@@ -283,6 +341,35 @@ function renderInflight(rows){
       eps.appendChild(p);
     }
     row.appendChild(eps);
+    const sessions=sessionRows(m);
+    if(sessions.length){
+      const box=el('div','sessions');
+      for(const s of sessions){
+        const sr=el('div','session');
+        const sid=el('span','sid', s.id||s.session||s.session_id||'');
+        sid.title=sid.textContent;
+        sr.appendChild(sid);
+        const ep=el('span','ep', s.endpoint||'');
+        ep.title=s.endpoint||'';
+        sr.appendChild(ep);
+        const lt=Number(s.lifetime_seconds||s.lifetime||s.age_seconds||s.age||0);
+        const life=el('span','life','lifetime '+humanLifetime(lt));
+        life.title='session started '+ (s.since||'');
+        life.dataset.base=lt;
+        life.dataset.sessions=1;
+        sr.appendChild(life);
+        box.appendChild(sr);
+      }
+      row.appendChild(box);
+      const toggle=el('span','sum','▸ '+sessions.length+' session'+(sessions.length===1?'':'s'));
+      toggle.style.cursor='pointer';
+      const flip=()=>{ const open=box.style.display!=='none' && box.style.display!==''; box.style.display=open?'none':'block'; toggle.textContent=(open?'▸':'▾')+' '+sessions.length+' session'+(sessions.length===1?'':'s'); };
+      box.style.display='none';
+      toggle.onclick=(e)=>{ e.stopPropagation(); flip(); };
+      head.style.cursor='pointer';
+      head.onclick=()=>flip();
+      head.appendChild(toggle);
+    }
     c.appendChild(row);
   }
 }

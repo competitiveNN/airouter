@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -73,6 +74,62 @@ func TestInflightTrackerUntrackIsIdempotent(t *testing.T) {
 	tr.Untrack("never-tracked")
 	if snap := tr.Snapshot(); len(snap) != 1 {
 		t.Fatalf("snapshot = %+v, want the session still alive until TTL", snap)
+	}
+}
+
+// TestInflightTrackerReportsCumulativeSessionLifetime pins the difference
+// between the oldest session's start (`since`) and the cumulative lifetime:
+// the latter is the sum of every live session's age, so two conversations
+// that began an hour and two hours ago report three hours of session time
+// while `since` reports only the older start. A dashboard that showed the
+// oldest age labelled "cumulative" would understate a busy model exactly
+// when it has the most work in flight.
+func TestInflightTrackerReportsCumulativeSessionLifetime(t *testing.T) {
+	tr := newInflightTracker()
+	tr.Track("s1", "smart", "fake:smart-a")
+	tr.Track("s2", "smart", "fake:smart-a")
+	tr.Track("s3", "fast", "fake:fast-a")
+
+	now := time.Now()
+	tr.mu.Lock()
+	tr.sessions["s1"].since = now.Add(-2 * time.Hour)
+	tr.sessions["s2"].since = now.Add(-1 * time.Hour)
+	tr.sessions["s3"].since = now.Add(-30 * time.Minute)
+	tr.mu.Unlock()
+
+	snap := tr.Snapshot()
+	rows := map[string]dashboardInflightModel{}
+	for _, m := range snap {
+		rows[m.Model] = m
+	}
+	smart, ok := rows["smart"]
+	if !ok {
+		t.Fatalf("snapshot = %+v, want a smart row", snap)
+	}
+	// Two hours + one hour. Allow a couple of seconds for the clock
+	// advancing between the fixture and Snapshot.
+	if got, want := smart.CumulativeLifetimeSeconds, 3*3600.0; math.Abs(got-want) > 2 {
+		t.Errorf("smart cumulative lifetime = %.1fs, want %.1fs", got, want)
+	}
+	// Since still reports the oldest start, not the sum.
+	if age := now.Sub(smart.Since); math.Abs(age.Hours()-2) > 0.01 {
+		t.Errorf("smart since is %.2fh old, want the oldest session at 2h", age.Hours())
+	}
+	fast := rows["fast"]
+	if got, want := fast.CumulativeLifetimeSeconds, 30*60.0; math.Abs(got-want) > 2 {
+		t.Errorf("fast cumulative lifetime = %.1fs, want %.1fs", got, want)
+	}
+
+	// A later request from an already-live session must not reset its
+	// lifetime: the conversation did not restart just because it sent
+	// another message.
+	tr.Track("s1", "smart", "fake:smart-b")
+	snap = tr.Snapshot()
+	for _, m := range snap {
+		if m.Model == "smart" && m.CumulativeLifetimeSeconds < 3*3600-2 {
+			t.Errorf("after re-tracking s1, smart cumulative lifetime = %.1fs, want it to keep the session's age",
+				m.CumulativeLifetimeSeconds)
+		}
 	}
 }
 
@@ -218,7 +275,8 @@ func TestDashboardPageReadsTheInflightFieldsThePayloadEmits(t *testing.T) {
 				Endpoint string `json:"endpoint"`
 				Sessions int    `json:"sessions"`
 			} `json:"endpoints"`
-			Since time.Time `json:"since"`
+			Since                     time.Time `json:"since"`
+			CumulativeLifetimeSeconds float64   `json:"cumulative_lifetime_seconds"`
 		} `json:"inflight"`
 	}
 	if err := json.Unmarshal(dataW.Body.Bytes(), &payload); err != nil {
@@ -233,7 +291,7 @@ func TestDashboardPageReadsTheInflightFieldsThePayloadEmits(t *testing.T) {
 		t.Fatalf("page: status = %d, want 200", pageW.Code)
 	}
 	html := pageW.Body.String()
-	for _, want := range []string{"inflight", "renderInflight", "m.model", "m.sessions", "e.endpoint", "e.sessions"} {
+	for _, want := range []string{"inflight", "renderInflight", "m.model", "m.sessions", "e.endpoint", "e.sessions", "cumulative_lifetime_seconds", "humanLifetime"} {
 		if !contains(html, want) {
 			t.Errorf("dashboard page does not read %q — the inflight section renders empty", want)
 		}

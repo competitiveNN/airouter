@@ -704,6 +704,11 @@ if large["sessions"] != 1:
     print(f"  FAIL large reports {large['sessions']} sessions, want 1",
           file=sys.stderr)
     sys.exit(1)
+life = large.get("cumulative_lifetime_seconds")
+if not isinstance(life, (int, float)) or life <= 0:
+    print(f"  FAIL large carries no positive cumulative session lifetime: "
+          f"{life!r}", file=sys.stderr)
+    sys.exit(1)
 eps = large.get("endpoints") or []
 if len(eps) != 1 or eps[0]["endpoint"] != "fake:slow-model" or eps[0]["sessions"] != 1:
     print(f"  FAIL large should be served by fake:slow-model with 1 "
@@ -982,6 +987,21 @@ global.fetch = async () => resp;
       + ' does not name large with 1 session');
     process.exit(1);
   }
+  // The header carries the cumulative lifetime of the live sessions, not
+  // just their count: a panel that dropped it (or rendered it without a
+  // live baseline) would silently lose the metadata this card exists to
+  // show. The span's data-base is what the one-second ticker advances.
+  const lifeSpan = ihead.children.find(c => c.className === 'life');
+  if (!lifeSpan || !/^cumulative /.test(lifeSpan.textContent)) {
+    console.error('inflight header ' + JSON.stringify(iheadText)
+      + ' does not render cumulative session lifetime');
+    process.exit(1);
+  }
+  if (!lifeSpan.dataset.base || Number(lifeSpan.dataset.base) <= 0) {
+    console.error('inflight lifetime has no live baseline: '
+      + JSON.stringify(lifeSpan.dataset.base));
+    process.exit(1);
+  }
   // A long endpoint slug must not hide the count it annotates:
   // slug and count render as separate spans and only the slug
   // ellipsizes. Render a synthetic row whose slug is longer
@@ -989,6 +1009,7 @@ global.fetch = async () => resp;
   // own .pct child -- the exact failure when slug and count
   // shared one ellipsizing text node.
   renderInflight([{model: 'large', sessions: 2,
+    cumulative_lifetime_seconds: 5400,
     endpoints: [{endpoint: 'commandcode2:meituan/longcat-2.5-preview-free', sessions: 2}]}]);
   const longPill = store['inflight'].children[0].children
     .find(c => c.className === 'eps').children[0];
