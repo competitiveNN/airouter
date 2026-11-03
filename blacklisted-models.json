@@ -1,17 +1,5 @@
 {
   "entries": {
-    "commandcode:poolside/laguna-s-2.1-free": {
-      "blacklisted_at": "2026-11-02T18:21:34.540345Z",
-      "cooldown_keys": [
-        "commandcode2:poolside/laguna-s-2.1-free"
-      ],
-      "date": "2026-11-02",
-      "model_id": "poolside/laguna-s-2.1-free",
-      "provider": "commandcode",
-      "reason": "not found (older than 2 weeks)",
-      "released": "2026-09-26",
-      "status_code": 404
-    },
     "google-ai-studio:gemma-4-2b-it": {
       "blacklisted_at": "2026-10-28T18:06:38.818285Z",
       "cooldown_keys": [
