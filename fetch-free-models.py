@@ -46,6 +46,7 @@ from model_blacklist import (
     BLACKLIST_FILE,
     COOLDOWNS_FILE,
     filter_models,
+    is_blacklisted,
     load_blacklist,
     update_blacklist_from_cooldowns,
 )
@@ -2779,6 +2780,21 @@ def output_json(data: list[dict], path: str | None) -> None:
         print(out)
 
 
+def is_decision_model(model: dict[str, Any]) -> bool:
+    """Whether a fetched model qualifies as a decision model.
+
+    Decision models are the strong generalists (intelligence >= 25), the same
+    pool that feeds the `decision` gateway profile.
+    """
+    score = model.get("intelligence")
+    if score is None:
+        return False
+    try:
+        return float(score) >= 25.0
+    except (TypeError, ValueError):
+        return False
+
+
 def output_csv(data: list[dict], path: str | None) -> None:
     if not data:
         return
@@ -2804,6 +2820,7 @@ def output_csv(data: list[dict], path: str | None) -> None:
             "reasoning": caps.get("reasoning"),
             "vision": caps.get("vision"),
             "open_weights": caps.get("open_weights"),
+            "decision": is_decision_model(d),
             "source": d.get("source"),
             "fetched_at": d.get("fetched_at"),
         }
@@ -2840,6 +2857,7 @@ def output_table(data: list[dict]) -> None:
         ("ctx", 10),
         ("reason", 6),
         ("vision", 6),
+        ("decision", 8),
     ]
 
     header = " | ".join(f"{name:<{w}}" for name, w in cols)
@@ -2882,6 +2900,7 @@ def output_table(data: list[dict]) -> None:
             ctx_disp,
             "Y" if caps.get("reasoning") else "N",
             "Y" if caps.get("vision") else "N",
+            "Y" if is_decision_model(d) else "N",
         ]
         print(" | ".join(f"{v:<{w}}" for (_, w), v in zip(cols, row, strict=True)))
 
@@ -3205,7 +3224,12 @@ def main() -> None:
                     print(f"  {entry}", file=sys.stderr)
         blacklist = load_blacklist(args.blacklist)
         before_blacklist = len(all_models)
+        # A model the live probe just confirmed free is never dropped by a stale blacklist entry: the probe is the authority on liveness, and a blacklisted-but-live model is exactly the 'did not output all commandcode free models' regression. Keep verified models regardless of blacklist.
+        _verified_live = [m for m in all_models if m.get('verified') is True]
         all_models = filter_models(all_models, blacklist)
+        for _m in _verified_live:
+            if _m not in all_models:
+                all_models.append(_m)
         if before_blacklist != len(all_models):
             print(f"Blacklist: filtered {before_blacklist - len(all_models)} models "
                   f"({len(all_models)} remain)", file=sys.stderr)
