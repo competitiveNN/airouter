@@ -1722,8 +1722,11 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, ups
 				}
 			} else {
 				// Tool calls disabled: forward all events verbatim to the client.
-				accumulateDelta(&acc, &tcs, raw)
-				if _, err := w.Write(raw); err != nil {
+				// "Verbatim" still normalizes the one field strict clients
+				// require and some upstreams omit (tool_calls[].index).
+				forwarded := normalizeToolCallIndices(raw)
+				accumulateDelta(&acc, &tcs, forwarded)
+				if _, err := w.Write(forwarded); err != nil {
 					return err
 				}
 				if _, err := w.Write([]byte("\n")); err != nil {
@@ -1879,6 +1882,68 @@ func (p *Proxy) streamSSE(w io.Writer, flusher http.Flusher, body io.Reader, ups
 	}
 	flusher.Flush()
 	return acc.String(), tcs, completionTokens, nil
+}
+
+// normalizeToolCallIndices makes every tool-call delta carry an explicit
+// `index`, which the OpenAI schema requires and strict clients reject without.
+//
+// Gemini's OpenAI-compatible surface emits a COMPLETE tool call in a single
+// chunk with no index, and the gateway forwards chunks verbatim when
+// synthesized tool calls are disabled (the daemon default). Measured
+// 2026-11-03 in maki's log: "failed to parse SSE chunk: missing field `index`"
+// for every Gemini tool call; the client drops the chunk, so the turn ends
+// with no tool call and the stream just stops.
+//
+// The position inside the chunk is the only correlation available when the
+// upstream omits the field, and a complete single call (the Gemini shape) is
+// index 0. Chunks that already carry an index are returned untouched, so this
+// costs one Contains + one Unmarshal only on the offending shape.
+func normalizeToolCallIndices(raw []byte) []byte {
+	payload := sseDataPayload(raw)
+	if !bytes.Contains(payload, []byte(`"tool_calls"`)) {
+		return raw
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return raw
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return raw
+	}
+	changed := false
+	for _, c := range choices {
+		ch, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		delta, ok := ch["delta"].(map[string]any)
+		if !ok {
+			continue
+		}
+		tcs, ok := delta["tool_calls"].([]any)
+		if !ok {
+			continue
+		}
+		for i, tc := range tcs {
+			m, ok := tc.(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, has := m["index"]; !has {
+				m["index"] = i
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return rewriteSSEEventData(raw, out)
 }
 
 // sseEventIsRelease reports whether an SSE event is safe to flush to the
