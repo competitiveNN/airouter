@@ -1500,8 +1500,8 @@ func TestHandleModels(t *testing.T) {
 	if result.Object != "list" {
 		t.Errorf("expected object 'list', got %s", result.Object)
 	}
-	if len(result.Data) != 4 {
-		t.Errorf("expected 4 models, got %d", len(result.Data))
+	if len(result.Data) != 5 {
+		t.Errorf("expected 5 models, got %d", len(result.Data))
 	}
 
 	modelMap := make(map[string]Model)
@@ -3274,10 +3274,11 @@ func TestFourModelAliases(t *testing.T) {
 			"test": {URL: backend.URL},
 		},
 		Models: map[string]ModelConfig{
-			"smart": {Chain: []ModelEndpoint{{Provider: "test", Model: "m1"}}},
-			"work":  {Chain: []ModelEndpoint{{Provider: "test", Model: "m2"}}},
-			"fast":  {Chain: []ModelEndpoint{{Provider: "test", Model: "m3"}}},
-			"large": {Chain: []ModelEndpoint{{Provider: "test", Model: "m4"}}},
+			"smart":    {Chain: []ModelEndpoint{{Provider: "test", Model: "m1"}}},
+			"work":     {Chain: []ModelEndpoint{{Provider: "test", Model: "m2"}}},
+			"fast":     {Chain: []ModelEndpoint{{Provider: "test", Model: "m3"}}},
+			"large":    {Chain: []ModelEndpoint{{Provider: "test", Model: "m4"}}},
+			"decision": {Chain: []ModelEndpoint{{Provider: "test", Model: "m5"}}},
 		},
 	}
 	router := NewRouter(cfg, "")
