@@ -113,6 +113,7 @@ func TestRealConfigChainInvariants(t *testing.T) {
 	// full group there would be wrong.
 	groups := map[string][]string{
 		"nvidia-nim":  {"nvidia", "nvidia2", "nvidia3"},
+		"gemini":      {"gemini", "gemini2", "gemini3", "gemini4", "gemini5"},
 		"commandcode": {"commandcode", "commandcode2"},
 	}
 	activeGroups := map[string][]string{}
