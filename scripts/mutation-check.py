@@ -525,7 +525,10 @@ SUITE_TEST_FLOORS = {
     # the emitter writing the canonical spelling, the preservation regression
     # for a commandcode record, validate-config accepting it on a commandcode
     # provider and rejecting it elsewhere, and rule 13 doing the same.
-    "scripts/test_regenerate_config.py": 73,
+    # 75 -- plus 2 for the Google key group: the five configured keys are
+    # emitted as one consecutive group for the same model id, and a key
+    # commented out of `providers:` is not re-emitted (2026-11-04).
+    "scripts/test_regenerate_config.py": 75,
     # EXACT, matching every other floor in this table (66/66, 65/65, 19/19, 16/16).
     # An earlier version of this entry sat at 14 against 22 functions on the
     # theory that a floor should have slack so that adding tests needs no edit.

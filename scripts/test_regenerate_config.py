@@ -1415,6 +1415,29 @@ def test_the_protocol_reaches_every_key_of_a_multi_key_group():
     assert all("protocol: responses" in _entry_yaml(e) for e in trio)
 
 
+def test_google_keys_are_emitted_as_one_group():
+    """Google AI Studio is one model id on every configured Google key, so a
+    429 on one project falls through to the next instead of the model going
+    dark while the other quota buckets sit idle (measured 2026-11-04)."""
+    models = [_model("gemini-flash-lite-latest", "google-ai-studio", 40.0,
+                     ctx=1048576)]
+    chain = gen.build_chain(models, "large")
+    providers = [e["provider"] for e in chain
+                 if e["model"] == "gemini-flash-lite-latest"]
+    assert providers == ["gemini", "gemini2", "gemini3", "gemini4", "gemini5"], providers
+
+
+def test_a_disabled_google_key_is_not_reemitted():
+    """Commenting a key out of `providers:` must be honored, like nvidia3."""
+    models = [_model("gemini-flash-lite-latest", "google-ai-studio", 40.0,
+                     ctx=1048576)]
+    chain = gen.build_chain(models, "large",
+                            providers_present={"gemini", "gemini2"})
+    providers = [e["provider"] for e in chain
+                 if e["model"] == "gemini-flash-lite-latest"]
+    assert providers == ["gemini", "gemini2"], providers
+
+
 def test_protocol_is_the_last_field_so_the_order_check_stays_honest():
     """check-rules.py compares the key order literally, so the emitter and the
     checker have to agree on where the field goes."""
