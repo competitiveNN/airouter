@@ -1379,6 +1379,18 @@ func (b *budgetState) attemptTimeout(preferred time.Duration) time.Duration {
 	if remaining <= 0 {
 		return 0
 	}
+	// The FIRST attempt may not spend the entire interruption budget. A
+	// Command Code attempt is allowed its full `max_interruption` (30s), which
+	// equalled the whole budget: when it timed out the walk had 0s left and the
+	// client got a 503 with every other provider untried. Measured 2026-11-04,
+	// every ~2 minutes: "budget exhausted after 1 attempts in 30.001s" while
+	// healthy providers sat further down the chain. Reserve a third of the
+	// budget for one fallback; later attempts may use whatever is left.
+	if b.attempts <= 1 && b.budget > 0 {
+		if limit := b.budget - b.budget/3; remaining > limit {
+			remaining = limit
+		}
+	}
 	if preferred > remaining {
 		return remaining
 	}
@@ -2810,6 +2822,8 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 	speed := make([]dashboardLeaderboardEntry, 0, len(aggs))
 	volume := make([]dashboardLeaderboardEntry, 0, len(aggs))
 	failures := make([]dashboardLeaderboardEntry, 0, len(aggs))
+	tokens := make([]dashboardLeaderboardEntry, 0, len(aggs))
+	latency := make([]dashboardLeaderboardEntry, 0, len(aggs))
 
 	// The window duration, in seconds, for the volume leaderboard's rate
 	// denominator. A zero or negative window means "no data": the query
@@ -2853,17 +2867,31 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 			entry.Rate = float64(a.Failures) / float64(a.Attempts)
 		}
 		failures = append(failures, entry)
+
+		entry.Rate = float64(a.Tokens)
+		tokens = append(tokens, entry)
+
+		if a.Attempts > 0 {
+			entry.Rate = float64(a.LatencyNS) / float64(a.Attempts) / 1e6
+		} else {
+			entry.Rate = 0
+		}
+		latency = append(latency, entry)
 	}
 
 	sort.Slice(speed, func(i, j int) bool { return speed[i].Rate > speed[j].Rate })
 	sort.Slice(volume, func(i, j int) bool { return volume[i].Rate > volume[j].Rate })
 	sort.Slice(failures, func(i, j int) bool { return failures[i].Rate > failures[j].Rate })
+	sort.Slice(tokens, func(i, j int) bool { return tokens[i].Rate > tokens[j].Rate })
+	sort.Slice(latency, func(i, j int) bool { return latency[i].Rate > latency[j].Rate })
 
 	resp := dashboardResponse{
 		Chains:         chains,
 		Speed:          speed,
 		Volume:         volume,
 		Failures:       failures,
+		Tokens:         tokens,
+		Latency:        latency,
 		Inflight:       g.inflight.Snapshot(),
 		Window:         string(win),
 		Now:            time.Now(),
