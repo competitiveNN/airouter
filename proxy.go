@@ -35,6 +35,10 @@ type StreamAttemptOptions struct {
 	// it to start a fresh interruption window and to release the attempt's
 	// connection/first-output deadline once output has started.
 	OnProgress func()
+	// Direct forces this attempt to skip the proxy pool even when the provider
+	// is configured to use it. The fallback loop sets it to retry the same
+	// endpoint without the middleman after a proxy failure.
+	Direct bool
 	// Reasoning, when non-nil, receives the reasoning content of this attempt.
 	// The chat fallback replays it as `reasoning_content` on the assistant
 	// message it appends: Command Code's thinking models reject a replayed
@@ -1146,8 +1150,9 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	//
 	// Select the transport and client for this attempt; see attemptClient.
 	// A prefill-sized body goes direct: the pool exists to rotate source IPs
-	// for rate limits, not to carry megabytes through a free proxy.
-	allowProxy := proxyAllowedForBody(len(body))
+	// for rate limits, not to carry megabytes through a free proxy. A call
+	// that asks for Direct skips it too (the proxy-failure retry).
+	allowProxy := proxyAllowedForBody(len(body)) && !opts.Direct
 	if !allowProxy && p.proxyTries(&endpoint) > 0 {
 		log.Printf("[proxy] body %d bytes exceeds %d; sending %s/%s direct",
 			len(body), maxProxiedBodyBytes, endpoint.Provider, endpoint.Model)
