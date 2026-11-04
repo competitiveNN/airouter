@@ -2331,11 +2331,18 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		if maxProxyTries <= 0 {
 			maxProxyTries = 1
 		}
+		// One extra iteration: after the first PROXY failure this endpoint is
+		// retried DIRECT before another proxy is tried. A pool proxy that
+		// cannot deliver a response inside the attempt budget is a dead end,
+		// while the direct connection is the same endpoint without the
+		// middleman (measured: a 5s `fast` attempt died on a public proxy while
+		// kilocode direct answers in about a second).
 		// The reasoning this attempt produced. It is replayed on the assistant
 		// message the fallback appends, because Command Code's thinking models
 		// refuse a replayed turn that does not echo it. Reset per proxy try so
 		// a failed transport does not concatenate two attempts' thinking.
 		var attemptReasoning strings.Builder
+		directNext := false
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
 			attemptReasoning.Reset()
 			// Each proxy retry gets only what is left of the interruption
@@ -2356,6 +2363,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				MaxIdleTimeout: minDuration(ceiling, walk.remaining()),
 				OnProgress:     walk.markProgress,
 				Reasoning:      &attemptReasoning,
+				Direct:         directNext,
 			})
 			if err != nil {
 				if errors.Is(err, ErrUpstreamSaturated) {
@@ -2369,6 +2377,12 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 					if pErr.MidStream {
 						break
 					}
+					// The direct attempt already failed: the endpoint itself is
+					// the problem, so another proxy is not worth the budget.
+					if directNext {
+						break
+					}
+					directNext = true
 					continue
 				}
 				break
