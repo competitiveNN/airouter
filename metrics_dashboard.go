@@ -188,6 +188,8 @@ type dashboardResponse struct {
 	Speed    []dashboardLeaderboardEntry `json:"speed"`
 	Volume   []dashboardLeaderboardEntry `json:"volume"`
 	Failures []dashboardLeaderboardEntry `json:"failures"`
+	Tokens   []dashboardLeaderboardEntry `json:"tokens"`
+	Latency  []dashboardLeaderboardEntry `json:"latency"`
 	// Inflight is the live set: models with sessions being
 	// served right now, and how many sessions each is
 	// generating tokens for.
