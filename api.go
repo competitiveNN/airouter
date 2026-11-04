@@ -1942,7 +1942,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			if isRetryableForChain(resp.StatusCode, string(respBody)) {
 				g.interAttemptWait(walk, g.providerMaxInterruption(ep.Provider), ctx, resp.StatusCode)
 			}
-			g.recordRequest(req.Model, resp.StatusCode, time.Since(start))
+			// Deliberately NOT recordRequest here: this status belongs to one
+			// upstream ATTEMPT, and the walk continues. Counting it as a client
+			// request made one served request look like a 429 followed by a 200
+			// (observed live), inflating the failure rates the dashboard and the
+			// operator judge the gateway by. The attempt is already counted by
+			// recordAttempt/recordFallback.
 			continue
 		}
 
