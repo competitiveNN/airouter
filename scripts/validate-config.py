@@ -114,6 +114,8 @@ def main() -> int:
     # key falls through to the next key on the same model.
     provider_groups: dict[str, tuple[str, ...]] = {
         "nvidia-nim": ("nvidia", "nvidia2", "nvidia3"),
+        "google-ai-studio": ("gemini", "gemini2", "gemini3", "gemini4",
+                             "gemini5"),
         "commandcode": ("commandcode", "commandcode2"),
     }
 

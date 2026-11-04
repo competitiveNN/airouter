@@ -23,20 +23,24 @@ Rules:
    - kilocode        -> kilocode
    - opencode        -> opencode
    - ollama-cloud    -> ollama
-   - google-ai-studio -> google
+   - google-ai-studio -> gemini, or the other Google keys (see rule 3)
    - commandcode      -> commandcode or commandcode2 (see rule 3)
 
-   3. Use all three NVIDIA API keys for every NVIDIA model, and both CommandCode
-     API keys for every CommandCode model. Any nvidia-nim model placed in a chain
-     is emitted as three consecutive entries with providers nvidia, nvidia2, nvidia3
-     (same model id), and any commandcode model is emitted as two consecutive
-     entries with providers commandcode, commandcode2 (same model id), so a
-     rate-limited key falls through to the next key on the same model instead of
-     failing the request. Preserve best-first ordering: for each model in score
-     order, emit its full provider group (nvidia/nvidia2/nvidia3 trio or
-     commandcode/commandcode2 pair) before moving to the next model. No nvidia-nim
-     model should ever appear on only one NVIDIA provider, and no commandcode model
-     should ever appear on only one CommandCode provider.
+   3. Use every configured key for a multi-key provider. A Google AI Studio
+     model is emitted on each Google key that exists: gemini, gemini2, gemini3,
+     gemini4, gemini5 (same model id, consecutive entries). Any nvidia-nim model
+     placed in a chain is emitted as three consecutive entries with providers
+     nvidia, nvidia2, nvidia3 (same model id), and any commandcode model is
+     emitted as two consecutive entries with providers commandcode,
+     commandcode2 (same model id), so a rate-limited key falls through to the
+     next key on the same model instead of failing the request. Preserve
+     best-first ordering: for each model in score order, emit its full provider
+     group (gemini group, nvidia/nvidia2/nvidia3 trio, or
+     commandcode/commandcode2 pair) before moving to the next model. No
+     google-ai-studio model should ever appear on only one Google provider, no
+     nvidia-nim model on only one NVIDIA provider, and no commandcode model on
+     only one CommandCode provider. Only keys present in `providers:` are
+     emitted: commenting one out disables it on purpose.
 
      CommandCode models are the four free-tier deals published at
      https://commandcode.ai/docs/resources/pricing-limits, fetched from the
@@ -60,7 +64,8 @@ Rules:
     "intelligence" as the single sortable score regardless of its source.
 
 5. Profile selection (a model may appear in several profiles when it fits, but
-   never twice in the same chain except the nvidia/nvidia2/nvidia3 trio).
+   never twice in the same chain except the gemini group and the
+   nvidia/nvidia2/nvidia3 trio).
    The `models:` section must contain EXACTLY these four keys and no others:
    `smart`, `work`, `fast`, `large`. The gateway's LogicalModels is
    [smart work fast large]; any other key (e.g. a `test` profile) is accepted
@@ -163,8 +168,10 @@ Rules:
       referenced provider exists in `providers:`, the last entry of each chain is
       the auto model chosen per rule 6, every concrete endpoint carries a
       `vision:` boolean (true/false), every nvidia-nim model id appears on
-      all three providers nvidia / nvidia2 / nvidia3, and every commandcode model
-      id appears on both providers commandcode / commandcode2. Finish with a compact
+      every google-ai-studio model id appears on every configured Google key
+      (gemini, gemini2, gemini3, gemini4, gemini5), every nvidia-nim model id
+      appears on all three providers nvidia / nvidia2 / nvidia3, and every
+      commandcode model id appears on both providers commandcode / commandcode2. Finish with a compact
       summary table listing the four chains (profile, entry count, head model,
       tail auto model).
 

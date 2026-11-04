@@ -679,7 +679,10 @@ CHECK_RULE_CASES = [
 _JSON_PROVIDER = {
     "nvidia": "nvidia-nim", "nvidia2": "nvidia-nim", "nvidia3": "nvidia-nim",
     "commandcode": "commandcode", "commandcode2": "commandcode",
-    "gemini": "google-ai-studio", "ollama": "ollama-cloud",
+    "gemini": "google-ai-studio", "gemini2": "google-ai-studio",
+    "gemini3": "google-ai-studio", "gemini4": "google-ai-studio",
+    "gemini5": "google-ai-studio",
+    "ollama": "ollama-cloud",
     "kilocode": "kilocode", "opencode": "opencode",
 }
 
