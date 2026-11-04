@@ -733,7 +733,11 @@ def build_chain(
         protocols = {}
     if providers_present is None:
         providers_present = set(
-            ("nvidia", "nvidia2", "nvidia3", "commandcode", "commandcode2")
+            (
+                "nvidia", "nvidia2", "nvidia3",
+                "gemini", "gemini2", "gemini3", "gemini4", "gemini5",
+                "commandcode", "commandcode2",
+            )
         )
 
     def entry_for(provider: str, m: Model) -> dict:
@@ -766,6 +770,14 @@ def build_chain(
         if m.mapped_provider == 'nvidia':
             # Emit trio: nvidia, nvidia2, nvidia3, but only for keys that exist.
             for prov in ('nvidia', 'nvidia2', 'nvidia3'):
+                if prov in providers_present:
+                    chain.append(entry_for(prov, m))
+        elif m.mapped_provider == 'gemini':
+            # Emit the key group: every configured Google key is a separate
+            # quota bucket on the same upstream, so a throttled key (429 on one
+            # project) falls through to a sibling instead of the model being
+            # unavailable. Same rule as nvidia: only keys that are declared.
+            for prov in ('gemini', 'gemini2', 'gemini3', 'gemini4', 'gemini5'):
                 if prov in providers_present:
                     chain.append(entry_for(prov, m))
         elif m.mapped_provider == 'commandcode':

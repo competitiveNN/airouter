@@ -76,6 +76,7 @@ BANNED_ID = re.compile(r"content-safety|x-preview-f-free")
 # the group, in consecutive entries, or a 429 on one key has nowhere to go.
 PROVIDER_GROUPS = {
     "nvidia-nim": ("nvidia", "nvidia2", "nvidia3"),
+    "gemini": ("gemini", "gemini2", "gemini3", "gemini4", "gemini5"),
     "commandcode": ("commandcode", "commandcode2"),
 }
 
