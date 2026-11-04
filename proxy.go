@@ -1178,6 +1178,11 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
+		// Keep the upstream's own words in the log. A "reason=unknown" with a
+		// body truncated to its first two bytes is what made the Google 400s
+		// undiagnosable: the message that names the offending field is in there.
+		log.Printf("[debug] upstream error provider=%s model=%s status=%d body=%s",
+			endpoint.Provider, endpoint.Model, resp.StatusCode, truncateErr(string(bodyBytes), 600))
 		// Command Code error statuses go through the same CC_STATUS_MAP
 		// the non-streaming path applies (api.go), so the cooldown
 		// classifier sees the OpenAI-equivalent status on streaming
