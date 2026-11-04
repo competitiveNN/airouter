@@ -36,10 +36,18 @@ button{background:#2563eb;color:#fff;border:none;padding:.6rem 1rem;border-radiu
 button:disabled{opacity:.5}
 button.wsel{background:transparent;color:#64748b;border:1px solid #cbd5e1;padding:.4rem .8rem}
 button.wsel.on{background:#2563eb;color:#fff;border-color:#2563eb}
-table{border-collapse:collapse;width:100%;font-size:.9rem}
-th,td{text-align:left;padding:.5rem .75rem;border-bottom:1px solid #e2e8f0}
+table{border-collapse:collapse;width:100%;font-size:.9rem;table-layout:fixed}
+th,td{text-align:left;padding:.5rem .75rem;border-bottom:1px solid #e2e8f0;overflow:hidden}
 th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem;letter-spacing:.05em}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
+td.clamp,th.clamp{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.clamp:hover{overflow:visible;white-space:normal;word-break:break-all}
+.pag{display:flex;gap:.5rem;align-items:center;margin-top:.5rem;font-size:.8rem}
+.pag button{background:transparent;color:#2563eb;border:1px solid #cbd5e1;padding:.2rem .6rem;border-radius:6px;cursor:pointer}
+.pag button:disabled{opacity:.4;cursor:default}
+details.tree{margin:.4rem 0}
+details.tree>summary{cursor:pointer;font-weight:600;padding:.3rem 0}
+details.tree[open]>summary{margin-bottom:.3rem}
 /* One chain is a header line (model plus the counts that answer the
    operator's question at a glance) over a grid of endpoint pills. A long
    fallback chain is not a paragraph: the grid keeps the pills in aligned
@@ -97,18 +105,27 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 <div class="grid">
 <div>
 <h3>Fastest (tokens/s)</h3>
-<table><thead><tr><th>Endpoint</th><th>Tok/s</th><th>Tokens</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>
+<table><thead><tr><th class="clamp">Endpoint</th><th>Tok/s</th><th>Tokens</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>
 <tbody id="speed"></tbody></table>
+<div class="pag" id="speed-pag"></div>
 </div>
 <div>
 <h3>Most requests</h3>
-<table><thead><tr><th>Endpoint</th><th>Req/s</th><th>Requests</th></tr></thead>
+<table><thead><tr><th class="clamp">Endpoint</th><th>Req/s</th><th>Requests</th></tr></thead>
 <tbody id="volume"></tbody></table>
+<div class="pag" id="volume-pag"></div>
 </div>
 <div>
 <h3>Highest failure rate</h3>
-<table><thead><tr><th>Endpoint</th><th>Fail %</th><th>Failures</th></tr></thead>
+<table><thead><tr><th class="clamp">Endpoint</th><th>Fail %</th><th>Failures</th></tr></thead>
 <tbody id="failures"></tbody></table>
+<div class="pag" id="failures-pag"></div>
+</div>
+<div>
+<h3>Most tokens</h3>
+<table><thead><tr><th class="clamp">Endpoint</th><th>Tokens</th></tr></thead>
+<tbody id="tokens"></tbody></table>
+<div class="pag" id="tokens-pag"></div>
 </div>
 </div>
 </div>
@@ -373,56 +390,145 @@ function renderInflight(rows){
     c.appendChild(row);
   }
 }
+const boardPages={};
 function renderBoard(id, rows, cols){
   const tb=document.getElementById(id);
   tb.innerHTML='';
-  const top=rows.slice(0,10);
-  for(const r of top){
+  const pageSize=10;
+  const totalPages=Math.max(1,Math.ceil((rows||[]).length/pageSize));
+  if(boardPages[id]===undefined) boardPages[id]=0;
+  boardPages[id]=Math.min(boardPages[id],totalPages-1);
+  const page=boardPages[id];
+  const pageRows=(rows||[]).slice(page*pageSize,page*pageSize+pageSize);
+  for(const r of pageRows){
     const tr=document.createElement('tr');
-    tr.appendChild(el('td',null,r.endpoint));
+    const td=el('td','clamp',r.endpoint); td.title=r.endpoint||'';
+    tr.appendChild(td);
     for(const [acc,fmt] of cols){
-      tr.appendChild(el('td','num',fmt(acc(r))));
+      const v=acc(r);
+      tr.appendChild(el('td','num',fmt(v)));
     }
     tb.appendChild(tr);
   }
+  // Keep table heights aligned by padding the last page to pageSize rows.
+  for(let i=pageRows.length;i<pageSize;i++){
+    const tr=document.createElement('tr');
+    for(let j=0;j<cols.length+1;j++) tr.appendChild(el('td',null,'\u00a0'));
+    tb.appendChild(tr);
+  }
+  const pag=document.getElementById(id+'-pag');
+  if(pag){
+    pag.innerHTML='';
+    if((rows||[]).length>pageSize){
+      const prev=el('button',null,'Prev'); prev.disabled=page===0; prev.onclick=()=>{boardPages[id]--; renderBoard(id,rows,cols);};
+      const info=el('span',null,(page+1)+'/'+totalPages);
+      const next=el('button',null,'Next'); next.disabled=page>=totalPages-1; next.onclick=()=>{boardPages[id]++; renderBoard(id,rows,cols);};
+      pag.appendChild(prev); pag.appendChild(info); pag.appendChild(next);
+    }
+  }
 }
 let cooldownSelection = new Set();
+let cooldownPage = 0;
+let circuitPage = 0;
 function renderCooldowns(data){
   const c=document.getElementById('cooldowns');
   c.innerHTML='';
   const cdRows=Object.entries(data.cooldowns||{}).map(([k,v])=>({model_key:k, expiry:v.expiry||null, status_code:v.status_code||0, error_count:v.error_count||0, last_error:v.last_error||'', state:''}));
-  const circRows=Object.entries(data.circuits||{}).map(([k,v])=>({model_key:k, expiry:null, status_code:-1, error_count:v.probes_sent||0, last_error:'', state:'circuit '+v.state}));
-  const rows=[...cdRows, ...circRows];
-  if(!rows.length){
+  const circRows=Object.entries(data.circuits||{}).map(([k,v])=>({model_key:k, expiry:null, status_code:-1, error_count:v.probes_sent||0, last_error:'', state:'circuit '+v.state, probes:v.probes_sent||0, opened:v.opened_at||null}));
+  if(!cdRows.length && !circRows.length){
     c.textContent='No cooldowns or circuits active.';
     document.getElementById('cooldownActions').style.display='none';
     return;
   }
   document.getElementById('cooldownActions').style.display='block';
-  const table=document.createElement('table');
-  const thead=document.createElement('thead');
-  const thr=document.createElement('tr');
-  for(const h of ['','Model','Expiry','Status','Errors','Last error']){
-    const th=document.createElement('th'); th.textContent=h; thr.appendChild(th);
+  const grid=el('div','grid');
+  // Left: cooldown errors grouped by status code, expandable.
+  const left=el('div');
+  left.appendChild(el('h3',null,'Cooldown errors'));
+  const pageSize=20;
+  const totalCdPages=Math.max(1,Math.ceil(cdRows.length/pageSize));
+  cooldownPage=Math.min(cooldownPage,totalCdPages-1);
+  const cdStart=cooldownPage*pageSize;
+  const pageCd=cdRows.slice(cdStart,cdStart+pageSize);
+  const groups={};
+  for(const r of pageCd){ const key = (r.status_code>0?r.status_code:'unknown'); (groups[key]=groups[key]||[]).push(r); }
+  const groupKeys=Object.keys(groups).sort();
+  if(!groupKeys.length){ left.appendChild(el('p',null,'No cooldown errors.')); }
+  for(const key of groupKeys){
+    const det=el('details','tree');
+    det.open=true;
+    const sum=el('summary',null,'Error '+key+' ('+groups[key].length+')');
+    det.appendChild(sum);
+    const table=document.createElement('table');
+    const thead=document.createElement('thead');
+    const thr=document.createElement('tr');
+    for(const h of ['','Model','Expiry','Status','Errors','Last error']){
+      const th=document.createElement('th'); th.textContent=h; thr.appendChild(th);
+    }
+    thead.appendChild(thr); table.appendChild(thead);
+    const tbody=document.createElement('tbody');
+    for(const r of groups[key]){
+      const tr=document.createElement('tr');
+      const cb=document.createElement('input'); cb.type='checkbox'; cb.value=r.model_key;
+      if(cooldownSelection.has(r.model_key)) cb.checked=true;
+      cb.onchange=e=>{ if(e.target.checked) cooldownSelection.add(r.model_key); else cooldownSelection.delete(r.model_key); updateClearButton(); };
+      const td0=document.createElement('td'); td0.appendChild(cb); tr.appendChild(td0);
+      const td1=document.createElement('td'); td1.className='clamp'; td1.textContent=r.model_key; td1.title=r.model_key; tr.appendChild(td1);
+      const td2=document.createElement('td'); td2.textContent=r.expiry?new Date(r.expiry).toLocaleString():'—'; tr.appendChild(td2);
+      const td3=document.createElement('td'); td3.textContent=(r.state||r.status_code); tr.appendChild(td3);
+      const td4=document.createElement('td'); td4.className='num'; td4.textContent=r.error_count||0; tr.appendChild(td4);
+      const td5=document.createElement('td'); td5.className='clamp'; td5.textContent=(r.last_error||'').slice(0,120); td5.title=r.last_error||''; tr.appendChild(td5);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    det.appendChild(table);
+    left.appendChild(det);
   }
-  thead.appendChild(thr);
-  table.appendChild(thead);
-  const tbody=document.createElement('tbody');
-  for(const r of rows){
+  if(cdRows.length>pageSize){
+    const pag=el('div','pag');
+    const prev=el('button',null,'Prev'); prev.disabled=cooldownPage===0; prev.onclick=()=>{cooldownPage--; renderCooldowns(data);};
+    const info=el('span',null,(cooldownPage+1)+'/'+totalCdPages);
+    const next=el('button',null,'Next'); next.disabled=cooldownPage>=totalCdPages-1; next.onclick=()=>{cooldownPage++; renderCooldowns(data);};
+    pag.appendChild(prev); pag.appendChild(info); pag.appendChild(next);
+    left.appendChild(pag);
+  }
+  grid.appendChild(left);
+
+  // Right: circuits separate table.
+  const right=el('div');
+  right.appendChild(el('h3',null,'Circuits'));
+  const totalCircPages=Math.max(1,Math.ceil(circRows.length/pageSize));
+  circuitPage=Math.min(circuitPage,totalCircPages-1);
+  const circStart=circuitPage*pageSize;
+  const pageCirc=circRows.slice(circStart,circStart+pageSize);
+  const ctable=document.createElement('table');
+  const cthead=document.createElement('thead');
+  const cthr=document.createElement('tr');
+  for(const h of ['Model','State','Opened','Probes']){
+    const th=document.createElement('th'); th.textContent=h; cthr.appendChild(th);
+  }
+  cthead.appendChild(cthr); ctable.appendChild(cthead);
+  const ctbody=document.createElement('tbody');
+  for(const r of pageCirc){
     const tr=document.createElement('tr');
-    const cb=document.createElement('input'); cb.type='checkbox'; cb.value=r.model_key;
-    if(cooldownSelection.has(r.model_key)) cb.checked=true;
-    cb.onchange=e=>{ if(e.target.checked) cooldownSelection.add(r.model_key); else cooldownSelection.delete(r.model_key); updateClearButton(); };
-    const td0=document.createElement('td'); td0.appendChild(cb); tr.appendChild(td0);
-    const td1=document.createElement('td'); td1.textContent=r.model_key; tr.appendChild(td1);
-    const td2=document.createElement('td'); td2.textContent=r.expiry?new Date(r.expiry).toLocaleString():'—'; tr.appendChild(td2);
-    const td3=document.createElement('td'); td3.textContent=(r.state||r.status_code); tr.appendChild(td3);
-    const td4=document.createElement('td'); td4.className='num'; td4.textContent=r.error_count||0; tr.appendChild(td4);
-    const td5=document.createElement('td'); td5.textContent=(r.last_error||'').slice(0,120); tr.appendChild(td5);
-    tbody.appendChild(tr);
+    const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=r.model_key; td0.title=r.model_key; tr.appendChild(td0);
+    const td1=document.createElement('td'); td1.textContent=r.state; tr.appendChild(td1);
+    const td2=document.createElement('td'); td2.textContent=r.opened?new Date(r.opened).toLocaleString():'—'; tr.appendChild(td2);
+    const td3=document.createElement('td'); td3.className='num'; td3.textContent=r.probes||0; tr.appendChild(td3);
+    ctbody.appendChild(tr);
   }
-  table.appendChild(tbody);
-  c.appendChild(table);
+  ctable.appendChild(ctbody);
+  right.appendChild(ctable);
+  if(circRows.length>pageSize){
+    const pag=el('div','pag');
+    const prev=el('button',null,'Prev'); prev.disabled=circuitPage===0; prev.onclick=()=>{circuitPage--; renderCooldowns(data);};
+    const info=el('span',null,(circuitPage+1)+'/'+totalCircPages);
+    const next=el('button',null,'Next'); next.disabled=circuitPage>=totalCircPages-1; next.onclick=()=>{circuitPage++; renderCooldowns(data);};
+    pag.appendChild(prev); pag.appendChild(info); pag.appendChild(next);
+    right.appendChild(pag);
+  }
+  grid.appendChild(right);
+  c.appendChild(grid);
   updateClearButton();
 }
 function updateClearButton(){
@@ -463,6 +569,7 @@ async function refresh(){
     renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.latency_percentiles?r.latency_percentiles.p50_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p95_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p99_ms:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
     renderBoard('volume', d.volume||[], [[r=>r.rate,v=>v.toFixed(3)],[r=>r.attempts,v=>v]]);
     renderBoard('failures', d.failures||[], [[r=>r.rate,v=>(v*100).toFixed(1)+'%'],[r=>r.failures,v=>v]]);
+    renderBoard('tokens', (d.tokens && d.tokens.length ? d.tokens : (d.latency||[])), [[r=>r.tokens||r.rate,v=>v]]);
     if(d.cooldowns||d.circuits) renderCooldowns(d);
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
