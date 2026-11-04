@@ -1260,3 +1260,30 @@ func TestCooldownDBCloseCheckpointsWAL(t *testing.T) {
 		t.Errorf("expected 1 cooldown after checkpointed close, got %d", len(cds))
 	}
 }
+
+// TestFirstAttemptCannotSpendTheWholeBudget pins the reservation that keeps one
+// slow attempt from turning every other provider into dead weight. Command
+// Code's max_interruption (30s) used to equal the whole 30s budget, so a
+// timeout left zero room for a fallback and the request 503'd after a single
+// attempt (measured 2026-11-04).
+func TestFirstAttemptCannotSpendTheWholeBudget(t *testing.T) {
+	walk := newBudgetState(time.Now(), 25*time.Second) // budget 30s
+	walk.next()
+	if got := walk.attemptTimeout(30 * time.Second); got != 20*time.Second {
+		t.Fatalf("first attempt timeout = %v, want 20s (two thirds of the 30s budget)", got)
+	}
+
+	// After the first attempt burns its cap, the fallback gets what is left.
+	walk.lastProgress = time.Now().Add(-20 * time.Second)
+	walk.next()
+	if got := walk.attemptTimeout(30 * time.Second); got > 10*time.Second {
+		t.Fatalf("fallback timeout = %v, want at most the remaining 10s", got)
+	}
+
+	// A small request's own timeout is below the cap and stays untouched.
+	small := newBudgetState(time.Now(), 5*time.Second)
+	small.next()
+	if got := small.attemptTimeout(5 * time.Second); got != 5*time.Second {
+		t.Fatalf("small-request timeout = %v, want 5s", got)
+	}
+}
