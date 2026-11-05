@@ -276,7 +276,7 @@ def test_terminator_prefers_kilocode_regardless_of_counts():
     }
     models = [_model(f"k/{i}", "kilocode", 30.0 - i) for i in range(2)]
     models += [_model(f"o/{i}", "opencode", 20.0 - i) for i in range(9)]
-    chain = gen.build_chain(models, "smart", catalog)
+    chain = gen.build_chain(models, "fast", catalog)
     assert chain[-1]["provider"] == "kilocode"
     assert chain[-1]["model"] == "kilo-auto/free"
     assert "dominates" not in chain[-1]["comment"], "count comparison is back"
@@ -287,7 +287,7 @@ def test_terminator_opencode_only_when_kilocode_absent():
         ("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode"),
         ("opencode", "big-pickle"): _auto("big-pickle", "opencode"),
     }
-    chain = gen.build_chain([_model("space-bunny-free", "opencode", 25.0)], "smart", catalog)
+    chain = gen.build_chain([_model("space-bunny-free", "opencode", 25.0)], "fast", catalog)
     assert (chain[-1]["provider"], chain[-1]["model"]) == ("opencode", "big-pickle")
 
     # Neither present: keep kilocode rather than emit a chain with no terminator.
@@ -307,11 +307,11 @@ def test_terminator_refuses_a_probed_and_failed_auto_model():
         ("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode", verified=False),
     }
     with pytest.raises(SystemExit, match="terminator"):
-        gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "smart", catalog)
+        gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "fast", catalog)
 
     # verified=None means "not probed" and must not block a regeneration.
     catalog[("kilocode", "kilo-auto/free")] = _auto("kilo-auto/free", "kilocode")
-    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "smart", catalog)
+    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "fast", catalog)
     assert chain[-1]["model"] == "kilo-auto/free"
 
 
@@ -328,13 +328,13 @@ def test_unprobed_kilocode_router_keeps_the_pre_probe_choice():
         ("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode"),  # verified=None
         ("opencode", "big-pickle"): _auto("big-pickle", "opencode", verified=False),
     }
-    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "smart", catalog)
+    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "fast", catalog)
     assert (chain[-1]["provider"], chain[-1]["model"]) == ("kilocode", "kilo-auto/free")
     assert "not probed" in chain[-1]["comment"] and "probed live" not in chain[-1]["comment"]
 
     # And a router that DID answer gets that recorded instead.
     catalog[("kilocode", "kilo-auto/free")] = _auto("kilo-auto/free", "kilocode", verified=True)
-    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "smart", catalog)
+    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "fast", catalog)
     assert "probed live" in chain[-1]["comment"]
 
 
@@ -364,7 +364,7 @@ def test_dead_kilocode_router_rescues_to_opencode_only_when_it_probed_live():
     dead_kilo = {("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode", verified=False)}
 
     # Rescue: the other router answered.
-    chain = gen.build_chain(models, "smart", {
+    chain = gen.build_chain(models, "fast", {
         **dead_kilo,
         ("opencode", "big-pickle"): _auto("big-pickle", "opencode", verified=True),
     })
@@ -374,11 +374,11 @@ def test_dead_kilocode_router_rescues_to_opencode_only_when_it_probed_live():
     # No live alternative: abort rather than write a dead terminator.
     for other in ({}, {("opencode", "big-pickle"): _auto("big-pickle", "opencode")}):
         with pytest.raises(SystemExit, match="refusing to write"):
-            gen.build_chain(models, "smart", {**dead_kilo, **other})
+            gen.build_chain(models, "fast", {**dead_kilo, **other})
 
     # An unprobed opencode router is not positive evidence.
     with pytest.raises(SystemExit, match="refusing to write"):
-        gen.build_chain(models, "smart", {**dead_kilo})
+        gen.build_chain(models, "fast", {**dead_kilo})
 
 
 def test_a_stale_verdict_decays_to_unknown_in_both_directions(capsys):
@@ -395,7 +395,7 @@ def test_a_stale_verdict_decays_to_unknown_in_both_directions(capsys):
     models = [_model("qwen/x:free", "kilocode", 33.7), _model("space-bunny-free", "opencode", 25.0)]
 
     # Stale live: the terminator stays put rather than chasing the rescue.
-    chain = gen.build_chain(models, "smart", {
+    chain = gen.build_chain(models, "fast", {
         ("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode", verified=True, age_days=stale),
         ("opencode", "big-pickle"): _auto("big-pickle", "opencode", verified=True, age_days=0),
     })
@@ -405,7 +405,7 @@ def test_a_stale_verdict_decays_to_unknown_in_both_directions(capsys):
 
     # Stale dead: a verdict that old is not grounds for refusing to write, so
     # kilocode is used unchallenged rather than the whole sync dying.
-    chain = gen.build_chain(models, "smart", {
+    chain = gen.build_chain(models, "fast", {
         ("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode", verified=False, age_days=stale),
         ("opencode", "big-pickle"): _auto("big-pickle", "opencode", verified=True, age_days=0),
     })
@@ -413,7 +413,7 @@ def test_a_stale_verdict_decays_to_unknown_in_both_directions(capsys):
 
     # Just inside the window is still actionable in both directions.
     inside = gen.AUTO_PROBE_MAX_AGE_DAYS - 1
-    chain = gen.build_chain(models, "smart", {
+    chain = gen.build_chain(models, "fast", {
         ("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode", verified=True, age_days=inside),
         ("opencode", "big-pickle"): _auto("big-pickle", "opencode", verified=True, age_days=0),
     })
@@ -432,7 +432,7 @@ def test_a_verdict_without_a_timestamp_is_not_trusted(capsys):
                ("opencode", "big-pickle"): _auto("big-pickle", "opencode", verified=True)}
     chain = gen.build_chain(
         [_model("qwen/x:free", "kilocode", 33.7), _model("space-bunny-free", "opencode", 25.0)],
-        "smart", catalog,
+        "fast", catalog,
     )
     assert (chain[-1]["provider"], chain[-1]["model"]) == ("kilocode", "kilo-auto/free")
     assert "no probe timestamp" in capsys.readouterr().err
@@ -492,7 +492,7 @@ def test_key_groups_are_emitted_whole_and_in_order():
         _model("poolside/laguna-s-2.1-free", "commandcode", 25.0, ctx=256000),
         _model("qwen/qwen3.8-27b:free", "kilocode", 33.7, ctx=262144),
     ]
-    chain = gen.build_chain(models, "smart", catalog)[:-1]
+    chain = gen.build_chain(models, "fast", catalog)[:-1]
     assert [(e["provider"], e["model"]) for e in chain] == [
         ("nvidia", "z-ai/glm-5.3"),
         ("nvidia2", "z-ai/glm-5.3"),
@@ -521,7 +521,7 @@ def test_every_concrete_endpoint_carries_a_score_and_the_router_does_not():
     """Rule 11: `intelligence` is what the router rotates over; the auto
     meta-router is not a model and must not carry one."""
     catalog = {("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode")}
-    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "smart", catalog)
+    chain = gen.build_chain([_model("qwen/x:free", "kilocode", 33.7)], "fast", catalog)
     concrete, router = chain[:-1], chain[-1]
     assert all(e["intelligence"] == 33.7 for e in concrete)
     assert "intelligence" not in router
@@ -539,13 +539,15 @@ def test_real_config_matches_the_pinned_shapes():
     for name, body in cfg["models"].items():
         chain = body["chain"]
         assert chain, f"{name} chain is empty"
-        for ep in chain[:-1]:
+        is_auto = chain[-1]["model"] in ("kilo-auto/free", "big-pickle")
+        concrete = chain[:-1] if is_auto else chain
+        for ep in concrete:
             assert isinstance(ep.get("vision"), bool), f"{name}: {ep} has no vision bool"
             assert isinstance(ep.get("intelligence"), (int, float)), f"{name}: {ep} has no score"
-        assert chain[-1]["model"] in ("kilo-auto/free", "big-pickle"), f"{name} terminator"
-        assert chain[-1]["provider"] == "kilocode" and chain[-1]["model"] == "kilo-auto/free"
-        assert chain[-1].get("vision") is True
-        assert "intelligence" not in chain[-1], f"{name} terminator must carry no score"
+        if name == "fast":
+            assert chain[-1]["provider"] == "kilocode" and chain[-1]["model"] == "kilo-auto/free"
+            assert chain[-1].get("vision") is True
+            assert "intelligence" not in chain[-1], f"{name} terminator must carry no score"
 
 
 # --------------------------------------------------------------------------
@@ -635,7 +637,9 @@ def _run_cli(tmp_path, verdicts, extra=(), runs=1, base=None):
 
 
 def _terminator(text):
-    return text.rsplit("        model: ", 1)[1].splitlines()[0].strip()
+    block = re.search(r"(?ms)^  fast:\n    chain:\n(.*?)(?=^  \w+:|\Z)", text)
+    lines = [ln for ln in block.group(1).splitlines() if ln.startswith("        model: ")]
+    return lines[-1].split("model: ", 1)[1].strip()
 
 
 @pytest.mark.parametrize("verdicts,expected", [
@@ -1201,7 +1205,7 @@ def test_emit_writes_vision_and_intelligence_for_concrete_endpoints_only():
             _model("qwen/vision:free", "kilocode", 33.7, vision=True),
             _model("text-only:free", "kilocode", 20.1, vision=False),
         ],
-        "smart", catalog,
+        "fast", catalog,
     )
     text = gen.format_chain_yaml(chain)
     assert "vision: true" in text

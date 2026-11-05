@@ -149,7 +149,10 @@ def main() -> int:
                 )
 
         last_model = chain[-1].get("model")
-        if last_model not in ("kilo-auto/free", "big-pickle"):
+        # Only the `fast` profile carries an auto-router as its trailing entry;
+        # the others exhaust their concrete endpoints and fall through to another
+        # profile, so their last entry is an ordinary model.
+        if name == "fast" and last_model not in ("kilo-auto/free", "big-pickle"):
             problems.append(
                 f"{name}: last chain entry must be kilo-auto/free or "
                 f"big-pickle, got {last_model!r}"

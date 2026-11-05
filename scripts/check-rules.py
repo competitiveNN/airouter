@@ -255,60 +255,51 @@ def check(
         # auto_fallback_terminator() so this check and the generator cannot
         # disagree. With no model list there is no probe evidence, and the
         # function degrades to the pre-probe choice.
-        rest = chain[:-1]
-        present = {e.get("provider") for e in rest}
-        want = None
-        try:
-            want = rc.auto_fallback_terminator(present, index)
-        except SystemExit as exc:
-            problems.append(
-                f"rule6: {tag0} has no usable auto router and the config should not "
-                f"have been written: {exc}"
-            )
         last = chain[-1]
-        if want is not None and (last.get("provider"), last.get("model")) != want[:2]:
-            problems.append(
-                f"rule6: {tag0} terminator is {last.get('provider')}/{last.get('model')}, "
-                f"expected {want[0]}/{want[1]} ({TERMINATOR_LADDER})"
-            )
-        elif want is not None and index is not None:
-            # The comment is the probe evidence recorded in the file, so it is
-            # checked, not trusted. Two failures, reported distinctly:
-            #
-            #  - the model list HAS a verdict and the comment says something
-            #    else: a contradiction (stale, hand-edited or simply wrong);
-            #  - the model list has NO verdict, so nothing can confirm or deny
-            #    the comment. The generator deliberately preserves whatever the
-            #    file already claims in that case (see
-            #    auto_fallback_terminator), so demanding a rewrite here would
-            #    fight it; the honest report is "this claim is unverifiable".
-            line = _terminator_line(config_text, profile)
-            expected = f"{last.get('model')}  {want[2]}"
-            if line is not None and line != expected:
-                if _no_verdict(rc, present, index):
-                    if "probed live" in line or "probed dead" in line:
+        is_auto_terminator = last.get("model") in AUTO_MODELS
+        if is_auto_terminator:
+            rest = chain[:-1]
+            present = {e.get("provider") for e in rest}
+            want = None
+            try:
+                want = rc.auto_fallback_terminator(present, index)
+            except SystemExit as exc:
+                problems.append(
+                    f"rule6: {tag0} has no usable auto router and the config should not "
+                    f"have been written: {exc}"
+                )
+            if want is not None and (last.get("provider"), last.get("model")) != want[:2]:
+                problems.append(
+                    f"rule6: {tag0} terminator is {last.get('provider')}/{last.get('model')}, "
+                    f"expected {want[0]}/{want[1]} ({TERMINATOR_LADDER})"
+                )
+            elif want is not None and index is not None:
+                line = _terminator_line(config_text, profile)
+                expected = f"{last.get('model')}  {want[2]}"
+                if line is not None and line != expected:
+                    if _no_verdict(rc, present, index):
+                        if "probed live" in line or "probed dead" in line:
+                            problems.append(
+                                f"rule6: {tag0} terminator comment claims a probe verdict "
+                                f"({line.split('#', 1)[-1].strip()!r}) but the model list has no "
+                                f"verdict for that router, so the claim cannot be checked. "
+                                f"Re-run fetch-free-models.py --probe-auto to make it true again."
+                            )
+                    else:
                         problems.append(
-                            f"rule6: {tag0} terminator comment claims a probe verdict "
-                            f"({line.split('#', 1)[-1].strip()!r}) but the model list has no "
-                            f"verdict for that router, so the claim cannot be checked. "
-                            f"Re-run fetch-free-models.py --probe-auto to make it true again."
+                            f"rule6: {tag0} terminator comment is {line!r}, but the probe record "
+                            f"implies {expected!r}. The comment is the only record of why this "
+                            f"endpoint was chosen."
                         )
-                    # else: an honest "not probed" comment is already correct.
-                else:
-                    problems.append(
-                        f"rule6: {tag0} terminator comment is {line!r}, but the probe record "
-                        f"implies {expected!r}. The comment is the only record of why this "
-                        f"endpoint was chosen."
-                    )
-        if last.get("vision") is not True:
-            problems.append(f"rule7: {tag0} terminator is a meta-router and needs vision: true")
-        if last.get("intelligence") is not None:
-            problems.append(
-                f"rule11: {tag0} terminator carries intelligence "
-                f"{last.get('intelligence')}; the auto router is not a model and must have none"
-            )
-        if last.get("model") not in AUTO_MODELS:
-            problems.append(f"rule6: {tag0} terminator {last.get('model')!r} is not an auto router")
+            if last.get("vision") is not True:
+                problems.append(f"rule7: {tag0} terminator is a meta-router and needs vision: true")
+            if last.get("intelligence") is not None:
+                problems.append(
+                    f"rule11: {tag0} terminator carries intelligence "
+                    f"{last.get('intelligence')}; the auto router is not a model and must have none"
+                )
+            if last.get("model") not in AUTO_MODELS:
+                problems.append(f"rule6: {tag0} terminator {last.get('model')!r} is not an auto router")
 
         scores: list[float] = []
         contexts: list[int] = []

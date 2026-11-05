@@ -792,7 +792,11 @@ def build_chain(
             chain.append(entry_for(m.mapped_provider, m))
 
     # The last-resort endpoint must itself be callable, so the choice is a
-    # liveness question, never a popularity one.
+    # liveness question, never a popularity one. Only the `fast` profile
+    # carries the meta-router as its trailing entry.
+    if profile != 'fast':
+        return chain
+
     auto_provider, auto_model, auto_comment = auto_fallback_terminator(
         {e['provider'] for e in chain}, records, previous
     )
@@ -1147,7 +1151,8 @@ def main(argv: list[str] | None = None):
     print("\n=== SUMMARY ===")
     for name, chain in [('smart', smart_chain), ('work', work_chain), ('fast', fast_chain), ('large', large_chain), ('decision', decision_chain)]:
         concrete = [e for e in chain if not e['model'].startswith('kilo-auto') and e['model'] != 'big-pickle']
-        print(f"{name:6s}: {len(chain)} entries ({len(concrete)} concrete), head={concrete[0]['model'] if concrete else 'N/A'}, tail={chain[-1]['model']}")
+        tail = chain[-1]['model'] if chain else 'N/A'
+        print(f"{name:6s}: {len(chain)} entries ({len(concrete)} concrete), head={concrete[0]['model'] if concrete else 'N/A'}, tail={tail}")
 
     write_config_atomically(config, new_config, args.write, config_path)
 
