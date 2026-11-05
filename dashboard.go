@@ -122,10 +122,10 @@ details.tree[open]>summary{margin-bottom:.3rem}
 <div class="pag" id="failures-pag"></div>
 </div>
 <div>
-<h3>Most tokens</h3>
-<table><thead><tr><th class="clamp">Endpoint</th><th>Tokens</th></tr></thead>
-<tbody id="tokens"></tbody></table>
-<div class="pag" id="tokens-pag"></div>
+<h3>Most sessions</h3>
+<table><thead><tr><th class="clamp">Endpoint</th><th>Sessions</th></tr></thead>
+<tbody id="sessions"></tbody></table>
+<div class="pag" id="sessions-pag"></div>
 </div>
 </div>
 </div>
@@ -569,7 +569,10 @@ async function refresh(){
     renderBoard('speed', d.speed||[], [[r=>r.rate,v=>v.toFixed(1)],[r=>r.tokens,v=>v],[r=>r.latency_percentiles?r.latency_percentiles.p50_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p95_ms:null,v=>v===null?'—':v.toFixed(1)+'ms'],[r=>r.latency_percentiles?r.latency_percentiles.p99_ms:null,v=>v===null?'—':v.toFixed(1)+'ms']]);
     renderBoard('volume', d.volume||[], [[r=>r.rate,v=>v.toFixed(3)],[r=>r.attempts,v=>v]]);
     renderBoard('failures', d.failures||[], [[r=>r.rate,v=>(v*100).toFixed(1)+'%'],[r=>r.failures,v=>v]]);
-    renderBoard('tokens', (d.tokens && d.tokens.length ? d.tokens : (d.latency||[])), [[r=>r.tokens||r.rate,v=>v]]);
+    const sessRows=[];
+    for(const m of (d.inflight||[])){ for(const e of (m.endpoints||[])){ sessRows.push({endpoint:e.endpoint, sessions:e.sessions||0}); } }
+    sessRows.sort((a,b)=>b.sessions-a.sessions);
+    renderBoard('sessions', sessRows, [[r=>r.sessions,v=>v]]);
     if(d.cooldowns||d.circuits) renderCooldowns(d);
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
