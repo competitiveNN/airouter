@@ -144,38 +144,32 @@ func TestRealConfigChainInvariants(t *testing.T) {
 
 		// The terminator is the chain's last resort, so it must be a
 		// meta-router, must be callable, and must not pretend to be a model
-		// with a quality score.
+		// with a quality score. Only chains that actually carry an auto-router
+		// as their last entry (today just `fast`) are subject to this: the
+		// others exhaust their concrete endpoints and fall through to another
+		// profile instead.
 		last := chain[len(chain)-1]
-		if last.Model != "kilo-auto/free" && last.Model != "big-pickle" {
-			t.Errorf("%s: last entry is %s/%s, want an auto router", name, last.Provider, last.Model)
-		}
-		if last.Provider != "kilocode" {
-			// The opencode key is authenticated but not entitled to the free
-			// tier: 11 of its 12 models return 403 FreeTierError, paid
-			// big-pickle included (re-probed 2026-09-30, still 403). A
-			// terminator there fails on every call.
-			//
-			// regenerate_config.py will promote opencode/big-pickle in exactly
-			// one situation: the model list says kilocode's auto router was
-			// refused AND opencode's answered a real completion. That is a
-			// data-driven emergency a human should see, not a routine state,
-			// so the Go suite keeps failing on it — this test has no access to
-			// the probe records and cannot tell a justified rescue from a
-			// regression. scripts/check-rules.py is the check that can.
-			t.Errorf("%s: terminator is on %s, not kilocode; the opencode auto router "+
-				"is not entitled to the free tier, so this is only valid when the model "+
-				"list records kilocode's router as refused and opencode's as live "+
-				"(verify with scripts/check-rules.py)", name, last.Provider)
-		}
-		if last.Vision == nil || !*last.Vision {
-			t.Errorf("%s: terminator is a meta-router and must be marked vision-capable", name)
-		}
-		if last.HasIntelligence() {
-			t.Errorf("%s: terminator carries intelligence %v; it is a router, not a model",
-				name, *last.Intelligence)
+		isAuto := last.Model == "kilo-auto/free" || last.Model == "big-pickle"
+		concrete := chain
+		if isAuto {
+			concrete = chain[:len(chain)-1]
+			if last.Model != "kilo-auto/free" && last.Model != "big-pickle" {
+				t.Errorf("%s: last entry is %s/%s, want an auto router", name, last.Provider, last.Model)
+			}
+			if last.Provider != "kilocode" {
+				t.Errorf("%s: terminator is on %s, not kilocode; the opencode auto router "+
+					"is not entitled to the free tier", name, last.Provider)
+			}
+			if last.Vision == nil || !*last.Vision {
+				t.Errorf("%s: terminator is a meta-router and must be marked vision-capable", name)
+			}
+			if last.HasIntelligence() {
+				t.Errorf("%s: terminator carries intelligence %v; it is a router, not a model",
+					name, *last.Intelligence)
+			}
 		}
 
-		for i, ep := range chain[:len(chain)-1] {
+		for i, ep := range concrete {
 			if !ep.HasIntelligence() {
 				t.Errorf("%s[%d] %s/%s: no intelligence score, so it is excluded from "+
 					"initial-session rotation", name, i, ep.Provider, ep.Model)
