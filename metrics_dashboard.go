@@ -116,7 +116,6 @@ type dashboardInflightSession struct {
 	AgeSeconds      float64   `json:"age_seconds"`
 	Duration        float64   `json:"duration"`
 	DurationSeconds float64   `json:"duration_seconds"`
-	AgeSecondsAlt   float64   `json:"age_seconds"`
 }
 
 // dashboardInflightModel is a logical model with sessions
