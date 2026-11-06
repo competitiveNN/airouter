@@ -446,6 +446,7 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 	}
 	r.loadCooldowns()
 	r.loadPriorities()
+	r.loadSessions()
 	r.SetCooldownJitter(cfg.Preferences.CooldownJitterFraction())
 	r.SetCircuitBreakerThreshold(cfg.Preferences.CircuitBreakerThresholdValue())
 	r.SetCircuitHalfOpenProbes(cfg.Preferences.CircuitHalfOpenProbesValue())
@@ -527,6 +528,8 @@ func (r *Router) sweepSessions() {
 		case <-ticker.C:
 			r.evictStaleSessions()
 			r.cleanupStaleEntries()
+			// Persist sessions too: evicted rows must leave the database.
+			r.saveSessions()
 			// The sweep can delete endpoints that were removed from the
 			// config. Schedule a flush so those rows leave the database too
 			// instead of waiting for the next failure to trigger a save.
@@ -570,8 +573,54 @@ func (r *Router) evictStaleSessions() {
 
 // Close stops the background session sweeper and flushes any pending cooldown
 // save so state isn't lost on shutdown. Called on graceful shutdown.
+
+// loadSessions restores sticky sessions persisted by a previous process so a
+// restart does not forget which model/chain each conversation was living on.
+func (r *Router) loadSessions() {
+	if r.store == nil {
+		return
+	}
+	loaded, err := r.store.loadSessions(time.Now())
+	if err != nil {
+		log.Printf("[warn] failed to load persisted sessions: %v", err)
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for sid, se := range loaded {
+		r.sessions[sid] = se
+	}
+}
+
+// persistSessionLocked writes one sticky session to disk. Caller must hold r.mu.
+func (r *Router) persistSessionLocked(sessionID string, se sessionEntry) {
+	if r.store == nil {
+		return
+	}
+	if err := r.store.saveSession(sessionID, se); err != nil {
+		log.Printf("[warn] failed to persist session %s: %v", sessionID, err)
+	}
+}
+
+// saveSessions flushes the full session map to disk.
+func (r *Router) saveSessions() {
+	if r.store == nil {
+		return
+	}
+	r.mu.RLock()
+	snapshot := make(map[string]sessionEntry, len(r.sessions))
+	for k, v := range r.sessions {
+		snapshot[k] = v
+	}
+	r.mu.RUnlock()
+	if err := r.store.saveSessions(snapshot); err != nil {
+		log.Printf("[warn] failed to save sessions: %v", err)
+	}
+}
+
 func (r *Router) Close() {
 	r.cooldownSave.stop()
+	r.saveSessions()
 	close(r.sessionsDone)
 	r.sessionsWG.Wait()
 	r.saveCooldowns()
@@ -1082,6 +1131,7 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 		// background sweeper while it is still in use.
 		se.lastUsed = time.Now()
 		r.sessions[sessionID] = se
+		r.persistSessionLocked(sessionID, se)
 	}
 
 	// The chains this selection may consult, in order: the requested chain
@@ -1127,6 +1177,7 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 				if se.model != logicalModel {
 					se.model = logicalModel
 					r.sessions[sessionID] = se
+					r.persistSessionLocked(sessionID, se)
 				}
 				return &ep, 0
 			}
@@ -1370,12 +1421,14 @@ func (r *Router) chainOrderLocked(cfg *Config, logicalModel string, se sessionEn
 //
 // The caller must hold r.mu.
 func (r *Router) bindSessionLocked(sessionID string, ep ModelEndpoint, model, chain string) {
-	r.sessions[sessionID] = sessionEntry{
+	se := sessionEntry{
 		ep:       ep,
 		lastUsed: time.Now(),
 		model:    model,
 		chain:    chain,
 	}
+	r.sessions[sessionID] = se
+	r.persistSessionLocked(sessionID, se)
 	r.evictOverCapLocked()
 }
 
