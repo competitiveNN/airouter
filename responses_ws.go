@@ -168,7 +168,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 	// The per-attempt timeout the fallback budget is scaled against also
 	// bounds each upstream attempt, so a stalled provider cannot hold the
 	// socket for longer than the turn's own budget allows.
-	timeout := requestTimeout(estimateTokens(chatReq))
+	timeout := requestAttemptTimeout(estimateTokens(chatReq))
 	walk := newBudgetState(turnStart, timeout)
 	tokens := estimateTokens(chatReq)
 
@@ -230,14 +230,18 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		// Command Code prefill is slower than the size-derived estimate;
 		// floor the per-attempt budget at max_interruption (see api.go).
 		perAttemptBase := timeout
+		ceiling := g.providerMaxInterruption(ep.Provider)
+		if tokens >= largeContextTokens && ceiling < timeout {
+			ceiling = timeout
+		}
 		if g.proxy.effectiveProtocol(ep) == protocolCommandCode {
-			if ceiling := g.providerMaxInterruption(ep.Provider); ceiling > perAttemptBase {
+			if ceiling > perAttemptBase {
 				perAttemptBase = ceiling
 			}
 		} else {
-			perAttemptBase = minDuration(timeout, g.providerMaxInterruption(ep.Provider))
+			perAttemptBase = minDuration(timeout, ceiling)
 		}
-		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
+		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
 			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			return

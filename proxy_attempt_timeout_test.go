@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -202,5 +204,52 @@ func TestAttemptClientReusesTheSharedTransport(t *testing.T) {
 	// shared transport's timeouts are unchanged by this call.
 	if shared.TLSHandshakeTimeout != beforeTLS {
 		t.Fatalf("the shared transport's TLS handshake timeout was changed: %v -> %v", beforeTLS, shared.TLSHandshakeTimeout)
+	}
+}
+
+// TestStreamAttemptTimeoutIsNotRaisedToMaxInterruption pins the 2026-11-06
+// live 503 cause: `max_interruption` was applied as a FLOOR inside
+// StreamToClient, AFTER the caller's fallback walk had already clamped the
+// attempt to its remaining budget. A Command Code provider configured with
+// max_interruption 30s therefore ignored a 20s attempt budget, ran for 30s,
+// and the walk had nothing left: "budget exhausted after 1 attempt" and a 503
+// to the client with every other endpoint untried.
+//
+// The callers that need the floor apply it before the budget clamp (api.go's
+// perAttemptBase, commandcode_api.go's own floor). Nothing downstream may
+// re-raise it.
+func TestStreamAttemptTimeoutIsNotRaisedToMaxInterruption(t *testing.T) {
+	release := make(chan struct{})
+	stall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer func() {
+		close(release)
+		stall.Close()
+	}()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			// Much larger than the caller's budget, like the shipped Command
+			// Code provider's 30s max_interruption.
+			"cc": {URL: stall.URL, MaxInterruption: 2 * time.Second},
+		},
+	}
+	p := NewProxy(cfg)
+	ep := ModelEndpoint{Provider: "cc", Model: "m", Protocol: "commandcode"}
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+
+	start := time.Now()
+	_, _, _, _ = p.StreamToClient(
+		context.Background(), io.Discard, nil, body, ep,
+		300*time.Millisecond, "attempt-timeout-test",
+	)
+	elapsed := time.Since(start)
+
+	if elapsed > 1200*time.Millisecond {
+		t.Fatalf("a 300ms attempt budget ran for %v: max_interruption (2s) was applied as a floor and undid the fallback budget", elapsed)
 	}
 }

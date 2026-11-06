@@ -117,7 +117,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 	start := time.Now()
 	ctx := r.Context()
 	tokens := estimateTokens(req)
-	timeout := requestTimeout(tokens)
+	timeout := requestAttemptTimeout(tokens)
 	// Wall-clock budget for this request's fallback walk. Shared policy with
 	// the chat loops: this path was the one that shipped unbounded for a
 	// while, so it must use the same bound rather than its own copy.
@@ -211,6 +211,9 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		// floor the per-attempt budget at max_interruption (see api.go).
 		perAttemptBase := timeout
 		ceiling := g.providerMaxInterruption(ep.Provider)
+		if tokens >= largeContextTokens && ceiling < timeout {
+			ceiling = timeout
+		}
 		if g.proxy.effectiveProtocol(ep) == protocolCommandCode {
 			if ceiling > perAttemptBase {
 				perAttemptBase = ceiling
@@ -218,7 +221,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		} else {
 			perAttemptBase = minDuration(timeout, ceiling)
 		}
-		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
+		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
@@ -421,7 +424,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	timeout := requestTimeout(estimateTokens(req))
+	timeout := requestAttemptTimeout(estimateTokens(req))
 	// Wall-clock budget for this request's fallback walk. Shared policy with
 	// the chat loops: this path was the one that shipped unbounded for a
 	// while, so it must use the same bound rather than its own copy.
@@ -531,6 +534,9 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		// floor the per-attempt budget at max_interruption (see api.go).
 		perAttemptBase := timeout
 		ceiling := g.providerMaxInterruption(ep.Provider)
+		if tokens >= largeContextTokens && ceiling < timeout {
+			ceiling = timeout
+		}
 		if g.proxy.effectiveProtocol(ep) == protocolCommandCode {
 			if ceiling > perAttemptBase {
 				perAttemptBase = ceiling
@@ -539,7 +545,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			perAttemptBase = minDuration(timeout, ceiling)
 		}
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
-			proxyTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
+			proxyTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 			if proxyTimeout <= 0 {
 				err = context.DeadlineExceeded
 				break
