@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS priorities (
 	tps REAL NOT NULL
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS sessions (
+	key         TEXT PRIMARY KEY,
+	model       TEXT NOT NULL,
+	chain       TEXT NOT NULL,
+	provider    TEXT NOT NULL,
+	model_name  TEXT NOT NULL,
+	last_used   INTEGER NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
@@ -613,5 +622,98 @@ func (s *cooldownStore) apply(d cooldownDiff, now time.Time) error {
 	if _, err := tx.Exec(`DELETE FROM cooldowns WHERE expiry <= ?`, unixNano(now)); err != nil {
 		return err
 	}
+	return tx.Commit()
+}
+
+// loadSessions reads the persisted sticky sessions. Entries older than the TTL
+// are dropped so a restart does not resurrect conversations that have already
+// expired.
+func (s *cooldownStore) loadSessions(now time.Time) (map[string]sessionEntry, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.Query("SELECT key, model, chain, provider, model_name, last_used FROM sessions")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]sessionEntry{}
+	for rows.Next() {
+		var key, model, chain, provider, modelName string
+		var lastUsed int64
+		if err := rows.Scan(&key, &model, &chain, &provider, &modelName, &lastUsed); err != nil {
+			return nil, err
+		}
+		se := sessionEntry{
+			model:    model,
+			chain:    chain,
+			lastUsed: timeFromUnixNano(lastUsed),
+			ep:       ModelEndpoint{Provider: provider, Model: modelName},
+		}
+		if now.Sub(se.lastUsed) > sessionTTL {
+			continue
+		}
+		out[key] = se
+	}
+	return out, rows.Err()
+}
+
+// saveSession upserts one sticky session row.
+func (s *cooldownStore) saveSession(key string, se sessionEntry) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO sessions (key, model, chain, provider, model_name, last_used)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET
+		   model=excluded.model, chain=excluded.chain, provider=excluded.provider,
+		   model_name=excluded.model_name, last_used=excluded.last_used`,
+		key, se.model, se.chain, se.ep.Provider, se.ep.Model, unixNano(se.lastUsed))
+	return err
+}
+
+// deleteSession removes one sticky session row.
+func (s *cooldownStore) deleteSession(key string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec("DELETE FROM sessions WHERE key = ?", key)
+	return err
+}
+
+// saveSessions rewrites the sessions table to match the supplied map.
+func (s *cooldownStore) saveSessions(sessions map[string]sessionEntry) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM sessions"); err != nil {
+		tx.Rollback()
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO sessions (key, model, chain, provider, model_name, last_used)
+		VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	for key, se := range sessions {
+		if _, err := stmt.Exec(key, se.model, se.chain, se.ep.Provider, se.ep.Model, unixNano(se.lastUsed)); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return err
+		}
+	}
+	stmt.Close()
 	return tx.Commit()
 }
