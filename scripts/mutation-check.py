@@ -329,10 +329,18 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "protocol carried to only the first key of a trio",
         "regenerate_config.py",
-        "                chain.append(entry_for(prov, m))\n        elif m.mapped_provider == 'commandcode':",
-        "                chain.append(entry_for(prov, m) if prov == 'nvidia' else {'provider': prov, 'model': m.id, 'vision': m.vision, 'intelligence': m.score, 'context_length': m.context_length, 'protocol': None, 'comment': m.get_comment()})\n        elif m.mapped_provider == 'commandcode':",
+        "            for prov in ('nvidia', 'nvidia2', 'nvidia3'):\n"
+        "                if prov in providers_present:\n"
+        "                    chain.append(entry_for(prov, m))",
+        "            for prov in ('nvidia', 'nvidia2', 'nvidia3'):\n"
+        "                if prov in providers_present:\n"
+        "                    chain.append(entry_for(prov, m) if prov == 'nvidia' else {'provider': prov, 'model': m.id, 'vision': m.vision, 'intelligence': m.score, 'context_length': m.context_length, 'protocol': None, 'comment': m.get_comment()})",
         "nvidia2/nvidia3 would keep addressing a responses-only model with the "
-        "chat shape, so the failure would look like an intermittent provider bug.",
+        "chat shape, so the failure would look like an intermittent provider bug. "
+        "The anchor is the nvidia loop specifically: the earlier form ended in "
+        "`elif m.mapped_provider == 'commandcode'`, which stopped being adjacent "
+        "when the Google key group was inserted between them, so the mutation "
+        "silently aimed at the gemini loop instead (2026-11-06).",
     ),
     # The emit path and the profile floors. A defect here does not crash
     # anything: it produces a config that parses, loads, and routes — just
@@ -490,7 +498,11 @@ SUITE_TEST_FLOORS = {
     # provider_released (AA still arbitrates first), it beats the
     # first-seen proxy in the first-seen fallback, and OpenCode's
     # listing-wide `created` is deliberately not a date (2026-10-07).
-    "scripts/test_fetch_free_models.py": 80,
+    # 84 -- the 80 above plus 4 for the AA V2 migration: the retired
+    # /api/v2/data path must never return, the paginated free endpoint walks
+    # every page, an all-unscored snapshot never overwrites a scored cache, and
+    # an HTTP error (410) falls back to the last scored snapshot (2026-11-06).
+    "scripts/test_fetch_free_models.py": 84,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
@@ -528,7 +540,10 @@ SUITE_TEST_FLOORS = {
     # 75 -- plus 2 for the Google key group: the five configured keys are
     # emitted as one consecutive group for the same model id, and a key
     # commented out of `providers:` is not re-emitted (2026-11-04).
-    "scripts/test_regenerate_config.py": 75,
+    # 77 -- the 75 above plus 2 for the degenerate-enrichment guard: a large
+    # model list whose smart/work pools collapsed is refused instead of written,
+    # and the small synthetic fixtures stay writable (2026-11-06).
+    "scripts/test_regenerate_config.py": 77,
     # EXACT, matching every other floor in this table (66/66, 65/65, 19/19, 16/16).
     # An earlier version of this entry sat at 14 against 22 functions on the
     # theory that a floor should have slack so that adding tests needs no edit.

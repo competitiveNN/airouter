@@ -46,6 +46,23 @@ def _load_fetcher():
 ff = _load_fetcher()
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_the_live_aa_cache(tmp_path, monkeypatch):
+    """Keep every AA-cache test off the repo's real aa-enrichment-cache.json.
+
+    `ff.load_cache` / `ff.save_cache` are imported from model_utils, and those
+    functions read/write model_utils.CACHE_FILE -- NOT ff.CACHE_FILE. The old
+    per-test `monkeypatch.setattr(ff, "CACHE_FILE", ...)` therefore looked
+    isolated while every save_cache() call rewrote the live cache. On 2026-11-06
+    a test run replaced the 726-model enrichment snapshot with a one-entry fake,
+    which is exactly the state that collapses smart/work on the next sync.
+    """
+    import model_utils
+    cache = tmp_path / "aa-cache.json"
+    monkeypatch.setattr(model_utils, "CACHE_FILE", cache)
+    monkeypatch.setattr(ff, "CACHE_FILE", cache)
+
+
 @pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
 def test_refusal_statuses_are_dead(status):
     """4xx is a statement about entitlement or existence, so it is actionable."""
@@ -1615,3 +1632,110 @@ def test_aa_enrichment_slash_to_hyphen_matcher_for_arena():
     assert ff.fuzzy_match_slug("reflection-beam-free", aa) == "reflection-beam"
     assert ff.fuzzy_match_slug("reflection/beam-free", aa) is None  # raw slash breaks unless dedupe in main
 ""
+
+# --------------------------------------------------------------------------
+# Artificial Analysis V2 migration (2026-11-04): the legacy /api/v2/data/*
+# endpoints now return 410 Gone. Regression coverage for the replacement
+# endpoint, its pagination, and the refusal to let a broken snapshot erase the
+# scores of the whole fleet.
+# --------------------------------------------------------------------------
+
+
+def test_the_aa_endpoint_is_the_v2_replacement_not_the_retired_path():
+    """The legacy path returns 410; it must never come back."""
+    assert ff.ARTIFICIAL_ANALYSIS_ENDPOINT == (
+        "https://artificialanalysis.ai/api/v2/language/models/free"
+    )
+    assert "/data/" not in ff.ARTIFICIAL_ANALYSIS_ENDPOINT
+
+
+def test_aa_walks_every_page_of_the_v2_free_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "test-key")
+    pages = {
+        1: {
+            "pagination": {"page": 1, "total_pages": 2, "has_more": True},
+            "data": [{
+                "slug": "page-one",
+                "evaluations": {"artificial_analysis_intelligence_index": 41.0},
+                "release_date": "2026-10-01",
+            }],
+        },
+        2: {
+            "pagination": {"page": 2, "total_pages": 2, "has_more": False},
+            "data": [{
+                "slug": "page-two",
+                "evaluations": {"artificial_analysis_intelligence_index": 12.5},
+                "release_date": "2026-10-02",
+            }],
+        },
+    }
+    seen = []
+
+    def _fake_urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        page = int(str(url).rsplit("page=", 1)[1]) if "page=" in str(url) else 1
+        seen.append(page)
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(pages[page]).encode()
+
+        return _Resp()
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _fake_urlopen)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    assert seen == [1, 2], "the fetch must follow has_more, not stop after page 1"
+    assert data["page-one"]["intelligence"] == 41.0
+    assert data["page-two"]["intelligence"] == 12.5
+    assert data["page-one"]["released"] == "2026-10-01"
+
+
+def test_an_unscored_snapshot_never_overwrites_a_scored_cache(tmp_path, monkeypatch):
+    """The 410 failure mode: a response that parses but carries no scores must
+    not be persisted over a good cache, or the next regeneration floors every
+    model and collapses smart/work."""
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "test-key")
+    ff.save_cache({"good-slug": {"intelligence": 30.0}})
+
+    def _fake_urlopen(req, timeout=None):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "pagination": {"has_more": False},
+                    "data": [{"slug": "unscored", "evaluations": None}],
+                }).encode()
+
+        return _Resp()
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _fake_urlopen)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    assert data["good-slug"]["intelligence"] == 30.0
+    assert "unscored" not in data
+    assert ff.load_cache()["good-slug"]["intelligence"] == 30.0
+
+
+def test_an_http_error_falls_back_to_the_last_scored_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(ff, "CACHE_FILE", tmp_path / "aa.json")
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "test-key")
+    ff.save_cache({"kept-slug": {"intelligence": 22.0}})
+
+    def _boom(req, timeout=None):
+        raise OSError("HTTP Error 410: Gone")
+
+    monkeypatch.setattr(ff.urllib.request, "urlopen", _boom)
+    data = ff.fetch_artificial_analysis_data(force=True)
+    assert data["kept-slug"]["intelligence"] == 22.0

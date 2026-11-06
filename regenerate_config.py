@@ -1084,6 +1084,23 @@ def main(argv: list[str] | None = None):
         context_first=True,
     )
     decision_models = sort_models(decision_models, newest_first)
+
+    # Fail closed when the intelligence enrichment collapses. A healthy fetch
+    # yields dozens of scored models; if smart/work come back with only one or
+    # two candidates out of a large list, the score source is broken (an API
+    # retirement, a schema change, a wrong key) and writing that config is worse
+    # than keeping yesterday's: a one-entry `work` chain is a single point of
+    # failure for every coding request, and it turns a provider 429 into a 503.
+    # Measured 2026-11-06: /api/v2/data returned 410 Gone, every model floored to
+    # SMART_FLOOR, and the nightly sync wrote smart/work with one endpoint each.
+    if len(model_list) >= 20:
+        for name, selected in (("smart", smart_models), ("work", work_models)):
+            if len(selected) < 3:
+                sys.exit(
+                    f"refusing to write: only {len(selected)} {name} candidate(s) "
+                    f"from {len(model_list)} models; the intelligence source looks "
+                    f"broken (no AA scores?). Previous config left untouched."
+                )
     
     print(f"\nSmart candidates ({len(smart_models)}):")
     for m in smart_models:

@@ -257,8 +257,24 @@ def check(
         # function degrades to the pre-probe choice.
         last = chain[-1]
         is_auto_terminator = last.get("model") in AUTO_MODELS
+        # Concrete entries = everything except the meta-router. Only `fast`
+        # carries that router, so for every other profile the whole chain is
+        # concrete. Initialising here matters: `rest` is used unconditionally
+        # below (rule5), and it used to be assigned only inside the terminator
+        # branch, so a non-fast profile crashed the checker with
+        # UnboundLocalError once the terminator became fast-only.
+        rest = chain
         if is_auto_terminator:
             rest = chain[:-1]
+        elif profile == "fast":
+            # `fast` must end in the auto router: without it an exhausted fast
+            # chain has no last resort. A fast chain whose last entry is a
+            # concrete model is a sync bug, not a valid configuration.
+            problems.append(
+                f"rule6: {tag0} terminator is {last.get('model')!r}, expected an auto "
+                f"router ({TERMINATOR_LADDER})"
+            )
+        if is_auto_terminator:
             present = {e.get("provider") for e in rest}
             want = None
             try:

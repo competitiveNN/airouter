@@ -674,9 +674,9 @@ def test_cli_uses_kilocode_when_the_chain_has_neither_provider(tmp_path):
     """
     ollama_only = [{
         "id": "gemma4:31b", "provider": "ollama-cloud", "context_length": 262144,
-        "intelligence": 19.0, "elo": None, "released": None,
+        "intelligence": 30.0, "elo": None, "released": None,
         "capabilities": {"vision": True}, "source": "ollama-cloud", "raw": {},
-    }]
+        }]
     models = tmp_path / "models.json"
     models.write_text(json.dumps([
         {
@@ -843,7 +843,7 @@ def test_preservation_never_inherits_a_comment_naming_another_endpoint(tmp_path)
     """
     rescued = _run_cli(tmp_path / "rescued", {"kilocode": False, "opencode": True})
     assert _terminator(rescued).startswith("big-pickle")
-    assert gen.parse_terminators(rescued)["smart"][:2] == ("opencode", "big-pickle")
+    assert gen.parse_terminators(rescued)["fast"][:2] == ("opencode", "big-pickle")
 
     # Regenerated with no verdicts at all: the decision is unverifiable, so
     # kilocode wins on preference and must get its own comment.
@@ -923,15 +923,27 @@ def test_an_unverifiable_run_preserves_the_comment_it_cannot_check(tmp_path):
     permanent noise. The claim is unverifiable, not false, and the checker
     reports that distinction.
     """
-    before = _run_cli(tmp_path / "src", {"kilocode": True, "opencode": False})
+    # A fast-qualifying endpoint keeps the `why` clause stable across runs:
+    # with an empty fast chain, the first run records "no auto provider in
+    # chain" and the second (whose previous config now holds the terminator)
+    # records "opencode auto not entitled" — a fixture artifact, not a
+    # preservation failure.
+    fast_model = [{
+        "id": "kilo/fast-free", "provider": "kilocode", "context_length": 262144,
+        "intelligence": 20.0, "elo": None, "released": None,
+        "capabilities": {"vision": False}, "source": "kilocode", "raw": {},
+    }]
+    before = _run_cli(tmp_path / "src", {"kilocode": True, "opencode": False},
+                      extra=fast_model)
     assert "probed live" in _terminator(before)
 
     # Same config, a list that carries no verdict at all.
-    after = _run_cli(tmp_path / "offline", {}, runs=2)
+    after = _run_cli(tmp_path / "offline", {}, runs=2, extra=fast_model)
     assert _terminator(after) == _terminator(before), "an unverifiable run rewrote the claim"
 
     # And a real verdict replaces it with a current one.
-    refreshed = _run_cli(tmp_path / "again", {"kilocode": True, "opencode": False})
+    refreshed = _run_cli(tmp_path / "again", {"kilocode": True, "opencode": False},
+                         extra=fast_model)
     assert "probed live" in _terminator(refreshed)
 
 
@@ -957,9 +969,10 @@ def test_parse_terminators_round_trips_the_comment_including_its_hash():
     parsed = gen.parse_terminators(CONFIG.read_text())
     assert set(parsed) == {"smart", "work", "fast", "large", "decision"}
     for profile, (provider, model, comment) in parsed.items():
-        assert provider in ("kilocode", "opencode")
-        assert model in ("kilo-auto/free", "big-pickle")
         assert comment.startswith("#"), f"{profile}: {comment!r} lost its hash"
+    # Only the `fast` profile carries the auto-router terminator; the other
+    # profiles' last entries are ordinary concrete endpoints.
+    assert parsed["fast"][:2] in (("kilocode", "kilo-auto/free"), ("opencode", "big-pickle"))
 
 
 def test_cli_rejects_a_typo_instead_of_exiting_zero(tmp_path, capsys):
@@ -1088,10 +1101,10 @@ def test_checker_demands_the_rescue_when_the_list_says_kilocode_is_refused(tmp_p
         f"      - provider: opencode\n        model: {want[1]}  {want[2]}",
         CONFIG.read_text(),
     )
-    assert rescued.count(f"model: {want[1]}  {want[2]}") == 5
+    assert rescued.count(f"model: {want[1]}  {want[2]}") == 1
     assert _rule6(_check_with(rescued, dead_kilo)) == []
     problems = _rule6(_check_with(CONFIG.read_text(), dead_kilo))
-    assert len([p for p in problems if "expected opencode/big-pickle" in p]) == 5, problems
+    assert len([p for p in problems if "expected opencode/big-pickle" in p]) == 1, problems
 
 
 # Comment shapes the generator must be able to read back and write out
@@ -1131,22 +1144,19 @@ def test_any_comment_survives_a_parse_emit_validate_round_trip(tmp_path, shape):
     substituted = re.findall(
         rf"(?m)^        model: kilo-auto/free  {re.escape(shape)}$", shaped
     )
-    assert len(substituted) == 5, "the substitution did not reach every chain"
+    assert len(substituted) == 1, "the substitution did not reach the fast chain"
 
     parsed = gen.parse_terminators(shaped)
-    assert {p: v[2] for p, v in parsed.items()} == {p: shape for p in parsed}
+    assert parsed["fast"][2] == shape
 
     # A verdict-less run must preserve it, and the result must still be a valid
-    # config. Compared per profile, not whole-file: the fixture model list has
-    # one model, so the chains legitimately differ from the shipped ones and a
-    # file-level comparison would only prove that.
+    # config. Only `fast` carries the terminator; the other profiles' last
+    # entries are concrete endpoints and keep their own comments.
     out = _run_cli(tmp_path, {}, runs=2, base=shaped)
     assert gen.validate_config_text(out) == []
-    for profile in ("smart", "work", "fast", "large", "decision"):
-        assert _terminator_in(out, profile) == f"kilo-auto/free  {shape}", (
-            f"{profile} terminator comment did not survive: "
-            f"{_terminator_in(out, profile)!r}"
-        )
+    assert _terminator_in(out, "fast") == f"kilo-auto/free  {shape}", (
+        f"terminator comment did not survive: {_terminator_in(out, 'fast')!r}"
+    )
 
 
 def test_a_terminator_with_no_comment_gets_one_rather_than_being_left_bare(tmp_path):
@@ -1157,13 +1167,12 @@ def test_a_terminator_with_no_comment_gets_one_rather_than_being_left_bare(tmp_p
         CONFIG.read_text(),
     )
     parsed = gen.parse_terminators(bare)
-    assert all(v[2] == "" for v in parsed.values()), parsed
+    assert parsed["fast"][2] == "", parsed
     out = _run_cli(tmp_path, {}, runs=2, base=bare)
     assert gen.validate_config_text(out) == []
-    for profile in ("smart", "work", "fast", "large", "decision"):
-        assert _terminator_in(out, profile).split("#", 1)[1].strip(), (
-            f"{profile} terminator was left without a comment"
-        )
+    assert _terminator_in(out, "fast").split("#", 1)[1].strip(), (
+        "the terminator was left without a comment"
+    )
 
 
 def _terminator_in(text, profile):
@@ -1225,7 +1234,7 @@ def test_emit_output_passes_the_generators_own_validator():
     chain = gen.build_chain(
         [_model("m/a:free", "kilocode", 30.0, vision=True),
          _model("m/b:free", "kilocode", 22.0, vision=False)],
-        "work", catalog,
+        "fast", catalog,
     )
     block = "models:\n  smart:\n    chain:\n" + gen.format_chain_yaml(chain) + "\n"
     merged = gen.merge_models_section(CONFIG.read_text(), block)
@@ -1812,3 +1821,65 @@ def test_the_validate_config_harness_has_teeth_beyond_the_protocol_rule(tmp_path
     bad_vision = CONFIG.read_text().replace("        vision: false",
                                             "        vision: maybe", 1)
     assert _validate_config(tmp_path, bad_vision).returncode == 1
+
+
+# --------------------------------------------------------------------------
+# Degenerate-enrichment guard (2026-11-06).
+#
+# Artificial Analysis retired /api/v2/data and returned 410 Gone. Every model
+# fell to SMART_FLOOR=10, only the single Arena-matched model cleared the
+# smart/work thresholds, and the nightly sync wrote a one-entry chain for both.
+# A one-entry chain has no fallback: one provider 429 becomes a client 503. The
+# generator must refuse that write and leave the previous config untouched.
+# --------------------------------------------------------------------------
+
+
+def _floored_models(count: int):
+    return [
+        {
+            "id": f"floored-{i}-free",
+            "provider": "kilocode",
+            "context_length": 262144,
+            "intelligence": 10.0,
+            "intelligence_source": "smart floor",
+            "released": "2026-01-01",
+            "capabilities": {"vision": False},
+            "raw": {},
+        }
+        for i in range(count)
+    ]
+
+
+def test_generator_refuses_to_collapse_smart_and_work(tmp_path):
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps(_floored_models(24)))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(CONFIG.read_text())
+    before = cfg.read_text()
+
+    with pytest.raises(SystemExit, match="refusing to write"):
+        gen.main(["--models", str(models), "--config", str(cfg), "--write"])
+
+    assert cfg.read_text() == before, "a degenerate candidate list must not touch the config"
+
+
+def test_the_collapse_guard_does_not_fire_on_a_small_test_fixture(tmp_path):
+    """Small synthetic fixtures (the CLI ladder tests) stay writable: the guard
+    is about a large list whose scores collapsed, not about list size itself."""
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps([
+        {
+            "id": "qwen/qwen3.8-27b:free",
+            "provider": "kilocode",
+            "context_length": 262144,
+            "intelligence": 33.7,
+            "released": "2026-01-01",
+            "capabilities": {"vision": False},
+            "raw": {},
+        },
+    ]))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(CONFIG.read_text())
+    gen.main(["--models", str(models), "--config", str(cfg), "--write"])
+    text = cfg.read_text()
+    assert "qwen/qwen3.8-27b:free" in text
