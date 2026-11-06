@@ -1217,6 +1217,56 @@ func extractCompletionTokens(body []byte) int {
 // longer than the maximum interruption the client was promised.
 const maxRequestAttemptTimeout = maxSessionInterruption - 5*time.Second
 
+// maxLargeContextAttemptTimeout is the ceiling for a prompt so large that
+// prefill cannot finish inside maxSessionInterruption. Measured 2026-11-06: a
+// ~350k-token prompt was killed at 20-30s on every provider (gemini, Command
+// Code, kilocode), the fallback budget expired with only one real attempt, and
+// the client got a 503. A large-context attempt may spend up to this ceiling;
+// normal requests stay on maxRequestAttemptTimeout.
+const maxLargeContextAttemptTimeout = 5 * time.Minute
+
+// largeContextTokens is the prompt size above which a prefill no longer fits
+// in maxSessionInterruption on typical upstreams. Below it the 30s contract is
+// kept exactly as it was.
+const largeContextTokens = 50_000
+
+// maxLargeContextSessionBudget bounds the whole fallback walk for a large
+// context. It allows one size-derived attempt plus a fallback (2 x the attempt
+// timeout), capped well below the server's write timeout.
+const maxLargeContextSessionBudget = 8 * time.Minute
+
+// prefillKeepalive is how often an attempt waiting for its first token writes
+// an SSE comment to the client. It must stay comfortably below the 30s
+// low-speed timeout clients such as maki apply to a stream.
+const prefillKeepalive = 10 * time.Second
+
+// requestAttemptTimeout is the per-attempt budget one request may use. Small
+// prompts keep the 30s interruption contract via requestTimeout. A large
+// context gets a size-derived budget long enough for prefill: the 30s window
+// plus 2s per 10k tokens above the threshold, capped at
+// maxLargeContextAttemptTimeout.
+func requestAttemptTimeout(tokens int) time.Duration {
+	if tokens < largeContextTokens {
+		return requestTimeout(tokens)
+	}
+	extra := (tokens - largeContextTokens + 9999) / 10000
+	timeout := maxSessionInterruption + time.Duration(extra)*2*time.Second
+	if timeout > maxLargeContextAttemptTimeout {
+		return maxLargeContextAttemptTimeout
+	}
+	return timeout
+}
+
+// attemptCeiling is the hard upper bound on a single attempt for this request.
+// It is the interruption contract for a normal prompt and the large-context
+// prefill ceiling above the threshold.
+func attemptCeiling(tokens int) time.Duration {
+	if tokens >= largeContextTokens {
+		return maxLargeContextAttemptTimeout
+	}
+	return maxSessionInterruption
+}
+
 // requestTimeout returns a timeout that scales with the request context size:
 // 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens (ceil
 // division), capped at maxRequestAttemptTimeout.
@@ -1279,6 +1329,17 @@ const maxFallbackWallClock = maxSessionInterruption
 // the effective ceiling back at minutes — the exact failure the ceiling exists
 // to prevent.
 func fallbackBudget(timeout time.Duration) time.Duration {
+	// A timeout above the normal per-attempt ceiling can only come from a
+	// large-context request. The 30s interruption budget does not fit one
+	// prefill, let alone a fallback, so scale the wall clock to the attempt:
+	// one full attempt plus a second one, capped.
+	if timeout > maxRequestAttemptTimeout {
+		budget := 2*timeout + 10*time.Second
+		if budget > maxLargeContextSessionBudget {
+			budget = maxLargeContextSessionBudget
+		}
+		return budget
+	}
 	budget := maxFallbackWallClock
 	switch {
 	case timeout <= 5*time.Second:
@@ -1618,7 +1679,7 @@ func (g *GatewayContext) interAttemptWait(walk *budgetState, ceiling time.Durati
 func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string, tokens int) {
 	start := time.Now()
 	ctx := r.Context()
-	timeout := requestTimeout(tokens)
+	timeout := requestAttemptTimeout(tokens)
 	// Wall-clock budget for this request's fallback walk. Shared by all four
 	// fallback loops so none can ship without the bound.
 	walk := newBudgetState(start, timeout)
@@ -1760,7 +1821,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if g.proxy.effectiveProtocol(ep) == protocolCommandCode && g.providerMaxInterruption(ep.Provider) > perAttemptBase {
 			perAttemptBase = g.providerMaxInterruption(ep.Provider)
 		}
-		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
+		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
@@ -2117,7 +2178,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, body []byte, req *ChatCompletionRequest, sessionID string, tokens int) {
 	start := time.Now()
 	ctx := r.Context()
-	timeout := requestTimeout(tokens)
+	timeout := requestAttemptTimeout(tokens)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -2304,11 +2365,17 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// for a short window (a local endpoint that answers in milliseconds)
 		// does not hold a client open for 30s on its cooldown.
 		ceiling := g.providerMaxInterruption(ep.Provider)
+		// A large context cannot prefill inside the normal provider window.
+		// Raise the ceiling to the request's size-derived timeout so the healthy
+		// provider gets a chance instead of being killed at 30s.
+		if tokens >= largeContextTokens && ceiling < timeout {
+			ceiling = timeout
+		}
 		perAttemptBase := timeout
 		if g.proxy.effectiveProtocol(ep) == protocolCommandCode && ceiling > perAttemptBase {
 			perAttemptBase = ceiling
 		}
-		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, maxSessionInterruption))
+		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			if accumulatedContent == "" {
@@ -2359,7 +2426,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				err = context.DeadlineExceeded
 				break
 			}
-			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, proxyTimeout, sessionID, StreamAttemptOptions{
+			streamOpts := StreamAttemptOptions{
 				// The client-visible silence allowed on this attempt is
 				// bounded by what the walk has LEFT, not by its original
 				// budget: the watchdog firing after the budget is spent turns
@@ -2369,7 +2436,14 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				OnProgress:     walk.markProgress,
 				Reasoning:      &attemptReasoning,
 				Direct:         directNext,
-			})
+			}
+			if tokens >= largeContextTokens {
+				// Prefill can run for minutes; keep the client's low-speed
+				// timer from killing the connection before the first token.
+				streamOpts.AllowLongPrefill = true
+				streamOpts.KeepaliveInterval = prefillKeepalive
+			}
+			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, proxyTimeout, sessionID, streamOpts)
 			if err != nil {
 				if errors.Is(err, ErrUpstreamSaturated) {
 					writeAPIError(w, http.StatusServiceUnavailable, "Upstream saturated", "server_error", "upstream_saturated")

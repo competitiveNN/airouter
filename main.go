@@ -143,8 +143,10 @@ func main() {
 		Handler:           recoveryMiddleware(mux),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      300 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// Large-context requests can spend minutes in prefill; a 5m write
+		// deadline cut them off before the fallback walk could finish.
+		WriteTimeout: 15 * time.Minute,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// The Command Code endpoint is a second, self-contained OpenAI-compatible

@@ -46,6 +46,19 @@ type StreamAttemptOptions struct {
 	// 'messages[N].reasoning_content'"), so a mid-stream failover died on
 	// arrival at the one provider that could have continued the answer.
 	Reasoning *strings.Builder
+
+	// AllowLongPrefill lets the attempt exceed the normal 30s interruption
+	// ceiling. It exists for the Command Code shim: a very large prompt spends
+	// more than 30s in prefill before the first event, and clamping it produced
+	// a guaranteed 502. The caller must also pass a size-derived timeout; this
+	// flag only removes the ceiling, it does not invent a budget.
+	AllowLongPrefill bool
+
+	// KeepaliveInterval, when > 0, writes an SSE comment to the client on this
+	// cadence while the attempt is waiting for its first client-visible byte.
+	// A long prefill is otherwise indistinguishable from a dead connection to
+	// the client's low-speed timeout. Keepalives stop at the first real write.
+	KeepaliveInterval time.Duration
 }
 
 // progressWriter observes successful writes to the client. It is deliberately
@@ -67,6 +80,56 @@ func (w *progressWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// keepaliveWriter writes SSE comments until the first real byte is written.
+// The stop function is idempotent and blocks until the ticker goroutine has
+// exited, so no keepalive can interleave with the first event or with an error
+// body written after the attempt returns.
+type keepaliveWriter struct {
+	w    io.Writer
+	stop func()
+	once sync.Once
+}
+
+func (k *keepaliveWriter) Write(p []byte) (int, error) {
+	k.once.Do(k.stop)
+	return k.w.Write(p)
+}
+
+// startSSEKeepalive returns a writer that emits ": keepalive\n\n" every
+// interval until its first Write, plus the stop function (safe to call more
+// than once). A nil flusher or a non-positive interval disables it.
+func startSSEKeepalive(w io.Writer, flusher http.Flusher, interval time.Duration) (*keepaliveWriter, func()) {
+	if interval <= 0 || flusher == nil {
+		return &keepaliveWriter{w: w, stop: func() {}}, func() {}
+	}
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-t.C:
+				if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(stopCh)
+			<-done
+		})
+	}
+	return &keepaliveWriter{w: w, stop: stop}, stop
+}
+
 type Proxy struct {
 	client *http.Client
 	// baseTransport is the shared transport. An attempt that needs its own
@@ -86,6 +149,14 @@ type Proxy struct {
 	// the direct one.
 	ccTransport *http.Transport
 	ccClient    *http.Client
+
+	// longClient/longTransport are the direct path for a large-context attempt,
+	// with a response-header budget large enough to cover prefill. The
+	// per-request context/attempt timer still bounds every attempt, so a short
+	// request cannot wait longer than its own budget merely because this
+	// transport's header timeout is larger.
+	longClient    *http.Client
+	longTransport *http.Transport
 
 	// protocolFor resolves an endpoint's effective protocol, consulting the
 	// router's learned map. Injected after construction for the same reason
@@ -236,7 +307,8 @@ func (p *Proxy) MarkProxyReady(proxyURL string) {
 func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration, allowProxy bool) (*http.Client, *ProxyInfo) {
 	client := p.client
 	transport := p.baseTransport
-	if p.effectiveProtocol(ep) == protocolCommandCode {
+	isCommandCode := p.effectiveProtocol(ep) == protocolCommandCode
+	if isCommandCode {
 		client = p.commandCodeClient()
 		transport = p.commandCodeTransport()
 	}
@@ -277,7 +349,16 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration, allowPro
 	// the shared pool and its idle connections stay intact instead of being
 	// re-dialed on every hop and every fallback attempt.
 	if usedProxy == nil && transport != nil {
-		client = &http.Client{Transport: transport}
+		if timeout > maxRequestAttemptTimeout && p.longClient != nil {
+			// The shared transport caps the response-header wait at
+			// maxRequestAttemptTimeout. Providers prefill before sending the
+			// headers, so that cap would kill a large-context attempt long
+			// before its own (larger) budget. The long client's per-attempt
+			// context is still bounded by the caller's timeout.
+			client = p.longClient
+		} else {
+			client = &http.Client{Transport: transport}
+		}
 	}
 	return client, usedProxy
 }
@@ -403,6 +484,14 @@ func NewProxy(cfg *Config) *Proxy {
 		streamIdleTimeout: defaultStreamIdleTimeout,
 	}
 	p.baseTransport = p.client.Transport.(*http.Transport)
+
+	// Large-context attempts prefill before the upstream writes headers, so the
+	// shared transport's 25s ResponseHeaderTimeout is too short. Give them a
+	// pooled transport with the large-context ceiling; the per-attempt context
+	// still enforces the real budget.
+	p.longTransport = p.baseTransport.Clone()
+	p.longTransport.ResponseHeaderTimeout = maxLargeContextAttemptTimeout
+	p.longClient = &http.Client{Transport: p.longTransport}
 
 	// Upstream concurrency cap: bounds how many upstream attempts run at
 	// once so a client burst cannot become unbounded dial fan-out. Sorted,
@@ -861,6 +950,15 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	if p.effectiveProtocol(&endpoint) == protocolCommandCode {
 		client = p.commandCodeClient()
 	}
+	// Large-context attempts prefill before the upstream writes headers, so the
+	// shared transport's 25s ResponseHeaderTimeout is too short. If this request
+	// has a larger deadline, use the long transport; the deadline still bounds
+	// the attempt.
+	if deadline, ok := ctx.Deadline(); ok && p.longClient != nil {
+		if remaining := time.Until(deadline); remaining > maxRequestAttemptTimeout {
+			client = p.longClient
+		}
+	}
 
 	// The proxy selected for this attempt, if any. Used to wrap dial failures
 	// as ProxyError so the router can cool down the proxy instead of the
@@ -1062,24 +1160,39 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	// model. Measured 2026-11-02: a 9.9k-token `work` request had a 6s attempt
 	// budget, the nvidia2 provider's configured `timeout: 20s` raised the
 	// attempt to 20s, the upstream stayed silent, and the client got a 503 with
-	// a healthy model still untried in the chain. The Command Code floor below
-	// is deliberate and stays: prefill there is genuinely slower than the
-	// size-derived estimate (see commandcode_api.go).
+	// a healthy model still untried in the chain.
 	if providerCfg.Timeout > 0 && (timeout <= 0 || providerCfg.Timeout < timeout) {
 		timeout = providerCfg.Timeout
 	}
-	if p.effectiveProtocol(&endpoint) == protocolCommandCode && providerCfg.MaxInterruption > timeout {
-		timeout = providerCfg.MaxInterruption
+	// Deliberately no `max_interruption` floor here. Callers that need one
+	// apply it BEFORE the fallback walk clamps the attempt to the budget that
+	// is left (api.go's perAttemptBase, commandcode_api.go's own floor). Doing
+	// it again here undid the walk's first-attempt reserve: a Command Code
+	// attempt was raised back to 30s while the entire interruption budget was
+	// 30s, so it timed out and the client got "budget exhausted after 1
+	// attempt" with every other endpoint untried (measured 2026-11-06, every
+	// ~2 minutes). Same failure class as the 2026-11-02 provider-timeout floor.
+	ceiling := maxSessionInterruption
+	if opts.AllowLongPrefill {
+		// A very large prompt cannot produce its first event inside the
+		// normal interruption window. The caller opts in and supplies a
+		// timeout derived from the prompt size.
+		ceiling = maxLargeContextAttemptTimeout
 	}
-	if timeout > maxSessionInterruption {
-		timeout = maxSessionInterruption
+	if timeout > ceiling {
+		timeout = ceiling
 	}
 	maxIdle := p.streamIdleTimeout
 	if opts.MaxIdleTimeout > 0 {
 		maxIdle = minDuration(maxIdle, opts.MaxIdleTimeout)
 	}
-	if maxIdle > maxSessionInterruption {
-		maxIdle = maxSessionInterruption
+	// The idle watchdog also starts before the first byte, so it must cover
+	// prefill too when the attempt is allowed to outlast the normal ceiling.
+	if opts.AllowLongPrefill && timeout > maxIdle {
+		maxIdle = timeout
+	}
+	if maxIdle > ceiling {
+		maxIdle = ceiling
 	}
 
 	// One deadline covers the WHOLE pre-output attempt: DNS, dial, TLS,
@@ -1121,6 +1234,21 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	req, err := p.buildRequest(attemptCtx, body, endpoint, &providerCfg, true, sessionID)
 	if err != nil {
 		return "", nil, 0, err
+	}
+
+	// A long prefill emits no bytes the client can use. Without a keepalive the
+	// client's own low-speed timer kills the connection before the upstream
+	// answers, so the attempt gets no chance to use its extended budget.
+	//
+	// This starts before client.Do because Command Code may do its prefill
+	// before sending the response headers. The first comment is delayed by a
+	// full interval, so an upstream that refuses immediately (429/401) still
+	// returns its real status and the caller can fail over; only a genuinely
+	// slow attempt commits the 200 + SSE response.
+	if opts.KeepaliveInterval > 0 {
+		keepalive, stop := startSSEKeepalive(w, flusher, opts.KeepaliveInterval)
+		defer stop()
+		w = keepalive
 	}
 
 	// The header wait is bounded by the SAME size-based budget as

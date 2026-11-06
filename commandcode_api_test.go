@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ccShimNDJSON is a minimal successful Command Code event stream: a start
@@ -672,5 +673,22 @@ func TestCommandCodeShimListsFallbackOnCatalogError(t *testing.T) {
 	}
 	if len(ids) != 2 || !ids["cc/one"] || !ids["cc/two"] {
 		t.Fatalf("listed = %v, want exactly cc/one and cc/two (fallback)", ids)
+	}
+}
+
+// A very large prompt spends longer in Command Code prefill than the normal
+// 30s interruption budget allows. The shim must give it a size-derived budget
+// (and cap it), or every large-context request is a guaranteed 502.
+func TestCommandCodeAttemptTimeoutScalesForLargeContexts(t *testing.T) {
+	if got, want := commandCodeAttemptTimeout(2_000), requestTimeout(2_000); got != want {
+		t.Fatalf("small prompt timeout = %v, want the generic %v", got, want)
+	}
+	// 350k tokens: 30s floor + 2s for each of the 30 ten-thousand-token
+	// blocks above the 50k threshold.
+	if got, want := commandCodeAttemptTimeout(350_000), 90*time.Second; got != want {
+		t.Fatalf("350k-token timeout = %v, want %v", got, want)
+	}
+	if got := commandCodeAttemptTimeout(10_000_000); got != maxLargeContextAttemptTimeout {
+		t.Fatalf("huge prompt timeout = %v, want the %v ceiling", got, maxLargeContextAttemptTimeout)
 	}
 }

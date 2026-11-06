@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -306,6 +307,33 @@ func sessionIndex(sessionID string, n int) int {
 	return int(h % uint32(n))
 }
 
+// commandCodeAttemptTimeout returns how long one Command Code attempt may take
+// before the shim gives up on it. It is the gateway-wide large-context policy:
+// a prompt too large to prefill inside the 30s interruption window gets a
+// size-derived budget (30s + 2s per 10k tokens above the threshold, capped).
+func commandCodeAttemptTimeout(tokens int) time.Duration {
+	return requestAttemptTimeout(tokens)
+}
+
+// ccWriteTracker records whether anything has reached the client's response.
+// Once a prefill keepalive has been flushed the response is committed to
+// 200 + SSE, so a later failure must terminate the stream with an event
+// instead of trying to write a 502 status line into it.
+type ccWriteTracker struct {
+	w     io.Writer
+	wrote atomic.Bool
+}
+
+func (t *ccWriteTracker) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if n > 0 {
+		t.wrote.Store(true)
+	}
+	return n, err
+}
+
+func (t *ccWriteTracker) Wrote() bool { return t.wrote.Load() }
+
 // HandleChatCompletions serves POST /v1/chat/completions.
 func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !s.gateway.checkAuth(r) {
@@ -360,7 +388,8 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 		writeAPIError(w, 503, "No Command Code provider is configured", "server_error", "provider_not_configured")
 		return
 	}
-	timeout := requestTimeout(estimateTokensFromBody(body))
+	tokens := estimateTokensFromBody(body)
+	timeout := commandCodeAttemptTimeout(tokens)
 	providerCfg := s.gateway.config.Load().Providers[eps[0].Provider]
 	if providerCfg.Timeout > 0 && providerCfg.Timeout > timeout {
 		timeout = providerCfg.Timeout
@@ -368,15 +397,17 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 	// Command Code prefill is slower than the default 1s/10k estimate assumes;
 	// floor the per-attempt budget at the provider's max_interruption so a
 	// moderately large context does not time out (and then poison the provider
-	// with a cooldown that fails every subsequent request).
+	// with a cooldown that fails every subsequent request). Large contexts have
+	// already been given a bigger budget above, so this floor only raises the
+	// small/medium case.
 	if providerCfg.MaxInterruption > 0 && providerCfg.MaxInterruption > timeout {
 		timeout = providerCfg.MaxInterruption
 	}
-	if timeout > maxSessionInterruption {
-		timeout = maxSessionInterruption
+	if timeout > maxLargeContextAttemptTimeout {
+		timeout = maxLargeContextAttemptTimeout
 	}
 	if head.Stream {
-		s.stream(w, r, body, model, eps, sessionID, timeout)
+		s.stream(w, r, body, model, eps, sessionID, timeout, tokens >= largeContextTokens)
 		return
 	}
 	s.complete(w, r, body, model, eps, sessionID, timeout)
@@ -387,7 +418,7 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 // of having two keys on one upstream); once output has started the stream
 // belongs to the client and a restart would duplicate text, so the attempt's
 // outcome is final.
-func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []byte, model string, eps []ModelEndpoint, sessionID string, timeout time.Duration) {
+func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []byte, model string, eps []ModelEndpoint, sessionID string, timeout time.Duration, longPrefill bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -421,6 +452,7 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 	}
 	defer sendDone()
 
+	tracker := &ccWriteTracker{w: w}
 	var lastErr error
 	for i := range eps {
 		ep := eps[i]
@@ -428,9 +460,16 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 			continue
 		}
 		attemptStart := time.Now()
+		opts := StreamAttemptOptions{MaxIdleTimeout: timeout}
+		if longPrefill {
+			// The attempt may spend minutes in prefill; keep the client's
+			// connection warm and let the proxy's interruption ceiling rise
+			// with the size-derived budget.
+			opts.AllowLongPrefill = true
+			opts.KeepaliveInterval = prefillKeepalive
+		}
 		partial, _, _, err := s.gateway.proxy.StreamToClient(
-			r.Context(), w, flusher, body, ep, timeout, sessionID,
-			StreamAttemptOptions{MaxIdleTimeout: timeout},
+			r.Context(), tracker, flusher, body, ep, timeout, sessionID, opts,
 		)
 		if err == nil {
 			// StreamToClient emits [DONE] on success; mark as sent so the
@@ -448,6 +487,17 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 			// the client hanging on a truncated stream.
 			log.Printf("[commandcode] session=%s model=%s provider=%s: stream failed after %d bytes: %v",
 				sessionID, model, ep.Provider, len(partial), err)
+			return
+		}
+		if tracker.Wrote() {
+			// A prefill keepalive already committed the response to 200 + SSE.
+			// A second provider cannot help the client now, and writing an HTTP
+			// 502 status line into the stream would corrupt it. Terminate with
+			// the SSE error event the client can actually parse.
+			log.Printf("[commandcode] session=%s model=%s provider=%s: attempt failed after a keepalive: %v",
+				sessionID, model, ep.Provider, err)
+			s.penalize(&ep, err, 0, sessionID)
+			writeSSEError(w, flusher, fmt.Sprintf("Command Code upstream failed: %v", err))
 			return
 		}
 		log.Printf("[commandcode] session=%s model=%s provider=%s: attempt failed before output: %v",

@@ -1287,3 +1287,27 @@ func TestFirstAttemptCannotSpendTheWholeBudget(t *testing.T) {
 		t.Fatalf("small-request timeout = %v, want 5s", got)
 	}
 }
+
+// TestLargeContextAttemptAndBudget scales out of the 30s contract above the
+// threshold. A prompt that cannot prefill inside 30s used to get only a 20-25s
+// attempt and a 30s walk, so the first timeout exhausted the budget and the
+// client got a 503 with the healthy providers untried.
+func TestLargeContextAttemptAndBudget(t *testing.T) {
+	if got, want := requestAttemptTimeout(4), requestTimeout(4); got != want {
+		t.Fatalf("small prompt timeout = %v, want the unchanged %v", got, want)
+	}
+	if got, want := requestAttemptTimeout(350_000), 90*time.Second; got != want {
+		t.Fatalf("350k-token attempt timeout = %v, want %v", got, want)
+	}
+	if got, want := fallbackBudget(requestAttemptTimeout(350_000)), 190*time.Second; got != want {
+		t.Fatalf("350k-token walk budget = %v, want %v", got, want)
+	}
+	walk := newBudgetState(time.Now(), requestAttemptTimeout(350_000))
+	walk.next()
+	if got := walk.attemptTimeout(90 * time.Second); got != 90*time.Second {
+		t.Fatalf("first large-context attempt = %v, want the full 90s", got)
+	}
+	if got := requestAttemptTimeout(10_000_000); got != maxLargeContextAttemptTimeout {
+		t.Fatalf("huge prompt timeout = %v, want the %v ceiling", got, maxLargeContextAttemptTimeout)
+	}
+}
