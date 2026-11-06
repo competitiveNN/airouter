@@ -58,7 +58,14 @@ OPENCODE_MODELS_URL = OPENCODE_ENDPOINT + "/models"
 GOOGLE_AI_STUDIO_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 NVIDIA_NIM_ENDPOINT = "https://integrate.api.nvidia.com/v1/models"
 COMMANDCODE_ENDPOINT = "https://api.commandcode.ai/provider/v1/models"
-ARTIFICIAL_ANALYSIS_ENDPOINT = "https://artificialanalysis.ai/api/v2/data/llms/models"
+# Artificial Analysis retired the legacy /api/v2/data/* endpoints on
+# 2026-11-04 (they now answer 410 Gone). The free replacement is
+# /api/v2/language/models/free: paginated, a `data` list with `slug`,
+# `release_date`, and headline indices under `evaluations`. Left un-migrated,
+# the 410 floored every model at SMART_FLOOR=10 and collapsed smart/work to the
+# single model that happened to have an Arena ELO -- the nightly sync wrote that
+# degenerate config and clients started getting 503s on any work request.
+ARTIFICIAL_ANALYSIS_ENDPOINT = "https://artificialanalysis.ai/api/v2/language/models/free"
 # arena.ai does not publish a public API for its leaderboard; this mirrors the
 # exact snapshot archived at the repo below (the code-arena leaderboard at
 # https://arena.ai/leaderboard/code). ELO is used as a FALLBACK intelligence
@@ -2574,6 +2581,12 @@ def fetch_artificial_analysis_data(force: bool = False) -> dict[str, dict[str, A
     snapshot may predate) is scored this run instead of falling to the smart
     floor. Key-less or failed forced fetches fall back to the last valid
     snapshot, so a forced refresh can never empty the enrichment.
+
+    The V2 free endpoint is paginated (200 models per page, ~4 pages), so this
+    walks every page. A response with zero scored models is treated as a failed
+    fetch, never as a valid empty snapshot: writing it to the cache would erase
+    the scores for a whole day and silently floor the whole fleet (what the
+    2026-11-04 /api/v2/data retirement did).
     """
     # Try cache first (skip it on a forced refresh)
     cached = None if force else load_cache()
@@ -2590,13 +2603,25 @@ def fetch_artificial_analysis_data(force: bool = False) -> dict[str, dict[str, A
         return {}
 
     print("Fetching intelligence scores and release dates from Artificial Analysis API...", file=sys.stderr)
-    req = urllib.request.Request(
-        ARTIFICIAL_ANALYSIS_ENDPOINT,
-        headers={"Accept": "application/json", "x-api-key": api_key}
-    )
+    records: list[dict[str, Any]] = []
+    page = 1
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        while True:
+            req = urllib.request.Request(
+                f"{ARTIFICIAL_ANALYSIS_ENDPOINT}?page={page}",
+                headers={"Accept": "application/json", "x-api-key": api_key},
+            )
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(data, dict) or "data" not in data:
+                raise ValueError("unexpected response shape")
+            records.extend(data["data"])
+            pagination = data.get("pagination") or {}
+            if not pagination.get("has_more"):
+                break
+            page += 1
+            if page > 100:
+                raise ValueError("pagination did not terminate")
     except Exception as e:
         print(f"Artificial Analysis: fetch failed: {e}", file=sys.stderr)
         if force:
@@ -2604,15 +2629,8 @@ def fetch_artificial_analysis_data(force: bool = False) -> dict[str, dict[str, A
             return load_cache() or {}
         return {}
 
-    if not data or not isinstance(data, dict) or "data" not in data:
-        print("Artificial Analysis: no data or unexpected format", file=sys.stderr)
-        if force:
-            print("Artificial Analysis: forced refresh returned unusable data; falling back to the last valid snapshot.", file=sys.stderr)
-            return load_cache() or {}
-        return {}
-
     result = {}
-    for model in data["data"]:
+    for model in records:
         slug = model.get("slug", "")
         if not slug:
             continue
@@ -2635,7 +2653,18 @@ def fetch_artificial_analysis_data(force: bool = False) -> dict[str, dict[str, A
         if entry:
             result[slug] = entry
 
-    print(f"Artificial Analysis: found {len(result)} models with data", file=sys.stderr)
+    scored = sum(1 for v in result.values() if "intelligence" in v)
+    print(f"Artificial Analysis: found {len(result)} models with data ({scored} scored)", file=sys.stderr)
+    if scored == 0:
+        # An all-unscored snapshot is indistinguishable from a broken/retired
+        # endpoint. If the previous cache still has scores, keep it and fail over
+        # to it; never overwrite a scored snapshot with an unscored one.
+        previous = load_cache() or {}
+        if any("intelligence" in v for v in previous.values()):
+            print("Artificial Analysis: no scored models in response; keeping previous snapshot", file=sys.stderr)
+            return previous
+    save_cache(result)
+    return result
     save_cache(result)
     return result
 

@@ -54,6 +54,29 @@ for t in git python3 go flock; do
   command -v "$t" >/dev/null 2>&1 || { echo "$P $t not found" >&2; exit 2; }
 done
 
+# The config stages need pyyaml and pytest. The distro `python3` on this host is
+# a bare interpreter (3.15, no pip, no site-packages for either), so invoking it
+# directly made `config rules check`, `config pytest` and `mutation-check` fail
+# with ModuleNotFoundError -- a red gate that says nothing about the code. Pick
+# an interpreter that can import both, preferring a project venv, and fall back
+# to python3 so the error names the real problem if none is available.
+PYTHON="${GATE_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for candidate in "$REPO/.venv/bin/python" "$HOME/.venvs/airouter/bin/python"; do
+    if [ -x "$candidate" ] && "$candidate" -c 'import yaml, pytest' 2>/dev/null; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$PYTHON" ]; then
+  PYTHON=python3
+fi
+if ! "$PYTHON" -c 'import yaml, pytest' 2>/dev/null; then
+  echo "$P $PYTHON cannot import pyyaml and pytest; set GATE_PYTHON to an interpreter that can" >&2
+  exit 2
+fi
+
 tree_fingerprint() {
   # HEAD plus the full worktree state. `git status` covers staged, unstaged and
   # untracked; hashing it catches a revert-and-restore cycle only if the content
@@ -549,13 +572,13 @@ run "dist-freshness-check"    bash "$REPO/scripts/dist-freshness-check.sh"
 # covers the structural half (profiles, providers, api_key_env); this covers
 # the half that needs the data. It degrades to a NOTICE, not a pass, when no
 # model list is present.
-run "config rules check"      python3 "$REPO/scripts/check-rules.py" --config "$REPO/config.yaml"
+run "config rules check"      "$PYTHON" "$REPO/scripts/check-rules.py" --config "$REPO/config.yaml"
 
 # The Go suite itself, measured rather than run: `go test ./...` is green when a
 # third of the tests have gone missing, and was green once when a test file was
 # truncated. This is the only place the SUITE has a contract, so it is the only
 # place losing a test is a failure rather than a smaller success.
-run "test-suite-check" python3 "$REPO/scripts/test-suite-check.py"
+run "test-suite-check" "$PYTHON" "$REPO/scripts/test-suite-check.py"
 
 # Every concurrent stage has finished. The verdicts are replayed here, in
 # registration order, so the output below reads exactly like a serial run.
@@ -610,7 +633,7 @@ run "sse-negative-check" bash "$REPO/scripts/sse-negative-check.sh"
 # COLLECT came back as "No tests collected" with exit status 0. The runner
 # asserts a collection floor, so "the suites passed" here means they ran.
 
-run "config pytest"           python3 "$REPO/scripts/run-config-tests.py"
+run "config pytest"           "$PYTHON" "$REPO/scripts/run-config-tests.py"
 
 # The tests above are only worth their runtime if they can fail. This plants a
 # defect in the sync chain, proves the suite goes red, restores the tree and
@@ -621,8 +644,8 @@ run "config pytest"           python3 "$REPO/scripts/run-config-tests.py"
 # killed mid-mutation (SIGKILL/OOM — the paths a finally cannot cover) makes
 # every later result untrustworthy, and the only thing that notices is this.
 
-run "mutation preflight"     python3 "$REPO/scripts/mutation-check.py" --preflight
-run "mutation-check"         python3 "$REPO/scripts/mutation-check.py"
+run "mutation preflight"     "$PYTHON" "$REPO/scripts/mutation-check.py" --preflight
+run "mutation-check"         "$PYTHON" "$REPO/scripts/mutation-check.py"
 
 # The handoff document, executed rather than grepped; see the file for why that
 # distinction is the whole point of it.

@@ -19,6 +19,30 @@ if [ -f "$PROJECT_DIR/.envrc" ]; then
     set +a
 fi
 
+# regenerate_config.py and validate-config.py parse YAML, and a bare `python3`
+# on this host is the distro interpreter, which ships without pyyaml (it was
+# 3.15 with no pip). The sync used to depend on whichever python3 systemd
+# resolved to; when that lost pyyaml the regeneration step died and restored the
+# previous config every night without anyone noticing. Pick an interpreter that
+# can actually import yaml, and fail loudly if there is none.
+PYTHON="${SYNC_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for candidate in "$PROJECT_DIR/.venv/bin/python" "$HOME/.venvs/airouter/bin/python"; do
+        if [ -x "$candidate" ] && "$candidate" -c 'import yaml' 2>/dev/null; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    PYTHON=python3
+fi
+if ! "$PYTHON" -c 'import yaml' 2>/dev/null; then
+    echo "[sync] ERROR: $PYTHON cannot import pyyaml; set SYNC_PYTHON to an interpreter that can" >&2
+    exit 1
+fi
+echo "[sync] using python: $PYTHON"
+
 echo "[sync] fetching free model list..."
 # The fetcher issues a few dozen API calls. --probe-auto calls both chain
 # terminators (kilocode kilo-auto/free, opencode big-pickle) with one real
@@ -26,7 +50,7 @@ echo "[sync] fetching free model list..."
 # list. regenerate_config.py acts on it: it will not write a refused terminator,
 # and it treats "no verdict" (a 429, a 5xx, a timeout) as no evidence at all.
 # Two extra calls per run.
-python3 "$PROJECT_DIR/fetch-free-models.py" --json --probe-auto \
+"$PYTHON" "$PROJECT_DIR/fetch-free-models.py" --json --probe-auto \
     --save "$MODELS_JSON"
 
 cp "$PROJECT_DIR/config.yaml" "$BACKUP"
@@ -62,14 +86,14 @@ echo "[sync] regenerating config.yaml..."
 # provider API reports that class of failure. It is recorded in cooldowns.db,
 # which the daemon owns and acts on at request time -- the cooldown is the
 # backoff, and the sync does not second-guess it.
-if ! python3 "$PROJECT_DIR/regenerate_config.py" --write; then
+if ! "$PYTHON" "$PROJECT_DIR/regenerate_config.py" --write; then
     echo "[sync] ERROR: regeneration failed, restoring previous config" >&2
     cp "$BACKUP" "$PROJECT_DIR/config.yaml"
     exit 1
 fi
 
 echo "[sync] validating config..."
-if ! python3 "$PROJECT_DIR/scripts/validate-config.py"; then
+if ! "$PYTHON" "$PROJECT_DIR/scripts/validate-config.py"; then
     echo "[sync] ERROR: invalid config, restoring previous one" >&2
     cp "$BACKUP" "$PROJECT_DIR/config.yaml"
     exit 1
@@ -82,7 +106,7 @@ fi
 # pair), the auto-fallback terminator, vision+intelligence sync against the
 # fetched records, and dead/invented ids all fail the sync here.
 echo "[sync] checking distribution rules against $MODELS_JSON..."
-if ! python3 "$PROJECT_DIR/scripts/check-rules.py" \
+if ! "$PYTHON" "$PROJECT_DIR/scripts/check-rules.py" \
         --config "$PROJECT_DIR/config.yaml" --models "$MODELS_JSON"; then
     echo "[sync] ERROR: config violates the distribution rules, restoring previous one" >&2
     cp "$BACKUP" "$PROJECT_DIR/config.yaml"
