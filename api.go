@@ -1462,11 +1462,13 @@ func (b *budgetState) attemptTimeout(preferred time.Duration) time.Duration {
 // cycleBackSleep returns how long the cycle-back waiter may sleep, and false
 // when the request must give up NOW instead of waiting.
 //
-// The wait is capped at the provider's own interruption ceiling (30s by
+// The sleep is capped at the provider's own interruption ceiling (30s by
 // default), so a long cooldown cannot hold a request open indefinitely. The
-// cap is not the whole story: a wait that outlasts the budget the request has
-// left is pure latency, because the loop re-checks the budget the instant the
-// wait ends and returns the 503 the budget was going to force anyway.
+// cap is not the whole story: a cooldown that outlasts the budget the request
+// has left is pure latency, because the loop re-checks the budget when the
+// sleep ends and returns the 503 the budget was going to force anyway. That
+// comparison uses the REAL cooldown, not the capped sleep: waiting 30s of a
+// 16-minute cooldown would otherwise repeat until the budget ran out.
 //
 // Measured on 2026-10-20 against a 30s transport cooldown and a 12s
 // small-request budget: the request was held open for 30.2s and then returned
@@ -1479,6 +1481,14 @@ func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration
 	if ceiling > maxSessionInterruption {
 		ceiling = maxSessionInterruption
 	}
+	// A cooldown that outlasts the budget cannot help. Compare the ACTUAL
+	// wait, not the capped sleep: sleeping 30s out of a 16-minute cooldown and
+	// re-checking merely repeats until the budget is spent and returns the
+	// same 503 minutes later. Only a cooldown that can expire inside the
+	// remaining budget is worth waiting for.
+	if wait <= 0 || wait >= walk.remaining() {
+		return 0, false
+	}
 	sleep := minDuration(wait, ceiling)
 	// Full jitter on wake: sessions waiting on the same cooldown still
 	// wake at slightly different moments so they do not re-hit the provider
@@ -1490,9 +1500,6 @@ func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration
 		if jitter > 0 {
 			sleep -= time.Duration(rand.Int64N(int64(jitter)))
 		}
-	}
-	if remaining := walk.remaining(); sleep >= remaining {
-		return 0, false
 	}
 	return sleep, true
 }
@@ -1744,6 +1751,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					return
 				}
 			}
+			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 503", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
@@ -1801,6 +1809,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				}
 				continue
 			}
+			log.Printf("[debug] session=%s model=%s -> no usable endpoint after %d attempts in %v (budget %v); returning 503", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return
@@ -2281,6 +2290,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 					return
 				}
 			}
+			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 503", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			// sendDone fires via defer
 			g.recordRequest(req.Model, 503, time.Since(start))
@@ -2339,6 +2349,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				}
 				continue
 			}
+			log.Printf("[debug] session=%s model=%s -> no usable endpoint after %d attempts in %v (budget %v); returning 503", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			writeSSEError(w, flusher, "All models are currently unavailable")
 			g.recordRequest(req.Model, 503, time.Since(start))
 			return

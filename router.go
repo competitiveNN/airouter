@@ -1235,12 +1235,55 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 		// chains rather than spin inside one.
 	}
 
-	// No chain has an untried usable endpoint. Per the one-attempt-per-model
-	// policy we do NOT cycle back to already-tried endpoints; instead we
-	// fail fast so the request chain's wall-clock budget stays low.
-	// If the caller wants to wait for a cooldown to expire, it can do so
-	// on the next request.
-	return nil, 0
+	// No chain has a usable endpoint right now. Two cases are different:
+	//
+	//   - Endpoints this request already TRIED: one attempt per model, so do
+	//     not cycle back to them. Fail fast.
+	//   - Endpoints this request has NOT tried that are only temporarily
+	//     cooled: report the shortest cooldown so the caller can sleep and
+	//     retry within its wall-clock budget. A 37.5s 429 cooldown must not
+	//     become an immediate client 503 while two minutes of budget remain.
+	//
+	// Measured 2026-11-07: "no usable endpoint after 4 attempts in 1.6s
+	// (budget 2m42s); returning 503" while gemini/ollama had 37.5s left and
+	// commandcode 30s. The caller still caps the wait at the remaining budget,
+	// so a long cooldown on a small request continues to fail fast.
+	var best time.Duration
+	for _, chainName := range chains {
+		mc, hasChain := cfg.Models[chainName]
+		if !hasChain {
+			continue
+		}
+		for i := range mc.Chain {
+			cand := &mc.Chain[i]
+			if tried[cand.Key()] || !r.visionEligible(cand, requireVision) || !contextFits(cand, promptTokens) {
+				continue
+			}
+			if w := r.cooldownWaitLocked(cand); w > 0 && (best == 0 || w < best) {
+				best = w
+			}
+		}
+	}
+	return nil, best
+}
+
+// cooldownWaitLocked is how long until ep could become available again because
+// of a timed backoff (host-level or endpoint-level), or 0 when none is
+// pending. The caller must hold r.mu.
+func (r *Router) cooldownWaitLocked(ep *ModelEndpoint) time.Duration {
+	now := time.Now()
+	var wait time.Duration
+	if hk := r.hostKeyForProviderLocked(ep.Provider); hk != "" {
+		if hc, ok := r.hostCooldowns[hk]; ok && now.Before(hc.Expiry) {
+			wait = hc.Expiry.Sub(now)
+		}
+	}
+	if cd, ok := r.cooldowns[ep.Key()]; ok && now.Before(cd.Expiry) {
+		if w := cd.Expiry.Sub(now); w > wait {
+			wait = w
+		}
+	}
+	return wait
 }
 
 // SkipSameHost marks, in the caller's per-request tried set, every endpoint on

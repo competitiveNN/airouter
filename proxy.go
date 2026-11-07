@@ -521,27 +521,119 @@ func NewProxy(cfg *Config) *Proxy {
 var geminiStripFields = []string{"thinking", "thinking_budget", "reasoning", "reasoning_effort"}
 
 // sanitizeRequestBody removes provider-specific unsupported fields from the
-// request JSON, recursing into nested objects and arrays. It returns the
-// original body unchanged if nothing applies or on a parse failure (fail-open
-// so we never drop a valid request).
+// request JSON, recursing into nested objects and arrays. For Gemini it also
+// guarantees the thought_signature Google requires on replayed tool calls.
+// It returns the original body unchanged if nothing applies or on a parse
+// failure (fail-open so we never drop a valid request).
 func sanitizeRequestBody(body []byte, provider string) []byte {
-	var fields []string
-	if strings.HasPrefix(provider, "gemini") {
-		fields = geminiStripFields
-	}
-	if len(fields) == 0 {
+	if !strings.HasPrefix(provider, "gemini") {
 		return body
 	}
-	fieldSet := make(map[string]bool, len(fields))
-	for _, f := range fields {
+	fieldSet := make(map[string]bool, len(geminiStripFields))
+	for _, f := range geminiStripFields {
 		fieldSet[f] = true
 	}
-	out, changed := stripJSONFields(body, fieldSet)
+	if out, changed := stripJSONFields(body, fieldSet); changed {
+		log.Printf("[debug] provider=%s -> stripped unsupported fields %v", provider, geminiStripFields)
+		body = out
+	}
+	return injectGeminiThoughtSignatures(body, provider)
+}
+
+// geminiSkipThoughtSignature is Google's documented dummy value for imported
+// function-call history. Gemini 3.x requires a thought_signature on every
+// replayed functionCall part and answers 400 INVALID_ARGUMENT otherwise:
+//
+//	Function call is missing a thought_signature in functionCall parts.
+//
+// A routed conversation can contain tool calls produced by a non-Google model
+// (or by a client that does not echo extra_content), so there is no real
+// signature to replay. Google documents these sentinels for exactly that case:
+// "skip_thought_signature_validator" or "context_engineering_is_the_way_to_go".
+const geminiSkipThoughtSignature = "skip_thought_signature_validator"
+
+// injectGeminiThoughtSignatures fills in the sentinel on every assistant tool
+// call that lacks one. Real signatures are never overwritten. The body is
+// returned byte-for-byte when nothing needed to change.
+//
+// Measured 2026-11-07: a 300k-token tool-using session failed over to the
+// Gemini keys, every one answered 400 for the same missing signature, and the
+// exhausted walk surfaced a 503 to the client. The signature cannot be
+// reconstructed from a tool call made by another provider, which is what the
+// sentinel is for.
+func injectGeminiThoughtSignatures(body []byte, provider string) []byte {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	messages, ok := doc["messages"].([]any)
+	if !ok {
+		return body
+	}
+	changed := false
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "assistant" {
+			continue
+		}
+		calls, ok := msg["tool_calls"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawCall := range calls {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				continue
+			}
+			if hasGeminiThoughtSignature(call["extra_content"]) {
+				continue
+			}
+			extra, _ := call["extra_content"].(map[string]any)
+			if extra == nil {
+				extra = map[string]any{}
+				call["extra_content"] = extra
+			}
+			google, _ := extra["google"].(map[string]any)
+			if google == nil {
+				google = map[string]any{}
+				extra["google"] = google
+			}
+			google["thought_signature"] = geminiSkipThoughtSignature
+			changed = true
+		}
+	}
 	if !changed {
 		return body
 	}
-	log.Printf("[debug] provider=%s -> stripped unsupported fields %v", provider, fields)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	log.Printf("[debug] provider=%s -> injected a dummy thought_signature into replayed tool calls", provider)
 	return out
+}
+
+// hasGeminiThoughtSignature reports whether an extra_content value already
+// carries a non-empty signature under either namespace Google uses
+// (generativelanguage: google, Vertex: vertex).
+func hasGeminiThoughtSignature(extra any) bool {
+	obj, ok := extra.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, ns := range []string{"google", "vertex"} {
+		inner, ok := obj[ns].(map[string]any)
+		if !ok {
+			continue
+		}
+		if sig, ok := inner["thought_signature"].(string); ok && strings.TrimSpace(sig) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // stripJSONFields recursively walks a JSON document and removes any object
