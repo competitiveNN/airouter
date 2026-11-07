@@ -2369,6 +2369,8 @@ func isTimeoutMessage(msg string) bool {
 		"i/o timeout",
 		"tls handshake timeout",
 		"deadline exceeded",
+		"upstream timedout",
+		"upstream timed out",
 	} {
 		if strings.Contains(lower, s) {
 			return true

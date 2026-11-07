@@ -459,3 +459,53 @@ def __getattr__(name: str):
     if any(tok in low for tok in ("param", "size", "billion")):
         return guess_param_count
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# ── System One / decision models ─────────────────────────────────────────────
+#
+# "System One" is the TypeSafe name for a model class that returns typed,
+# calibrated decisions (Jev, then the open alternatives Laya and Kev, plus
+# Bespoke Nimble, OpenThai-SystemOne, SemIf, NanoJev, jevlike). They are
+# NOT general chat models: Artificial Analysis has no intelligence score for
+# them, and routing them must be by MODEL IDENTITY, never by an intelligence
+# threshold. Selecting them by score is exactly the bug that made the old
+# `decision` profile a duplicate of `smart`.
+#
+# Matching is deliberately token-anchored: a bare substring test would put any
+# id containing "kev" (e.g. an unrelated "kevin" slug) in the profile.
+SYSTEMONE_FAMILY_TOKENS = (
+    "jev", "kev", "laya", "nimble", "openthai", "semif", "nanojev",
+    "jevlike", "systemone", "system-one", "sys1",
+)
+_SYSTEMONE_TOKEN_RE = re.compile(
+    r"(?<![a-z0-9])(" + "|".join(
+        re.escape(t) for t in SYSTEMONE_FAMILY_TOKENS
+    ) + r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def is_systemone_model_id(model_id: str, name: str = "") -> bool:
+    """True when a model id/name identifies an actual System One decision model.
+
+    Token-anchored so an unrelated slug that merely contains a family token
+    (e.g. "kevin") is not admitted. Used by the fetcher, the generator and
+    the rules checker, so the three cannot drift.
+    """
+    haystack = " ".join(x for x in (model_id, name) if x)
+    return bool(_SYSTEMONE_TOKEN_RE.search(haystack))
+
+
+def systemone_rank(model_id: str) -> int:
+    """Curated preference order for the System One fallback chain.
+
+    Lower is better: Jev (hosted, best) first, then Kev (large → small),
+    then Laya, then everything else. Used to order the chain; the router
+    still walks it in configured order.
+    """
+    low = (model_id or "").lower()
+    for idx, tok in enumerate(("jev", "kev-27", "kev-9", "kev-4", "kev-0.8", "kev",
+                               "laya", "nimble", "openthai")):
+        if tok in low:
+            return idx
+    return len(SYSTEMONE_FAMILY_TOKENS) + 1
