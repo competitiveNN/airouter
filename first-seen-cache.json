@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-06T04:49:36.045473Z",
+  "fetched_at": "2026-11-07T05:08:48.112389Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
@@ -12,7 +12,6 @@
     "deepseek-v4.1-flash-free": "2026-11-06",
     "dots-studio/dots-3-note-preview:free": "2026-09-26",
     "exo-free": "2026-10-08",
-    "fledge-alpha-free": "2026-10-02",
     "flint-40b-free": "2026-10-26",
     "gemini-flash-lite-latest": "2026-11-06",
     "gemma-4-26b-a4b-it": "2026-11-06",
@@ -23,6 +22,7 @@
     "glm-5.3-flash-free": "2026-11-06",
     "ibm/granite-3.0-3b-a800m-instruct": "2026-09-26",
     "ibm/granite-3.0-8b-instruct": "2026-09-26",
+    "iceman-free": "2026-11-07",
     "inclusionai/ling-3.1-flash": "2026-10-03",
     "inclusionai/ling-3.1-flash:free": "2026-10-01",
     "jev-1.13-free": "2026-09-26",
@@ -31,7 +31,6 @@
     "longcat-2.5-preview-free": "2026-09-26",
     "meta/llama2-70b": "2026-09-26",
     "meta/muse-glimmer-30b": "2026-11-06",
-    "mimo-v2.5-free": "2026-09-26",
     "mimo-v2.6-flash-free": "2026-09-26",
     "minimaxai/minimax-m3.1-flash": "2026-11-06",
     "mistralai/mistral-large-4-1t-a52b": "2026-11-06",
@@ -53,7 +52,6 @@
     "stealth/cat-jam:free": "2026-10-16",
     "stealth/crouton-alpha": "2026-11-04",
     "stealth/glyph-cluster:free": "2026-10-08",
-    "stealth/space-bunny-alpha": "2026-09-26",
     "step-5-preview-free": "2026-10-08",
     "stepfun-ai/step-5-preview": "2026-10-16",
     "z-ai/glm-5.3-flash": "2026-11-06"
@@ -62,21 +60,19 @@
     "beam": "2026-11-06",
     "cat-jam-free": "2026-10-16",
     "exo-free": "2026-10-12",
-    "fledge-alpha-free": "2026-10-08",
     "inclusionai/ling-3.1-flash": "2026-10-14",
     "inclusionai/ling-3.1-flash:free": "2026-10-15",
     "jev-1.13-free": "2026-10-30",
     "ling-3.1-flash-free": "2026-10-15",
     "ll-alpha-free": "2026-10-16",
     "longcat-2.5-preview-free": "2026-10-22",
-    "mimo-v2.5-free": "2026-10-08",
     "nvidia/nemotron-3.5-content-safety:free": "2026-11-04",
     "poolside/laguna-s-2.1-free": "2026-11-06",
     "poolside/laguna-s-2.1:free": "2026-10-31",
     "poolside/laguna-xs-2.1:free": "2026-10-31",
+    "pulse-alpha-free": "2026-11-07",
     "space-bunny-free": "2026-10-20",
     "stealth/cat-jam:free": "2026-10-19",
-    "stealth/space-bunny-alpha": "2026-10-08",
     "step-5-preview-free": "2026-10-16"
   }
 }
