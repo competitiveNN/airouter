@@ -424,6 +424,14 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Same pre-output protection as the chat stream: a client's per-read
+	// timeout must not fire while the fallback walk is choosing an endpoint or
+	// waiting out a cooldown. The first comment is at 10s, so fast failures
+	// still return a real HTTP status.
+	keepalive, stopKeepalive := startSSEIdleKeepalive(w, flusher, prefillKeepalive)
+	defer stopKeepalive()
+	w = idleKeepaliveResponseWriter{ResponseWriter: w, keepalive: keepalive}
+
 	timeout := requestAttemptTimeout(estimateTokens(req))
 	// Wall-clock budget for this request's fallback walk. Shared policy with
 	// the chat loops: this path was the one that shipped unbounded for a
@@ -484,6 +492,8 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 					g.recordRequest(req.Model, 503, time.Since(start))
 					return
 				}
+				fmt.Fprintf(w, ": reconnecting in %v\n\n", sleep.Round(time.Second))
+				flusher.Flush()
 				timer := time.NewTimer(sleep)
 				select {
 				case <-ctx.Done():

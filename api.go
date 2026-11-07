@@ -2201,6 +2201,18 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		return
 	}
 
+	// Keep the client connection warm while the fallback walk is still choosing
+	// an endpoint. A streaming client (maki, reqwest generally) applies a
+	// per-read timeout -- 30s in maki -- and StreamToClient deliberately buffers
+	// until the first token. A large-context attempt, a proxy retry, or a
+	// cooldown wait could therefore leave the socket silent long enough for the
+	// client to report "connection error" while the gateway was still working.
+	// The first comment is at prefillKeepalive (10s), so a fast failure still
+	// returns a real HTTP status instead of committing to 200 first.
+	keepalive, stopKeepalive := startSSEIdleKeepalive(w, flusher, prefillKeepalive)
+	defer stopKeepalive()
+	w = idleKeepaliveResponseWriter{ResponseWriter: w, keepalive: keepalive}
+
 	// Wall-clock budget for this request's fallback walk, shared policy.
 	walk := newBudgetState(start, timeout)
 	chainLen := g.router.ChainLength(req.Model)
@@ -2318,17 +2330,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				}
 			}
 			// Every endpoint in the chain is on cooldown (or otherwise
-			// ineligible). Wait out the SHORTEST remaining cooldown and
-			// cycle back: SelectEndpoint restarts its walk at the head of
-			// the chain, so the last model in the chain leads back to the
-			// first, and a model that recovers mid-request gives this
-			// request another chance instead of a terminated stream. The
-			// reconnecting comment keeps the SSE connection alive during
-			// the wait. The wait is capped at the provider's own interruption
-			// ceiling, and the loop stays bounded by the wall-clock budget and
-			// the attempts counter above, so this cannot spin forever. A zero
-			// wait means no cooldown is pending anywhere in the chain; there is
-			// nothing to wait for, so fail fast.
+			// ineligible). Wait out the SHORTEST remaining cooldown for an
+			// endpoint this request has NOT tried; already-tried endpoints are
+			// never revisited. The wait is capped at the provider's own
+			// interruption ceiling, and the loop stays bounded by the
+			// wall-clock budget and the attempts counter above. A zero wait
+			// means nothing is merely cooling (everything was already tried);
+			// there is nothing to wait for, so fail fast.
 			if wait > 0 {
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
@@ -2450,15 +2458,18 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				Direct:         directNext,
 			}
 			if tokens >= largeContextTokens {
-				// Prefill can run for minutes; keep the client's low-speed
-				// timer from killing the connection before the first token.
+				// Prefill can run for minutes; raise the attempt ceiling. The
+				// handler-level idle keepalive already keeps the client's
+				// low-speed timer satisfied, so no per-attempt one is needed.
 				streamOpts.AllowLongPrefill = true
-				streamOpts.KeepaliveInterval = prefillKeepalive
 			}
 			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, proxyTimeout, sessionID, streamOpts)
 			if err != nil {
 				if errors.Is(err, ErrUpstreamSaturated) {
-					writeAPIError(w, http.StatusServiceUnavailable, "Upstream saturated", "server_error", "upstream_saturated")
+					// The pre-output keepalive may already have committed the
+					// response to 200, so an SSE error event is the only shape
+					// that cannot corrupt the stream.
+					writeSSEError(w, flusher, "Upstream saturated")
 					g.recordRequest(req.Model, 503, time.Since(start))
 					return
 				}
