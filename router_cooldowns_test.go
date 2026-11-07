@@ -1311,3 +1311,28 @@ func TestLargeContextAttemptAndBudget(t *testing.T) {
 		t.Fatalf("huge prompt timeout = %v, want the %v ceiling", got, maxLargeContextAttemptTimeout)
 	}
 }
+
+// TestCycleBackSleepComparesTheRealCooldownToTheBudget pins the difference
+// between the capped sleep and the real cooldown. Sleeping 30s out of a
+// 16-minute cooldown, re-checking and repeating spends the whole budget and
+// returns exactly the 503 the request would have returned immediately. Only a
+// cooldown that can actually expire inside the remaining budget is worth
+// waiting for (2026-11-07).
+func TestCycleBackSleepComparesTheRealCooldownToTheBudget(t *testing.T) {
+	start := time.Now()
+	walk := &budgetState{start: start, budget: 2 * time.Minute, lastProgress: start}
+
+	if _, ok := cycleBackSleep(16*time.Minute, walk, maxSessionInterruption); ok {
+		t.Fatal("waited for a cooldown that outlasts the remaining budget")
+	}
+	if _, ok := cycleBackSleep(0, walk, maxSessionInterruption); ok {
+		t.Fatal("waited with no cooldown pending")
+	}
+	sleep, ok := cycleBackSleep(20*time.Second, walk, maxSessionInterruption)
+	if !ok {
+		t.Fatal("refused a cooldown that fits the budget")
+	}
+	if sleep <= 0 || sleep > 20*time.Second {
+		t.Fatalf("sleep = %v, want a positive duration bounded by the cooldown", sleep)
+	}
+}

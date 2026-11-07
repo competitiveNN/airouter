@@ -689,13 +689,16 @@ func TestRouterSelectEndpointAllInCooldown(t *testing.T) {
 		}
 	}
 
-	// Should return nil + zero wait (no cycle-back; fail fast).
+	// All cooled, none tried: report the shortest cooldown so the caller can
+	// wait within its budget rather than turning a transient 429 into a 503.
+	// The wait does NOT resurrect an endpoint this request already tried -- the
+	// one-attempt-per-model rule is unchanged.
 	ep, wait := router.SelectEndpoint("smart", sessionID, false, nil)
 	if ep != nil {
 		t.Error("expected nil endpoint when all chains are in cooldown")
 	}
-	if wait != 0 {
-		t.Errorf("expected zero wait (no cycle-back wait), got %v", wait)
+	if wait <= 0 {
+		t.Errorf("expected the shortest cooldown as a positive wait, got %v", wait)
 	}
 }
 
