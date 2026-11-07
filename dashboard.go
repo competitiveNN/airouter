@@ -88,7 +88,7 @@ details.tree[open]>summary{margin-bottom:.3rem}
 </style>
 </head>
 <body>
-<header><h1>AI Router Dashboard</h1><span id="configUpdated"></span><span id="status"></span></header>
+<header><h1>AI Router Dashboard</h1><span id="configUpdated"></span><span id="status"></span><button id="configEditorBtn" data-href="/admin/config/editor /admin/config/edit /admin/config-editor" onclick="openConfigEditor()" style="margin-left:1rem">Config Editor</button></header>
 <main>
 <div class="card">
 <h2>Chains</h2>
@@ -138,13 +138,7 @@ details.tree[open]>summary{margin-bottom:.3rem}
 <button id="selectAll" class="wsel" onclick="toggleSelectAll()">Select all</button>
 </div>
 </div>
-<div class="card">
-<h2>Config Editor</h2>
-<p>Load and edit config (JSON). Save writes back to config.yaml and reloads.</p>
-<button id="load">Load Config</button>
-<button id="save" disabled>Save Config</button>
-<textarea id="editor" rows="16"></textarea>
-</div>
+
 </div>
 </div>
 </main>
@@ -451,13 +445,22 @@ function renderCooldowns(data){
   const cdStart=cooldownPage*pageSize;
   const pageCd=cdRows.slice(cdStart,cdStart+pageSize);
   const groups={};
-  for(const r of pageCd){ const key = (r.status_code>0?r.status_code:'unknown'); (groups[key]=groups[key]||[]).push(r); }
+  for(const r of pageCd){
+    let key = r.status_code>0 ? r.status_code : 'unknown';
+    if(r.status_code===0){
+      const le=(r.last_error||'').toLowerCase();
+      if(le.includes('timeout')||le.includes('timed out')||le.includes('timedout')||le.includes('upstream timedout')||le.includes('upstream timed out')||le.includes('upstream timeout')||le.includes('deadline exceeded')||le.includes('i/o timeout')||le.includes('tls handshake timeout')||le.includes('client.timeout exceeded')||le.includes('timeout awaiting response headers')){
+        key='timeout';
+      }
+    }
+    (groups[key]=groups[key]||[]).push(r);
+  }
   const groupKeys=Object.keys(groups).sort();
   if(!groupKeys.length){ left.appendChild(el('p',null,'No cooldown errors.')); }
   for(const key of groupKeys){
     const det=el('details','tree');
     det.open=true;
-    const sum=el('summary',null,'Error '+key+' ('+groups[key].length+')');
+    const sum=el('summary',null,(key==='timeout'?'Timeout':'Error '+key)+' ('+groups[key].length+')');
     det.appendChild(sum);
     const table=document.createElement('table');
     const thead=document.createElement('thead');
@@ -581,23 +584,12 @@ async function refresh(){
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
 }
-const editor=document.getElementById('editor');
-document.getElementById('load').onclick=async()=>{
-  try{
-    cfg=await req('/admin/config');
-    editor.value=JSON.stringify(cfg,null,2);
-    document.getElementById('save').disabled=false;
-    document.getElementById('status').textContent='Loaded';
-  }catch(e){ alert(e); }
-};
-document.getElementById('save').onclick=async()=>{
-  try{
-    const parsed=JSON.parse(editor.value);
-    await req('/admin/config',{method:'POST',body:JSON.stringify(parsed)});
-    alert('Saved and reloaded');
-    document.getElementById('status').textContent='Saved';
-  }catch(e){ alert('Save failed: '+e); }
-};
+function openConfigEditor(){
+  // Supported: /admin/config/editor /admin/config/edit /admin/config-editor
+  const u=new URL('/admin/config/editor', location.href);
+  if(apiKey) u.searchParams.set('api_key', apiKey);
+  window.location.href=u.toString();
+}
 document.getElementById('clearSelected').onclick=clearSelectedCooldowns;
 refresh();
 setInterval(refresh, 30000);
