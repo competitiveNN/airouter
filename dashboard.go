@@ -88,7 +88,7 @@ details.tree[open]>summary{margin-bottom:.3rem}
 </style>
 </head>
 <body>
-<header><h1>AI Router Dashboard</h1><span id="status"></span></header>
+<header><h1>AI Router Dashboard</h1><span id="configUpdated"></span><span id="status"></span></header>
 <main>
 <div class="card">
 <h2>Chains</h2>
@@ -563,6 +563,10 @@ async function refresh(){
     // authority on whether an endpoint is cooling down, so its "now" is the
     // reference the countdown advances from.
     if(d.now) serverNow = new Date(d.now).getTime();
+    if(d.config_updated_at){
+      const elc=document.getElementById('configUpdated');
+      if(elc) elc.textContent='Config updated '+new Date(d.config_updated_at).toLocaleString()+'  ';
+    }
     renderWindowSel();
     renderChains(d.chains||[], d.circuit_breaker);
     renderInflight(d.inflight||[]);

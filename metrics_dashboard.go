@@ -211,6 +211,10 @@ type dashboardResponse struct {
 	// clear it without restarting the daemon.
 	Cooldowns map[string]CooldownEntry   `json:"cooldowns"`
 	Circuits  map[string]*CircuitBreaker `json:"circuits"`
+	// ConfigUpdatedAt is the modification time of the config file the
+	// gateway loaded, so the dashboard can show when the chains were
+	// last changed.
+	ConfigUpdatedAt time.Time `json:"config_updated_at"`
 }
 
 // dashboardWindowSeconds maps a dashboard window name onto the number of
