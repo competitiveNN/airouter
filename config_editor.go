@@ -273,11 +273,16 @@ function refreshRaw(){
 // patch: make renderTree store rootValue
 // (already global)
 
-// initial
-editor.addEventListener('change', ()=>{
-  try{ rootValue = JSON.parse(editor.value); renderTree(null, rootValue); }
-  catch(e){}
-});
+// Auto-load config on page load
+document.getElementById('load').click();
+
+// Back button preservation of api_key
+document.getElementById('back').onclick = (e) => {
+  e.preventDefault();
+  const u = new URL('/admin/dashboard', location.href);
+  if(apiKey) u.searchParams.set('api_key', apiKey);
+  window.location.href = u.toString();
+};
 </script>
 </body>
 </html>`

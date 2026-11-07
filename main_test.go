@@ -3277,11 +3277,11 @@ func TestFourModelAliases(t *testing.T) {
 			"test": {URL: backend.URL},
 		},
 		Models: map[string]ModelConfig{
-			"smart":    {Chain: []ModelEndpoint{{Provider: "test", Model: "m1"}}},
-			"work":     {Chain: []ModelEndpoint{{Provider: "test", Model: "m2"}}},
-			"fast":     {Chain: []ModelEndpoint{{Provider: "test", Model: "m3"}}},
-			"large":    {Chain: []ModelEndpoint{{Provider: "test", Model: "m4"}}},
-			"decision": {Chain: []ModelEndpoint{{Provider: "test", Model: "m5"}}},
+			"smart":     {Chain: []ModelEndpoint{{Provider: "test", Model: "m1"}}},
+			"work":      {Chain: []ModelEndpoint{{Provider: "test", Model: "m2"}}},
+			"fast":      {Chain: []ModelEndpoint{{Provider: "test", Model: "m3"}}},
+			"large":     {Chain: []ModelEndpoint{{Provider: "test", Model: "m4"}}},
+			"systemone": {Chain: []ModelEndpoint{{Provider: "test", Model: "m5"}}},
 		},
 	}
 	router := NewRouter(cfg, "")

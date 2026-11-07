@@ -53,7 +53,7 @@ def main() -> int:
     # /v1/chat/completions answers "Unknown model". The nightly maki sync
     # added a `test:` profile this way before it was caught, so reject any
     # extra profile at the validation step, where it is cheap to fix.
-    extra = set(models) - {"smart", "work", "fast", "large", "decision"}
+    extra = set(models) - {"smart", "work", "fast", "large", "systemone"}
     if extra:
         problems.append(
             f"unroutable profile(s) {sorted(extra)}: models may only contain "
@@ -119,7 +119,7 @@ def main() -> int:
         "commandcode": ("commandcode", "commandcode2"),
     }
 
-    for name in ("smart", "work", "fast", "large", "decision"):
+    for name in ("smart", "work", "fast", "large", "systemone"):
         if name not in models:
             problems.append(f"missing profile {name}")
             continue
