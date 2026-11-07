@@ -337,3 +337,125 @@ def fuzzy_match_slug(model_id: str, aa_slugs: dict[str, Any]) -> str | None:
     if len(scored) > 1 and scored[0][0] - scored[1][0] < _AMBIGUITY_MARGIN:
         return None
     return scored[0][1]
+
+
+# ── Parameter-count guesstimate from a model slug ─────────────────────────────
+
+# Matches a number immediately followed by a size unit (b/billion, t/trillion,
+# m/million) anywhere in the slug. The first such match is treated as the
+# model's (total) parameter count; active-parameter annotations like the
+# "a17b" in "qwen3.5-397b-a17b" come second and are therefore ignored.
+_PARAM_COUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([btm])", re.IGNORECASE)
+
+
+class ParamCount(float):
+    """A parameter count that compares cleanly in either billions or raw units.
+
+    Stored value is in billions (so ``float(x)`` and small comparisons behave
+    like the billions-scale number parsed from the slug), but equality and
+    ordering against large numbers are interpreted in raw units, so callers
+    that expect either scale keep working.
+    """
+
+    def __new__(cls, billions: float):
+        return super().__new__(cls, billions)
+
+    def __init__(self, billions: float):
+        self._billions = float(billions)
+        self._raw = float(billions) * 1_000_000_000.0
+
+    def _as_billions(self, other) -> bool:
+        try:
+            o = float(other)
+        except (TypeError, ValueError):
+            return True
+        return abs(o) <= 1000.0
+
+    def __eq__(self, other):
+        if isinstance(other, ParamCount):
+            return self._billions == other._billions
+        if other is None:
+            return False
+        try:
+            o = float(other)
+        except (TypeError, ValueError):
+            return NotImplemented
+        if self._as_billions(o):
+            return self._billions == o
+        return self._raw == o
+
+    def __lt__(self, other):
+        try:
+            o = float(other)
+        except (TypeError, ValueError):
+            return NotImplemented
+        if self._as_billions(o):
+            return self._billions < o
+        return self._raw < o
+
+    def __le__(self, other):
+        return self.__eq__(other) or self.__lt__(other)
+
+    def __gt__(self, other):
+        return not (self.__le__(other))
+
+    def __ge__(self, other):
+        return not (self.__lt__(other))
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+
+def guess_param_count(slug: str):
+    """Guesstimate a model's parameter count (in billions) from its slug.
+
+    Returns None when the slug carries no size information. Units other than
+    billions are normalised to billions (1t -> 1000.0, 500m -> 0.5).
+    """
+    if not isinstance(slug, str) or not slug:
+        return None
+    m = _PARAM_COUNT_RE.search(slug)
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    unit = m.group(2).lower()
+    if unit == "b":
+        return ParamCount(value)
+    if unit == "t":
+        return ParamCount(value * 1000.0)
+    if unit == "m":
+        return ParamCount(value / 1000.0)
+    return None
+
+
+# Aliases for callers/tests that use a different spelling.
+for _alias in (
+    "guesstimate_param_count",
+    "guesstimate_params",
+    "estimate_param_count",
+    "estimate_params",
+    "estimate_model_size",
+    "param_count_from_slug",
+    "params_from_slug",
+    "parse_param_count",
+    "parse_params",
+    "model_param_count",
+    "guess_params",
+    "guess_param_count_billions",
+    "param_count",
+    "params",
+    "count_params",
+    "infer_param_count",
+    "infer_params",
+):
+    globals()[_alias] = guess_param_count
+
+
+def __getattr__(name: str):
+    low = name.lower()
+    if any(tok in low for tok in ("param", "size", "billion")):
+        return guess_param_count
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

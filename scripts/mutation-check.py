@@ -502,7 +502,9 @@ SUITE_TEST_FLOORS = {
     # /api/v2/data path must never return, the paginated free endpoint walks
     # every page, an all-unscored snapshot never overwrites a scored cache, and
     # an HTTP error (410) falls back to the last scored snapshot (2026-11-06).
-    "scripts/test_fetch_free_models.py": 84,
+    # 86 -- the 84 above plus 2 for the parameter-count guesstimate used by the
+    # smart floor (2026-11-07).
+    "scripts/test_fetch_free_models.py": 86,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
