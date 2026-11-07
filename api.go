@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -2994,6 +2995,11 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		Circuits:       g.router.GetAllCircuits(),
 	}
 
+	if g.configPath != "" {
+		if info, err := os.Stat(g.configPath); err == nil {
+			resp.ConfigUpdatedAt = info.ModTime()
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
