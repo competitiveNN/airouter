@@ -130,6 +130,93 @@ func startSSEKeepalive(w io.Writer, flusher http.Flusher, interval time.Duration
 	return &keepaliveWriter{w: w, stop: stop}, stop
 }
 
+// keepaliveResponseWriter is an http.ResponseWriter whose body writes go
+// through a keepaliveWriter, so the pre-output keepalive stops on the first
+// real byte (content, an SSE error, or a "reconnecting" comment) and cannot
+// interleave with it.
+type keepaliveResponseWriter struct {
+	http.ResponseWriter
+	keepalive *keepaliveWriter
+}
+
+func (k keepaliveResponseWriter) Write(p []byte) (int, error) { return k.keepalive.Write(p) }
+
+// idleKeepaliveWriter serializes every client write and emits an SSE comment
+// whenever the stream has been silent for a full interval. Unlike the one-shot
+// pre-output keepalive, it keeps covering the stream for its whole lifetime,
+// which also covers a long prefill, a cooldown wait, and a mid-stream stall.
+//
+// The interval must stay well below the client's per-read timeout (maki:
+// 30s). Without this, silence is indistinguishable from a dead connection and
+// surfaces as "connection error" even though the gateway is still working.
+type idleKeepaliveWriter struct {
+	w        io.Writer
+	flusher  http.Flusher
+	interval time.Duration
+	mu       sync.Mutex
+	last     time.Time
+}
+
+// startSSEIdleKeepalive wraps w. stop is idempotent and waits for the ticker
+// goroutine to exit, so no comment can be written after the handler returns.
+func startSSEIdleKeepalive(w io.Writer, flusher http.Flusher, interval time.Duration) (*idleKeepaliveWriter, func()) {
+	k := &idleKeepaliveWriter{w: w, flusher: flusher, interval: interval, last: time.Now()}
+	if interval <= 0 || flusher == nil {
+		return k, func() {}
+	}
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case now := <-t.C:
+				k.mu.Lock()
+				if now.Sub(k.last) >= interval {
+					if _, err := io.WriteString(k.w, ": keepalive\n\n"); err != nil {
+						k.mu.Unlock()
+						return
+					}
+					k.flusher.Flush()
+					k.last = now
+				}
+				k.mu.Unlock()
+			}
+		}
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(stopCh)
+			<-done
+		})
+	}
+	return k, stop
+}
+
+// Write records the write before returning, so the ticker measures silence
+// from the last real byte (content, an SSE error, or a reconnecting comment).
+func (k *idleKeepaliveWriter) Write(p []byte) (int, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	n, err := k.w.Write(p)
+	if n > 0 {
+		k.last = time.Now()
+	}
+	return n, err
+}
+
+type idleKeepaliveResponseWriter struct {
+	http.ResponseWriter
+	keepalive *idleKeepaliveWriter
+}
+
+func (k idleKeepaliveResponseWriter) Write(p []byte) (int, error) { return k.keepalive.Write(p) }
+
 type Proxy struct {
 	client *http.Client
 	// baseTransport is the shared transport. An attempt that needs its own
