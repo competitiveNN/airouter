@@ -1,0 +1,838 @@
+# Airouter AI Gateway Configuration
+#
+# Providers: OpenAI-compatible backend endpoints
+# Each provider has:
+#   url: The base URL for the OpenAI-compatible API
+#   api_key_env: Environment variable name containing the API key
+#
+# Models: Logical model names (smart, work, fast, large) mapped to fallback chains
+# Each chain is a list of endpoints, each specifying:
+#   provider: Provider name (key in providers)
+#   model: Actual model name on that provider
+#
+# Distribution rules (see AGENTS.md and scripts/sync-instruction.txt, which
+# scripts/check-rules.py enforces against the fetched model list):
+#   - Each chain is ordered best-first by model quality (intelligence benchmark),
+#     descending; the strongest model for the profile sits at the top. `large`
+#     is the exception: it sorts by context window descending, then intelligence.
+#   - Profile membership, so a model lands where it is meant to be used:
+#       smart  intelligence >= 25, any context window
+#       work   the smart pool extended down to intelligence >= 15. The
+#              tiny-model drop is NOT waived for dedicated code models, so
+#              cohere/north-mini-code (9.9) stays out of `work` and qualifies
+#              only through `large`.
+#       fast   intelligence < 25 or an id containing flash-lite / lightning /
+#              nano / gemma / lfm / laguna-xs, capped at 10 distinct models
+#              (counted before the key expansion, so the chain is longer)
+#       large  context_length >= 200000 only
+#   - Every NVIDIA NIM model is emitted as a consecutive nvidia / nvidia2 / nvidia3
+#     trio (same model id, three API keys) so a 429 on one key falls through to the
+#     next key on the same model instead of failing the request. No NVIDIA-NIM model
+#     ever appears on only one key. Likewise every CommandCode model is emitted as a
+#     consecutive commandcode / commandcode2 pair (same model id, two API keys on the
+#     shared localhost:3050 proxy) so a rate-limited key falls through to the next.
+#     CommandCode models are NOT enumerated anywhere, in this file or in the
+#     tooling. There is no free-tier flag to read and a hand-maintained list
+#     goes stale the moment a deal ends: meituan/longcat-2.0-free stayed listed
+#     long after it stopped being free (probed 2026-10-01: HTTP 400 "You have
+#     insufficient credits ... Please purchase more credits"). `fetch-free-models
+#     .py` selects candidates by the provider's own free-suffix convention plus a
+#     small seed list, then PROVES each one with a real 1-token completion, and
+#     `scripts/check-rules.py` rule 3 requires that probe verdict rather than
+#     membership of any list. A deal that ends leaves on the next sync; a deal
+#     that starts is admitted without editing anything.
+#   - The LAST entry of every chain is that profile's "auto" fallback, and it is
+#     chosen on a PROBE VERDICT, never on popularity. `fetch-free-models.py
+#     --probe-auto` calls each router with one real 1-token completion and
+#     records the verdict in the model list: `verified: true` = it answered,
+#     `verified: false` = the provider REFUSED it (4xx), absent = no verdict
+#     (not probed, or the probe hit a 429/5xx/timeout — a missing verdict is
+#     absence of evidence, so a flaky network neither moves the terminator nor
+#     blocks a sync). A verdict also goes stale: older than 7 days
+#     (AUTO_PROBE_MAX_AGE_DAYS) it counts as no verdict, so a fetcher that
+#     stops running cannot pin the terminator to a router that died meanwhile.
+#     The ladder:
+#       preferred = opencode `big-pickle` only when the chain contains opencode
+#                  endpoints and no kilocode ones; otherwise kilocode
+#                  `kilo-auto/free`
+#       live or no verdict -> use the preferred router
+#       refused           -> use the other router ONLY if it probed live (the
+#                            rescue is always available, so one degenerate
+#                            chain cannot strand the other three); if nothing
+#                            probed live, do not write the file at all and
+#                            leave this config as it is. A refused terminator
+#                            fails every exhausted request, so regenerating
+#                            anyway would replace a working config with a worse
+#                            one. scripts/check-rules.py enforces exactly this
+#                            ladder — it calls the generator's own decision
+#                            function, and also checks that each terminator's
+#                            trailing comment matches the probe record, so the
+#                            evidence in this file cannot drift from the data.
+#
+#     The opencode key authenticates but is not entitled to the free tier: 11 of
+#     its 12 models return 403 FreeTierError, `big-pickle` included (re-probed
+#     2026-09-30, still 403) — the attribution headers in proxy.go do not change
+#     the outcome. So the opencode rescue is an emergency path for a confirmed
+#     outage, not a routine choice.
+#
+#     A run that cannot obtain a verdict (no keys, SKIP_AUTO_PROBE=1, a stale
+#     record, an offline fixture) does NOT rewrite these comments. It leaves the
+#     claim it cannot check exactly as it found it, and scripts/check-rules.py
+#     reports an unverifiable claim as its own problem rather than demanding a
+#     different comment — so an offline regeneration cannot quietly turn a
+#     recorded "probed live" into "not probed", and cannot quietly pass either.
+#
+#     (Earlier this was a raw kilocode-vs-opencode count comparison, which
+#     appended opencode `big-pickle` as the last-resort endpoint for `smart`
+#     while that endpoint 403'd on every call. Counts are not a health signal.
+#     The fetcher is: it probes every opencode candidate with a real 1-token
+#     completion and only emits the ones that answer, so the nightly sync cannot
+#     re-add a dead endpoint. An opencode model that passes that probe is still
+#     a legitimate chain entry — currently `space-bunny-free` — it just may
+#     never be the terminator.)
+#
+# Every concrete endpoint carries a `vision:` boolean (true/false) taken from the
+# source model's capabilities, driving capability-aware routing (vision requests go
+# only to vision-capable models). The trailing auto-fallback meta-router is treated
+# as vision-capable (vision: true).
+#
+# Models carry their approximate quality score (intelligence benchmark) and
+# context window (ctx, in tokens). The score is emitted as a real
+# `intelligence:` field on every concrete endpoint, which the gateway reads
+# for initial-model rotation (see preferences.initial_rotation_window
+# below). The context window is emitted as a real `context_length:` field
+# and surfaced to clients as the logical model's `max_context_tokens`
+# floor in /v1/models: the value advertised is the SMALLEST context window
+# in the chain, so a client never plans for more input than every backend
+# the profile might relay to (including fallbacks after a failure) can
+# accept. It is NOT max_tokens (output ceiling): the upstream model lists
+# publish no output-token data for any backend, and neither does OpenAI's
+# own /v1/models schema.
+
+providers:
+  nvidia:
+    url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY
+  nvidia2:
+    url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY_2
+  nvidia3:
+    url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY_3
+  ollama:
+    url: https://ollama.com/v1
+    api_key_env: OLLAMA_API_KEY
+  opencode:
+    url: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY
+  opencode2:
+    url: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY_2
+  kilocode:
+    url: https://api.kilo.ai/api/gateway/v1
+    api_key_env: KILOCODE_API_KEY
+    proxy: 3
+  gemini:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY
+  gemini2:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_2
+  gemini3:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_3
+  gemini4:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_4
+  gemini5:
+    url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY_5
+  commandcode:
+    url: https://api.commandcode.ai
+    api_key_env: COMMANDCODE_API_KEY
+    max_interruption: 30s
+# KEEP THIS COMMENTED
+#  commandcode2:
+#    url: https://api.commandcode.ai
+#    api_key_env: COMMANDCODE_API_KEY_2
+#    max_interruption: 30s
+
+preferences:
+  # When two models have the same intelligence score, place the newer
+  # model (by release date) before the older one in the fallback chain.
+  # When false, ties keep their source-provider enumeration order.
+  newest_first_on_tie: true
+  # How many endpoints at the head of a chain are rotated between for the
+  # FIRST pick of each brand new session. Consecutive new sessions start at
+  # depths 0,1,...,N-1,0,... so load spreads evenly across the top of the
+  # chain instead of one model serving all traffic.
+  #
+  # This applies ONLY to a new session's first endpoint. Once a session is
+  # pinned it is sticky, and a retrying request walks the chain in strict
+  # order, so rotation never delays escalation to a better model. Endpoints
+  # beyond the window stay purely reactive.
+  #
+  # Set to 0 to disable rotation (every new session starts at depth 0).
+  initial_rotation_window: 8
+  # Random fraction (0..0.25) added to transient cooldowns (429/5xx) so
+  # concurrent clients hitting the same rate-limited model don't all wake up
+  # at the same instant and stampede the provider. 0 disables jitter.
+  # Values are clamped to [0, 0.25] regardless of what is written here.
+  cooldown_jitter: 0.25
+  # Circuit breaker: after this many consecutive transient failures (429/5xx)
+  # on an endpoint, the circuit opens and the model is hard-blocked until
+  # its cooldown expires and a single half-open probe succeeds. Works
+  # alongside cooldowns; a value of 0 disables it (cooldown escalation alone
+  # handles failures). When the key is omitted the default (5) is used.
+  circuit_breaker_threshold: 5
+  # How many probe requests are allowed through in half-open state before the
+  # circuit re-opens. Default 1 (one probe must succeed to close the circuit).
+  circuit_half_open_probes: 1
+  # Default output-token ceiling applied to requests that omit max_tokens.
+  # A pointer is used so three states are distinguishable:
+  #   nil (absent) -> "auto": half of the profile's advertised context window
+  #                   (max_context_tokens). This is the default.
+  #   0            -> "never default": send the request upstream without
+  #                   max_tokens, letting the provider choose.
+  #   positive      -> use that absolute value regardless of profile.
+  #
+  # Half-of-context is right for chat models but wrong for reasoning models
+  # (deepseek-r1, gpt-oss, nemotron-3-nano reasoning, ...): their thinking
+  # tokens live OUTSIDE the visible output and can exceed a half-context
+  # budget, so the provider rejects the request. Operators with reasoning
+  # models in a chain should set this to 0 (or a larger value) to opt out.
+  # default_max_tokens: 0   # uncomment + set to override the auto behavior
+
+  # Maximum distinct provider:model labels the /metrics registry will track.
+  # Endpoint labels come from this file, and this file is hot-reloadable, so
+  # without a bound a config churn loop (or a nightly model sync inventing new
+  # model ids) grows the registry until the gateway is OOM-killed.
+  #
+  # 512 is roughly 8x the current endpoint count, so the default is already
+  # generous; raise it only if `airouter_metrics_label_evictions_total` is
+  # climbing steadily, which means real endpoints are losing their series to
+  # newer ones. When the window is full, a label that is not already tracked
+  # recycles the least-recently-admitted slot and rolls that label's counters
+  # into an `__overflow__` bucket, so totals stay correct either way.
+  #
+  # Must be between 16 and 65536; validate-config.py rejects anything else
+  # rather than letting it be silently clamped at load.
+  # max_label_cardinality: 512   # uncomment to override the default
+
+models:
+  smart:
+    chain:
+      - provider: opencode
+        model: inkling-2-small-free  # 30.6
+        vision: false
+        intelligence: 30.6
+        context_length: 1048576
+      - provider: nvidia
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: nvidia2
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: nvidia3
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: opencode
+        model: deepseek-v4.1-flash-free  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 200000
+      - provider: nvidia
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia2
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia3
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: nvidia2
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: nvidia3
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: opencode
+        model: glm-5.3-flash-free  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 200000
+      - provider: nvidia
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: nvidia2
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: nvidia3
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: opencode
+        model: mimo-v2.6-flash-free  # 26.7  elo=1636
+        vision: false
+        intelligence: 26.7
+        context_length: 200000
+      - provider: nvidia
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+      - provider: nvidia2
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+      - provider: nvidia3
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+  work:
+    chain:
+      - provider: opencode
+        model: inkling-2-small-free  # 30.6
+        vision: false
+        intelligence: 30.6
+        context_length: 1048576
+      - provider: nvidia
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: nvidia2
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: nvidia3
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: opencode
+        model: deepseek-v4.1-flash-free  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 200000
+      - provider: nvidia
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia2
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia3
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: nvidia2
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: nvidia3
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: opencode
+        model: glm-5.3-flash-free  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 200000
+      - provider: nvidia
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: nvidia2
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: nvidia3
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: opencode
+        model: mimo-v2.6-flash-free  # 26.7  elo=1636
+        vision: false
+        intelligence: 26.7
+        context_length: 200000
+      - provider: nvidia
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+      - provider: nvidia2
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+      - provider: nvidia3
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+      - provider: kilocode
+        model: reflection/beam-free  # 17.7
+        vision: false
+        intelligence: 17.7
+        context_length: 1048576
+      - provider: commandcode
+        model: reflection/beam:free  # 17.7
+        vision: false
+        intelligence: 17.7
+        context_length: 1048576
+        protocol: commandcode
+  fast:
+    chain:
+      - provider: kilocode
+        model: reflection/beam-free  # 17.7
+        vision: false
+        intelligence: 17.7
+        context_length: 1048576
+      - provider: commandcode
+        model: reflection/beam:free  # 17.7
+        vision: false
+        intelligence: 17.7
+        context_length: 1048576
+        protocol: commandcode
+      - provider: nvidia
+        model: nvidia/nemotron-3.5-super-vl-120b-a12b  # 13.6
+        vision: true
+        intelligence: 13.6
+      - provider: nvidia2
+        model: nvidia/nemotron-3.5-super-vl-120b-a12b  # 13.6
+        vision: true
+        intelligence: 13.6
+      - provider: nvidia3
+        model: nvidia/nemotron-3.5-super-vl-120b-a12b  # 13.6
+        vision: true
+        intelligence: 13.6
+      - provider: kilocode
+        model: nvidia/nemotron-3.5-super-vl:free  # 13.6
+        vision: true
+        intelligence: 13.6
+        context_length: 1000000
+      - provider: opencode
+        model: nemotron-3.5-super-vl-free  # 13.6
+        vision: false
+        intelligence: 13.6
+        context_length: 1048576
+      - provider: ollama
+        model: nemotron-3-super  # 13.6
+        vision: false
+        intelligence: 13.6
+        context_length: 262144
+      - provider: kilocode
+        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: ollama
+        model: nemotron-3-ultra  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: nvidia
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: nvidia2
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: nvidia3
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: gemini
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini2
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini3
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini4
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini5
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: kilocode
+        model: kilo-auto/free  # last: kilocode (auto router probed live; opencode auto not entitled to free tier)
+        vision: true
+  large:
+    chain:
+      - provider: opencode
+        model: inkling-2-small-free  # 30.6
+        vision: false
+        intelligence: 30.6
+        context_length: 1048576
+      - provider: kilocode
+        model: reflection/beam-free  # 17.7
+        vision: false
+        intelligence: 17.7
+        context_length: 1048576
+      - provider: commandcode
+        model: reflection/beam:free  # 17.7
+        vision: false
+        intelligence: 17.7
+        context_length: 1048576
+        protocol: commandcode
+      - provider: opencode
+        model: nemotron-3.5-super-vl-free  # 13.6
+        vision: false
+        intelligence: 13.6
+        context_length: 1048576
+      - provider: gemini
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini2
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini3
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini4
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: gemini5
+        model: gemini-flash-lite-latest  # 11.7
+        vision: true
+        intelligence: 11.7
+        context_length: 1048576
+      - provider: opencode
+        model: crouton-alpha-free  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 1048576
+      - provider: commandcode
+        model: stealth/crouton-alpha  # 10.0  floor
+        vision: true
+        intelligence: 10.0
+        context_length: 1048576
+        protocol: commandcode
+      - provider: opencode
+        model: beam-free  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 1048576
+      - provider: kilocode
+        model: nvidia/nemotron-3.5-super-vl:free  # 13.6
+        vision: true
+        intelligence: 13.6
+        context_length: 1000000
+      - provider: kilocode
+        model: nvidia/nemotron-3-ultra-550b-a55b:free  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: ollama
+        model: nemotron-3-ultra  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: nvidia
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: nvidia2
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: nvidia3
+        model: nvidia/nemotron-3-ultra-550b-a55b  # 11.8
+        vision: false
+        intelligence: 11.8
+        context_length: 1000000
+      - provider: kilocode
+        model: nvidia/nemotron-3.5-lightning:free  # 5.5
+        vision: false
+        intelligence: 5.5
+        context_length: 1000000
+      - provider: kilocode
+        model: dots-studio/dots-3-note-preview:free  # 10.0  floor
+        vision: true
+        intelligence: 10.0
+        context_length: 512000
+      - provider: ollama
+        model: nemotron-3-super  # 13.6
+        vision: false
+        intelligence: 13.6
+        context_length: 262144
+      - provider: opencode
+        model: iceman-free  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: kilocode
+        model: liquid/lfm-3-1.7b:free  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: opencode
+        model: flint-40b-free  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: gemini
+        model: gemma-4-26b-a4b-it  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: gemini2
+        model: gemma-4-26b-a4b-it  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: gemini3
+        model: gemma-4-26b-a4b-it  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: gemini4
+        model: gemma-4-26b-a4b-it  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: gemini5
+        model: gemma-4-26b-a4b-it  # 10.0  floor
+        vision: false
+        intelligence: 10.0
+        context_length: 262144
+      - provider: nvidia
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.0  floor
+        vision: true
+        intelligence: 10.0
+        context_length: 262144
+      - provider: nvidia2
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.0  floor
+        vision: true
+        intelligence: 10.0
+        context_length: 262144
+      - provider: nvidia3
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # 10.0  floor
+        vision: true
+        intelligence: 10.0
+        context_length: 262144
+      - provider: opencode
+        model: nemotron-3.5-lightning-free  # 5.5
+        vision: false
+        intelligence: 5.5
+        context_length: 262144
+      - provider: ollama
+        model: gemma4:31b  # 4.4
+        vision: true
+        intelligence: 4.4
+        context_length: 262144
+      - provider: gemini
+        model: gemma-4-31b-it  # 4.4
+        vision: false
+        intelligence: 4.4
+        context_length: 262144
+      - provider: gemini2
+        model: gemma-4-31b-it  # 4.4
+        vision: false
+        intelligence: 4.4
+        context_length: 262144
+      - provider: gemini3
+        model: gemma-4-31b-it  # 4.4
+        vision: false
+        intelligence: 4.4
+        context_length: 262144
+      - provider: gemini4
+        model: gemma-4-31b-it  # 4.4
+        vision: false
+        intelligence: 4.4
+        context_length: 262144
+      - provider: gemini5
+        model: gemma-4-31b-it  # 4.4
+        vision: false
+        intelligence: 4.4
+        context_length: 262144
+      - provider: commandcode
+        model: stealth/glyph-cluster:free  # 10.0  floor
+        vision: true
+        intelligence: 10.0
+        context_length: 256000
+        protocol: commandcode
+      - provider: kilocode
+        model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  # 10.0  floor
+        vision: true
+        intelligence: 10.0
+        context_length: 256000
+      - provider: kilocode
+        model: cohere/north-mini-code:free  # 3.4
+        vision: false
+        intelligence: 3.4
+        context_length: 256000
+      - provider: opencode
+        model: deepseek-v4.1-flash-free  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 200000
+      - provider: opencode
+        model: glm-5.3-flash-free  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 200000
+      - provider: opencode
+        model: mimo-v2.6-flash-free  # 26.7  elo=1636
+        vision: false
+        intelligence: 26.7
+        context_length: 200000
+  systemone:
+    chain:
+      - provider: opencode
+        model: inkling-2-small-free  # 30.6
+        vision: false
+        intelligence: 30.6
+        context_length: 1048576
+      - provider: nvidia
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: nvidia2
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: nvidia3
+        model: minimaxai/minimax-m3.1-flash  # 29.1
+        vision: false
+        intelligence: 29.1
+      - provider: opencode
+        model: deepseek-v4.1-flash-free  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 200000
+      - provider: nvidia
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia2
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia3
+        model: deepseek-ai/deepseek-v4.1-flash  # 28.6
+        vision: false
+        intelligence: 28.6
+        context_length: 131072
+      - provider: nvidia
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: nvidia2
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: nvidia3
+        model: stepfun-ai/step-5-preview  # 28.5
+        vision: false
+        intelligence: 28.5
+        context_length: 131072
+      - provider: opencode
+        model: glm-5.3-flash-free  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 200000
+      - provider: nvidia
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: nvidia2
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: nvidia3
+        model: z-ai/glm-5.3-flash  # 27.8
+        vision: false
+        intelligence: 27.8
+        context_length: 131072
+      - provider: opencode
+        model: mimo-v2.6-flash-free  # 26.7  elo=1636
+        vision: false
+        intelligence: 26.7
+        context_length: 200000
+      - provider: nvidia
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+      - provider: nvidia2
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072
+      - provider: nvidia3
+        model: mistralai/mistral-large-4-1t-a52b  # 26.1
+        vision: false
+        intelligence: 26.1
+        context_length: 131072

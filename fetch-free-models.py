@@ -2810,19 +2810,11 @@ def output_json(data: list[dict], path: str | None) -> None:
         print(out)
 
 
-def is_decision_model(model: dict[str, Any]) -> bool:
-    """Whether a fetched model qualifies as a decision model.
-
-    Decision models are the strong generalists (intelligence >= 25), the same
-    pool that feeds the `decision` gateway profile.
-    """
-    score = model.get("intelligence")
-    if score is None:
-        return False
-    try:
-        return float(score) >= 25.0
-    except (TypeError, ValueError):
-        return False
+def is_systemone_model(model: dict[str, Any]) -> bool:
+    """Whether a fetched model qualifies as a System One decision model."""
+    model_id = model.get("id") or ""
+    name = model.get("name") or ""
+    return is_systemone_model_id(str(model_id), str(name))
 
 
 def output_csv(data: list[dict], path: str | None) -> None:
@@ -2850,7 +2842,7 @@ def output_csv(data: list[dict], path: str | None) -> None:
             "reasoning": caps.get("reasoning"),
             "vision": caps.get("vision"),
             "open_weights": caps.get("open_weights"),
-            "decision": is_decision_model(d),
+            "systemone": is_systemone_model(d),
             "source": d.get("source"),
             "fetched_at": d.get("fetched_at"),
         }
@@ -2887,7 +2879,7 @@ def output_table(data: list[dict]) -> None:
         ("ctx", 10),
         ("reason", 6),
         ("vision", 6),
-        ("decision", 8),
+        ("systemone", 8),
     ]
 
     header = " | ".join(f"{name:<{w}}" for name, w in cols)
@@ -2930,7 +2922,7 @@ def output_table(data: list[dict]) -> None:
             ctx_disp,
             "Y" if caps.get("reasoning") else "N",
             "Y" if caps.get("vision") else "N",
-            "Y" if is_decision_model(d) else "N",
+            "Y" if is_systemone_model(d) else "N",
         ]
         print(" | ".join(f"{v:<{w}}" for (_, w), v in zip(cols, row, strict=True)))
 
