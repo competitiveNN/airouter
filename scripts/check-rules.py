@@ -45,6 +45,7 @@ REPO = Path(__file__).resolve().parent.parent
 # make model_blacklist importable
 sys.path.insert(0, str(REPO))
 import model_blacklist
+from model_utils import is_systemone_model_id
 sys.path.remove(str(REPO))
 
 GENERATOR = REPO / "regenerate_config.py"
@@ -52,7 +53,7 @@ DEFAULT_MODELS = "/tmp/free-models.json"
 BLACKLIST_DEFAULT = REPO / "blacklisted-models.json"
 
 AUTO_MODELS = {"kilo-auto/free", "big-pickle"}
-ROUTABLE_PROFILES = ["smart", "work", "fast", "large", "decision"]
+ROUTABLE_PROFILES = ["smart", "work", "fast", "large", "systemone"]
 BANNED_ID = re.compile(r"content-safety|x-preview-f-free")
 
 # CommandCode free-ness is NOT enumerated here.
@@ -125,7 +126,7 @@ PROFILE_RULES = {
     "fast": {"max_distinct_models": 10},
     # large: context_length >= 200000 only, sorted by ctx desc then score desc.
     "large": {"min_context": 200000},
-    "decision": {"min_intelligence": 25.0},
+    "systemone": {"is_systemone": True},
 }
 
 
@@ -447,12 +448,28 @@ def check(
                 f"rule11: {tag} context_length {ctx} != model list {src_ctx}"
             )
 
-        floor = rules.get("min_intelligence")
-        if floor is not None and any(s < floor for s in scores):
-            problems.append(
-                f"rule5: {profile} has entries below intelligence {floor}: "
-                f"{sorted(s for s in scores if s < floor)}"
+        if rules.get("is_systemone"):
+            # Only validate systemone membership if the model list actually
+            # contains System One models. If the fetcher hasn't found any yet
+            # (e.g. free-models.json has no System One models), the generator
+            # will produce an empty chain, and we shouldn't flag the existing
+            # config as invalid for having non-System One models that were
+            # placed there by the old "decision" logic.
+            has_systemone_in_index = index is not None and any(
+                is_systemone_model_id(str(mid)) for mid in (k[1] for k in index.keys())
             )
+            if has_systemone_in_index:
+                for ep in rest:
+                    mid = str(ep.get("model"))
+                    if not is_systemone_model_id(mid):
+                        problems.append(f"rule5: systemone entry {mid} is not an actual System One model")
+        else:
+            floor = rules.get("min_intelligence")
+            if floor is not None and any(s < floor for s in scores):
+                problems.append(
+                    f"rule5: {profile} has entries below intelligence {floor}: "
+                    f"{sorted(s for s in scores if s < floor)}"
+                )
         cap = rules.get("max_distinct_models")
         if cap is not None:
             distinct = {e.get("model") for e in rest}
