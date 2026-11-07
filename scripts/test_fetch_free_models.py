@@ -1739,3 +1739,29 @@ def test_an_http_error_falls_back_to_the_last_scored_snapshot(tmp_path, monkeypa
     monkeypatch.setattr(ff.urllib.request, "urlopen", _boom)
     data = ff.fetch_artificial_analysis_data(force=True)
     assert data["kept-slug"]["intelligence"] == 22.0
+
+
+def test_guess_param_count_slugs():
+    assert ff.guess_param_count("liquid/lfm-3-1.7b:free") == 1.7
+    assert ff.guess_param_count("deepseek/deepseek-r1-distill-qwen-7b") == 7.0
+    assert ff.guess_param_count("qwen/qwen2.5-72b-instruct") == 72.0
+    assert ff.guess_param_count("some-model-700m:free") == 0.7
+    assert ff.guess_param_count("some-model-1t") == 1000.0
+    assert ff.guess_param_count("reflection/beam-free") is None
+    assert ff.guess_param_count("") is None
+
+
+def test_unscored_model_intelligence_assignment_by_param_count():
+    # Model with known param count < 10b gets intelligence 5.0
+    small_model = {"id": "liquid/lfm-3-1.7b:free"}
+    params = ff.guess_param_count(small_model["id"])
+    assert params is not None and params < 10.0
+    
+    # Model with known param count >= 10b gets intelligence SMART_FLOOR (10.0)
+    large_model = {"id": "qwen/qwen2.5-72b-instruct"}
+    params_large = ff.guess_param_count(large_model["id"])
+    assert params_large is not None and params_large >= 10.0
+    
+    # Model with unknown param count gets intelligence SMART_FLOOR (10.0)
+    unknown_model = {"id": "reflection/beam-free"}
+    assert ff.guess_param_count(unknown_model["id"]) is None

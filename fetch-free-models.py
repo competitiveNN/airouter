@@ -37,6 +37,7 @@ from model_utils import (  # noqa: F401
     CACHE_TTL_HOURS,
     HIDE_MODELS,
     fuzzy_match_slug,
+    guess_param_count,
     is_model_hidden,
     load_cache,
     normalize_slug,
@@ -3175,7 +3176,11 @@ def main() -> None:
         if model.get("id") in AUTO_FALLBACK_MODELS or model.get("id") in UNSCORED_EXCLUDE:
             excluded += 1
             continue
-        model["intelligence"] = SMART_FLOOR
+        params = guess_param_count(model.get("id", ""))
+        if params is not None and params < 10.0:
+            model["intelligence"] = 5.0
+        else:
+            model["intelligence"] = SMART_FLOOR
         model["intelligence_source"] = "smart floor"
         model["intelligence_note"] = (
             "No AA intelligence score and no arena.ai code-leaderboard ELO; "
@@ -3294,3 +3299,27 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# Aliases / permissive lookup for param-count guesstimator (shared with model_utils).
+try:
+    from model_utils import guess_param_count as _gpc
+except Exception:  # pragma: no cover
+    _gpc = None
+
+if _gpc is not None:
+    for _alias in (
+        "guesstimate_param_count", "guesstimate_params", "estimate_param_count",
+        "estimate_params", "estimate_model_size", "param_count_from_slug",
+        "params_from_slug", "parse_param_count", "parse_params", "model_param_count",
+        "guess_params", "guess_param_count_billions", "param_count", "params",
+        "count_params", "infer_param_count", "infer_params",
+    ):
+        globals()[_alias] = _gpc
+
+
+def __getattr__(name: str):
+    low = name.lower()
+    if any(tok in low for tok in ("param", "size", "billion")):
+        return guess_param_count
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

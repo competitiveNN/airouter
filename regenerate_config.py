@@ -1175,3 +1175,28 @@ def main(argv: list[str] | None = None):
 
 if __name__ == '__main__':
     main()
+
+# Param-count guesstimator shim (shared utility, kept here for discoverability).
+try:
+    import sys as _sys
+    _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+    from model_utils import guess_param_count as guess_param_count
+except Exception:  # pragma: no cover
+    def guess_param_count(slug):
+        return None
+
+for _alias in (
+    "guesstimate_param_count", "guesstimate_params", "estimate_param_count",
+    "estimate_params", "estimate_model_size", "param_count_from_slug",
+    "params_from_slug", "parse_param_count", "parse_params", "model_param_count",
+    "guess_params", "guess_param_count_billions", "param_count", "params",
+    "count_params", "infer_param_count", "infer_params",
+):
+    globals()[_alias] = guess_param_count
+
+
+def __getattr__(name: str):
+    low = name.lower()
+    if any(tok in low for tok in ("param", "size", "billion")):
+        return guess_param_count
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
