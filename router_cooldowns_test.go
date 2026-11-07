@@ -1336,3 +1336,48 @@ func TestCycleBackSleepComparesTheRealCooldownToTheBudget(t *testing.T) {
 		t.Fatalf("sleep = %v, want a positive duration bounded by the cooldown", sleep)
 	}
 }
+
+// TestCycleBackSleepWaitsOutAShortCooldownWithinGrace pins the 2026-11-07 503
+// fix: a streaming request may wait past its nominal budget for a free-tier
+// 429 that clears in tens of seconds, because the SSE idle keepalive keeps the
+// client connected. The grace is charged and the walk is extended so the retry
+// after the wait is not killed by the exhaustion check.
+func TestCycleBackSleepWaitsOutAShortCooldownWithinGrace(t *testing.T) {
+	start := time.Now().Add(-6 * time.Second)
+	walk := &budgetState{
+		start: start, budget: 20 * time.Second, lastProgress: start,
+		cooldownGrace: maxCooldownGrace,
+	}
+	// 14s of budget left, a 30s cooldown: 16s of overrun, well inside 90s.
+	sleep, ok := cycleBackSleep(30*time.Second, walk, maxSessionInterruption)
+	if !ok {
+		t.Fatal("refused a short cooldown with grace available")
+	}
+	if sleep <= 0 || sleep > maxSessionInterruption {
+		t.Fatalf("sleep = %v, want a positive duration capped by the ceiling", sleep)
+	}
+	if walk.remaining() <= 0 {
+		t.Fatalf("walk budget was not extended for the retry: remaining = %v", walk.remaining())
+	}
+	if walk.cooldownGrace >= maxCooldownGrace {
+		t.Fatalf("grace was not charged: %v", walk.cooldownGrace)
+	}
+}
+
+func TestCycleBackSleepRefusesACooldownBeyondTheGrace(t *testing.T) {
+	start := time.Now()
+	walk := &budgetState{
+		start: start, budget: 20 * time.Second, lastProgress: start,
+		cooldownGrace: maxCooldownGrace,
+	}
+	if _, ok := cycleBackSleep(20*time.Second+maxCooldownGrace+time.Second, walk, maxSessionInterruption); ok {
+		t.Fatal("waited for a cooldown that exceeds the grace")
+	}
+}
+
+func TestNonStreamingRequestsDoNotGetCooldownGrace(t *testing.T) {
+	walk := newBudgetState(time.Now(), 7*time.Second)
+	if walk.cooldownGrace != 0 {
+		t.Fatalf("non-streaming budget has grace %v, want 0 (no keepalives)", walk.cooldownGrace)
+	}
+}

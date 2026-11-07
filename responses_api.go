@@ -437,6 +437,8 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 	// the chat loops: this path was the one that shipped unbounded for a
 	// while, so it must use the same bound rather than its own copy.
 	walk := newBudgetState(start, timeout)
+	// Streaming response: the SSE idle keepalive keeps the client connected.
+	walk.cooldownGrace = maxCooldownGrace
 
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1

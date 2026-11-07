@@ -1268,6 +1268,18 @@ func attemptCeiling(tokens int) time.Duration {
 	return maxSessionInterruption
 }
 
+// maxCooldownGrace bounds how far past its nominal interruption budget a
+// STREAMING request may wait for a short cooldown to expire. Free-tier 429s
+// clear in tens of seconds; with the SSE idle keepalive the client stays
+// connected, so a 30s wait beats a 503. The grace is a per-request total, not
+// a per-wait one, so a chain of cooldowns cannot hold a client indefinitely.
+const maxCooldownGrace = 90 * time.Second
+
+// cooldownRetryMargin is added to the extended budget when a wait is granted,
+// so the attempt after the wait has room to run instead of dying in
+// attemptTimeout with a zero budget.
+const cooldownRetryMargin = 10 * time.Second
+
 // requestTimeout returns a timeout that scales with the request context size:
 // 5s for up to 1000 tokens, plus 1s for each additional 10000 tokens (ceil
 // division), capped at maxRequestAttemptTimeout.
@@ -1381,6 +1393,11 @@ type budgetState struct {
 	// therefore still allowed a full failover budget for the RESUME, while the
 	// time it spent producing output is not counted as interruption.
 	lastProgress time.Time
+	// cooldownGrace is the total extra wall clock this request may spend
+	// waiting out short cooldowns beyond its nominal budget. It is non-zero
+	// only for streaming requests (see maxCooldownGrace): a non-streaming
+	// client cannot be kept alive during the wait.
+	cooldownGrace time.Duration
 }
 
 // newBudgetState starts a budget for one request's fallback walk. timeout is
@@ -1470,10 +1487,18 @@ func (b *budgetState) attemptTimeout(preferred time.Duration) time.Duration {
 // comparison uses the REAL cooldown, not the capped sleep: waiting 30s of a
 // 16-minute cooldown would otherwise repeat until the budget ran out.
 //
-// Measured on 2026-10-20 against a 30s transport cooldown and a 12s
-// small-request budget: the request was held open for 30.2s and then returned
-// exactly the 503 it would have returned immediately. The client saw a hung
-// request for half a minute and got the same answer.
+// STREAMING callers may grant a bounded grace (walk.cooldownGrace) for a
+// cooldown that is longer than the nominal budget but still short. Free-tier
+// 429s clear in 30-90s, and a live client that is kept alive with SSE comments
+// prefers a 30s wait to a 503. The grace is charged against a per-request
+// total, so a chain of waits cannot hold the client indefinitely. Non-streaming
+// paths leave the grace at zero: they cannot send keepalives, so a silent wait
+// is worse than a fast error.
+//
+// Measured on 2026-11-07: the dominant 503 was
+// "cycle-back wait 31.352s outlasts the remaining fallback budget 20s" while
+// nvidia/gemini 429s had 25-55s left. Those are exactly the waits the grace
+// exists for.
 func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration) (time.Duration, bool) {
 	if ceiling <= 0 {
 		ceiling = maxSessionInterruption
@@ -1481,13 +1506,21 @@ func cycleBackSleep(wait time.Duration, walk *budgetState, ceiling time.Duration
 	if ceiling > maxSessionInterruption {
 		ceiling = maxSessionInterruption
 	}
-	// A cooldown that outlasts the budget cannot help. Compare the ACTUAL
-	// wait, not the capped sleep: sleeping 30s out of a 16-minute cooldown and
-	// re-checking merely repeats until the budget is spent and returns the
-	// same 503 minutes later. Only a cooldown that can expire inside the
-	// remaining budget is worth waiting for.
-	if wait <= 0 || wait >= walk.remaining() {
+	if wait <= 0 {
 		return 0, false
+	}
+	if remaining := walk.remaining(); wait > remaining {
+		// The cooldown outlasts the nominal budget. Allow it only when the
+		// request has grace left and the overrun fits that grace.
+		extra := wait - remaining
+		if extra > walk.cooldownGrace {
+			return 0, false
+		}
+		walk.cooldownGrace -= extra
+		// Extend the walk too, or the exhaustion check fires the instant the
+		// sleep ends and returns the same 503 a little later. The margin gives
+		// the retry that follows the wait somewhere to run.
+		walk.budget += extra + cooldownRetryMargin
 	}
 	sleep := minDuration(wait, ceiling)
 	// Full jitter on wake: sessions waiting on the same cooldown still
@@ -2215,6 +2248,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 
 	// Wall-clock budget for this request's fallback walk, shared policy.
 	walk := newBudgetState(start, timeout)
+	// This is a streaming response: the SSE idle keepalive keeps the client
+	// connected, so a short cooldown wait is better than an immediate 503.
+	walk.cooldownGrace = maxCooldownGrace
 	chainLen := g.router.ChainLength(req.Model)
 	maxAttempts := chainLen*3 + 1
 	if maxAttempts <= 1 {
