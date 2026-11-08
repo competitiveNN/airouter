@@ -83,8 +83,6 @@ PROVIDER_GROUPS = {
     "commandcode": ("commandcode", "commandcode2"),
 }
 
-FAST_KEYWORDS = ("flash-lite", "lightning", "nano", "gemma", "lfm", "laguna-xs")
-
 # Rule 6, the terminator ladder. Kept here as prose because the EXPECTATION is
 # derived by calling regenerate_config.auto_fallback_terminator() — the same
 # function the generator uses, so the checker cannot police a rule the generator
@@ -122,8 +120,8 @@ PROFILE_RULES = {
     # drop is NOT waived for dedicated code models: cohere/north-mini-code
     # scores 9.9, so it stays out of `work` and only qualifies via `large`.
     "work": {"min_intelligence": 15.0},
-    # fast: small/cheap only, capped at 10 distinct models before key expansion.
-    "fast": {"max_distinct_models": 10},
+    # fast: strictly intelligence < 10. No cap - all qualifying models included.
+    "fast": {},
     # large: context_length >= 200000 only, sorted by ctx desc then score desc.
     "large": {"min_context": 200000},
     "systemone": {"is_systemone": True},
@@ -478,7 +476,7 @@ def check(
             for ep in rest:
                 mid_l, sc = str(ep.get("model")).lower(), ep.get("intelligence")
                 if isinstance(sc, (int, float)) and not (
-                    sc < 25 or any(k in mid_l for k in FAST_KEYWORDS)
+                    sc < 10
                 ):
                     problems.append(f"rule5: {profile} entry {ep.get('model')} is neither small nor cheap")
 

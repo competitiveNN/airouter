@@ -610,12 +610,12 @@ CHECK_RULE_CASES = [
     ),
     (
         "terminator given a score",
-        lambda t: t.replace(
-            "        model: kilo-auto/free  # last: kilocode (auto router probed live; "
-            "opencode auto not entitled to free tier)\n        vision: true",
-            "        model: kilo-auto/free  # last: kilocode (auto router probed live; "
-            "opencode auto not entitled to free tier)\n        vision: true\n"
-            "        intelligence: 25.0", 1),
+        # Comment-agnostic: the terminator comment wording depends on the last
+        # probe verdict, and pinning it here made the mutation a silent no-op
+        # whenever that verdict changed.
+        lambda t: re.sub(
+            r"(?m)^(      - provider: kilocode\n        model: kilo-auto/free  # last:.*\n        vision: true)$",
+            r"\1\n        intelligence: 25.0", t, count=1),
         "the auto router is not a model",
     ),
     (
@@ -698,11 +698,18 @@ def _model_list_from_config(config_text, tmp_path):
     from datetime import UTC, datetime, timedelta
 
     now = (datetime.now(UTC) - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    # Read the verdict from the terminator's comment ONLY. A whole-file search
+    # for "probed live" also matches the header documentation, which marked the
+    # router live while the chain comment said "not probed" and made the
+    # control case fail against its own derived list (2026-11-07).
+    verdict = bool(re.search(
+        r"(?m)^        model: (?:kilo-auto/free|big-pickle)  # last:.*probed live",
+        config_text,
+    ))
     records, seen = [], set()
     for body in yaml.safe_load(config_text)["models"].values():
         for ep in body["chain"]:
             if ep["model"] in ("kilo-auto/free", "big-pickle"):
-                verdict = "probed live" in config_text
                 rec = {
                     "id": ep["model"], "provider": _JSON_PROVIDER.get(ep["provider"], ep["provider"]),
                     "context_length": ep.get("context_length", 0),

@@ -485,7 +485,8 @@ def test_probe_only_records_can_never_become_chain_candidates():
 def test_key_groups_are_emitted_whole_and_in_order():
     """Rule 3: an nvidia-nim model is three consecutive entries, a commandcode
     model two — so a 429 on one key falls through to the next instead of
-    failing the request."""
+    failing the request. Striding interleaves models by intelligence but key
+    groups must stay whole and adjacent."""
     catalog = {("kilocode", "kilo-auto/free"): _auto("kilo-auto/free", "kilocode")}
     models = [
         _model("z-ai/glm-5.3", "nvidia-nim", 44.8, ctx=131072),
@@ -493,13 +494,15 @@ def test_key_groups_are_emitted_whole_and_in_order():
         _model("qwen/qwen3.8-27b:free", "kilocode", 33.7, ctx=262144),
     ]
     chain = gen.build_chain(models, "fast", catalog)[:-1]
+    # Striding interleaves: high[0]=nvidia(44.8), low[0]=kilocode(33.7), high[1]=commandcode(25.0)
+    # Key groups stay consecutive within each model.
     assert [(e["provider"], e["model"]) for e in chain] == [
         ("nvidia", "z-ai/glm-5.3"),
         ("nvidia2", "z-ai/glm-5.3"),
         ("nvidia3", "z-ai/glm-5.3"),
+        ("kilocode", "qwen/qwen3.8-27b:free"),
         ("commandcode", "poolside/laguna-s-2.1-free"),
         ("commandcode2", "poolside/laguna-s-2.1-free"),
-        ("kilocode", "qwen/qwen3.8-27b:free"),
     ]
 
 
@@ -593,6 +596,11 @@ def _fixture_models(verdicts, extra=()):
             "id": "qwen/qwen3.8-27b:free", "provider": "kilocode", "context_length": 262144,
             "intelligence": 33.7, "elo": 1671.0, "released": "2026-01-01",
             "capabilities": {"vision": True}, "source": "kilocode", "raw": {},
+        },
+        {
+            "id": "small/fast-free", "provider": "kilocode", "context_length": 131072,
+            "intelligence": 5.0, "elo": None, "released": None,
+            "capabilities": {"vision": False}, "source": "kilocode", "raw": {},
         },
     ]
     for provider, model in (("kilocode", "kilo-auto/free"), ("opencode", "big-pickle")):
@@ -933,7 +941,7 @@ def test_an_unverifiable_run_preserves_the_comment_it_cannot_check(tmp_path):
     # preservation failure.
     fast_model = [{
         "id": "kilo/fast-free", "provider": "kilocode", "context_length": 262144,
-        "intelligence": 20.0, "elo": None, "released": None,
+        "intelligence": 5.0, "elo": None, "released": None,
         "capabilities": {"vision": False}, "source": "kilocode", "raw": {},
     }]
     before = _run_cli(tmp_path / "src", {"kilocode": True, "opencode": False},
@@ -1270,10 +1278,13 @@ def test_profile_floors_are_inclusive_and_enforced(filtername, provider, boundar
 
 def test_fast_cap_and_large_floor_are_enforced():
     """The other two profiles' limits, for the same reason."""
-    # `fast` takes intelligence < 25 OR a small-model id keyword; these are
-    # below the ceiling, so all 14 qualify and the cap has to do the work.
-    many = [_model(f"small/{i}:free", "kilocode", 24.0 - i * 0.1) for i in range(14)]
-    assert len(gen.filter_fast(many)) == 10
+    # `fast` takes strictly intelligence < 10. No cap - all qualify.
+    many = [
+        _model("small/high:free", "kilocode", 15.0),   # excluded: >= 10
+        _model("small/mid:free", "kilocode", 9.9),     # included: < 10
+        _model("small/low:free", "kilocode", 5.0),     # included: < 10
+    ]
+    assert len(gen.filter_fast(many)) == 2
 
     small = _model("large/small:free", "kilocode", 30.0, ctx=131072)
     big = _model("large/big:free", "kilocode", 30.0, ctx=262144)
@@ -1304,17 +1315,37 @@ def _systemone_record(model_id="jev", provider="kilocode", score=35.0, *, vision
     return _record_json(model_id, provider, score, vision=vision, ctx=ctx)
 
 
-def test_a_regenerated_chain_is_non_increasing_by_score(tmp_path):
-    """The end-to-end version, so a reversed sort cannot ship.
+def test_a_regenerated_chain_strides_smart_models_throughout(tmp_path):
+    """Striding interleaves smart and lower-intelligence models so no stretch
+    of the chain lacks a strong model. The head is always the smartest, and
+    smart models recur at roughly every other position.
 
-    Comparing two runs of the generator cannot catch it: both would be reversed.
+    Replaces the old 'non-increasing by score' test, which is incompatible
+    with striding by design.
     """
     text = _run_cli(tmp_path, {"kilocode": True, "opencode": False},
                     extra=[_record_json("order/a:free", "kilocode", 30.0, vision=True),
                            _record_json("order/b:free", "kilocode", 20.0, vision=False)])
-    for name, body in yaml.safe_load(text)["models"].items():
-        scores = [e["intelligence"] for e in body["chain"][:-1] if "intelligence" in e]
-        assert scores == sorted(scores, reverse=True), f"{name} is not best-first: {scores}"
+    parsed = yaml.safe_load(text)["models"]
+    for name, body in parsed.items():
+        chain = body["chain"][:-1]  # drop the auto terminator
+        if not chain:
+            continue
+        scores = [e["intelligence"] for e in chain if "intelligence" in e]
+        if not scores:
+            continue
+        # Head is always the smartest
+        assert scores[0] == max(scores), f"{name} head is not the smartest: {scores}"
+        # No model appears twice
+        ids = [e["model"] for e in chain]
+        assert len(ids) == len(set(ids)), f"{name} has duplicate models: {ids}"
+        # With >= 3 models, a second smart model should recur within the first
+        # few positions (striding property)
+        if len(scores) >= 3:
+            top_score = scores[0]
+            # Another model within 5 points of the top should appear by index 2
+            near_top = [s for s in scores[1:3] if s >= top_score - 5]
+            assert near_top, f"{name} lacks a near-top model within first 3 positions: {scores}"
 
 
 if __name__ == "__main__":
@@ -1892,3 +1923,41 @@ def test_the_collapse_guard_does_not_fire_on_a_small_test_fixture(tmp_path):
     gen.main(["--models", str(models), "--config", str(cfg), "--write"])
     text = cfg.read_text()
     assert "qwen/qwen3.8-27b:free" in text
+
+
+def test_systemone_fallback_reuses_smart_chain(tmp_path):
+    """When System One candidates are empty, the smart chain is reused instead of writing an empty profile.
+
+    This test ensures that the validator doesn't reject an empty System One chain and that
+    the systemone fallback logic works correctly during config regeneration.
+    """
+    # Create a fixture with no System One models (empty System One candidate pool)
+    # Use the same format as _fixture_models - a list of model records
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps([
+        _record_json("smart-model:free", "kilocode", 35.0, vision=True, ctx=262144),
+        _record_json("work-model:free", "kilocode", 30.0, vision=True, ctx=262144),
+        _record_json("fast-model:free", "kilocode", 25.0, vision=True, ctx=131072),
+        _record_json("large-model:free", "kilocode", 20.0, vision=True, ctx=262144),
+    ]))
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(CONFIG.read_text())
+
+    # Run the generator
+    gen.main(["--models", str(models), "--config", str(cfg), "--write"])
+
+    # Read the generated config
+    text = cfg.read_text()
+
+    # Verify that the config contains the expected models
+    parsed = yaml.safe_load(text)
+
+    # Verify that systemone is present (should be reusing smart chain)
+    assert "systemone" in parsed["models"]
+    systemone_chain = parsed["models"]["systemone"]["chain"]
+    assert systemone_chain, "systemone chain should not be empty"
+
+    # Verify that the systemone chain reuses the smart model
+    assert systemone_chain[0]["model"] == "smart-model:free"
+    assert systemone_chain[0]["provider"] == "kilocode"

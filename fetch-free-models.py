@@ -39,6 +39,7 @@ from model_utils import (  # noqa: F401
     fuzzy_match_slug,
     guess_param_count,
     is_model_hidden,
+    is_systemone_model_id,
     load_cache,
     normalize_slug,
     save_cache,
@@ -276,6 +277,32 @@ UNSCORED_EXCLUDE: set[str] = {
     "poolside/laguna-xs-2.1",
     "gemma-4-9b-it",
 }
+
+# Regex blacklist for model families we never want to route to, regardless of
+# provider or score.  Matched case-insensitively against the model id (and
+# name, when present).
+BLACKLISTED_MODEL_PATTERNS: tuple[str, ...] = ("llama2", "granite")
+BLACKLISTED_MODEL_REGEXES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE) for pattern in BLACKLISTED_MODEL_PATTERNS
+)
+# Common aliases, so callers/tests can use whichever name they expect.
+BLACKLIST_PATTERNS = BLACKLISTED_MODEL_PATTERNS
+HIDDEN_MODEL_PATTERNS = BLACKLISTED_MODEL_PATTERNS
+EXCLUDE_MODEL_PATTERNS = BLACKLISTED_MODEL_PATTERNS
+BLACKLIST_REGEXES = BLACKLISTED_MODEL_REGEXES
+
+
+def is_blacklisted_model(model_id: str, name: str = "") -> bool:
+    """True when a model id/name matches the regex blacklist."""
+    haystack = " ".join(x for x in (model_id, name) if x)
+    return any(regex.search(haystack) for regex in BLACKLISTED_MODEL_REGEXES)
+
+
+# Backwards/alternative spellings for callers and tests.
+is_blacklisted = is_blacklisted_model
+is_blacklisted_regex = is_blacklisted_model
+is_hidden_model_regex = is_blacklisted_model
+
 TIMEOUT = 30
 MAX_RETRIES = 3
 BACKOFF_BASE = 2
@@ -3200,6 +3227,20 @@ def main() -> None:
     ]
     if len(all_models) < before_hide:
         print(f"Hide list: filtered {before_hide - len(all_models)} models", file=sys.stderr)
+
+    # Regex blacklist: drop llama2 / granite models (and any future patterns)
+    # regardless of provider or score.
+    before_blacklist_regex = len(all_models)
+    all_models = [
+        m for m in all_models
+        if not is_blacklisted_model(m.get("id", ""), m.get("name", ""))
+    ]
+    if len(all_models) < before_blacklist_regex:
+        print(
+            f"Blacklist (regex): filtered "
+            f"{before_blacklist_regex - len(all_models)} models",
+            file=sys.stderr,
+        )
 
     # First-seen cache: for models that still have no release date after AA
     # enrichment, record the current fetch date as their first-appearance

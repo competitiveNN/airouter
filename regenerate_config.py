@@ -385,6 +385,30 @@ def sort_models(
     return models
 
 
+def stride_models(models: list[Model]) -> list[Model]:
+    """Interleave high- and lower-intelligence models so smart models recur
+    throughout the chain instead of clustering at the head.
+
+    With models sorted descending by intelligence, split into a smarter half
+    and a less-smart half, then interleave: high[0], low[0], high[1], low[1], ...
+    A session that settles at depth N still encounters a near-top model at
+    depth N+2, so no stretch of the chain is left without smart coverage.
+    """
+    n = len(models)
+    if n <= 2:
+        return models
+    mid = (n + 1) // 2
+    high = models[:mid]
+    low = models[mid:]
+    result = []
+    for i in range(max(len(high), len(low))):
+        if i < len(high):
+            result.append(high[i])
+        if i < len(low):
+            result.append(low[i])
+    return result
+
+
 def filter_smart(models: list[Model]) -> list[Model]:
     """smart: strongest generalists, intelligence >= 25, any context length"""
     return [m for m in models
@@ -405,19 +429,17 @@ def filter_work(models: list[Model]) -> list[Model]:
 
 
 def filter_fast(models: list[Model]) -> list[Model]:
-    """fast: small/cheap models only: intelligence < 25, or ids containing flash-lite / lightning / nano / gemma / lfm / laguna-xs. Cap at 10 entries."""
-    fast_keywords = ['flash-lite', 'lightning', 'nano', 'gemma', 'lfm', 'laguna-xs']
+    """fast: small/cheap models only - strictly intelligence < 10, no cap.
+    All qualifying models included, sorted descending by intelligence."""
     candidates = []
     for m in models:
         if m.score is None or not m.is_chain_candidate:
             continue
-        id_lower = m.id.lower()
-        is_fast = m.score < 25 or any(kw in id_lower for kw in fast_keywords)
-        if is_fast:
+        if m.score < 10:
             candidates.append(m)
-    # Sort by intelligence desc, take top 10
+    # Sort by intelligence desc - all qualifying models included
     candidates.sort(key=lambda x: x.score, reverse=True)
-    return candidates[:10]
+    return candidates
 
 
 def filter_large(models: list[Model]) -> list[Model]:
@@ -549,8 +571,10 @@ def auto_fallback_terminator(
     if verdict(preferred) != 'dead':
         provider, model = available[preferred]
         state = verdict(preferred)
-        if state == 'unknown' and previous is not None \
-                and previous[:2] == (provider, model) and previous[2]:
+        # Preserve the previous comment when the verdict is unknown and the
+        # endpoint is unchanged: a run that could not check the claim must not
+        # rewrite it into a different claim.
+        if state == 'unknown' and previous is not None and previous[:2] == (provider, model):
             return provider, model, previous[2]
         # The probe verdict is stable text, not the probe timestamp: a date here
         # would rewrite every chain on every nightly run for no added signal,
@@ -766,6 +790,13 @@ def build_chain(
         }
 
     chain = []
+
+    # Stride models per chain so smart models recur throughout the chain
+    # instead of clustering at the head. A session settling at depth N still
+    # encounters a near-top model at depth N+2. `large` is excluded because
+    # it sorts by context_length, not intelligence.
+    if profile != 'large':
+        models = stride_models(models)
 
     for m in models:
         if m.mapped_provider == 'nvidia':
@@ -1142,7 +1173,7 @@ def main(argv: list[str] | None = None):
     work_chain = build_chain(work_models, 'work', records, previous.get('work'), protocols, providers_present)
     fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'), protocols, providers_present)
     large_chain = build_chain(large_models, 'large', records, previous.get('large'), protocols, providers_present)
-    systemone_chain = build_chain(systemone_models, 'systemone', records, previous.get('systemone'), protocols, providers_present)
+    systemone_chain = build_chain(systemone_models if systemone_models else smart_models, 'systemone', records, previous.get('systemone'), protocols, providers_present)
     
     # Generate new models section
     new_models = f"""models:

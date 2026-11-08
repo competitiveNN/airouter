@@ -116,6 +116,12 @@ def is_model_hidden(
         return False
     if model_id in HIDE_MODELS:
         return True
+    # Regex blacklist (llama2, granite, ...) applies to all providers' nvidia
+    # entries too, so the hide list and the fetcher agree.
+    import re
+    for pattern in ("llama2", "granite"):
+        if re.search(pattern, model_id, re.IGNORECASE):
+            return True
     # If we have an intelligence score, use it as primary filter
     if intelligence is not None:
         if intelligence < MIN_INTELLIGENCE_SCORE:

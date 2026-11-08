@@ -545,7 +545,10 @@ SUITE_TEST_FLOORS = {
     # 77 -- the 75 above plus 2 for the degenerate-enrichment guard: a large
     # model list whose smart/work pools collapsed is refused instead of written,
     # and the small synthetic fixtures stay writable (2026-11-06).
-    "scripts/test_regenerate_config.py": 77,
+    # 78 -- the 77 above plus 1 for the systemone fallback: an empty System One
+    # candidate pool reuses the smart chain instead of writing an empty profile
+    # (which the validator rejects and which would 503 every systemone request).
+    "scripts/test_regenerate_config.py": 78,
     # EXACT, matching every other floor in this table (66/66, 65/65, 19/19, 16/16).
     # An earlier version of this entry sat at 14 against 22 functions on the
     # theory that a floor should have slack so that adding tests needs no edit.
