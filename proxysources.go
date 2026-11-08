@@ -70,6 +70,12 @@ type proxySource struct {
 
 	// Extract turns a response body into proxies plus its own as-of date.
 	Extract func(body []byte) sourceExtract
+
+	// MaxAge is the maximum allowed age of the source's contents before they
+	// are considered stale and discarded. If zero, the global proxySourceMaxAge
+	// is used. This allows per-source TTL configuration (e.g., spys.one can
+	// have a longer TTL since its "last check" dates are more reliable).
+	MaxAge time.Duration
 }
 
 // defaultProxySources is the built-in source list. Proxy lists are long-lived
@@ -103,12 +109,14 @@ var defaultProxySources = []proxySource{
 		URL:      "https://spys.one/en/anonymous-proxy-list/",
 		Protocol: "https",
 		Extract:  extractorSpysOne("https"),
+		MaxAge:   24 * time.Hour,
 	},
 	{
 		Name:     "spys.one socks",
 		URL:      "https://spys.one/en/socks-proxy-list/",
 		Protocol: "socks5",
 		Extract:  extractorSpysOne("socks5"),
+		MaxAge:   24 * time.Hour,
 	},
 	{
 		Name:     "proxydb.net",

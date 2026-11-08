@@ -711,19 +711,23 @@ func (s *ProxyService) fetchAll(ctx context.Context, sources []proxySource) []*P
 		result := f.result
 
 		// Freshness: a list that says its newest entry was checked more than
-		// proxySourceMaxAge ago is a list of addresses that have probably gone
-		// dead. Discard the source rather than spend the next requests
-		// discovering that one attempt at a time.
+		// its MaxAge (or the global proxySourceMaxAge) ago is a list of addresses
+		// that have probably gone dead. Discard the source rather than spend the
+		// next requests discovering that one attempt at a time.
 		//
 		// Sources whose format carries no date (the two raw GitHub text lists)
 		// report a zero AsOf. That is genuinely unknown, not stale, so they are
 		// kept -- and logged as such, so a silently never-discarded source is
 		// visible instead of looking like it passed the check.
+		maxAge := source.MaxAge
+		if maxAge == 0 {
+			maxAge = proxySourceMaxAge
+		}
 		if result.AsOf.IsZero() {
 			log.Printf("[proxy] source %d (%s): no date in body, freshness unknown (kept)", idx, source.Name)
-		} else if age := time.Since(result.AsOf); age > proxySourceMaxAge {
+		} else if age := time.Since(result.AsOf); age > maxAge {
 			log.Printf("[proxy] source %d (%s): DISCARDED, contents dated %s (%s old, limit %s)",
-				idx, source.Name, result.AsOf.UTC().Format(time.RFC3339), age.Round(time.Second), proxySourceMaxAge)
+				idx, source.Name, result.AsOf.UTC().Format(time.RFC3339), age.Round(time.Second), maxAge)
 			continue
 		}
 

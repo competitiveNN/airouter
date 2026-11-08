@@ -540,11 +540,14 @@ func TestStaleSourceIsDiscarded(t *testing.T) {
 	cases := []struct {
 		name     string
 		asOf     time.Time
+		maxAge   time.Duration
 		wantKept bool
 	}{
-		{"fresh contents are kept", fresh, true},
-		{"stale contents are discarded", stale, false},
-		{"unknown date is kept, not assumed stale", time.Time{}, true},
+		{"fresh contents are kept", fresh, 0, true},
+		{"stale contents are discarded", stale, 0, false},
+		{"unknown date is kept, not assumed stale", time.Time{}, 0, true},
+		{"custom MaxAge: fresh per-source", time.Now().Add(-30 * time.Minute), 1 * time.Hour, true},
+		{"custom MaxAge: stale per-source", time.Now().Add(-2 * time.Hour), 1 * time.Hour, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -555,8 +558,9 @@ func TestStaleSourceIsDiscarded(t *testing.T) {
 
 			svc := NewProxyService("", time.Minute)
 			sources := []proxySource{{
-				Name: "test",
-				URL:  srv.URL,
+				Name:    "test",
+				URL:     srv.URL,
+				MaxAge:  tc.maxAge,
 				Extract: func([]byte) sourceExtract {
 					return sourceExtract{
 						Proxies: []*ProxyInfo{{IP: "1.2.3.4", Port: "8080", Protocol: "https", URL: "http://1.2.3.4:8080"}},

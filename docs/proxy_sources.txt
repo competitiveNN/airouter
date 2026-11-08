@@ -17,7 +17,10 @@
 # cells (one computes them with obfuscated JavaScript).
 #
 # A source is discarded whole when its contents report they are older than
-# proxySourceMaxAge (15 minutes); re-fetched every 15 minutes.
+# its MaxAge (default: proxySourceMaxAge = 15 minutes); re-fetched every
+# refreshInterval. Per-source MaxAge can be configured in defaultProxySources
+# (e.g., spys.one sources use 24 hours because their "last check" dates are
+# reliable and the lists update less frequently).
 
 https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/refs/heads/main/proxies/top-trusted.txt
 https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/protocols/https.txt
