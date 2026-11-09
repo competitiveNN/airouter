@@ -170,16 +170,16 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "comment preservation dropped",
         "regenerate_config.py",
-        "        if state == 'unknown' and previous is not None \\\n                and previous[:2] == (provider, model) and previous[2]:",
-        "        if False:",
+        "if state == 'unknown' and previous is not None and previous[:2] == (provider, model):",
+        "if False:",
         "An unverifiable run would rewrite a recorded 'probed live' into "
         "'not probed' on every nightly sync.",
     ),
     Mutation(
         "preservation ignores an endpoint change",
         "regenerate_config.py",
-        "                and previous[:2] == (provider, model) and previous[2]:",
-        "                and previous[2]:",
+        "previous[:2] == (provider, model):",
+        "previous[:2] == (provider, model) and False:",
         "A kilocode terminator would inherit a comment naming opencode — the "
         "exact class of comment-without-its-hash defect, one indirection away.",
     ),

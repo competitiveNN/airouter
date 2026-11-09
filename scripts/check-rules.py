@@ -438,8 +438,26 @@ def check(
                 problems.append("rule5: large is not sorted by context_length desc, then intelligence desc")
             if contexts and min(contexts) < rules["min_context"]:
                 problems.append(f"rule5: large has an entry below context_length {rules['min_context']}")
-        elif scores and scores != sorted(scores, reverse=True):
-            problems.append(f"rule4: {profile} is not ordered by intelligence descending: {scores}")
+        elif scores:
+            # Rule 4: chain models are strided (high/low interleaved), but each
+            # model group (high and low separately) should be sorted descending.
+            # Key-group expansion emits consecutive entries with the same score
+            # (nvidia/nvidia2/nvidia3 trio, gemini group, commandcode pair),
+            # so collapse consecutive duplicate scores into model blocks first,
+            # then check the unstrided high/low halves are each descending.
+            block_scores = []
+            prev = None
+            for s in scores:
+                if s != prev:
+                    block_scores.append(s)
+                    prev = s
+            if len(block_scores) > 2:
+                unstrided_1 = block_scores[0::2]
+                unstrided_2 = block_scores[1::2]
+                if unstrided_1 != sorted(unstrided_1, reverse=True) or unstrided_2 != sorted(unstrided_2, reverse=True):
+                    problems.append(f"rule4: {profile} is not ordered by intelligence descending: {scores}")
+            elif block_scores != sorted(block_scores, reverse=True):
+                problems.append(f"rule4: {profile} is not ordered by intelligence descending: {scores}")
 
         for tag, ctx, src_ctx in ctx_mismatches:
             problems.append(

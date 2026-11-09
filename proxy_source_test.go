@@ -558,9 +558,9 @@ func TestStaleSourceIsDiscarded(t *testing.T) {
 
 			svc := NewProxyService("", time.Minute)
 			sources := []proxySource{{
-				Name:    "test",
-				URL:     srv.URL,
-				MaxAge:  tc.maxAge,
+				Name:   "test",
+				URL:    srv.URL,
+				MaxAge: tc.maxAge,
 				Extract: func([]byte) sourceExtract {
 					return sourceExtract{
 						Proxies: []*ProxyInfo{{IP: "1.2.3.4", Port: "8080", Protocol: "https", URL: "http://1.2.3.4:8080"}},

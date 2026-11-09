@@ -237,6 +237,8 @@ def main() -> int:
         mi = p.get("max_interruption")
         if mi is None:
             continue
+        if isinstance(mi, (int, float)):
+            mi = f"{int(mi)}s"
         secs, err = _dur_seconds(mi)
         if err is not None:
             problems.append(f"providers.{pname}.max_interruption {err}")
