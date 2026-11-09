@@ -1271,9 +1271,14 @@ func attemptCeiling(tokens int) time.Duration {
 // maxCooldownGrace bounds how far past its nominal interruption budget a
 // STREAMING request may wait for a short cooldown to expire. Free-tier 429s
 // clear in tens of seconds; with the SSE idle keepalive the client stays
-// connected, so a 30s wait beats a 503. The grace is a per-request total, not
+// connected, so waiting beats a 503. The grace is a per-request total, not
 // a per-wait one, so a chain of cooldowns cannot hold a client indefinitely.
-const maxCooldownGrace = 90 * time.Second
+//
+// The escalation curve means a 429 at errorCount=3 already sits at 120s
+// (plus jitter ~150s) and timeouts at errorCount=2 hit 240s. The grace must
+// exceed those or concurrent rate-limiting across every provider in a chain
+// forces an immediate 503 even though endpoints recover within minutes.
+const maxCooldownGrace = 5 * time.Minute
 
 // cooldownRetryMargin is added to the extended budget when a wait is granted,
 // so the attempt after the wait has room to run instead of dying in
