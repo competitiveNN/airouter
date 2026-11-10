@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-07T05:08:48.112389Z",
+  "fetched_at": "2026-11-10T05:10:47.525543Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
@@ -28,6 +28,7 @@
     "jev-1.13-free": "2026-09-26",
     "ling-3.1-flash-free": "2026-10-02",
     "ll-alpha-free": "2026-10-16",
+    "longcat-2.5-free": "2026-11-10",
     "longcat-2.5-preview-free": "2026-09-26",
     "meta/llama2-70b": "2026-09-26",
     "meta/muse-glimmer-30b": "2026-11-06",
@@ -59,6 +60,7 @@
   "missing_since": {
     "beam": "2026-11-06",
     "cat-jam-free": "2026-10-16",
+    "crouton-alpha-free": "2026-11-10",
     "exo-free": "2026-10-12",
     "inclusionai/ling-3.1-flash": "2026-10-14",
     "inclusionai/ling-3.1-flash:free": "2026-10-15",
@@ -71,6 +73,7 @@
     "poolside/laguna-s-2.1:free": "2026-10-31",
     "poolside/laguna-xs-2.1:free": "2026-10-31",
     "pulse-alpha-free": "2026-11-07",
+    "reflection/beam:free": "2026-11-10",
     "space-bunny-free": "2026-10-20",
     "stealth/cat-jam:free": "2026-10-19",
     "step-5-preview-free": "2026-10-16"
