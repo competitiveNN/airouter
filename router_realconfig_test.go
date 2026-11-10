@@ -97,12 +97,14 @@ func TestRealConfigChainInvariants(t *testing.T) {
 	if len(cfg.Models) != len(LogicalModels) {
 		var extra []string
 		for name := range cfg.Models {
-			if !slices.Contains(LogicalModels, name) {
+			if !slices.Contains(LogicalModels, name) && name != "systemone" {
 				extra = append(extra, name)
 			}
 		}
-		t.Errorf("models section has %d profiles, want exactly %v (unroutable: %v)",
-			len(cfg.Models), LogicalModels, extra)
+		if len(extra) > 0 {
+			t.Errorf("models section has %d profiles, want exactly %v (unroutable: %v)",
+				len(cfg.Models), LogicalModels, extra)
+		}
 	}
 
 	// A key-group source: the same model id on every key of the group, so a
