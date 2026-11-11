@@ -39,7 +39,6 @@ from model_utils import (  # noqa: F401
     fuzzy_match_slug,
     guess_param_count,
     is_model_hidden,
-    is_systemone_model_id,
     load_cache,
     normalize_slug,
     save_cache,
@@ -223,7 +222,7 @@ def update_first_seen_cache(
                 pruned += 1
     for model in models:
         mid = model.get("id", "")
-        if not mid or mid in AUTO_FALLBACK_MODELS:
+        if not mid or mid in META_ROUTER_MODELS:
             continue
         if model.get("released") is not None:
             continue
@@ -249,9 +248,10 @@ def update_first_seen_cache(
 
 
 # Meta-router auto-fallback models. They are never real candidates, so they
-# stay unscored (null intelligence) and only ever appear as the trailing
-# chain entry -- never floored into the concrete pool.
-AUTO_FALLBACK_MODELS = {"kilo-auto/free", "big-pickle"}
+# Meta-router models (formerly AUTO_FALLBACK_MODELS). These are now treated as
+# regular models with hardcoded intelligence scores (see INTELLIGENCE_OVERRIDES)
+# and can appear anywhere in chains, not just as trailing terminators.
+META_ROUTER_MODELS: set[str] = {"kilo-auto/free", "big-pickle"}
 
 # Models that are unscored (no AA intelligence, no arena ELO) but are NOT
 # usable routing candidates. They are excluded BEFORE the smart floor is
@@ -281,7 +281,12 @@ UNSCORED_EXCLUDE: set[str] = {
 # Regex blacklist for model families we never want to route to, regardless of
 # provider or score.  Matched case-insensitively against the model id (and
 # name, when present).
-BLACKLISTED_MODEL_PATTERNS: tuple[str, ...] = ("llama2", "granite")
+BLACKLISTED_MODEL_PATTERNS: tuple[str, ...] = (
+    "llama2",
+    "granite",
+    "nemotron-3.5-bolt-e4b",  # deprecated/blocked: does not meet quality bar for routing
+    "deepseek-coder-6.7b-instruct",  # deprecated/blocked: superseded by newer deepseek models
+)
 BLACKLISTED_MODEL_REGEXES: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE) for pattern in BLACKLISTED_MODEL_PATTERNS
 )
@@ -504,6 +509,16 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+
+# Hardcoded intelligence score overrides for specific models.
+# These take precedence over AA, Arena ELO, and the smart floor.
+# Format: "provider/model-id": intelligence_score (float)
+INTELLIGENCE_OVERRIDES: dict[str, float] = {
+    "poolside/laguna-xs-2.1": 10.0,
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": 2.5,
+    "kilo-auto/free": 5.0,
+    "big-pickle": 5.0,
+}
 
 # NVIDIA NIM release date mapping: model_id -> "YYYY-MM"
 # These are the ORIGINAL MODEL RELEASE DATES, not when NVIDIA added them to NIM.
@@ -2837,13 +2852,6 @@ def output_json(data: list[dict], path: str | None) -> None:
         print(out)
 
 
-def is_systemone_model(model: dict[str, Any]) -> bool:
-    """Whether a fetched model qualifies as a System One decision model."""
-    model_id = model.get("id") or ""
-    name = model.get("name") or ""
-    return is_systemone_model_id(str(model_id), str(name))
-
-
 def output_csv(data: list[dict], path: str | None) -> None:
     if not data:
         return
@@ -2869,7 +2877,6 @@ def output_csv(data: list[dict], path: str | None) -> None:
             "reasoning": caps.get("reasoning"),
             "vision": caps.get("vision"),
             "open_weights": caps.get("open_weights"),
-            "systemone": is_systemone_model(d),
             "source": d.get("source"),
             "fetched_at": d.get("fetched_at"),
         }
@@ -2906,7 +2913,6 @@ def output_table(data: list[dict]) -> None:
         ("ctx", 10),
         ("reason", 6),
         ("vision", 6),
-        ("systemone", 8),
     ]
 
     header = " | ".join(f"{name:<{w}}" for name, w in cols)
@@ -2949,7 +2955,6 @@ def output_table(data: list[dict]) -> None:
             ctx_disp,
             "Y" if caps.get("reasoning") else "N",
             "Y" if caps.get("vision") else "N",
-            "Y" if is_systemone_model(d) else "N",
         ]
         print(" | ".join(f"{v:<{w}}" for (_, w), v in zip(cols, row, strict=True)))
 
@@ -2967,7 +2972,7 @@ def _first_seen_grew(
     24h-TTL snapshot would otherwise leave the newcomer floored at the
     deterministic 25.0 for models Artificial Analysis has already scored.
     """
-    return bool(census - AUTO_FALLBACK_MODELS - set(first_seen))
+    return bool(census - META_ROUTER_MODELS - set(first_seen))
 
 
 def main() -> None:
@@ -3088,7 +3093,7 @@ def main() -> None:
     # providers still list, and those must not start an absence countdown.
     census = {m.get("id", "") for m in all_models}
     census.discard("")
-    census -= AUTO_FALLBACK_MODELS
+    census -= META_ROUTER_MODELS
 
     # Enrich with Artificial Analysis data (intelligence scores + release dates)
     # Keep the enrichment snapshot in step with first-seen: a brand-new
@@ -3182,6 +3187,14 @@ def main() -> None:
                     model["intelligence"] = normalize_elo_to_intelligence(entry["elo"])
         print(f"Arena code: matched ELO for {matched} models", file=sys.stderr)
 
+    # Apply hardcoded intelligence overrides (takes precedence over AA, Arena ELO, and smart floor).
+    for model in all_models:
+        mid = model.get("id", "")
+        if mid in INTELLIGENCE_OVERRIDES:
+            model["intelligence"] = INTELLIGENCE_OVERRIDES[mid]
+            model["intelligence_source"] = "hardcoded override"
+            model["intelligence_note"] = "Manually specified intelligence score"
+
     # Deterministic smart floor: any model that still has no intelligence
     # score (neither AA nor arena code ELO) gets the lowest value that lets
     # it enter the smart/work/large chains. Auto-fallback meta-router models
@@ -3192,7 +3205,7 @@ def main() -> None:
     for model in all_models:
         if model.get("intelligence") is not None:
             continue
-        if model.get("id") in AUTO_FALLBACK_MODELS or model.get("id") in UNSCORED_EXCLUDE:
+        if model.get("id") in META_ROUTER_MODELS or model.get("id") in UNSCORED_EXCLUDE:
             excluded += 1
             continue
         params = guess_param_count(model.get("id", ""))
