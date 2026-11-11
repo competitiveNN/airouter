@@ -384,7 +384,7 @@ func (g *GatewayContext) recordRequest(model string, status int, latency time.Du
 // retries" to "the upstream at step M said 429/timeout/not-found". Without
 // it, the only signal is the metric counter, which says THAT something
 // advanced but not WHICH request or WHEN in the chain.
-func (g *GatewayContext) recordFallback(ep *ModelEndpoint, err error, statusCode int, body string) {
+func (g *GatewayContext) recordFallback(ep *ModelEndpoint, err error, statusCode int, body string, usedProxy bool) {
 	reason := failoverReasonOf(err, statusCode, body)
 	key := ""
 	if ep != nil {
@@ -392,8 +392,12 @@ func (g *GatewayContext) recordFallback(ep *ModelEndpoint, err error, statusCode
 	}
 	// Log before the metric so a logged fallback is never dropped just because
 	// the metrics backend hasn't been wired.
-	log.Printf("[fallback] reason=%s endpoint=%s status=%d err=%s",
-		reason, key, statusCode, summarizeError(errString(err, body)))
+	proxyMarker := ""
+	if usedProxy {
+		proxyMarker = " [PROXY]"
+	}
+	log.Printf("[fallback]%s reason=%s endpoint=%s status=%d err=%s%s",
+		proxyMarker, reason, key, statusCode, summarizeError(errString(err, body)), proxyMarker)
 	if g.metrics == nil {
 		return
 	}
@@ -1899,6 +1903,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if maxProxyTries <= 0 {
 			maxProxyTries = 1
 		}
+		var usedProxy bool
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
 			r, fc, err := g.proxy.Forward(reqCtx, body, *ep, sessionID)
 			fwdCancel = fc
@@ -1914,6 +1919,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				if errors.As(err, &pErr) {
 					// Proxy failure: mark the proxy down and try again with a
 					// different proxy on the same endpoint.
+					usedProxy = true
 					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
 					fwdCancel()
 					lastErr = err
@@ -1926,6 +1932,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			}
 			resp = r
 			gotResp = true
+			usedProxy = g.proxy.proxyTries(ep) > 0
 			break
 		}
 		if !gotResp {
@@ -1958,7 +1965,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				return
 			}
 			tried[ep.Key()] = true
-			g.recordFallback(ep, lastErr, 0, lastErr.Error())
+			g.recordFallback(ep, lastErr, 0, lastErr.Error(), usedProxy)
 			if !errors.As(lastErr, &pErr) {
 				// Only cool down the endpoint for non-proxy errors.
 				if g.testCooldown > 0 {
@@ -2024,7 +2031,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep, nil, resp.StatusCode, string(respBody))
+			g.recordFallback(ep, nil, resp.StatusCode, string(respBody), usedProxy)
 			if g.testCooldown > 0 {
 				// In test mode the caller-specified duration wins and the real
 				// escalation ladder is skipped (see ApplyCooldownWithDuration):
@@ -2070,7 +2077,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if readErr != nil {
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep, readErr, 502, readErr.Error())
+			g.recordFallback(ep, readErr, 502, readErr.Error(), usedProxy)
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, 502, readErr.Error(), sessionID, g.testCooldown)
 			} else {
@@ -2085,7 +2092,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			readErr = fmt.Errorf("upstream response body exceeds %d bytes", maxUpstreamBodyBytes)
 			g.recordAttempt(ep, time.Since(attemptStart), false)
 			tried[ep.Key()] = true
-			g.recordFallback(ep, readErr, 502, readErr.Error())
+			g.recordFallback(ep, readErr, 502, readErr.Error(), usedProxy)
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, 502, readErr.Error(), sessionID, g.testCooldown)
 			} else {
@@ -2476,6 +2483,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		// a failed transport does not concatenate two attempts' thinking.
 		var attemptReasoning strings.Builder
 		directNext := false
+		var usedProxy bool
 		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
 			attemptReasoning.Reset()
 			// Each proxy retry gets only what is left of the interruption
@@ -2516,6 +2524,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				}
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
+					usedProxy = true
 					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
 					if pErr.MidStream {
 						break
@@ -2591,7 +2600,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			log.Printf("[debug] session=%s model=%s -> mid-stream failover from %s (replaying %d chars, %d tool calls); resuming on next model",
 				sessionID, req.Model, ep.Key(), len(partial), len(toolCalls))
 		} else {
-			g.recordFallback(ep, err, 0, err.Error())
+			g.recordFallback(ep, err, 0, err.Error(), usedProxy)
 		}
 		var pErr *ProxyError
 		if !errors.As(err, &pErr) {

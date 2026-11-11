@@ -299,6 +299,11 @@ func (p *Proxy) effectiveProtocol(ep *ModelEndpoint) protocol {
 // proxyTries resolves this endpoint's proxy budget: the maximum number of
 // different proxies to try before the endpoint gives up. 0 means a direct
 // connection (no proxy).
+//
+// When the provider has MandatoryProxy set to true, proxyTries still returns
+// the proxy budget so that proxy attempts are made, but the caller (attemptClient
+// and Forward) is responsible for not falling back to direct connection when
+// mandatory_proxy is true and proxy fails/unavailable.
 func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 	// Command Code upstreams never route through the proxy pool: the
 	// protocol has its own auth model and the proxy pool is not used.
@@ -320,6 +325,36 @@ func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 		return 0
 	}
 	return provider.Proxy
+}
+
+// proxyBudget returns the effective proxy budget for an endpoint, considering
+// the MandatoryProxy setting. When mandatory_proxy is true and the provider
+// has a proxy budget, we return the budget to ensure proxy attempts are made.
+// The caller must then handle the "no proxy available" case without falling
+// back to direct.
+func (p *Proxy) proxyBudgetWithMandatory(ep *ModelEndpoint) int {
+	if p == nil || p.config == nil {
+		return 0
+	}
+	cfg := p.config.Load()
+	if cfg == nil {
+		return 0
+	}
+	// If the provider has MandatoryProxy enabled, ensure proxy budget is
+	// respected so that proxy attempts are made. The actual enforcement
+	// (not falling back to direct) happens in attemptClient and Forward.
+	provider, ok := cfg.Providers[ep.Provider]
+	if !ok {
+		return 0
+	}
+	budget := p.proxyTries(ep)
+	// When mandatory_proxy is true and we have a proxy budget, return it
+	// so attempts are made. The "no proxy available" case is handled by
+	// the caller not falling back to direct.
+	if provider.MandatoryProxy && budget > 0 {
+		return budget
+	}
+	return budget
 }
 
 // maxProxiedBodyBytes is the largest request body an attempt may send through
@@ -429,7 +464,20 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration, allowPro
 					ep.Provider, ep.Model, svc.pool.len(), svc.ReadyCount())
 			}
 		}
+	} else {
+		// If mandatory proxy is enabled and no proxy is available, do not fall back to direct
+		if p.config != nil {
+			cfg := p.config.Load()
+			if cfg != nil {
+				provider := cfg.Providers[ep.Provider]
+				if provider.MandatoryProxy && usedProxy == nil {
+					// No proxy available and mandatory proxy is required - fail the attempt
+					return nil, nil
+				}
+			}
+		}
 	}
+
 	// The direct path reuses the shared pooled transport. Per-attempt
 	// deadlines are applied via the request context, not per-transport
 	// timeouts (see handleCompletion / handleStream and StreamToClient), so
@@ -1182,6 +1230,17 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 		}
 	}
 
+	// Enforce mandatory proxy routing: if the provider requires proxy
+	// routing and no proxy was selected, fail the attempt instead of
+	// falling back to a direct connection.
+	if usedProxy == nil && providerCfg.MandatoryProxy {
+		cancel()
+		return nil, func() {}, &ProxyError{
+			Proxy: nil,
+			Err:   fmt.Errorf("mandatory proxy routing enabled but no proxy available for %s/%s", endpoint.Provider, endpoint.Model),
+		}
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		// Nothing has reached the client yet, so a proxy fault here is safe to
@@ -1465,6 +1524,14 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 			len(body), maxProxiedBodyBytes, endpoint.Provider, endpoint.Model)
 	}
 	client, usedProxy := p.attemptClient(&endpoint, timeout, allowProxy)
+	if client == nil {
+		// Mandatory proxy routing is enabled but no proxy is available.
+		// Fail this attempt so the fallback chain can advance.
+		return "", nil, 0, &ProxyError{
+			Proxy: nil,
+			Err:   fmt.Errorf("mandatory proxy routing enabled but no proxy available for %s/%s", endpoint.Provider, endpoint.Model),
+		}
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

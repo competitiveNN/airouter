@@ -34,6 +34,14 @@ type ProviderConfig struct {
 	// override for the rare chain entry that needs a different budget).
 	Proxy int `yaml:"proxy,omitempty"`
 
+	// MandatoryProxy when true forces all outgoing connections for this provider
+	// to route through a proxy. If no proxy is available or the proxy fails,
+	// the request will not fall back to direct connection but will instead
+	// trigger an error that causes the fallback chain to advance to the next
+	// model. Set to false (or omitted) to keep the existing behaviour where
+	// direct connections are used when proxy is unavailable.
+	MandatoryProxy bool `yaml:"mandatory_proxy,omitempty"`
+
 	// MaxInterruption is the maximum time this provider's endpoint may
 	// leave a client without new output during a fallback walk, including
 	// the cycle-back wait when every endpoint in the chain is on cooldown.
@@ -1060,7 +1068,7 @@ type Config struct {
 	MaxConcurrentRequests         *int `yaml:"max_concurrent_requests,omitempty"`
 }
 
-var LogicalModels = []string{"smart", "work", "fast", "large", "systemone"}
+var LogicalModels = []string{"smart", "work", "fast", "large"}
 
 func LoadConfig(path string) (*Config, error) {
 	// Bound file size to prevent OOM from malformed/malicious config

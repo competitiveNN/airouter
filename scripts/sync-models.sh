@@ -44,13 +44,17 @@ fi
 echo "[sync] using python: $PYTHON"
 
 echo "[sync] fetching free model list..."
-# The fetcher issues a few dozen API calls. --probe-auto calls both chain
-# terminators (kilocode kilo-auto/free, opencode big-pickle) with one real
-# 1-token completion each and records a live/dead/unknown verdict in the model
-# list. regenerate_config.py acts on it: it will not write a refused terminator,
-# and it treats "no verdict" (a 429, a 5xx, a timeout) as no evidence at all.
-# Two extra calls per run.
-"$PYTHON" "$PROJECT_DIR/fetch-free-models.py" --json --probe-auto \
+# --probe-auto calls both chain terminators (kilocode kilo-auto/free, opencode
+# big-pickle) with one real 1-token completion each and records a live/dead/
+# unknown verdict in the model list. ENABLE_OPENCODE_PROBE=1 additionally
+# live-verifies every free OpenCode candidate so only endpoints the gateway can
+# actually serve enter the fallback chains; dead ones (4xx refusals) are
+# rejected before they reach config.yaml, and verified-live ones are protected
+# from stale permanent-blacklist entries. regenerate_config.py acts on the
+# verdicts: it never writes a refused terminator, and treats "no verdict"
+# (a 429, a 5xx, a timeout) as no evidence at all. Two extra calls per run
+# for the terminators, plus one probe per OpenCode candidate.
+ENABLE_OPENCODE_PROBE=1 "$PYTHON" "$PROJECT_DIR/fetch-free-models.py" --json --probe-auto \
     --save "$MODELS_JSON"
 
 cp "$PROJECT_DIR/config.yaml" "$BACKUP"

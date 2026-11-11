@@ -71,6 +71,12 @@ providers:
   #                The proxy service starts automatically when any provider or
   #                endpoint asks for it, so nothing runs when all values are 0.
   #
+  #   mandatory_proxy: <bool>   When true, all outgoing connections for this
+  #                provider must route through a proxy. If no proxy is
+  #                available or the proxy fails, the request does NOT fall back
+  #                to a direct connection; instead it fails so the fallback
+  #                chain advances to the next model. Defaults to false.
+  #
   # A chain entry may override its provider with its own `proxy: <N>` (same
   # meaning, this endpoint only) -- see the models: section below.
 

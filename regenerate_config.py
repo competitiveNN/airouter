@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from model_utils import is_systemone_model_id
+
 
 
 def _parse_release_date(value: str | int | None) -> datetime | None:
@@ -453,11 +453,7 @@ def filter_large(models: list[Model]) -> list[Model]:
     return candidates
 
 
-def filter_systemone(models: list[Model]) -> list[Model]:
-    """systemone: models suited for System One decision-making tasks (identified by model identity)."""
-    return [m for m in models
-            if is_systemone_model_id(m.id, m.name)
-            and m.is_chain_candidate]
+
 
 
 def auto_fallback_terminator(
@@ -574,7 +570,7 @@ def auto_fallback_terminator(
         # Preserve the previous comment when the verdict is unknown and the
         # endpoint is unchanged: a run that could not check the claim must not
         # rewrite it into a different claim.
-        if False:
+        if state == 'unknown' and previous is not None and previous[:2] == (provider, model):
             return provider, model, previous[2]
         # The probe verdict is stable text, not the probe timestamp: a date here
         # would rewrite every chain on every nightly run for no added signal,
@@ -702,7 +698,7 @@ def parse_terminators(config_text: str) -> dict[str, tuple[str, str, str]]:
     auto_fallback_terminator).
     """
     out: dict[str, tuple[str, str, str]] = {}
-    for profile in ('smart', 'work', 'fast', 'large', 'systemone'):
+    for profile in ('smart', 'work', 'fast', 'large'):
         m = re.search(
             rf'(?ms)^  {profile}:\n    chain:\n(.*?)(?=^  \w+:|\Z)', config_text
         )
@@ -818,6 +814,15 @@ def build_chain(
             # Emit commandcode2 only when it is actually configured: commenting
             # a provider out in config.yaml must be respected by regeneration.
             for prov in ('commandcode', 'commandcode2'):
+                if prov in providers_present:
+                    chain.append(entry_for(prov, m))
+        elif m.mapped_provider == 'opencode':
+            # Emit the key group: every configured OpenCode key is a separate
+            # quota bucket on the same upstream, so a rate-limited key (429 on
+            # one project) falls through to a sibling instead of the model being
+            # unavailable. Same rule as nvidia/gemini: only keys that are
+            # declared are emitted.
+            for prov in ('opencode', 'opencode2', 'opencode3', 'opencode4'):
                 if prov in providers_present:
                     chain.append(entry_for(prov, m))
         else:
@@ -1136,7 +1141,6 @@ def main(argv: list[str] | None = None):
     work_models = filter_work(model_list)
     fast_models = filter_fast(model_list)
     large_models = filter_large(model_list)
-    systemone_models = filter_systemone(model_list)
 
     # Sort each, applying the configured tie-break.
     smart_models = sort_models(smart_models, newest_first)
@@ -1149,7 +1153,6 @@ def main(argv: list[str] | None = None):
         newest_first,
         context_first=True,
     )
-    systemone_models = sort_models(systemone_models, newest_first)
 
     # Fail closed when the intelligence enrichment collapses. A healthy fetch
     # yields dozens of scored models; if smart/work come back with only one or
@@ -1183,10 +1186,6 @@ def main(argv: list[str] | None = None):
     print(f"\nLarge candidates ({len(large_models)}):")
     for m in large_models:
         print(f"  {m.mapped_provider:12s} {m.id:50s} score={m.score} ctx={m.context_length} vision={m.vision}")
-
-    print(f"\nSystem One candidates ({len(systemone_models)}):")
-    for m in systemone_models:
-        print(f"  {m.mapped_provider:12s} {m.id:50s} score={m.score} ctx={m.context_length} vision={m.vision}")
     
     # Build chains. The full catalog is passed so the terminator can be checked
     # against the fetcher's probe verdict, not just counted.
@@ -1207,7 +1206,6 @@ def main(argv: list[str] | None = None):
     work_chain = build_chain(work_models, 'work', records, previous.get('work'), protocols, providers_present)
     fast_chain = build_chain(fast_models, 'fast', records, previous.get('fast'), protocols, providers_present)
     large_chain = build_chain(large_models, 'large', records, previous.get('large'), protocols, providers_present)
-    systemone_chain = build_chain(systemone_models if systemone_models else smart_models, 'systemone', records, previous.get('systemone'), protocols, providers_present)
     
     # Generate new models section
     new_models = f"""models:
@@ -1223,16 +1221,13 @@ def main(argv: list[str] | None = None):
   large:
     chain:
 {format_chain_yaml(large_chain)}
-  systemone:
-    chain:
-{format_chain_yaml(systemone_chain)}
 """
     
     # Replace the models section, preserving everything else byte-for-byte.
     new_config = merge_models_section(config, new_models)
 
     print("\n=== SUMMARY ===")
-    for name, chain in [('smart', smart_chain), ('work', work_chain), ('fast', fast_chain), ('large', large_chain), ('systemone', systemone_chain)]:
+    for name, chain in [('smart', smart_chain), ('work', work_chain), ('fast', fast_chain), ('large', large_chain)]:
         concrete = [e for e in chain if not e['model'].startswith('kilo-auto') and e['model'] != 'big-pickle']
         tail = chain[-1]['model'] if chain else 'N/A'
         print(f"{name:6s}: {len(chain)} entries ({len(concrete)} concrete), head={concrete[0]['model'] if concrete else 'N/A'}, tail={tail}")

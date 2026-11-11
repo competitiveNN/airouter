@@ -538,7 +538,7 @@ def test_real_config_matches_the_pinned_shapes():
     the file the daemon actually loads drifts.
     """
     cfg = yaml.safe_load(CONFIG.read_text())
-    assert set(cfg["models"]) == {"smart", "work", "fast", "large", "systemone"}
+    assert set(cfg["models"]) == {"smart", "work", "fast", "large"}
     for name, body in cfg["models"].items():
         chain = body["chain"]
         assert chain, f"{name} chain is empty"
@@ -632,8 +632,7 @@ def _run_cli(tmp_path, verdicts, extra=(), runs=1, base=None):
     `base` is the config to start from; it defaults to the real one, which
     supplies the providers/preferences header the validator insists on.
     """
-    # Add a System One model to ensure the systemone chain is not empty
-    extra = list(extra) + [_systemone_record()]
+    
     tmp_path.mkdir(parents=True, exist_ok=True)
     models = tmp_path / "models.json"
     models.write_text(json.dumps(_fixture_models(verdicts, extra)))
@@ -697,7 +696,6 @@ def test_cli_uses_kilocode_when_the_chain_has_neither_provider(tmp_path):
             "auto_probe": {"verdict": "live", "status": 200, "detail": "fixture",
                            "checked_at": _now_iso()},
         },
-        _systemone_record(),
     ] + ollama_only))
     cfg = tmp_path / "config.yaml"
     cfg.write_text(CONFIG.read_text())
@@ -978,7 +976,7 @@ def test_parse_terminators_round_trips_the_comment_including_its_hash():
     the first time this was introduced.
     """
     parsed = gen.parse_terminators(CONFIG.read_text())
-    assert set(parsed) == {"smart", "work", "fast", "large", "systemone"}
+    assert set(parsed) == {"smart", "work", "fast", "large"}
     for profile, (provider, model, comment) in parsed.items():
         assert comment.startswith("#"), f"{profile}: {comment!r} lost its hash"
     # Only the `fast` profile carries the auto-router terminator; the other
@@ -1007,7 +1005,7 @@ def test_cli_rejects_a_typo_instead_of_exiting_zero(tmp_path, capsys):
 def test_cli_is_a_dry_run_without_write(tmp_path):
     """`--write` is still required to touch a file."""
     models = tmp_path / "models.json"
-    models.write_text(json.dumps(_fixture_models({"kilocode": True, "opencode": False}) + [_systemone_record()]))
+    models.write_text(json.dumps(_fixture_models({"kilocode": True, "opencode": False})))
     cfg = tmp_path / "config.yaml"
     original = CONFIG.read_text()
     cfg.write_text(original)
@@ -1308,11 +1306,6 @@ def _record_json(model_id, provider, score, *, vision=False, ctx=262144):
         "intelligence": score, "elo": None, "released": None,
         "capabilities": {"vision": vision}, "source": provider, "raw": {},
     }
-
-
-def _systemone_record(model_id="jev", provider="kilocode", score=35.0, *, vision=False, ctx=262144):
-    """Create a mock System One model record for tests."""
-    return _record_json(model_id, provider, score, vision=vision, ctx=ctx)
 
 
 def test_a_regenerated_chain_strides_smart_models_throughout(tmp_path):
@@ -1916,7 +1909,6 @@ def test_the_collapse_guard_does_not_fire_on_a_small_test_fixture(tmp_path):
             "capabilities": {"vision": False},
             "raw": {},
         },
-        _systemone_record(),
     ]))
     cfg = tmp_path / "config.yaml"
     cfg.write_text(CONFIG.read_text())
@@ -1925,39 +1917,4 @@ def test_the_collapse_guard_does_not_fire_on_a_small_test_fixture(tmp_path):
     assert "qwen/qwen3.8-27b:free" in text
 
 
-def test_systemone_fallback_reuses_smart_chain(tmp_path):
-    """When System One candidates are empty, the smart chain is reused instead of writing an empty profile.
 
-    This test ensures that the validator doesn't reject an empty System One chain and that
-    the systemone fallback logic works correctly during config regeneration.
-    """
-    # Create a fixture with no System One models (empty System One candidate pool)
-    # Use the same format as _fixture_models - a list of model records
-    models = tmp_path / "models.json"
-    models.write_text(json.dumps([
-        _record_json("smart-model:free", "kilocode", 35.0, vision=True, ctx=262144),
-        _record_json("work-model:free", "kilocode", 30.0, vision=True, ctx=262144),
-        _record_json("fast-model:free", "kilocode", 25.0, vision=True, ctx=131072),
-        _record_json("large-model:free", "kilocode", 20.0, vision=True, ctx=262144),
-    ]))
-
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(CONFIG.read_text())
-
-    # Run the generator
-    gen.main(["--models", str(models), "--config", str(cfg), "--write"])
-
-    # Read the generated config
-    text = cfg.read_text()
-
-    # Verify that the config contains the expected models
-    parsed = yaml.safe_load(text)
-
-    # Verify that systemone is present (should be reusing smart chain)
-    assert "systemone" in parsed["models"]
-    systemone_chain = parsed["models"]["systemone"]["chain"]
-    assert systemone_chain, "systemone chain should not be empty"
-
-    # Verify that the systemone chain reuses the smart model
-    assert systemone_chain[0]["model"] == "smart-model:free"
-    assert systemone_chain[0]["provider"] == "kilocode"
