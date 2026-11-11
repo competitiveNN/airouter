@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-10T05:10:47.525543Z",
+  "fetched_at": "2026-11-11T05:13:47.644532Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
@@ -11,7 +11,6 @@
     "deepseek-ai/deepseek-v4.1-flash": "2026-11-06",
     "deepseek-v4.1-flash-free": "2026-11-06",
     "dots-studio/dots-3-note-preview:free": "2026-09-26",
-    "exo-free": "2026-10-08",
     "flint-40b-free": "2026-10-26",
     "gemini-flash-lite-latest": "2026-11-06",
     "gemma-4-26b-a4b-it": "2026-11-06",
@@ -61,7 +60,6 @@
     "beam": "2026-11-06",
     "cat-jam-free": "2026-10-16",
     "crouton-alpha-free": "2026-11-10",
-    "exo-free": "2026-10-12",
     "inclusionai/ling-3.1-flash": "2026-10-14",
     "inclusionai/ling-3.1-flash:free": "2026-10-15",
     "jev-1.13-free": "2026-10-30",
@@ -76,6 +74,7 @@
     "reflection/beam:free": "2026-11-10",
     "space-bunny-free": "2026-10-20",
     "stealth/cat-jam:free": "2026-10-19",
+    "stealth/crouton-alpha": "2026-11-11",
     "step-5-preview-free": "2026-10-16"
   }
 }
