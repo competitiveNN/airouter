@@ -937,10 +937,10 @@ func TestTopUpReadyStopsAtTheRequirement(t *testing.T) {
 func TestRequiredProxyTriesSumsProvidersAndEndpoints(t *testing.T) {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
-			"a":       {Proxy: 3},
-			"b":       {Proxy: 3},
-			"direct":  {Proxy: 0},
-			"negativ": {Proxy: -1},
+			"a":       {Proxies: ProxyConfig{Retries: 3}},
+			"b":       {Proxies: ProxyConfig{Retries: 3}},
+			"direct":  {Proxies: ProxyConfig{Retries: 0}},
+			"negativ": {Proxies: ProxyConfig{Retries: -1}},
 		},
 		Models: map[string]ModelConfig{
 			"smart": {Chain: []ModelEndpoint{
@@ -960,7 +960,7 @@ func TestRequiredProxyTriesSumsProvidersAndEndpoints(t *testing.T) {
 // must not demand a ready pool.
 func TestRequiredProxyTriesWithNoProxiesIsZero(t *testing.T) {
 	cfg := &Config{
-		Providers: map[string]ProviderConfig{"a": {Proxy: 0}},
+		Providers: map[string]ProviderConfig{"a": {Proxies: ProxyConfig{Retries: 0}}},
 		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "a", Model: "m1"}}}},
 	}
 	if got := NewProxy(cfg).requiredProxyTries(); got != 0 {
@@ -973,7 +973,7 @@ func TestRequiredProxyTriesWithNoProxiesIsZero(t *testing.T) {
 // a nil service must not panic (tests build bare Proxies).
 func TestUpdateRequiredReadyPushesIntoTheService(t *testing.T) {
 	cfg := &Config{
-		Providers: map[string]ProviderConfig{"a": {Proxy: 3}, "b": {Proxy: 3}},
+		Providers: map[string]ProviderConfig{"a": {Proxies: ProxyConfig{Retries: 3}}, "b": {Proxies: ProxyConfig{Retries: 3}}},
 		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "a", Model: "m1"}}}},
 	}
 	p := NewProxy(cfg)
@@ -994,7 +994,7 @@ func TestUpdateRequiredReadyPushesIntoTheService(t *testing.T) {
 // enabling a proxy on a provider at runtime must raise it without a restart.
 func TestConfigReloadUpdatesTheRequirement(t *testing.T) {
 	before := &Config{
-		Providers: map[string]ProviderConfig{"a": {Proxy: 3}},
+		Providers: map[string]ProviderConfig{"a": {Proxies: ProxyConfig{Retries: 3}}},
 		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "a", Model: "m1"}}}},
 	}
 	router := NewRouter(before, "")
@@ -1008,7 +1008,7 @@ func TestConfigReloadUpdatesTheRequirement(t *testing.T) {
 	}
 
 	after := &Config{
-		Providers: map[string]ProviderConfig{"a": {Proxy: 3}, "b": {Proxy: 4}},
+		Providers: map[string]ProviderConfig{"a": {Proxies: ProxyConfig{Retries: 3}}, "b": {Proxies: ProxyConfig{Retries: 4}}},
 		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "a", Model: "m1"}}}},
 	}
 	g := NewGatewayContext(router, proxy, after, "", "", true)
@@ -1170,7 +1170,7 @@ func TestAPoolProxyIsActuallyUsed(t *testing.T) {
 
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
-			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY", Proxy: 2},
+			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY", Proxies: ProxyConfig{Retries: 2}},
 		},
 		Models: map[string]ModelConfig{
 			"smart": {Chain: []ModelEndpoint{{Provider: "test", Model: "gpt-4"}}},
@@ -1250,7 +1250,7 @@ func TestPoolProxyFailureChargesTheProxyNotTheEndpoint(t *testing.T) {
 
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
-			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY", Proxy: 2},
+			"test": {URL: backend.URL, APIKeyEnv: "TEST_API_KEY", Proxies: ProxyConfig{Retries: 2}},
 		},
 		Models: map[string]ModelConfig{
 			"smart": {Chain: []ModelEndpoint{{Provider: "test", Model: "gpt-4"}}},

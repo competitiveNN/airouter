@@ -299,11 +299,6 @@ func (p *Proxy) effectiveProtocol(ep *ModelEndpoint) protocol {
 // proxyTries resolves this endpoint's proxy budget: the maximum number of
 // different proxies to try before the endpoint gives up. 0 means a direct
 // connection (no proxy).
-//
-// When the provider has MandatoryProxy set to true, proxyTries still returns
-// the proxy budget so that proxy attempts are made, but the caller (attemptClient
-// and Forward) is responsible for not falling back to direct connection when
-// mandatory_proxy is true and proxy fails/unavailable.
 func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 	// Command Code upstreams never route through the proxy pool: the
 	// protocol has its own auth model and the proxy pool is not used.
@@ -321,40 +316,10 @@ func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 		return 0
 	}
 	provider, ok := cfg.Providers[ep.Provider]
-	if !ok || provider.Proxy <= 0 {
+	if !ok || provider.Proxies.Retries <= 0 {
 		return 0
 	}
-	return provider.Proxy
-}
-
-// proxyBudget returns the effective proxy budget for an endpoint, considering
-// the MandatoryProxy setting. When mandatory_proxy is true and the provider
-// has a proxy budget, we return the budget to ensure proxy attempts are made.
-// The caller must then handle the "no proxy available" case without falling
-// back to direct.
-func (p *Proxy) proxyBudgetWithMandatory(ep *ModelEndpoint) int {
-	if p == nil || p.config == nil {
-		return 0
-	}
-	cfg := p.config.Load()
-	if cfg == nil {
-		return 0
-	}
-	// If the provider has MandatoryProxy enabled, ensure proxy budget is
-	// respected so that proxy attempts are made. The actual enforcement
-	// (not falling back to direct) happens in attemptClient and Forward.
-	provider, ok := cfg.Providers[ep.Provider]
-	if !ok {
-		return 0
-	}
-	budget := p.proxyTries(ep)
-	// When mandatory_proxy is true and we have a proxy budget, return it
-	// so attempts are made. The "no proxy available" case is handled by
-	// the caller not falling back to direct.
-	if provider.MandatoryProxy && budget > 0 {
-		return budget
-	}
-	return budget
+	return provider.Proxies.Retries
 }
 
 // maxProxiedBodyBytes is the largest request body an attempt may send through
@@ -470,7 +435,7 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration, allowPro
 			cfg := p.config.Load()
 			if cfg != nil {
 				provider := cfg.Providers[ep.Provider]
-				if provider.MandatoryProxy && usedProxy == nil {
+				if provider.Proxies.Mandatory && usedProxy == nil {
 					// No proxy available and mandatory proxy is required - fail the attempt
 					return nil, nil
 				}
@@ -516,8 +481,8 @@ func (p *Proxy) requiredProxyTries() int {
 	}
 	total := 0
 	for _, provider := range cfg.Providers {
-		if provider.Proxy > 0 {
-			total += provider.Proxy
+		if provider.Proxies.Retries > 0 {
+			total += provider.Proxies.Retries
 		}
 	}
 	for _, model := range cfg.Models {
@@ -1233,7 +1198,7 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	// Enforce mandatory proxy routing: if the provider requires proxy
 	// routing and no proxy was selected, fail the attempt instead of
 	// falling back to a direct connection.
-	if usedProxy == nil && providerCfg.MandatoryProxy {
+	if usedProxy == nil && providerCfg.Proxies.Mandatory {
 		cancel()
 		return nil, func() {}, &ProxyError{
 			Proxy: nil,

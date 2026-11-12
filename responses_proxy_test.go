@@ -71,7 +71,7 @@ func responsesProxyFixture(t *testing.T, first http.HandlerFunc, second http.Han
 		// never touch the proxy the fixture exists to exercise.
 		Preferences: &Preferences{InitialRotationWindow: &noRotation},
 		Providers: map[string]ProviderConfig{
-			"proxied": {URL: backend1.URL, APIKeyEnv: "TEST_KEY", Proxy: 1},
+			"proxied": {URL: backend1.URL, APIKeyEnv: "TEST_KEY", Proxies: ProxyConfig{Retries: 1}},
 			"direct":  {URL: backend2.URL, APIKeyEnv: "TEST_KEY"},
 		},
 		Models: map[string]ModelConfig{

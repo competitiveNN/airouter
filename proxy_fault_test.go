@@ -357,7 +357,7 @@ func TestHandleStream_ProxyMidStreamFailureDoesNotRetryEndpoint(t *testing.T) {
 		Providers: map[string]ProviderConfig{
 			// The proxied one. The provider carries the proxy budget, so the
 			// router picks the relay and nothing else.
-			"backend1": {URL: rp.backend.URL, Proxy: 3},
+			"backend1": {URL: rp.backend.URL, Proxies: ProxyConfig{Retries: 3}},
 			"backend2": {URL: backend2.URL},
 		},
 		Models: map[string]ModelConfig{

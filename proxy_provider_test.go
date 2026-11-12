@@ -13,7 +13,7 @@ import (
 
 func TestProxyTriesEndpointOverridesProvider(t *testing.T) {
 	p := NewProxy(&Config{Providers: map[string]ProviderConfig{
-		"prov": {Proxy: 3},
+		"prov": {Proxies: ProxyConfig{Retries: 3}},
 	}})
 	ep := &ModelEndpoint{Provider: "prov", Model: "m", Proxy: 7}
 
@@ -24,7 +24,7 @@ func TestProxyTriesEndpointOverridesProvider(t *testing.T) {
 
 func TestProxyTriesInheritsProviderValue(t *testing.T) {
 	p := NewProxy(&Config{Providers: map[string]ProviderConfig{
-		"prov": {Proxy: 3},
+		"prov": {Proxies: ProxyConfig{Retries: 3}},
 	}})
 	ep := &ModelEndpoint{Provider: "prov", Model: "m"}
 
@@ -37,8 +37,8 @@ func TestProxyTriesInheritsProviderValue(t *testing.T) {
 // the chain: resolve per endpoint, not globally.
 func TestProxyTriesResolvesPerProvider(t *testing.T) {
 	p := NewProxy(&Config{Providers: map[string]ProviderConfig{
-		"proxied":  {Proxy: 4},
-		"direct":   {Proxy: 0},
+		"proxied":  {Proxies: ProxyConfig{Retries: 4}},
+		"direct":   {Proxies: ProxyConfig{Retries: 0}},
 		"unset":    {},
 		"unlisted": {},
 	}})
@@ -64,7 +64,7 @@ func TestProxyTriesResolvesPerProvider(t *testing.T) {
 // budget: api.go's retry loop would then never execute an attempt.
 func TestProxyTriesNegativeProviderIsDirect(t *testing.T) {
 	p := NewProxy(&Config{Providers: map[string]ProviderConfig{
-		"prov": {Proxy: -5},
+		"prov": {Proxies: ProxyConfig{Retries: -5}},
 	}})
 	ep := &ModelEndpoint{Provider: "prov", Model: "m"}
 
@@ -105,7 +105,7 @@ func TestProxyTriesNilProxyKeepsEndpointValue(t *testing.T) {
 // key, since no chain entry carries a value of its own.
 func TestProxyEnabledProviderLevel(t *testing.T) {
 	cfg := &Config{
-		Providers: map[string]ProviderConfig{"prov": {Proxy: 2}},
+		Providers: map[string]ProviderConfig{"prov": {Proxies: ProxyConfig{Retries: 2}}},
 		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "prov", Model: "m"}}}},
 	}
 	if !proxyEnabled(cfg) {
@@ -125,7 +125,7 @@ func TestProxyEnabledEndpointLevelOnly(t *testing.T) {
 
 func TestProxyEnabledAllDirect(t *testing.T) {
 	cfg := &Config{
-		Providers: map[string]ProviderConfig{"prov": {Proxy: 0}},
+		Providers: map[string]ProviderConfig{"prov": {Proxies: ProxyConfig{Retries: 0}}},
 		Models:    map[string]ModelConfig{"smart": {Chain: []ModelEndpoint{{Provider: "prov", Model: "m", Proxy: 0}}}},
 	}
 	if proxyEnabled(cfg) {
@@ -147,7 +147,8 @@ providers:
   proxied-provider:
     url: https://example.invalid/v1
     api_key_env: PROXIED_API_KEY
-    proxy: 6
+    proxies:
+      retries: 6
   plain-provider:
     url: https://example.invalid/v1
     api_key_env: PLAIN_API_KEY
@@ -167,10 +168,10 @@ models:
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if got := cfg.Providers["proxied-provider"].Proxy; got != 6 {
+	if got := cfg.Providers["proxied-provider"].Proxies.Retries; got != 6 {
 		t.Errorf("provider proxy = %d, want 6", got)
 	}
-	if got := cfg.Providers["plain-provider"].Proxy; got != 0 {
+	if got := cfg.Providers["plain-provider"].Proxies.Retries; got != 0 {
 		t.Errorf("provider without the key: proxy = %d, want 0", got)
 	}
 

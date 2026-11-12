@@ -17,30 +17,47 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ProxyConfig is the nested provider-level proxy configuration.
+type ProxyConfig struct {
+	// Retries is the maximum number of different proxies to try on an endpoint
+	// before falling back to the next model in the chain. 0 (or omitted) means
+	// direct connections for this provider.
+	Retries int `yaml:"retries,omitempty"`
+
+	// Mandatory forces all outgoing connections for this provider to route
+	// through a proxy. When true, an unavailable or failing proxy does not fall
+	// back to a direct connection; the request errors so the fallback chain
+	// advances to the next model.
+	Mandatory bool `yaml:"mandatory,omitempty"`
+}
+
 type ProviderConfig struct {
 	URL       string            `yaml:"url"`
 	APIKeyEnv string            `yaml:"api_key_env"`
 	Headers   map[string]string `yaml:"headers,omitempty"`
 
-	// Proxy is the provider-wide proxy setting: the maximum number of
-	// different proxies to try on any endpoint that routes through this
-	// provider, before falling back to the next model in the chain. 0 (or
-	// omitted) means direct connections for this provider.
+	// Proxies is the provider-wide nested proxy configuration. It groups the
+	// proxy budget and the mandatory-routing flag under one key so the common
+	// case stays a couple of lines instead of scattered top-level keys:
 	//
-	// This exists so the common case stays one line instead of one line per
-	// model: proxy a provider once and every chain entry that does not carry
-	// its own proxy value inherits that. An endpoint's own proxy value, when
-	// set to a non-zero number, takes precedence over this one (a per-model
-	// override for the rare chain entry that needs a different budget).
-	Proxy int `yaml:"proxy,omitempty"`
-
-	// MandatoryProxy when true forces all outgoing connections for this provider
-	// to route through a proxy. If no proxy is available or the proxy fails,
-	// the request will not fall back to direct connection but will instead
-	// trigger an error that causes the fallback chain to advance to the next
-	// model. Set to false (or omitted) to keep the existing behaviour where
-	// direct connections are used when proxy is unavailable.
-	MandatoryProxy bool `yaml:"mandatory_proxy,omitempty"`
+	//   proxies:
+	//     mandatory: true
+	//     retries: 3
+	//
+	// Retries is the maximum number of different proxies to try on any endpoint
+	// that routes through this provider, before falling back to the next model
+	// in the chain. 0 (or omitted) means direct connections for this provider.
+	// An endpoint's own `proxy` value, when set to a non-zero number, takes
+	// precedence over Retries (a per-model override for the rare chain entry
+	// that needs a different budget).
+	//
+	// Mandatory forces all outgoing connections for this provider to route
+	// through a proxy. If no proxy is available or the proxy fails, the request
+	// will not fall back to a direct connection but will instead trigger an
+	// error that advances the fallback chain to the next model. Set to false
+	// (or omitted) to keep the existing behaviour where direct connections are
+	// used when proxy is unavailable.
+	Proxies ProxyConfig `yaml:"proxies,omitempty"`
 
 	// MaxInterruption is the maximum time this provider's endpoint may
 	// leave a client without new output during a fallback walk, including
@@ -1325,7 +1342,7 @@ func proxyEnabled(cfg *Config) bool {
 		return false
 	}
 	for _, provider := range cfg.Providers {
-		if provider.Proxy > 0 {
+		if provider.Proxies.Retries > 0 {
 			return true
 		}
 	}
