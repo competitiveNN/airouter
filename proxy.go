@@ -429,16 +429,21 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration, allowPro
 					ep.Provider, ep.Model, svc.pool.len(), svc.ReadyCount())
 			}
 		}
-	} else {
-		// If mandatory proxy is enabled and no proxy is available, do not fall back to direct
-		if p.config != nil {
-			cfg := p.config.Load()
-			if cfg != nil {
-				provider := cfg.Providers[ep.Provider]
-				if provider.Proxies.Mandatory && usedProxy == nil {
-					// No proxy available and mandatory proxy is required - fail the attempt
-					return nil, nil
-				}
+	}
+
+	// Enforce mandatory proxy routing: when the provider requires proxy routing
+	// and no proxy was selected, fail the attempt (nil client) so the caller
+	// advances the fallback chain instead of silently going direct. This mirrors
+	// Forward, which does the same check inline. attemptClient backs the two
+	// streaming surfaces (StreamToClient, streamResponsesAttempt), both of which
+	// treat a nil client as "mandatory proxy unavailable". The check must run
+	// after the selection block: a non-empty pool whose pick() returns nil, or a
+	// transport that could not be built, otherwise leaves usedProxy nil and would
+	// fall through to a direct connection, defeating the mandatory flag.
+	if usedProxy == nil && p.config != nil {
+		if cfg := p.config.Load(); cfg != nil {
+			if provider := cfg.Providers[ep.Provider]; provider.Proxies.Mandatory {
+				return nil, nil
 			}
 		}
 	}

@@ -413,7 +413,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "recordFallback log line replaced with no-op",
         "api.go",
-        "\tlog.Printf(\"[fallback] reason=%s endpoint=%s status=%d err=%s\",\n\t\treason, key, statusCode, summarizeError(errString(err, body)))",
+        "\tproxyMarker := \"\"\n\tif usedProxy {\n\t\tproxyMarker = \" [PROXY]\"\n\t}\n\tlog.Printf(\"[fallback]%s reason=%s endpoint=%s status=%d err=%s%s\",\n\t\tproxyMarker, reason, key, statusCode, summarizeError(errString(err, body)), proxyMarker)",
         "// noop",
         "Operators would lose the structured log line needed to tie a request's "
         "Nms, K retries, and THEN which upstream said what failure.",
