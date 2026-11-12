@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 
 DONE = "data: [DONE]"
-MODELS = ("smart", "work", "fast", "large", "systemone")
+MODELS = ("smart", "work", "fast", "large")
 
 
 def load_api_key(explicit: str | None) -> str:

@@ -60,6 +60,18 @@
       "released": "2025-03-01",
       "status_code": 404
     },
+    "nvidia-nim:meta/muse-glimmer-30b": {
+      "blacklisted_at": "2026-11-12T04:46:27.989352Z",
+      "cooldown_keys": [
+        "nvidia2:meta/muse-glimmer-30b"
+      ],
+      "date": "2026-11-12",
+      "model_id": "meta/muse-glimmer-30b",
+      "provider": "nvidia-nim",
+      "reason": "not found (older than 2 weeks)",
+      "released": "2026-08-10",
+      "status_code": 404
+    },
     "nvidia-nim:moonshotai/kimi-k2.6": {
       "blacklisted_at": "2026-10-28T18:06:38.818364Z",
       "cooldown_keys": [
