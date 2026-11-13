@@ -1911,9 +1911,10 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				if errors.Is(err, ErrUpstreamSaturated) {
 					cancel()
 					fwdCancel()
-					writeAPIError(w, http.StatusServiceUnavailable, "Upstream saturated", "server_error", "upstream_saturated")
-					g.recordRequest(req.Model, 503, time.Since(start))
-					return
+					// Upstream saturated on this endpoint: mark it tried and fall
+					// back to the next model in the chain instead of returning 503.
+					lastErr = err
+					break
 				}
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
@@ -2515,12 +2516,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			partial, toolCalls, completionTokens, err = g.proxy.StreamToClient(ctx, w, flusher, body, *ep, proxyTimeout, sessionID, streamOpts)
 			if err != nil {
 				if errors.Is(err, ErrUpstreamSaturated) {
-					// The pre-output keepalive may already have committed the
-					// response to 200, so an SSE error event is the only shape
-					// that cannot corrupt the stream.
-					writeSSEError(w, flusher, "Upstream saturated")
-					g.recordRequest(req.Model, 503, time.Since(start))
-					return
+					// Upstream saturated on this endpoint: mark it tried and fall
+					// back to the next model in the chain instead of returning 503.
+					break
 				}
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
