@@ -61,6 +61,13 @@ type responsesStreamWriter struct {
 	// path, where a second attempt's usage must overwrite rather than add to
 	// the first — see setUsage.
 	usage int
+	// onProgress is called once when the first text delta is emitted, so the
+	// caller can reset its interruption budget (markProgress).
+	onProgress func()
+	// reasoning accumulates the model's reasoning content for Command Code
+	// fallback replay. It is populated by translateChatSSE when a model
+	// emits reasoning_content deltas.
+	reasoning strings.Builder
 }
 
 // setUsage records the upstream-reported completion token count. It replaces
@@ -156,12 +163,23 @@ func (s *responsesStreamWriter) openTextItem() {
 	})
 }
 
+// SetProgressCallback sets a function to be called once when the first
+// text delta is emitted. This allows the caller to mark progress and
+// reset its interruption budget.
+func (s *responsesStreamWriter) SetProgressCallback(fn func()) {
+	s.onProgress = fn
+}
+
 // textDelta forwards one text increment as a Responses delta event.
 func (s *responsesStreamWriter) textDelta(text string) {
 	if text == "" {
 		return
 	}
 	s.openTextItem()
+	if !s.sawText && s.onProgress != nil {
+		s.onProgress()
+		s.onProgress = nil // only fire once
+	}
 	s.sawText = true
 	s.acc.WriteString(text)
 	s.emit(evOutputTextDelta, map[string]any{
@@ -281,7 +299,7 @@ func (s *responsesStreamWriter) fail(code, message, errType string) {
 // caller buffers each attempt in order to decide whether to replay it. The
 // lifecycle events (response.created / response.in_progress) have already been
 // written by newResponsesStreamWriter before this is called.
-func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel string) (string, []streamToolCall, error) {
+func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel string, reasoning *strings.Builder) (string, []streamToolCall, error) {
 	var buffered bytes.Buffer
 	released := false
 	var acc strings.Builder
@@ -357,11 +375,13 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel stri
 
 		// ChatCompletionStreamDelta has no ToolCalls field (the chat path
 		// parses them from an anonymous struct in accumulateDelta), so we
-		// decode into the same anonymous shape here.
+		// decode into the same anonymous shape here. We also capture
+		// reasoning_content for Command Code fallback replay.
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
+					Content           string `json:"content"`
+					ReasoningContent  string `json:"reasoning_content"`
 					ToolCalls []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
@@ -387,6 +407,10 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel stri
 			continue
 		}
 		choice := chunk.Choices[0]
+		// Capture reasoning content for Command Code fallback replay.
+		if rc := choice.Delta.ReasoningContent; rc != "" {
+			sw.reasoning.WriteString(rc)
+		}
 		if d := choice.Delta.Content; d != "" {
 			if !released {
 				buffered.WriteString(d)
@@ -408,6 +432,9 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel stri
 	}
 	release()
 	sw.finish(lastFinishReason(tcs), tcs)
+	if reasoning != nil && sw.reasoning.Len() > 0 {
+		reasoning.WriteString(sw.reasoning.String())
+	}
 	return acc.String(), tcs, nil
 }
 

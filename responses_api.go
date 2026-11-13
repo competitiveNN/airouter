@@ -560,25 +560,34 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		} else {
 			perAttemptBase = minDuration(timeout, ceiling)
 		}
-		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
-			proxyTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
-			if proxyTimeout <= 0 {
-				err = context.DeadlineExceeded
-				break
+		var attemptReasoning strings.Builder
+			for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+				proxyTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
+				if proxyTimeout <= 0 {
+					err = context.DeadlineExceeded
+					break
+				}
+				buf.Reset()
+				attempt = newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
+				// Wire progress callback so the walk budget resets on first token.
+				attempt.SetProgressCallback(walk.markProgress)
+				text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt, proxyTimeout, walk.markProgress, &attemptReasoning)
+				if err == nil {
+					break
+				}
+				var pErr *ProxyError
+				if !errors.As(err, &pErr) {
+					break // endpoint failure: another proxy would not help
+				}
+				usedProxy = true
+				// If the proxy failed mid-stream, we must not retry the same
+				// endpoint with a different proxy because the client has already
+				// received partial output. Break to fall back to the next model.
+				if pErr.MidStream {
+					break
+				}
+				g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
 			}
-			buf.Reset()
-			attempt = newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
-			text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt, proxyTimeout)
-			if err == nil {
-				break
-			}
-			var pErr *ProxyError
-			if !errors.As(err, &pErr) {
-				break // endpoint failure: another proxy would not help
-			}
-			usedProxy = true
-			g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
-		}
 		if err != nil {
 			tried[ep.Key()] = true
 			g.recordFallback(ep, err, 0, err.Error(), usedProxy)
@@ -597,6 +606,17 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			}
 			g.skipSameHostOnTransportFailure(ep, err, tried)
 			g.recordCooldown()
+
+			// If we have partial assistant output (text or reasoning), append it
+			// to the conversation so the next model can continue rather than
+			// restarting. This mirrors the chat streaming path's fallback replay.
+			// We rebuild on: endpoint errors (no proxy), or mid-stream proxy errors.
+			hasPartial := text != "" || attemptReasoning.Len() > 0
+			isEndpointErr := !errors.As(err, &pErr)
+			isMidStreamProxy := pErr != nil && pErr.MidStream
+			if hasPartial && (isEndpointErr || isMidStreamProxy) {
+				retryBody = appendAssistantMessage(retryBody, text, nil, attemptReasoning.String())
+			}
 			continue
 		}
 
@@ -627,20 +647,10 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 }
 
 // streamResponsesAttempt runs one upstream attempt through the Responses
-// translator, writing into sw. It returns the accumulated text and tool calls
-// so a failure can carry them into the retry.
+// translator, writing into sw. It returns the accumulated text, tool calls,
+// and reasoning so a failure can carry them into the retry.
 //
-// Like every other proxy surface, a proxied endpoint routes through the pool: a
-// transport-layer failure with a proxy in the path becomes a ProxyError, so the
-// caller cools the proxy rather than the endpoint. Dialing direct here would
-// both silently bypass the operator's proxy setting and mis-attribute the fault
-// to a healthy endpoint.
-//
-// timeout bounds this attempt by the request's own size-adjusted budget: it
-// caps the connection phases (dial, TLS, response headers) through the
-// per-attempt transport, and the time-to-first-token through firstByteReader.
-// The idle watchdog below then bounds the rest of the stream.
-func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte, ep ModelEndpoint, sessionID string, sw *responsesStreamWriter, timeout time.Duration) (string, []streamToolCall, error) {
+func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte, ep ModelEndpoint, sessionID string, sw *responsesStreamWriter, timeout time.Duration, onProgress func(), reasoning *strings.Builder) (string, []streamToolCall, error) {
 	providerCfg, ok := g.proxy.config.Load().Providers[ep.Provider]
 	if !ok {
 		return "", nil, fmt.Errorf("unknown provider: %s", ep.Provider)
@@ -717,7 +727,8 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	idle := newIdleTimeoutReader(guarded, minDuration(g.proxy.streamIdleTimeout, timeout))
 	defer idle.Close()
 
-	return translateChatSSE(idle, sw, ep.Model)
+	text, toolCalls, err := translateChatSSE(idle, sw, ep.Model, reasoning)
+	return text, toolCalls, err
 }
 
 // nopFlusher satisfies flushWriter while we buffer. The real flush happens

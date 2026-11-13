@@ -339,6 +339,14 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 	return g
 }
 
+// Close stops background goroutines and releases resources held by the gateway.
+// It should be called during graceful shutdown after active requests have drained.
+func (g *GatewayContext) Close() {
+	if g.inflight != nil {
+		g.inflight.Stop()
+	}
+}
+
 // SetTestCooldown overrides the cooldown duration returned by
 // ApplyCooldownForSession for testing. Zero disables the override.
 func (g *GatewayContext) SetTestCooldown(d time.Duration) {

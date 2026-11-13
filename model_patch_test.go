@@ -407,7 +407,7 @@ func TestTranslateChatSSE_DotsThinkingCall(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	sw := newResponsesStreamWriter(buf, nopFlusher{}, "smart")
-	_, tcs, err := translateChatSSE(strings.NewReader(input), sw, "dots-studio/dots-3-note-preview:free")
+	_, tcs, err := translateChatSSE(strings.NewReader(input), sw, "dots-studio/dots-3-note-preview:free", nil)
 	if err != nil {
 		t.Fatalf("translateChatSSE returned error: %v", err)
 	}

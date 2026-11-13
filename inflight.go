@@ -37,21 +37,45 @@ type inflightSession struct {
 // refreshed on every attempt so the breakdown shows where tokens are being
 // generated now.
 //
-// Untrack no longer removes a session: a request finishing does not mean
-// the conversation is over. Sessions leave the set only when they have
-// been idle for sessionTTL, matching the router's own session TTL. This
-// keeps the dashboard honest about "how many live sessions each model is
-// serving" rather than "how many upstream calls are mid-flight".
+// A background sweeper runs every minute to evict idle sessions, so the
+// tracker does not grow unbounded even if the dashboard is never polled
+// (Snapshot is never called).
 type inflightTracker struct {
 	mu       sync.RWMutex
 	ttl      time.Duration
 	sessions map[string]*inflightSession
+	sweepTicker *time.Ticker
+	sweepDone   chan struct{}
 }
 
 func newInflightTracker() *inflightTracker {
-	return &inflightTracker{
+	t := &inflightTracker{
 		ttl:      sessionTTL,
 		sessions: map[string]*inflightSession{},
+		sweepDone: make(chan struct{}),
+	}
+	t.sweepTicker = time.NewTicker(time.Minute)
+	go t.sweepLoop()
+	return t
+}
+
+func (t *inflightTracker) Stop() {
+	if t.sweepTicker != nil {
+		t.sweepTicker.Stop()
+	}
+	close(t.sweepDone)
+}
+
+func (t *inflightTracker) sweepLoop() {
+	for {
+		select {
+		case <-t.sweepTicker.C:
+			t.mu.Lock()
+			t.sweepLocked()
+			t.mu.Unlock()
+		case <-t.sweepDone:
+			return
+		}
 	}
 }
 

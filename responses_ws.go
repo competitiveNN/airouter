@@ -248,7 +248,9 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		}
 		var buf strings.Builder
 		attempt := newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
-		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt, attemptTimeout)
+		attempt.SetProgressCallback(walk.markProgress)
+		var attemptReasoning strings.Builder
+		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt, attemptTimeout, walk.markProgress, &attemptReasoning)
 		if err != nil {
 			tried[ep.Key()] = true
 			if g.testCooldown > 0 {

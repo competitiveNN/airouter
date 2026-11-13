@@ -232,6 +232,7 @@ func main() {
 	}
 
 	<-ctx.Done()
+	gateway.Close()
 	router.Close()
 	log.Println("Server stopped")
 }
