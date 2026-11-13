@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-11T05:13:47.644532Z",
+  "fetched_at": "2026-11-13T05:02:53.215424Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
@@ -22,7 +22,6 @@
     "ibm/granite-3.0-3b-a800m-instruct": "2026-09-26",
     "ibm/granite-3.0-8b-instruct": "2026-09-26",
     "iceman-free": "2026-11-07",
-    "inclusionai/ling-3.1-flash": "2026-10-03",
     "inclusionai/ling-3.1-flash:free": "2026-10-01",
     "jev-1.13-free": "2026-09-26",
     "ling-3.1-flash-free": "2026-10-02",
@@ -60,7 +59,6 @@
     "beam": "2026-11-06",
     "cat-jam-free": "2026-10-16",
     "crouton-alpha-free": "2026-11-10",
-    "inclusionai/ling-3.1-flash": "2026-10-14",
     "inclusionai/ling-3.1-flash:free": "2026-10-15",
     "jev-1.13-free": "2026-10-30",
     "ling-3.1-flash-free": "2026-10-15",
