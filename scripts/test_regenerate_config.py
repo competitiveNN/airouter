@@ -1616,11 +1616,6 @@ def test_rule13_fires_when_the_config_drops_a_proved_protocol(tmp_path):
       - provider: kilocode
         model: kilo-auto/free
         vision: true
-  systemone:
-    chain:
-      - provider: kilocode
-        model: kilo-auto/free
-        vision: true
 """
     problems = _checker_problems(config, models_path)
     assert [p for p in problems if p.startswith("rule13")], problems
@@ -1738,8 +1733,6 @@ def _a_commandcode_config():
         "  fast:\n"
         "    chain:\n" + chain +
         "  large:\n"
-        "    chain:\n" + chain +
-        "  systemone:\n"
         "    chain:\n" + chain
     )
 

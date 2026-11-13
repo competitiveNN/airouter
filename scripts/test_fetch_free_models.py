@@ -1419,7 +1419,7 @@ def test_opencode_created_is_not_a_release_date():
 def test_first_seen_ignores_meta_router_models():
     """The auto-fallback terminators are never real candidates."""
     today = date(2026, 10, 6)
-    for mid in ff.AUTO_FALLBACK_MODELS:
+    for mid in ff.META_ROUTER_MODELS:
         first_seen, missing_since = {}, {}
         models = [{"id": mid, "released": None}]
         newly, _ = ff.update_first_seen_cache(
@@ -1457,7 +1457,7 @@ def test_first_seen_grew_is_false_when_nothing_new():
 def test_first_seen_grew_ignores_meta_router_ids():
     """Auto-fallback terminators are never real candidates, so they must not
     trigger an AA refresh."""
-    assert ff._first_seen_grew(set(ff.AUTO_FALLBACK_MODELS), {}) is False
+    assert ff._first_seen_grew(set(ff.META_ROUTER_MODELS), {}) is False
 
 
 def test_forced_aa_fetch_refreshes_the_cache(tmp_path, monkeypatch):

@@ -724,7 +724,18 @@ func (s *ProxyService) fetchAll(ctx context.Context, sources []proxySource) []*P
 			maxAge = proxySourceMaxAge
 		}
 		if result.AsOf.IsZero() {
-			log.Printf("[proxy] source %d (%s): no date in body, freshness unknown (kept)", idx, source.Name)
+			// Source format carries no date (e.g., plain text lists from GitHub).
+			// Fall back to the fetch time. If the fetch time is older than maxAge,
+			// discard the source to prevent permanently stale proxies from a source
+			// that stopped updating.
+			fetchTime := time.Now()
+			if age := time.Since(fetchTime); age > maxAge {
+				log.Printf("[proxy] source %d (%s): DISCARDED, no body date, fetch time %s (%s old, limit %s)",
+					idx, source.Name, fetchTime.UTC().Format(time.RFC3339), age.Round(time.Second), maxAge)
+				continue
+			}
+			log.Printf("[proxy] source %d (%s): no date in body, used fetch time %s (%s old, limit %s)",
+				idx, source.Name, fetchTime.UTC().Format(time.RFC3339), time.Since(fetchTime).Round(time.Second), maxAge)
 		} else if age := time.Since(result.AsOf); age > maxAge {
 			log.Printf("[proxy] source %d (%s): DISCARDED, contents dated %s (%s old, limit %s)",
 				idx, source.Name, result.AsOf.UTC().Format(time.RFC3339), age.Round(time.Second), maxAge)

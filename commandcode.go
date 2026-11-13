@@ -1825,6 +1825,11 @@ func ccStatusMap(status int, body []byte) (int, string) {
 	case 404:
 		return 404, "not_found"
 	case 422:
+		// 422 is a validation error from Command Code (e.g., missing reasoning_content).
+		// It may also carry a quota refusal body. Check for quota first.
+		if isQuotaRefusal(422, string(body)) {
+			return 429, "rate_limit_error"
+		}
 		return 400, "invalid_request_error"
 	case 429:
 		return 429, "rate_limit_error"

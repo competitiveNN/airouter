@@ -758,6 +758,8 @@ def build_chain(
                 "nvidia", "nvidia2", "nvidia3",
                 "gemini", "gemini2", "gemini3", "gemini4", "gemini5",
                 "commandcode", "commandcode2",
+                "kilocode", "opencode", "opencode2", "opencode3", "opencode4",
+                "ollama",
             )
         )
 
