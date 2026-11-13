@@ -627,10 +627,16 @@ func (s *cooldownStore) apply(d cooldownDiff, now time.Time) error {
 
 // loadSessions reads the persisted sticky sessions. Entries older than the TTL
 // are dropped so a restart does not resurrect conversations that have already
-// expired.
+// expired. Expired rows are deleted from the table to prevent unbounded growth
+// of stale entries across restarts.
 func (s *cooldownStore) loadSessions(now time.Time) (map[string]sessionEntry, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
+	}
+	// Purge expired sessions from the database first.
+	// sessionTTL is 2 hours (defined in router.go).
+	if _, err := s.db.Exec("DELETE FROM sessions WHERE last_used < ?", unixNano(now.Add(-sessionTTL))); err != nil {
+		return nil, err
 	}
 	rows, err := s.db.Query("SELECT key, model, chain, provider, model_name, last_used FROM sessions")
 	if err != nil {
@@ -650,6 +656,7 @@ func (s *cooldownStore) loadSessions(now time.Time) (map[string]sessionEntry, er
 			lastUsed: timeFromUnixNano(lastUsed),
 			ep:       ModelEndpoint{Provider: provider, Model: modelName},
 		}
+		// Double-check in-memory (should not be needed after DELETE, but harmless).
 		if now.Sub(se.lastUsed) > sessionTTL {
 			continue
 		}

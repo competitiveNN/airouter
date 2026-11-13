@@ -1777,10 +1777,13 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 	if !isClientRequestError(statusCode) && retryAfter > duration {
 		duration = retryAfter
 	}
-	// Add up to 25% random jitter on transient errors (429/5xx) so concurrent
-	// clients hitting the same rate-limited model don't all wake up at the same
-	// instant and stampede the provider again.
-	if statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
+	// Add up to 25% random jitter on transient errors (429/5xx/timeout) so concurrent
+	// clients hitting the same rate-limited or timeouting model don't all wake up
+	// at the same instant and stampede the provider again.
+	// statusCode == 0 covers transport failures (timeouts, connection resets) that
+	// have no HTTP response; they also use the transient escalation curve and need
+	// jitter to avoid thundering herds when many clients hit the same failing host.
+	if statusCode == 0 || statusCode == 429 || (statusCode >= 500 && statusCode <= 599) {
 		if r.cooldownJitter > 0 {
 			duration += time.Duration(float64(duration) * r.cooldownJitter)
 		}

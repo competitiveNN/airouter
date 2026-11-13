@@ -1637,6 +1637,9 @@ func (f *firstByteReader) Read(p []byte) (int, error) {
 	ch := make(chan result, 1)
 	go func() {
 		n, err := f.r.Read(p)
+		// Even if the caller has given up (context done), we must complete
+		// the send on ch to avoid a goroutine leak. The channel is buffered
+		// (cap 1) so this send never blocks once the read returns.
 		ch <- result{n, err}
 	}()
 	select {
@@ -1654,7 +1657,11 @@ func (f *firstByteReader) Read(p []byte) (int, error) {
 		if c, ok := f.r.(io.Closer); ok {
 			c.Close()
 		}
-		return 0, f.firstCtx.Err()
+		// Wait for the background read to finish and send on ch before returning.
+		// This ensures the goroutine completes and the channel is drained, avoiding
+		// a leak if the caller abandons this Read call.
+		res := <-ch
+		return res.n, f.firstCtx.Err()
 	case res := <-ch:
 		// Only release the first-byte timeout once we actually received data.
 		// An io.Reader may return (0, nil) which doesn't count as "first byte".
