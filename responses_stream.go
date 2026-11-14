@@ -414,6 +414,14 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel stri
 		if d := choice.Delta.Content; d != "" {
 			if !released {
 				buffered.WriteString(d)
+				// Fire onProgress on first text delta so the interruption
+				// budget resets during prefill. The delta event itself is
+				// held until release(), but the budget must reset now.
+				if !sw.sawText && sw.onProgress != nil {
+					sw.onProgress()
+					sw.onProgress = nil
+				}
+				sw.sawText = true
 				continue
 			}
 			acc.WriteString(d)
