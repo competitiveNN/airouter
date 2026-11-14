@@ -94,10 +94,12 @@ const (
 	// ready pool still meets the requirement.
 	proxyVerifyInterval = 15 * time.Second
 	// proxyVerifyTimeout bounds one readiness probe.
-	proxyVerifyTimeout = 3 * time.Second
+	proxyVerifyTimeout = 500 * time.Millisecond
 	// maxProbesPerCycle bounds how much of the pool one top-up pass will walk,
 	// so a pool where nothing answers cannot stall the loop for minutes.
 	maxProbesPerCycle = 40
+	// maxAcceptableLatency is the low-latency threshold (<500ms) for active proxies.
+	maxAcceptableLatency = 500 * time.Millisecond
 )
 
 type ProxyService struct {
@@ -1134,6 +1136,10 @@ func (s *ProxyService) probeReachable(ctx context.Context, p *ProxyInfo) bool {
 	}
 	latency := time.Since(start)
 	conn.Close()
+
+	if latency > maxAcceptableLatency {
+		return false
+	}
 
 	// Record the measured latency so pick() can prefer faster proxies.
 	s.readyLatencyMu.Lock()

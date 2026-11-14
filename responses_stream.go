@@ -380,9 +380,9 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel stri
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content           string `json:"content"`
-					ReasoningContent  string `json:"reasoning_content"`
-					ToolCalls []struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Type     string `json:"type"`

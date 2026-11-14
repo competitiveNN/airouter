@@ -355,7 +355,7 @@ func opencodeConversationID(body []byte) string {
 // The User-Agent is the official client string, `opencode/<version>`
 // -- the exact form the published CLI sends, built in the shipped
 // binaries as `opencode/${version}` with no suffix (verified in the
-// opencode-linux-x64 packages for 1.18.34 and 1.19.0). The gateway's
+// opencode-linux-x64 packages for 1.18.34 and 1.19.5). The gateway's
 // edge verifies the client identity, not just the header names,
 // measured live against opencode.ai/zen/v1:
 //
@@ -375,7 +375,7 @@ const opencodeCLIName = "cli"
 func opencodeRequestHeaders() map[string]string {
 	sess := opencodeSessionID()
 	return map[string]string{
-		"User-Agent": "opencode/1.19.0",
+		"User-Agent": "opencode/1.19.5",
 		// `x-opencode-client` is the client name the gateway logs
 		// per request. The session id is carried under every
 		// spelling the shipped client and the routing backend

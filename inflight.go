@@ -41,17 +41,17 @@ type inflightSession struct {
 // tracker does not grow unbounded even if the dashboard is never polled
 // (Snapshot is never called).
 type inflightTracker struct {
-	mu       sync.RWMutex
-	ttl      time.Duration
-	sessions map[string]*inflightSession
+	mu          sync.RWMutex
+	ttl         time.Duration
+	sessions    map[string]*inflightSession
 	sweepTicker *time.Ticker
 	sweepDone   chan struct{}
 }
 
 func newInflightTracker() *inflightTracker {
 	t := &inflightTracker{
-		ttl:      sessionTTL,
-		sessions: map[string]*inflightSession{},
+		ttl:       sessionTTL,
+		sessions:  map[string]*inflightSession{},
 		sweepDone: make(chan struct{}),
 	}
 	t.sweepTicker = time.NewTicker(time.Minute)

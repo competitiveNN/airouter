@@ -86,6 +86,14 @@ providers:
   # A chain entry may override its provider with its own `proxy: <N>` (same
   # meaning, this endpoint only) -- see the models: section below.
 
+  # Example: NVIDIA NIM with mandatory proxy (fails if proxy unavailable/fails, no direct fallback)
+  # nvidia:
+  #   url: https://integrate.api.nvidia.com/v1
+  #   api_key_env: NVIDIA_API_KEY
+  #   proxies:
+  #     retries: 3
+  #     mandatory: true
+
   # Example: NVIDIA NIM
   nvidia:
     url: https://integrate.api.nvidia.com/v1

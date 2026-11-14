@@ -561,33 +561,33 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			perAttemptBase = minDuration(timeout, ceiling)
 		}
 		var attemptReasoning strings.Builder
-			for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
-				proxyTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
-				if proxyTimeout <= 0 {
-					err = context.DeadlineExceeded
-					break
-				}
-				buf.Reset()
-				attempt = newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
-				// Wire progress callback so the walk budget resets on first token.
-				attempt.SetProgressCallback(walk.markProgress)
-				text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt, proxyTimeout, walk.markProgress, &attemptReasoning)
-				if err == nil {
-					break
-				}
-				var pErr *ProxyError
-				if !errors.As(err, &pErr) {
-					break // endpoint failure: another proxy would not help
-				}
-				usedProxy = true
-				// If the proxy failed mid-stream, we must not retry the same
-				// endpoint with a different proxy because the client has already
-				// received partial output. Break to fall back to the next model.
-				if pErr.MidStream {
-					break
-				}
-				g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+		for proxyTry := 0; proxyTry < maxProxyTries; proxyTry++ {
+			proxyTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
+			if proxyTimeout <= 0 {
+				err = context.DeadlineExceeded
+				break
 			}
+			buf.Reset()
+			attempt = newResponsesStreamWriter(&buf, nopFlusher{}, req.Model)
+			// Wire progress callback so the walk budget resets on first token.
+			attempt.SetProgressCallback(walk.markProgress)
+			text, toolCalls, err = g.streamResponsesAttempt(ctx, retryBody, *ep, sessionID, attempt, proxyTimeout, walk.markProgress, &attemptReasoning)
+			if err == nil {
+				break
+			}
+			var pErr *ProxyError
+			if !errors.As(err, &pErr) {
+				break // endpoint failure: another proxy would not help
+			}
+			usedProxy = true
+			// If the proxy failed mid-stream, we must not retry the same
+			// endpoint with a different proxy because the client has already
+			// received partial output. Break to fall back to the next model.
+			if pErr.MidStream {
+				break
+			}
+			g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+		}
 		if err != nil {
 			tried[ep.Key()] = true
 			g.recordFallback(ep, err, 0, err.Error(), usedProxy)
@@ -649,7 +649,6 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 // streamResponsesAttempt runs one upstream attempt through the Responses
 // translator, writing into sw. It returns the accumulated text, tool calls,
 // and reasoning so a failure can carry them into the retry.
-//
 func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte, ep ModelEndpoint, sessionID string, sw *responsesStreamWriter, timeout time.Duration, onProgress func(), reasoning *strings.Builder) (string, []streamToolCall, error) {
 	providerCfg, ok := g.proxy.config.Load().Providers[ep.Provider]
 	if !ok {

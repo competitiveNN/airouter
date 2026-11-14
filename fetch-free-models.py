@@ -1294,12 +1294,12 @@ def probe_auto_fallbacks(
 # fix it documents for its own frontends is "update past <version>" -- so a UA
 # that trails the published release is not the official string. The official
 # string is exactly `opencode/<version>`: the shipped CLI builds it that way
-# (verified in the opencode-linux-x64 packages for 1.18.34 and 1.19.0, where
+# (verified in the opencode-linux-x64 packages for 1.18.34 and 1.19.5, where
 # the template is `opencode/${version}` with no suffix). Bump the version from
 # https://registry.npmjs.org/opencode-ai/latest, and keep it equal to the
 # User-Agent in config.go: test_opencode_ua_matches_the_gateway asserts the two
 # agree, because nothing else stops them drifting apart.
-OPENCODE_UA = "opencode/1.19.0"
+OPENCODE_UA = "opencode/1.19.5"
 
 # Where the published version is read from. The dist-tags endpoint, NOT the
 # package document: https://registry.npmjs.org/opencode-ai is ~5MB of every

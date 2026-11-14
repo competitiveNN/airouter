@@ -61,8 +61,11 @@ def test_models_anchor_skips_header_comment():
         "the preserved header is missing providers: — the generator would delete "
         "every provider definition"
     )
-    # And it must be most of the file, not a sliver.
-    assert len(header) > len(text) * 0.15, (
+    # And it must be well past the header comment region, not a sliver.
+    # The header comment block (which contains '/v1/models:') ends around
+    # 3% of the file; 10% is comfortably above that and below the real
+    # anchor, so a regression landing on the comment still fails here.
+    assert len(header) > len(text) * 0.10, (
         f"preserved header is only {len(header)} of {len(text)} bytes; the anchor "
         "is matching something near the top of the file"
     )

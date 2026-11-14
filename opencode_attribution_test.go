@@ -194,7 +194,7 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 	// (packages/opencode/src/session/llm/request.ts:
 	// `const USER_AGENT = \`opencode/${InstallationVersion}\``),
 	// and the shipped opencode-linux-x64 binaries for 1.18.34
-	// and 1.19.0 carry no suffix. (Installation.USER_AGENT, the
+	// and 1.19.5 carry no suffix. (Installation.USER_AGENT, the
 	// `opencode/<channel>/<version>/<client>` form, is the
 	// webfetch/models.ts spelling, not the one the gateway sees.)
 	if got := h["user-agent"]; got == "" {

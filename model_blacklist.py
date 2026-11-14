@@ -69,26 +69,44 @@ def load_cooldown_entries(path=None):
     }
 
 
-def load_blacklist(path=None):
+def load_blacklist(path=None, include_pending=False):
+    """Load blacklist entries and optionally pending streak tracking from JSON file.
+
+    By default (include_pending=False) returns only the entries dict for backward compatibility.
+    When include_pending=True, returns dict with 'entries' and 'pending' keys.
+    """
     path = Path(path or BLACKLIST_FILE)
     if not path.exists():
+        if include_pending:
+            return {"entries": {}, "pending": {}}
         return {}
     try:
         data = json.load(path.open())
     except (json.JSONDecodeError, OSError):
+        if include_pending:
+            return {"entries": {}, "pending": {}}
         return {}
-    entries = data.get("entries", {}) if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        if include_pending:
+            return {"entries": {}, "pending": {}}
+        return {}
+    entries = data.get("entries", {})
+    pending = data.get("pending", {})
     if not isinstance(entries, dict):
-        return {}
+        entries = {}
+    if not isinstance(pending, dict):
+        pending = {}
     for k in list(entries):
         if not isinstance(entries[k], dict):
             entries[k] = {"reason": str(entries[k]), "date": datetime.now(timezone.utc).date().isoformat()}
+    if include_pending:
+        return {"entries": entries, "pending": pending}
     return entries
 
 
-def save_blacklist(entries, path=None):
+def save_blacklist(entries, path=None, pending=None):
     path = Path(path or BLACKLIST_FILE)
-    out = {"entries": entries}
+    out = {"entries": entries, "pending": pending or {}}
     path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
 
 
@@ -130,7 +148,8 @@ def _find_model(models_by_id, model_id):
 
 
 def update_blacklist_from_cooldowns(models, cooldowns_path=None, blacklist_path=None):
-    """Scan the cooldown store, add 404/not-found models older than 2 weeks.
+    """Scan the cooldown store, add 404/not-found models older than 2 weeks,
+    requiring 404s on 2 consecutive days (tracked via streak/date in blacklist entry).
 
     Returns the list of newly blacklisted keys.
     """
@@ -140,17 +159,34 @@ def update_blacklist_from_cooldowns(models, cooldowns_path=None, blacklist_path=
 
     # ---- read existing blacklist ----
     bp = Path(blacklist_path or BLACKLIST_FILE)
-    blacklist = load_blacklist(bp)
+    bl_data = load_blacklist(bp, include_pending=True)
+    entries = bl_data.get("entries", {})
+    pending = bl_data.get("pending", {})
 
     # ---- index models from the fetched list ----
-    # models is a list dicts with "provider" (source), "id", "released"
     index = {}
     for m in models:
         prov = m.get("provider", "")
         mid = m.get("id", "")
         index.setdefault((prov, mid), m)
 
+    # ---- multi-endpoint providers: require 404 on at least 2 endpoints ----
+    MULTI_ENDPOINT_PREFIXES = ("nvidia", "gemini", "opencode", "commandcode")
+    not_found_by_model = {}
+    for key, entry in cooldowns.items():
+        if not isinstance(entry, dict):
+            continue
+        if not _not_found_check(entry):
+            continue
+        if ":" in key:
+            prov_cfg, model_id = key.split(":", 1)
+        else:
+            prov_cfg, model_id = "", key
+        src = source_for_config_provider(prov_cfg)
+        not_found_by_model.setdefault((src, model_id), []).append(prov_cfg)
+
     today = datetime.now(timezone.utc).date()
+    today_iso = today.isoformat()
     cutoff = today - timedelta(days=RUNTIME_MIN_AGE_DAYS)
     added = []
 
@@ -160,17 +196,13 @@ def update_blacklist_from_cooldowns(models, cooldowns_path=None, blacklist_path=
             continue
         if not _not_found_check(entry):
             continue
-        # key format: "<config-provider>:<model-id>"
         if ":" in key:
             prov_cfg, model_id = key.split(":", 1)
         else:
             prov_cfg, model_id = "", key
-        # map config provider name to fetcher source name
         src = source_for_config_provider(prov_cfg)
         m = None
-        # try exact source match first
         m = index.get((src, model_id))
-        # fall back to any matching model id
         if m is None:
             for (p, mid), rec in index.items():
                 if mid == model_id:
@@ -178,42 +210,77 @@ def update_blacklist_from_cooldowns(models, cooldowns_path=None, blacklist_path=
                     break
         if m is None:
             continue
-        # A model the live probe just confirmed free is never permanently
-        # blacklisted: the probe is the authority on liveness, and blacklisting
-        # a verified-live deal is what dropped commandcode free models from the
-        # output (the regression). Transient 404s on a live deal must not become
-        # permanent.
         if m.get("verified") is True:
             continue
-        # A model currently in the catalog with free indicators (-free suffix,
-        # stealth/ prefix for commandcode) should not be blacklisted based on
-        # stale cooldowns. The current catalog presence overrides historical
-        # 404s — the provider has re-listed it as free.
         if m.get("provider") == "commandcode":
             mid = m.get("id", "")
             if mid.lower().startswith("stealth/") or mid.lower().endswith("-free") or mid.lower().endswith(":free"):
                 continue
-        # parse release date
+
+        # OpenCode never answers a genuine model removal with 404: a missing
+        # model comes back as 400 "Model is unavailable". A 404 with a generic
+        # "Not Found"/"page not found" body is the upstream HOST answering for a
+        # route it does not know (wrong base URL, misrouted request) -- not a
+        # model-not-found verdict, so it must never feed the blacklist.
+        if src == "opencode":
+            msg = str(entry.get("last_error") or "").strip().lower()
+            if msg in ("", "not found", "page not found") and entry.get("status_code") == 404:
+                continue
+
+        # For multi-endpoint providers, require 404 on at least 2 endpoints
+        # before even tracking a pending streak.
+        is_multi = any(prov_cfg.lower().startswith(p) for p in MULTI_ENDPOINT_PREFIXES)
+        if is_multi:
+            endpoints_with_404 = set(not_found_by_model.get((src, model_id), []))
+            if len(endpoints_with_404) < 2:
+                continue
+
         released = _parse_release_date(m.get("released") or m.get("provider_released"))
         if released is None:
             continue
-        # older than two weeks => blacklist
         if released <= cutoff:
-            # blacklist key uses source provider so it matches filter_models()
             blkey = f"{m.get('provider', src)}:{model_id}"
-            if blkey not in blacklist:
-                blacklist[blkey] = {"reason": "not found (older than 2 weeks)",
-                                   "date": datetime.now(timezone.utc).date().isoformat(),
-                                   "model_id": model_id,
-                                   "provider": m.get("provider", src),
-                                   "released": (str(released) if released else None),
-                                   "cooldown_keys": [key],
-                                   "blacklisted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                                   "status_code": entry.get("status_code")}
-                added.append(blkey)
 
-    # ---- save blacklist ----
-    save_blacklist(blacklist, bp)
+            # Already blacklisted, nothing to do
+            if blkey in entries:
+                continue
+
+            # Track consecutive 404 days in pending
+            p = pending.get(blkey)
+            if p is None:
+                # First time seeing 404 for this model - start streak
+                pending[blkey] = {"first_seen": today_iso, "last_seen": today_iso, "streak": 1}
+            else:
+                last_seen = datetime.strptime(p.get("last_seen", today_iso), "%Y-%m-%d").date()
+                # If last_seen is yesterday, increment streak
+                if last_seen == today - timedelta(days=1):
+                    new_streak = p.get("streak", 1) + 1
+                # If last_seen is today, keep same streak (don't double-count same day)
+                elif last_seen == today:
+                    new_streak = p.get("streak", 1)
+                # If gap > 1 day, reset streak
+                else:
+                    new_streak = 1
+                pending[blkey] = {"first_seen": p.get("first_seen", today_iso), "last_seen": today_iso, "streak": new_streak}
+
+                # If streak >= 2 consecutive days, promote to blacklist
+                if new_streak >= 2:
+                    # collect all cooldown keys for this model across endpoints
+                    all_keys = [k for k in cooldowns if (":" in k and k.split(":", 1)[1] == model_id) or (":" not in k and k == model_id)]
+                    entries[blkey] = {"reason": "not found (older than 2 weeks)",
+                                     "date": today_iso,
+                                     "model_id": model_id,
+                                     "provider": m.get("provider", src),
+                                     "released": (str(released) if released else None),
+                                     "cooldown_keys": all_keys if all_keys else [key],
+                                     "blacklisted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                     "status_code": entry.get("status_code")}
+                    added.append(blkey)
+                    # Remove from pending since now permanently blacklisted
+                    del pending[blkey]
+
+    # ---- save blacklist with updated pending tracking ----
+    save_blacklist(entries, bp, pending)
     return added
 
 
@@ -229,7 +296,8 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
     if args.show:
-        print(json.dumps(load_blacklist(), indent=2))
+        bl_data = load_blacklist(args.blacklist_path)
+        print(json.dumps(bl_data, indent=2))
         sys.exit(0)
     if args.update and args.models_json:
         models = json.load(open(args.models_json))
@@ -238,8 +306,8 @@ if __name__ == "__main__":
         print(f"Newly blacklisted ({len(added)}): {added}")
     else:
         # default: just show
-        bl = load_blacklist()
-        print(json.dumps(bl, indent=2))
+        bl_data = load_blacklist(args.blacklist_path)
+        print(json.dumps(bl_data, indent=2))
 
 def is_blacklisted(provider, model_id, entries):
     """Whether a (fetcher-provider, model-id) pair is in the blacklist."""

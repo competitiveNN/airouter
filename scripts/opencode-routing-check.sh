@@ -203,7 +203,7 @@ print('ses_%012x%s' % (~val & mask, b62()), 'msg_%012x%s' % (val, b62()))
     "${url}chat/completions" \
     -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
     -H 'Content-Type: application/json' \
-    -H 'User-Agent: opencode/1.19.0' \
+    -H 'User-Agent: opencode/1.19.5' \
     -H 'x-opencode-client: cli' \
     -H 'x-opencode-project: default' \
     -H "x-opencode-session: $session" \
