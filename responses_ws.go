@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -253,12 +254,15 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		_, _, err := g.streamResponsesAttempt(ctx, body, *ep, sessionID, attempt, attemptTimeout, walk.markProgress, &attemptReasoning)
 		if err != nil {
 			tried[ep.Key()] = true
-			if g.testCooldown > 0 {
-				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
-			} else {
-				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+			isSaturated := errors.Is(err, ErrUpstreamSaturated)
+			if !isSaturated {
+				if g.testCooldown > 0 {
+					g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
+				} else {
+					g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
+				}
+				g.skipSameHostOnTransportFailure(ep, err, tried)
 			}
-			g.skipSameHostOnTransportFailure(ep, err, tried)
 			// ApplyCooldownFromErrorForSession already advances the circuit
 			// breaker state machine; the redundant RecordFailure call would
 			// double-count this failure and trip the circuit at half the

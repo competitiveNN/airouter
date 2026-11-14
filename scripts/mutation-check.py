@@ -445,8 +445,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "responses_ws.go cooldown escalation bypass removed",
         "responses_ws.go",
-        "\t\t\tif g.testCooldown > 0 {\n\t\t\t\tg.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)\n\t\t\t} else {\n\t\t\t\tg.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)\n\t\t\t}",
-        "\t\t\tif g.testCooldown > 0 {\n\t\t\t\tg.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)\n\t\t\t} else {\n\t\t\t\tg.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)\n\t\t\t}\n\t\t\tg.router.RecordFailure(ep)",
+        "\t\t\t\tif g.testCooldown > 0 {\n\t\t\t\t\tg.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)\n\t\t\t\t} else {\n\t\t\t\t\tg.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)\n\t\t\t\t}",
+        "\t\t\t\tif g.testCooldown > 0 {\n\t\t\t\t\tg.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)\n\t\t\t\t} else {\n\t\t\t\t\tg.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)\n\t\t\t\t}\n\t\t\t\tg.router.RecordFailure(ep)",
         "The real escalation ladder would re-apply after the test-duration "
         "cooldown, re-escalating the circuit state and parking the endpoint "
         "indefinitely in tests.",

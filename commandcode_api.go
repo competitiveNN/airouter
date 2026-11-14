@@ -616,6 +616,12 @@ func (s *CommandCodeShim) penalize(ep *ModelEndpoint, err error, status int, ses
 	if err != nil && errors.As(err, &pErr) {
 		return
 	}
+	// Upstream saturation is a gateway-wide concurrency limit, not an endpoint
+	// fault: do not cool the endpoint.
+	if err != nil && errors.Is(err, ErrUpstreamSaturated) {
+		s.gateway.recordCooldown()
+		return
+	}
 	if err != nil {
 		s.gateway.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 	} else {

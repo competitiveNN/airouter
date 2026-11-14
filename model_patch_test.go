@@ -422,3 +422,26 @@ func TestTranslateChatSSE_DotsThinkingCall(t *testing.T) {
 		t.Errorf("tool arguments = %q", tcs[0].Arguments)
 	}
 }
+
+// TestTranslateChatSSE_FiresOnProgressOnFirstTextDeltaDuringPrefill
+// guards the regression where the Responses streaming path buffered the
+// entire attempt and only replayed it on success, so the onProgress callback
+// (which resets the interruption budget via walk.markProgress) never fired
+// during a long prefill, exhausting the fallback budget and returning a 503.
+func TestTranslateChatSSE_FiresOnProgressOnFirstTextDeltaDuringPrefill(t *testing.T) {
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n"
+
+	buf := &bytes.Buffer{}
+	sw := newResponsesStreamWriter(buf, nopFlusher{}, "smart")
+	fired := false
+	sw.SetProgressCallback(func() { fired = true })
+
+	_, _, err := translateChatSSE(strings.NewReader(input), sw, "m", nil)
+	// The error event is expected to abort the attempt; the assertion is
+	// about onProgress, not about success.
+	_ = err
+	if !fired {
+		t.Fatal("onProgress was not fired on the first text delta during prefill")
+	}
+}

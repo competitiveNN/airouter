@@ -592,19 +592,24 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			tried[ep.Key()] = true
 			g.recordFallback(ep, err, 0, err.Error(), usedProxy)
 			var pErr *ProxyError
+			isSaturated := errors.Is(err, ErrUpstreamSaturated)
 			// ApplyCooldownFromErrorForSession already advances the circuit
 			// breaker state machine; the redundant RecordFailure call would
 			// double-count this failure and trip the circuit at half the
 			// configured threshold.
-			if !errors.As(err, &pErr) {
+			if !errors.As(err, &pErr) && !isSaturated {
 				// Only the endpoint is at fault when no proxy was in the path.
+				// Upstream saturation is a gateway-wide concurrency limit, not
+				// an endpoint fault, so it must not cool or skip the endpoint.
 				if g.testCooldown > 0 {
 					g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
 				} else {
 					g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 				}
 			}
-			g.skipSameHostOnTransportFailure(ep, err, tried)
+			if !isSaturated {
+				g.skipSameHostOnTransportFailure(ep, err, tried)
+			}
 			g.recordCooldown()
 
 			// If we have partial assistant output (text or reasoning), append it
@@ -677,6 +682,15 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 			Err:   fmt.Errorf("mandatory proxy routing enabled but no proxy available for %s/%s", ep.Provider, ep.Model),
 		}
 	}
+	// Bound this attempt by the gateway-wide upstream concurrency cap, so the
+	// Responses surfaces cannot bypass the cap that the chat surfaces enforce.
+	// Without it, a busy gateway could let Responses traffic overwhelm the
+	// upstreams and turn into upstream 503s (which then become client 503s).
+	release, err := g.proxy.acquireUpstream(attemptCtx)
+	if err != nil {
+		return "", nil, err
+	}
+	defer release()
 	resp, err := client.Do(req)
 	if err != nil {
 		// proxyAttribution, not proxyFault: a bare CONNECT status-text rejection

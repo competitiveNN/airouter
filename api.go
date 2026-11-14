@@ -1975,8 +1975,12 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			}
 			tried[ep.Key()] = true
 			g.recordFallback(ep, lastErr, 0, lastErr.Error(), usedProxy)
-			if !errors.As(lastErr, &pErr) {
+			isSaturated := errors.Is(lastErr, ErrUpstreamSaturated)
+			if !errors.As(lastErr, &pErr) && !isSaturated {
 				// Only cool down the endpoint for non-proxy errors.
+				// Upstream saturation is a gateway-wide concurrency limit, not an
+				// endpoint fault: cooling the endpoint would wrongly remove a
+				// healthy model from rotation (and could cascade into 503s).
 				if g.testCooldown > 0 {
 					// In test mode the caller-specified duration wins and the
 					// real escalation ladder is skipped (see
@@ -1988,7 +1992,9 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					g.router.ApplyCooldownFromErrorForSession(ep, lastErr, sessionID)
 				}
 			}
-			g.skipSameHostOnTransportFailure(ep, lastErr, tried)
+			if !isSaturated {
+				g.skipSameHostOnTransportFailure(ep, lastErr, tried)
+			}
 			g.recordCooldown()
 			continue
 		}
@@ -2609,17 +2615,22 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			g.recordFallback(ep, err, 0, err.Error(), usedProxy)
 		}
 		var pErr *ProxyError
-		if !errors.As(err, &pErr) {
+		isSaturated := errors.Is(err, ErrUpstreamSaturated)
+		if !errors.As(err, &pErr) && !isSaturated {
 			// Only cool down the endpoint for non-proxy errors. A proxy failure
 			// already took its penalty on the proxy above, and charging the
-			// endpoint too would drop a healthy model from rotation.
+			// endpoint too would drop a healthy model from rotation. Upstream
+			// saturation is a gateway-wide concurrency limit, not an endpoint
+			// fault, so it must not cool or skip the endpoint either.
 			if g.testCooldown > 0 {
 				g.router.ApplyCooldownWithDuration(ep, 0, err.Error(), sessionID, g.testCooldown)
 			} else {
 				g.router.ApplyCooldownFromErrorForSession(ep, err, sessionID)
 			}
 		}
-		g.skipSameHostOnTransportFailure(ep, err, tried)
+		if !isSaturated {
+			g.skipSameHostOnTransportFailure(ep, err, tried)
+		}
 		g.recordCooldown()
 		// Mid-stream failure after we already flushed content to the client:
 		// resume on the next model by replaying what the client already received
