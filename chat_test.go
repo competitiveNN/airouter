@@ -7,6 +7,7 @@ package main
 // without touching the network.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1175,6 +1176,56 @@ func TestChatPageBenchmarkUI(t *testing.T) {
 	}
 	if strings.Contains(chatHTML, "function runBenchmark") && !strings.Contains(chatHTML, "s.decode_tokens_per_sec") {
 		t.Errorf("benchmark rows do not record decode speed")
+	}
+}
+
+// nonFlusherResponseWriter wraps an http.ResponseWriter and intentionally omits
+// http.Flusher so we can test that streaming requests degrade gracefully rather
+// than returning 503.
+type nonFlusherResponseWriter struct {
+	http.ResponseWriter
+	header http.Header
+	code   int
+	buf    bytes.Buffer
+}
+
+func (w *nonFlusherResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *nonFlusherResponseWriter) WriteHeader(statusCode int) {
+	w.code = statusCode
+}
+
+func (w *nonFlusherResponseWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
+func TestChatProxyStreamingUnsupportedDegradesToSynthesized200(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello non-flusher"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	g := newChatTestGateway(t)
+	payload := `{"endpoint":{"url":"` + upstream.URL + `/v1"},"model":"smart","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	rec := &nonFlusherResponseWriter{code: 200}
+	g.HandleWebChatCompletions(rec, chatTestRequest(t, http.MethodPost, "/chat/completions", payload))
+
+	if rec.code != 200 {
+		t.Fatalf("expected status 200, got %d", rec.code)
+	}
+	body := rec.buf.String()
+	if !strings.Contains(body, "hello non-flusher") {
+		t.Errorf("expected synthesized stream content, got: %s", body)
+	}
+	if !strings.Contains(body, chatStatsEvent) {
+		t.Errorf("expected stats event appended")
 	}
 }
 

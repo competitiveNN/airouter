@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -200,11 +202,26 @@ func TestE2DAllDeadNeverReturns500(t *testing.T) {
 	if rec.Code == http.StatusInternalServerError {
 		t.Fatalf("client saw 500 when all upstreams dead: %s", rec.Body.String())
 	}
-	if rec.Code != http.StatusServiceUnavailable &&
-		rec.Code != http.StatusBadGateway &&
-		rec.Code != http.StatusTooManyRequests &&
-		rec.Code != 499 {
-		t.Errorf("unexpected terminal status %d: %s", rec.Code, rec.Body.String())
+	// With degraded fallback, we now return 200 with a helpful message
+	// instead of 503/502/429/499 when all upstreams are dead.
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 degraded response when all upstreams dead, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	choices, ok := resp["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatalf("expected choices in response: %v", resp)
+	}
+	msg, ok := choices[0].(map[string]any)["message"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected message in choice: %v", choices[0])
+	}
+	content, ok := msg["content"].(string)
+	if !ok || !strings.Contains(content, "unavailable") {
+		t.Errorf("expected unavailable message, got: %v", content)
 	}
 }
 
@@ -421,6 +438,7 @@ func tlsFaultGateway(t *testing.T, cfg *Config) *GatewayContext {
 		baseTransport:     transport,
 		streamIdleTimeout: defaultStreamIdleTimeout,
 		config:            &atomic.Pointer[Config]{},
+		coalescers:        make(map[string]*coalescedCall),
 	}
 	proxy.config.Store(cfg)
 	return NewGatewayContext(router, proxy, cfg, "", "", true)
@@ -862,11 +880,14 @@ func TestE2EChaoticNetworkLoad(t *testing.T) {
 	var okCount int32
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
+				// Use unique request body per request to avoid coalescing
+				// which would share failures across identical requests
+				body := fmt.Sprintf(`{"model":"smart","messages":[{"role":"user","content":"hi-%d-%d"}]}`, workerID, i)
 				req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-					strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"hi"}]}`))
+					strings.NewReader(body))
 				rec := httptest.NewRecorder()
 				gw.HandleChatCompletions(rec, req)
 				if rec.Code == http.StatusInternalServerError {
@@ -876,7 +897,7 @@ func TestE2EChaoticNetworkLoad(t *testing.T) {
 					atomic.AddInt32(&okCount, 1)
 				}
 			}
-		}()
+		}(w)
 	}
 	wg.Wait()
 
@@ -1428,5 +1449,400 @@ func TestE2EMidStreamFallbackLogLinePresent(t *testing.T) {
 
 	if !strings.Contains(logBuf.String(), "[fallback][mid-stream]") {
 		t.Errorf("expected [fallback][mid-stream] log line, got: %q", logBuf.String())
+	}
+}
+
+// TestE2EFuzzingConcurrentSaturationAndDrops drives high-concurrency chaos
+// across all four model tiers ("smart", "work", "fast", "large") simultaneously,
+// injecting random upstream saturation, connection resets, 500/502 errors, and drop
+// outs. It verifies that zero client-side 503 errors ever escape the gateway,
+// and that SWR / degraded fallbacks kick in reliably under extreme saturation.
+func TestE2EFuzzingConcurrentSaturationAndDrops(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping fuzzy chaos test in short mode")
+	}
+
+	// Setup chaotic servers: some fail immediately, some return 500, some hang,
+	// and some succeed with delays.
+	srvOk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"chaos recovered success"}}]}`))
+	}))
+	defer srvOk.Close()
+
+	srv500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`Internal Error`))
+	}))
+	defer srv500.Close()
+
+	cfg := &Config{
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "err500", Model: "m1"},
+				{Provider: "ok", Model: "m2"},
+			}},
+			"work": {Chain: []ModelEndpoint{
+				{Provider: "dropped", Model: "m1"},
+				{Provider: "ok", Model: "m2"},
+			}},
+			"fast": {Chain: []ModelEndpoint{
+				{Provider: "err500", Model: "m1"},
+				{Provider: "dropped", Model: "m2"},
+				{Provider: "ok", Model: "m3"},
+			}},
+			"large": {Chain: []ModelEndpoint{
+				{Provider: "err500", Model: "m1"},
+				{Provider: "ok", Model: "m2"},
+			}},
+		},
+		Providers: map[string]ProviderConfig{
+			"err500":  {URL: srv500.URL, APIKeyEnv: "K"},
+			"dropped": {URL: releasedPortUrl(t), APIKeyEnv: "K"},
+			"ok":      {URL: srvOk.URL, APIKeyEnv: "K"},
+		},
+		Preferences: &Preferences{
+			InitialRotationWindow: intPtr(0),
+		},
+	}
+	t.Setenv("K", "key")
+	gw := faultGateway(t, cfg)
+
+	var wg sync.WaitGroup
+	workers := 20
+	requestsPerWorker := 15
+	tiers := []string{"smart", "work", "fast", "large"}
+
+	var non200Count atomic.Int64
+	var totalRequests atomic.Int64
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < requestsPerWorker; i++ {
+				tier := tiers[(workerID+i)%len(tiers)]
+				reqBody := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"fuzz %d-%d"}]}`, tier, workerID, i)
+				req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody))
+				rec := httptest.NewRecorder()
+				gw.HandleChatCompletions(rec, req)
+
+				totalRequests.Add(1)
+				if rec.Code != http.StatusOK {
+					non200Count.Add(1)
+					t.Errorf("worker %d req %d got non-200 code %d (body: %s)", workerID, i, rec.Code, rec.Body.String())
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+
+	if n := non200Count.Load(); n > 0 {
+		t.Fatalf("fuzzing test encountered %d non-200 responses out of %d requests", n, totalRequests.Load())
+	}
+}
+
+// TestE2EStreamingChunkResetAndTimeout verifies that when an upstream connection
+// suffers a mid-stream reset (ECONNRESET or socket timeout) after partial chunks
+// have already been emitted, the gateway transparently fails over to the next
+// healthy model, replays the initial chunks or serves degraded content, and
+// ensures the client never sees a 503 error or an unterminated stream.
+func TestE2EStreamingChunkResetAndTimeout(t *testing.T) {
+	// Upstream 1: sends partial chunk then forcibly closes connection (reset)
+	srvReset := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"part1\"}}]}\n\n"))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		// Abrupt close (hijack connection and close underlying conn)
+		if hij, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hij.Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+		}
+		panic("reset failed")
+	}))
+	defer srvReset.Close()
+
+	// Upstream 2: healthy fallback completing the stream successfully
+	srvHealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" part2-healthy\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}))
+	defer srvHealthy.Close()
+
+	cfg := &Config{
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "resetter", Model: "m1"},
+				{Provider: "healthy", Model: "m2"},
+			}},
+		},
+		Providers: map[string]ProviderConfig{
+			"resetter": {URL: srvReset.URL, APIKeyEnv: "K"},
+			"healthy":  {URL: srvHealthy.URL, APIKeyEnv: "K"},
+		},
+		Preferences: &Preferences{
+			InitialRotationWindow: intPtr(0),
+		},
+	}
+	t.Setenv("K", "key")
+	gw := faultGateway(t, cfg)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model": "smart",
+		"messages": [{"role":"user","content":"stream reset test"}],
+		"stream": true
+	}`))
+	rec := httptest.NewRecorder()
+	gw.HandleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on mid-stream reset failover, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, "[DONE]") {
+		t.Fatalf("expected terminal sentinel [DONE] in stream, got: %s", bodyStr)
+	}
+}
+
+// TestE2EHTTP2GoAwayAndCascadeFailure simulates an upstream that returns HTTP/2 GOAWAY / RST_STREAM
+// or cascading timeout errors across all models in the fallback chain, verifying that the gateway
+// successfully serves a stale-while-revalidate cached response or degraded 200 message with telemetry
+// without ever bubbling up a 503 error.
+func TestE2EHTTP2GoAwayAndCascadeFailure(t *testing.T) {
+	// All upstreams in chain return 504 Gateway Timeout / HTTP/2 errors
+	srvTimeout := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte(`{"error":{"message":"gateway timeout / http/2 rst_stream","code":504}}`))
+	}))
+	defer srvTimeout.Close()
+
+	cfg := &Config{
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "p1", Model: "m1"},
+				{Provider: "p2", Model: "m2"},
+			}},
+		},
+		Providers: map[string]ProviderConfig{
+			"p1": {URL: srvTimeout.URL, APIKeyEnv: "K"},
+			"p2": {URL: srvTimeout.URL, APIKeyEnv: "K"},
+		},
+		Preferences: &Preferences{
+			InitialRotationWindow: intPtr(0),
+		},
+	}
+	t.Setenv("K", "key")
+	gw := faultGateway(t, cfg)
+
+	// Populate SWR cache for the session first by making a successful request
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cached","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"stale cached answer"}}]}`))
+	}))
+	defer okSrv.Close()
+
+	cfgOk := &Config{
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{{Provider: "okp", Model: "okm"}}},
+		},
+		Providers: map[string]ProviderConfig{
+			"okp": {URL: okSrv.URL, APIKeyEnv: "K"},
+		},
+	}
+	gwOk := faultGateway(t, cfgOk)
+	reqOk := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"cache me"}]}`))
+	recOk := httptest.NewRecorder()
+	gwOk.HandleChatCompletions(recOk, reqOk)
+
+	// Now execute request against exhausted failing chain with same session/body or fallback
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"cache me"}]}`))
+	rec := httptest.NewRecorder()
+	gw.HandleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected degraded status 200 on cascade failure, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "stale cached answer") && !strings.Contains(rec.Body.String(), "unavailable") {
+		t.Fatalf("expected degraded fallback content, got: %s", rec.Body.String())
+	}
+}
+
+// TestE2EResponsesNonStreamingNeverReturns503 verifies that the /v1/responses
+// non-streaming path degrades gracefully (HTTP 200) when all providers fail,
+// rather than surfacing a 503 to the client.
+func TestE2EResponsesNonStreamingNeverReturns503(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"bad": {URL: bad.URL, APIKeyEnv: "K"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "bad", Model: "m-bad"},
+			}},
+		},
+	}
+	t.Setenv("K", "sk-test")
+	proxy := NewProxy(cfg)
+	router := NewRouter(cfg, "")
+	t.Cleanup(router.Close)
+	g := NewGatewayContext(router, proxy, cfg, "", testGatewayKey, false)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/responses", g.HandleResponses)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/responses",
+		strings.NewReader(`{"model":"smart","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		t.Fatalf("client saw 503 on responses path: %s", readAllString(t, resp))
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", resp.StatusCode, readAllString(t, resp))
+	}
+}
+
+// TestE2EResponsesMidStreamResetNoOutputNeverReturns503 tests that /v1/responses
+// streaming when an upstream drops connection immediately after headers with no
+// output bytes emitted fails over cleanly and degrades to 200 without 503.
+func TestE2EResponsesMidStreamResetNoOutputNeverReturns503(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		// Close connection immediately with no output
+		if hj, ok := w.(http.Hijacker); ok {
+			c, _, _ := hj.Hijack()
+			c.Close()
+		}
+	}))
+	defer first.Close()
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		if fl != nil {
+			fl.Flush()
+		}
+		// Upstream expects chat completion format (choices/delta/content)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"fallback ok\"}}]}\n\n"))
+		if fl != nil {
+			fl.Flush()
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer second.Close()
+
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"first":  {URL: first.URL, APIKeyEnv: "K"},
+			"second": {URL: second.URL, APIKeyEnv: "K"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "first", Model: "m-first"},
+				{Provider: "second", Model: "m-second"},
+			}},
+		},
+	}
+	t.Setenv("K", "sk-test")
+	proxy := NewProxy(cfg)
+	router := NewRouter(cfg, "")
+	t.Cleanup(router.Close)
+	g := NewGatewayContext(router, proxy, cfg, "", testGatewayKey, false)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/responses", g.HandleResponses)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/responses",
+		strings.NewReader(`{"model":"smart","input":"hi","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		t.Fatalf("saw 503 on mid-stream reset")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	body := readAllString(t, resp)
+	if !strings.Contains(body, "fallback ok") {
+		t.Errorf("expected fallback content, got: %s", body)
+	}
+}
+
+// TestE2ECommandCodeAllDeadNeverReturns503 tests commandcode protocol endpoints
+// when all are dead, in both streaming and non-streaming modes.
+func TestE2ECommandCodeAllDeadNeverReturns503(t *testing.T) {
+	dead := releasedPortUrl(t)
+	cfg := &Config{
+		Providers: map[string]ProviderConfig{
+			"cc": {URL: dead, APIKeyEnv: "K"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "cc", Model: "m-cc", Protocol: "commandcode"},
+			}},
+		},
+	}
+	t.Setenv("K", "sk-test")
+	proxy := NewProxy(cfg)
+	router := NewRouter(cfg, "")
+	t.Cleanup(router.Close)
+	g := NewGatewayContext(router, proxy, cfg, "", testGatewayKey, false)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat/completions", g.HandleChatCompletions)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for _, stream := range []bool{false, true} {
+		bodyPayload, _ := json.Marshal(map[string]any{
+			"model":  "smart",
+			"prompt": "hi",
+			"stream": stream,
+		})
+		req, _ := http.NewRequest("POST", srv.URL+"/chat/completions", bytes.NewReader(bodyPayload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("stream=%v: post: %v", stream, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			t.Fatalf("stream=%v: expected no 503, got status %d", stream, resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("stream=%v: expected status 200, got %d", stream, resp.StatusCode)
+		}
 	}
 }

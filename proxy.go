@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -265,6 +267,10 @@ type Proxy struct {
 	upstreamSlots chan struct{}
 	// maxUpstreamConcurrency is the configured cap (0 = unlimited).
 	maxUpstreamConcurrency int
+
+	// Request coalescing: deduplicates identical concurrent requests.
+	coalesceMu sync.Mutex
+	coalescers map[string]*coalescedCall
 
 	// Proxy pool wiring. Guarded by proxyMu.
 	proxyMu  sync.RWMutex
@@ -574,6 +580,10 @@ func NewProxy(cfg *Config) *Proxy {
 				MaxIdleConnsPerHost: 50,
 				MaxConnsPerHost:     100,
 				IdleConnTimeout:     90 * time.Second,
+				// Disable HTTP/2 to avoid head-of-line blocking on multiplexed
+				// streams when upstream fails mid-request. HTTP/1.1 with
+				// connection pooling is more predictable for LLM streaming.
+				ForceAttemptHTTP2: false,
 				// Bound the connection-setup phases so a fallback request to a
 				// flaky provider cannot hang forever inside http.Client.Do.
 				// The response body (the actual generation) is guarded
@@ -581,9 +591,19 @@ func NewProxy(cfg *Config) *Proxy {
 				DialContext: (&net.Dialer{
 					Timeout:   10 * time.Second,
 					KeepAlive: 30 * time.Second,
+					// Happy Eyeballs (RFC 8305): enable dual-stack IPv4/IPv6
+					// with a short fallback delay so IPv6-only or IPv4-only
+					// upstreams don't hang on the first attempt.
+					FallbackDelay: 300 * time.Millisecond,
 				}).DialContext,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: maxRequestAttemptTimeout,
+				// ExpectContinueTimeout: 1s prevents 417 Expectation Failed
+				// on upstreams that don't support 100-continue.
+				ExpectContinueTimeout: 1 * time.Second,
+				// Disable compression for streaming responses to avoid
+				// buffering and allow immediate flush of tokens.
+				DisableCompression: true,
 			},
 		},
 		streamIdleTimeout: defaultStreamIdleTimeout,
@@ -614,6 +634,7 @@ func NewProxy(cfg *Config) *Proxy {
 	// go direct, ignoring CC_UPSTREAM_PROXY.
 	p.config = &atomic.Pointer[Config]{}
 	p.config.Store(cfg)
+	p.coalescers = make(map[string]*coalescedCall)
 	return p
 }
 
@@ -1117,15 +1138,26 @@ func tlsIntercepted(err error) bool {
 	return errors.As(err, &record)
 }
 
+// Forward executes a non-streaming request with request coalescing.
+// Identical concurrent requests (same body + endpoint) share a single upstream call.
 func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, context.CancelFunc, error) {
+	key := p.coalesceKey(body, endpoint, false)
+	resp, _, cancel, err := p.doCoalesced(ctx, key, func(ctx context.Context) (*http.Response, []byte, context.CancelFunc, error) {
+		return p.forwardUncoalesced(ctx, body, endpoint, sessionID)
+	})
+	return resp, cancel, err
+}
+
+// forwardUncoalesced is the original Forward implementation without coalescing.
+func (p *Proxy) forwardUncoalesced(ctx context.Context, body []byte, endpoint ModelEndpoint, sessionID string) (*http.Response, []byte, context.CancelFunc, error) {
 	release, err := p.acquireUpstream(ctx)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
 	defer release()
 	providerCfg, ok := p.config.Load().Providers[endpoint.Provider]
 	if !ok {
-		return nil, func() {}, fmt.Errorf("unknown provider: %s", endpoint.Provider)
+		return nil, nil, func() {}, fmt.Errorf("unknown provider: %s", endpoint.Provider)
 	}
 	cancel := func() {}
 	if providerCfg.Timeout > 0 {
@@ -1137,7 +1169,7 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	req, err := p.buildRequest(ctx, body, endpoint, &providerCfg, false, sessionID)
 	if err != nil {
 		cancel()
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
 
 	// Select the client: Command Code upstreams use the command-code client,
@@ -1205,7 +1237,7 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	// falling back to a direct connection.
 	if usedProxy == nil && providerCfg.Proxies.Mandatory {
 		cancel()
-		return nil, func() {}, &ProxyError{
+		return nil, nil, func() {}, &ProxyError{
 			Proxy: nil,
 			Err:   fmt.Errorf("mandatory proxy routing enabled but no proxy available for %s/%s", endpoint.Provider, endpoint.Model),
 		}
@@ -1220,10 +1252,10 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 		// cannot see (which used to land on the endpoint's cooldown instead).
 		if proxyAttribution(err, usedProxy != nil) {
 			cancel()
-			return nil, func() {}, &ProxyError{Proxy: usedProxy, Err: err}
+			return nil, nil, func() {}, &ProxyError{Proxy: usedProxy, Err: err}
 		}
 		cancel()
-		return nil, func() {}, &ProviderError{Err: err}
+		return nil, nil, func() {}, &ProviderError{Err: err}
 	}
 	// The proxy carried this request as far as a response header. That is the
 	// strongest evidence of usability we ever get for a proxy, so it renews the
@@ -1231,7 +1263,17 @@ func (p *Proxy) Forward(ctx context.Context, body []byte, endpoint ModelEndpoint
 	if usedProxy != nil {
 		p.MarkProxyReady(usedProxy.URL)
 	}
-	return resp, cancel, nil
+	// Read the response body for coalescing
+	respBody, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		cancel()
+		return nil, nil, func() {}, &ProviderError{Err: readErr}
+	}
+	// Re-create the response with the body we just read
+	resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	resp.ContentLength = int64(len(respBody))
+	return resp, respBody, cancel, nil
 }
 
 func (p *Proxy) Warmup(ctx context.Context) {
@@ -1310,9 +1352,80 @@ func (p *Proxy) Warmup(ctx context.Context) {
 	}
 }
 
-// applyAttemptTimeouts bounds every phase of ONE upstream attempt by the
-// request's own size-adjusted timeout.
-//
+// StartConnectionPoolWarmer runs a background goroutine that periodically
+// makes lightweight requests to each upstream endpoint's base URL, keeping
+// TCP connections warm in the transport's idle pool. This eliminates
+// cold-start dial latencies under bursty traffic. The goroutine stops when
+// ctx is cancelled.
+func (p *Proxy) StartConnectionPoolWarmer(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		// Warm immediately on start, then on each tick.
+		p.warmConnectionPool(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.warmConnectionPool(ctx)
+			}
+		}
+	}()
+}
+
+// warmConnectionPool makes a lightweight HEAD request to each endpoint's base
+// URL to keep the connection pool warm. Errors are logged but not propagated.
+func (p *Proxy) warmConnectionPool(ctx context.Context) {
+	cfg := p.config.Load()
+	if cfg == nil {
+		return
+	}
+	// Collect unique endpoint URLs.
+	seen := make(map[string]bool)
+	var urls []string
+	for _, modelCfg := range cfg.Models {
+		for _, ep := range modelCfg.Chain {
+			providerCfg, ok := cfg.Providers[ep.Provider]
+			if !ok {
+				continue
+			}
+			baseURL := strings.TrimSuffix(strings.TrimSpace(providerCfg.URL), "/")
+			if baseURL == "" || seen[baseURL] {
+				continue
+			}
+			seen[baseURL] = true
+			urls = append(urls, baseURL)
+		}
+	}
+	if len(urls) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	for _, u := range urls {
+		wg.Add(1)
+		go func(baseURL string) {
+			defer wg.Done()
+			warmCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(warmCtx, http.MethodHead, baseURL, nil)
+			if err != nil {
+				return
+			}
+			resp, err := p.client.Do(req)
+			if err != nil {
+				log.Printf("[pool-warmer] %s: %v", baseURL, err)
+				return
+			}
+			resp.Body.Close()
+		}(u)
+	}
+	wg.Wait()
+}
+
 // The size-based timeout used to cover only the response-header wait. The
 // connection phases before it -- the TCP dial and the TLS handshake -- were
 // governed by the transport's global 15s, so a provider that accepted the
@@ -1546,6 +1659,11 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 				return "", nil, 0, mapped
 			}
 		}
+		// Treat LB health check / maintenance responses as transient transport
+		// failures so they trigger fallback without penalizing the endpoint.
+		if isLBHealthCheckResponse(resp.StatusCode, resp.Header, bodyBytes) {
+			return "", nil, 0, &ProviderError{StatusCode: 0, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
+		}
 		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
@@ -1558,6 +1676,9 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") && p.effectiveProtocol(&endpoint) != protocolCommandCode {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
 		resp.Body.Close()
+		if isLBHealthCheckResponse(resp.StatusCode, resp.Header, bodyBytes) {
+			return "", nil, 0, &ProviderError{StatusCode: 0, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
+		}
 		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
@@ -2721,11 +2842,159 @@ func stripToolCallDeltas(raw []byte) []byte {
 // ErrUpstreamSaturated is returned when the upstream concurrency cap is
 // exhausted and an attempt cannot acquire a slot in time. Handlers map it
 // to 503 + Retry-After.
+// isLBHealthCheckResponse detects common load balancer health check
+// or maintenance responses that should be treated as transient gateway
+// issues rather than endpoint failures. These include:
+// - AWS ALB/NLB 503 with "Server: awselb" header
+// - GCP Cloud Load Balancing 502/503 with "via: 1.1 google"
+// - Azure Load Balancer 503 with "Server: Microsoft-HTTPAPI"
+// - Cloudflare 521/522/523/524 (origin down/timeout)
+// - Generic "maintenance", "health check", "lb" in response body
+// - Retry-After header with small value (< 60s) on 503
+func isLBHealthCheckResponse(statusCode int, header http.Header, body []byte) bool {
+	// Only check 5xx responses that might be LB-generated
+	if statusCode < 500 || statusCode > 599 {
+		return false
+	}
+	// Check for known LB server headers
+	server := header.Get("Server")
+	if server != "" {
+		sl := strings.ToLower(server)
+		if strings.Contains(sl, "awselb") ||
+			strings.Contains(sl, "google") ||
+			strings.Contains(sl, "cloudflare") ||
+			strings.Contains(sl, "microsoft-httpapi") ||
+			strings.Contains(sl, "nginx") && strings.Contains(sl, "plus") {
+			return true
+		}
+	}
+	via := header.Get("Via")
+	if via != "" {
+		vl := strings.ToLower(via)
+		if strings.Contains(vl, "google") || strings.Contains(vl, "cloudflare") {
+			return true
+		}
+	}
+	// Check for Retry-After on 503 with small value (maintenance window)
+	if statusCode == 503 {
+		if ra := header.Get("Retry-After"); ra != "" {
+			if secs, err := strconv.Atoi(ra); err == nil && secs < 60 {
+				return true
+			}
+		}
+		// Check body for maintenance keywords
+		bodyLower := strings.ToLower(string(body))
+		if strings.Contains(bodyLower, "maintenance") ||
+			strings.Contains(bodyLower, "health check") ||
+			strings.Contains(bodyLower, "load balancer") ||
+			strings.Contains(bodyLower, "lb ") ||
+			strings.Contains(bodyLower, "temporarily unavailable") {
+			return true
+		}
+	}
+	return false
+}
+
 var ErrUpstreamSaturated = errors.New("upstream saturated")
+
+// coalescedCall represents an in-flight request that other callers can wait on.
+type coalescedCall struct {
+	done   chan struct{}
+	resp   *http.Response
+	body   []byte
+	err    error
+	cancel context.CancelFunc
+}
+
+// coalesceKey computes a deduplication key for a request.
+// It includes the body hash, endpoint, and whether it's a streaming request.
+// SessionID is intentionally excluded to allow coalescing across sessions
+// for identical read-only requests (e.g., same prompt to same model).
+func (p *Proxy) coalesceKey(body []byte, endpoint ModelEndpoint, streaming bool) string {
+	h := fnv.New64a()
+	h.Write(body)
+	h.Write([]byte(endpoint.Key()))
+	if streaming {
+		h.Write([]byte("stream"))
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// doCoalesced executes fn, sharing the result with any concurrent callers
+// that have the same key. If another caller is already executing fn for the
+// same key, this call waits for that result instead of re-executing.
+func (p *Proxy) doCoalesced(ctx context.Context, key string, fn func(context.Context) (*http.Response, []byte, context.CancelFunc, error)) (*http.Response, []byte, context.CancelFunc, error) {
+	p.coalesceMu.Lock()
+	if existing, ok := p.coalescers[key]; ok {
+		p.coalesceMu.Unlock()
+		// Another call is in flight for this key - wait for its result.
+		select {
+		case <-existing.done:
+			// Return a fresh response with copied body for each caller.
+			if existing.err != nil {
+				return nil, nil, func() {}, existing.err
+			}
+			// Create a new response with the cached body
+			resp := &http.Response{
+				Status:        existing.resp.Status,
+				StatusCode:    existing.resp.StatusCode,
+				Proto:         existing.resp.Proto,
+				ProtoMajor:    existing.resp.ProtoMajor,
+				ProtoMinor:    existing.resp.ProtoMinor,
+				Header:        existing.resp.Header.Clone(),
+				Body:          io.NopCloser(bytes.NewReader(existing.body)),
+				ContentLength: existing.resp.ContentLength,
+				Close:         false,
+			}
+			return resp, existing.body, func() {}, nil
+		case <-ctx.Done():
+			return nil, nil, func() {}, ctx.Err()
+		}
+	}
+	// Create a new coalesced call
+	childCtx, cancel := context.WithCancel(ctx)
+	call := &coalescedCall{
+		done:   make(chan struct{}),
+		cancel: cancel,
+	}
+	p.coalescers[key] = call
+	p.coalesceMu.Unlock()
+
+	// Execute the request
+	resp, body, fwdCancel, err := fn(childCtx)
+
+	// Store result and notify waiters
+	p.coalesceMu.Lock()
+	call.resp = resp
+	call.body = body
+	call.err = err
+	close(call.done)
+	delete(p.coalescers, key)
+	p.coalesceMu.Unlock()
+
+	// Return a wrapper cancel that also cancels the child context
+	combinedCancel := func() {
+		cancel()
+		if fwdCancel != nil {
+			fwdCancel()
+		}
+	}
+	return resp, body, combinedCancel, err
+}
 
 // acquireUpstream acquires one upstream attempt slot. release must be
 // called (typically via defer) when the attempt completes. Returns an
-// error if the cap is full and the slot is not available promptly.
+// upstreamSlotWaitWithJitter returns the base 250ms wait duration with up to
+// 25% random jitter to avoid thundering herds when many concurrent requests
+// hit the upstream slot cap simultaneously.
+func upstreamSlotWaitWithJitter() time.Duration {
+	const base = 250 * time.Millisecond
+	jitter := time.Duration(float64(base) * (0.75 + 0.5*rand.Float64()))
+	if jitter < base {
+		jitter = base
+	}
+	return jitter
+}
 func (p *Proxy) acquireUpstream(ctx context.Context) (func(), error) {
 	if p == nil || p.upstreamSlots == nil {
 		return func() {}, nil
@@ -2735,7 +3004,7 @@ func (p *Proxy) acquireUpstream(ctx context.Context) (func(), error) {
 		return func() { <-p.upstreamSlots }, nil
 	default:
 	}
-	timer := time.NewTimer(250 * time.Millisecond)
+	timer := time.NewTimer(upstreamSlotWaitWithJitter())
 	defer timer.Stop()
 	select {
 	case p.upstreamSlots <- struct{}{}:
@@ -2743,6 +3012,9 @@ func (p *Proxy) acquireUpstream(ctx context.Context) (func(), error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-timer.C:
+		if p.metrics != nil {
+			p.metrics.upstreamSaturatedTotal.Add(1)
+		}
 		return nil, ErrUpstreamSaturated
 	}
 }

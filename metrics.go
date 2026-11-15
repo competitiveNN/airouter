@@ -67,10 +67,13 @@ type Metrics struct {
 	// fallbacksByReason categorizes each fallback by why the chain advanced.
 	// Operators use this to answer "which endpoints are failing and WHY"
 	// without log grepping. Bounded like the other single-label maps.
-	fallbacksByReason map[labelKey]*atomic.Int64
-	cooldownsApplied  atomic.Int64
-	latencySumNS      atomic.Int64
-	latencyCount      atomic.Int64
+	fallbacksByReason                map[labelKey]*atomic.Int64
+	cooldownsApplied                 atomic.Int64
+	degradedFallbacksTotal           atomic.Int64
+	degradedFallbacksByType          map[labelKey]*atomic.Int64
+	sessionRetryBudgetExhaustedTotal atomic.Int64
+	latencySumNS                     atomic.Int64
+	latencyCount                     atomic.Int64
 	// latencyBuckets[i] is the count of requests whose latency fell at or
 	// below the boundary defined by latencyBoundaries[i]. The last bucket
 	// (+Inf) catches everything above the largest finite boundary.
@@ -79,9 +82,16 @@ type Metrics struct {
 	// circuitTransitions tracks circuit breaker state changes
 	// (from="closed",to="open",endpoint="..."). Low-cardinality and
 	// actionable: operators can see which endpoints are flapping.
-	circuitTransitions map[labelKey]*atomic.Int64
-	// sseCommentsRoutedOut counts SSE comment (":" prefixed) lines dropped
-	// before they could be mistaken for a data event.
+	circuitTransitions     map[labelKey]*atomic.Int64
+	fallbackChainLengths   map[labelKey]*atomic.Int64
+	upstreamSaturatedTotal atomic.Int64
+	// fallbackChainTransitionSumNS and count track the time spent transitioning
+	// between a failed attempt and the next endpoint selection in the fallback
+	// walk. This surfaces micro-latency bottlenecks that are invisible in the
+	// per-request latency histogram (which includes upstream generation time).
+	fallbackChainTransitionSumNS   atomic.Int64
+	fallbackChainTransitionCount   atomic.Int64
+	fallbackChainTransitionBuckets []atomic.Int64
 	//
 	// This is a canary, not a throughput metric. A relay that emits
 	// ": keepalive" lines is a relay whose stream had once already tripped the
@@ -237,7 +247,14 @@ var attemptLatencyBoundaries = []float64{
 	0.25, 0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45,
 }
 
-// NewMetrics creates a new Metrics instance with pre-allocated maps.
+// fallbackChainTransitionBoundaries are the histogram boundaries for the time
+// spent transitioning between a failed attempt and the next endpoint selection
+// in the fallback walk, in seconds. The interesting range is sub-second for
+// healthy chains and seconds for chains that hit cooldown waits.
+var fallbackChainTransitionBoundaries = []float64{
+	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10,
+}
+
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		requestsByModel:              make(map[labelKey]*atomic.Int64),
@@ -246,7 +263,9 @@ func NewMetrics() *Metrics {
 		fallbacksByFromEndpoint:      make(map[labelKey]*atomic.Int64),
 		midstreamFallbacksByEndpoint: make(map[labelKey]*atomic.Int64),
 		fallbacksByReason:            make(map[labelKey]*atomic.Int64),
+		degradedFallbacksByType:      make(map[labelKey]*atomic.Int64),
 		circuitTransitions:           make(map[labelKey]*atomic.Int64),
+		fallbackChainLengths:         make(map[labelKey]*atomic.Int64),
 		attemptsByEndpoint:           make(map[labelKey]*atomic.Int64),
 		attemptFailuresByEnd:         make(map[labelKey]*atomic.Int64),
 		attemptLatencyNSByEnd:        make(map[labelKey]*atomic.Int64),
@@ -257,6 +276,7 @@ func NewMetrics() *Metrics {
 		attemptRing:                  make([]*attemptTick, dashboardRingLen),
 	}
 	m.attemptLatencyBounds = attemptLatencyBoundaries
+	m.fallbackChainTransitionBuckets = make([]atomic.Int64, len(fallbackChainTransitionBoundaries)+1) // +1 for +Inf
 	m.latencyBoundaries = defaultLatencyBuckets
 	m.latencyBuckets = make([]atomic.Int64, len(defaultLatencyBuckets)+1) // +1 for +Inf
 	return m
@@ -374,6 +394,22 @@ func (m *Metrics) Request(model string, status int, latency time.Duration) {
 	m.latencyBuckets[len(m.latencyBuckets)-1].Add(1) // +Inf
 }
 
+// FallbackChainTransition records the time spent transitioning between a failed
+// upstream attempt and the next endpoint selection in the fallback walk. This
+// surfaces micro-latency bottlenecks that are invisible in the per-request
+// latency histogram (which includes upstream generation time).
+func (m *Metrics) FallbackChainTransition(d time.Duration) {
+	m.fallbackChainTransitionSumNS.Add(d.Nanoseconds())
+	m.fallbackChainTransitionCount.Add(1)
+	secs := d.Seconds()
+	for i, bound := range fallbackChainTransitionBoundaries {
+		if secs <= bound {
+			m.fallbackChainTransitionBuckets[i].Add(1)
+		}
+	}
+	m.fallbackChainTransitionBuckets[len(m.fallbackChainTransitionBuckets)-1].Add(1) // +Inf
+}
+
 // FallbackWithReason is Fallback with a classification of why the chain
 // advanced past the endpoint. It increments the reason-bounded series
 // alongside the existing total and per-endpoint counters.
@@ -387,6 +423,24 @@ func (m *Metrics) FallbackWithReason(fromEndpoint string, reason FailoverReason)
 // (Kept so existing tests don't break.)
 func (m *Metrics) Fallback(fromEndpoint string) {
 	m.FallbackWithReason(fromEndpoint, FailoverUnknown)
+}
+
+// RecordFallbackChainLength records the number of fallback attempts made for a
+// request (amplification factor). Useful for dashboards to see how many models
+// were tried before success or exhaustion.
+func (m *Metrics) RecordFallbackChainLength(model string, length int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := singleLabelKey("model", model)
+	if _, ok := m.fallbackChainLengths[key]; !ok {
+		if len(m.fallbackChainLengths) >= m.labelsCap-1 {
+			key = overflowKeyFor("model")
+		}
+		if _, ok := m.fallbackChainLengths[key]; !ok {
+			m.fallbackChainLengths[key] = &atomic.Int64{}
+		}
+	}
+	m.fallbackChainLengths[key].Add(int64(length))
 }
 
 // counterFallbackFrom returns the atomic counter for the given endpoint,
@@ -442,6 +496,31 @@ func (m *Metrics) recordReasonCounter(reason FailoverReason) {
 // endpoint, creating it on first access. Bounded like the attempt telemetry.
 func (m *Metrics) counterMidStreamFallbackFrom(key labelKey) *atomic.Int64 {
 	return m.admitCollapsible(m.midstreamFallbacksByEndpoint, key, labelNameEndpoint)
+}
+
+// DegradedFallback records when an exhausted fallback chain serves a degraded
+// response (stale cached body or synthetic unavailable message) instead of a 503.
+func (m *Metrics) DegradedFallback(degradedType string) {
+	m.degradedFallbacksTotal.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := singleLabelKey("type", degradedType)
+	if _, ok := m.degradedFallbacksByType[key]; !ok {
+		if len(m.degradedFallbacksByType) >= m.labelsCap-1 {
+			key = overflowKeyFor("type")
+		}
+		if _, ok := m.degradedFallbacksByType[key]; !ok {
+			m.degradedFallbacksByType[key] = &atomic.Int64{}
+		}
+	}
+	m.degradedFallbacksByType[key].Add(1)
+}
+
+func (m *Metrics) SessionRetryBudgetExhausted() {
+	if m == nil {
+		return
+	}
+	m.sessionRetryBudgetExhaustedTotal.Add(1)
 }
 
 // TransportDrop records that the client disconnected mid-request and the
@@ -1092,9 +1171,37 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE airouter_cooldowns_applied_total counter")
 	fmt.Fprintf(w, "airouter_cooldowns_applied_total %d\n", m.cooldownsApplied.Load())
 
+	fmt.Fprintln(w, "# HELP airouter_degraded_fallbacks_total Number of degraded responses served on fallback chain exhaustion")
+	fmt.Fprintln(w, "# TYPE airouter_degraded_fallbacks_total counter")
+	fmt.Fprintf(w, "airouter_degraded_fallbacks_total %d\n", m.degradedFallbacksTotal.Load())
+
+	fmt.Fprintln(w, "# HELP airouter_session_retry_budget_exhausted_total Number of requests degraded due to session retry budget exhaustion")
+	fmt.Fprintln(w, "# TYPE airouter_session_retry_budget_exhausted_total counter")
+	fmt.Fprintf(w, "airouter_session_retry_budget_exhausted_total %d\n", m.sessionRetryBudgetExhaustedTotal.Load())
+
+	fmt.Fprintln(w, "# HELP airouter_degraded_fallbacks_total_by_type Number of degraded responses served by type (stale vs unavailable)")
+	fmt.Fprintln(w, "# TYPE airouter_degraded_fallbacks_total_by_type counter")
+	m.mu.RLock()
+	for k, c := range m.degradedFallbacksByType {
+		writeSample(w, "airouter_degraded_fallbacks_total_by_type", k, c.Load())
+	}
+	m.mu.RUnlock()
+
+	fmt.Fprintln(w, "# HELP airouter_fallback_chain_length Number of fallback attempts per request (amplification)")
+	fmt.Fprintln(w, "# TYPE airouter_fallback_chain_length counter")
+	m.mu.RLock()
+	for k, c := range m.fallbackChainLengths {
+		writeSample(w, "airouter_fallback_chain_length", k, c.Load())
+	}
+	m.mu.RUnlock()
+
 	fmt.Fprintln(w, "# HELP airrouter_transport_drops_total Number of responses abandoned because the client disconnected")
 	fmt.Fprintln(w, "# TYPE airrouter_transport_drops_total counter")
 	fmt.Fprintf(w, "airouter_transport_drops_total %d\n", m.transportDropsTotal.Load())
+
+	fmt.Fprintln(w, "# HELP airouter_upstream_saturated_total Number of requests rejected due to upstream concurrency cap")
+	fmt.Fprintln(w, "# TYPE airouter_upstream_saturated_total counter")
+	fmt.Fprintf(w, "airouter_upstream_saturated_total %d\n", m.upstreamSaturatedTotal.Load())
 
 	// -- Mid-stream fallback visibility ----------------------------------
 	fmt.Fprintln(w, "# HELP airouter_midstream_fallbacks_total Number of mid-stream (post-content) model failovers")
@@ -1151,6 +1258,22 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sum := float64(m.latencySumNS.Load()) / 1e9
 		fmt.Fprintf(w, "airouter_request_duration_seconds_sum %f\n", sum)
 		fmt.Fprintf(w, "airouter_request_duration_seconds_count %d\n", count)
+	}
+
+	// Fallback chain transition histogram (Prometheus _bucket / _sum / _count).
+	fmt.Fprintln(w, "# HELP airouter_fallback_chain_transition_seconds Time spent transitioning between a failed attempt and the next endpoint selection in the fallback walk")
+	fmt.Fprintln(w, "# TYPE airouter_fallback_chain_transition_seconds histogram")
+	for i, bound := range fallbackChainTransitionBoundaries {
+		fmt.Fprintf(w, "airouter_fallback_chain_transition_seconds_bucket{le=\"%g\"} %d\n",
+			bound, m.fallbackChainTransitionBuckets[i].Load())
+	}
+	fmt.Fprintf(w, "airouter_fallback_chain_transition_seconds_bucket{le=\"+Inf\"} %d\n",
+		m.fallbackChainTransitionBuckets[len(m.fallbackChainTransitionBuckets)-1].Load())
+	transCount := m.fallbackChainTransitionCount.Load()
+	if transCount > 0 {
+		transSum := float64(m.fallbackChainTransitionSumNS.Load()) / 1e9
+		fmt.Fprintf(w, "airouter_fallback_chain_transition_seconds_sum %f\n", transSum)
+		fmt.Fprintf(w, "airouter_fallback_chain_transition_seconds_count %d\n", transCount)
 	}
 
 	fmt.Fprintln(w, "# HELP airouter_sse_comments_routed_out SSE comment lines dropped instead of being parsed as events")

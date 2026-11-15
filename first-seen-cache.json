@@ -1,10 +1,9 @@
 {
-  "fetched_at": "2026-11-14T04:25:17.944900Z",
+  "fetched_at": "2026-11-15T05:01:50.255078Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
     "beam-free": "2026-10-16",
-    "cat-jam-free": "2026-10-14",
     "crouton-alpha-free": "2026-11-04",
     "databricks/dbrx-instruct": "2026-11-06",
     "deepseek-ai/deepseek-coder-6.7b-instruct": "2026-09-26",
@@ -23,7 +22,6 @@
     "ibm/granite-3.0-8b-instruct": "2026-09-26",
     "iceman-free": "2026-11-07",
     "jev-1.13-free": "2026-09-26",
-    "ll-alpha-free": "2026-10-16",
     "longcat-2.5-free": "2026-11-10",
     "longcat-2.5-preview-free": "2026-09-26",
     "meta/llama2-70b": "2026-09-26",
@@ -49,16 +47,13 @@
     "stealth/cat-jam:free": "2026-10-16",
     "stealth/crouton-alpha": "2026-11-04",
     "stealth/glyph-cluster:free": "2026-10-08",
-    "step-5-preview-free": "2026-10-08",
     "stepfun-ai/step-5-preview": "2026-10-16",
     "z-ai/glm-5.3-flash": "2026-11-06"
   },
   "missing_since": {
     "beam": "2026-11-06",
-    "cat-jam-free": "2026-10-16",
     "crouton-alpha-free": "2026-11-10",
     "jev-1.13-free": "2026-10-30",
-    "ll-alpha-free": "2026-10-16",
     "longcat-2.5-preview-free": "2026-10-22",
     "nvidia/nemotron-3.5-content-safety:free": "2026-11-04",
     "poolside/laguna-s-2.1-free": "2026-11-06",
@@ -68,7 +63,6 @@
     "reflection/beam:free": "2026-11-10",
     "space-bunny-free": "2026-10-20",
     "stealth/cat-jam:free": "2026-10-19",
-    "stealth/crouton-alpha": "2026-11-11",
-    "step-5-preview-free": "2026-10-16"
+    "stealth/crouton-alpha": "2026-11-11"
   }
 }

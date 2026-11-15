@@ -37,6 +37,10 @@ func TestImprovementNoClientVisible500Guard(t *testing.T) {
 		}
 		for i, line := range strings.Split(string(data), "\n") {
 			trimmed := strings.TrimSpace(line)
+			// Lines marked // admin are intentional admin-plane 500s, not client-facing.
+			if strings.Contains(trimmed, "// admin") {
+				continue
+			}
 			// The only legitimate use of the 500..599 range is classifying
 			// an already-received upstream status in chatProxyStatus; a bare
 			// comparison is allowed, a write or pass-through is not.

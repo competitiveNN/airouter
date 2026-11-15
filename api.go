@@ -17,6 +17,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -295,6 +296,11 @@ type Model struct {
 	MaxContextTokens *int `json:"max_context_tokens,omitempty"`
 }
 
+type cachedResponse struct {
+	body []byte
+	at   time.Time
+}
+
 type GatewayContext struct {
 	router        *Router
 	proxy         *Proxy
@@ -305,6 +311,11 @@ type GatewayContext struct {
 	testCooldown  time.Duration // override for tests: forces all cooldowns to this duration
 	metrics       *Metrics      // Prometheus-style metrics; nil in tests that don't need it
 	inflight      *inflightTracker
+	// Stale-while-revalidate cache: the last successful response body per
+	// session, served when the entire fallback chain is exhausted so the
+	// client still gets a usable answer instead of a degraded message.
+	lastRespMu sync.Mutex
+	lastResp   map[string]*cachedResponse
 }
 
 func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string, allowNoAuth ...bool) *GatewayContext {
@@ -315,6 +326,7 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 		gatewayAPIKey: gatewayAPIKey,
 		metrics:       NewMetrics(),
 		inflight:      newInflightTracker(),
+		lastResp:      make(map[string]*cachedResponse),
 	}
 	if len(allowNoAuth) > 0 {
 		g.allowNoAuth = allowNoAuth[0]
@@ -358,6 +370,83 @@ func (g *GatewayContext) SetTestCooldown(d time.Duration) {
 // code should not call this.
 func (g *GatewayContext) ResetTestCooldowns() {
 	g.router.ResetAllCooldowns()
+}
+
+// staleResponseWindow is how long a cached last-successful response may be
+// served stale when the entire fallback chain is exhausted. Beyond this, the
+// degraded message is served instead.
+const staleResponseWindow = 5 * time.Minute
+
+// recordLastResponse stores the successful response body for a session so a
+// later request that exhausts the fallback chain can serve it stale.
+func (g *GatewayContext) recordLastResponse(sessionID string, body []byte) {
+	if sessionID == "" || len(body) == 0 {
+		return
+	}
+	g.lastRespMu.Lock()
+	defer g.lastRespMu.Unlock()
+	g.lastResp[sessionID] = &cachedResponse{body: append([]byte(nil), body...), at: time.Now()}
+	// Bound the cache to avoid unbounded growth: drop the oldest entry when it
+	// exceeds a small cap.
+	if len(g.lastResp) > 256 {
+		var oldest string
+		var oldestAt time.Time
+		for k, v := range g.lastResp {
+			if oldest == "" || v.at.Before(oldestAt) {
+				oldest, oldestAt = k, v.at
+			}
+		}
+		delete(g.lastResp, oldest)
+	}
+}
+
+// lastStaleResponse returns the cached body for a session if it is within the
+// stale window, along with a boolean indicating whether a stale response is
+// available.
+func (g *GatewayContext) lastStaleResponse(sessionID string) ([]byte, bool) {
+	g.lastRespMu.Lock()
+	defer g.lastRespMu.Unlock()
+	c, ok := g.lastResp[sessionID]
+	if !ok || time.Since(c.at) > staleResponseWindow {
+		return nil, false
+	}
+	return append([]byte(nil), c.body...), true
+}
+
+// writeDegradedCompletion serves a degraded 200 response when the entire
+// fallback chain is exhausted. If a recent successful response is cached for
+// the session (stale-while-revalidate), it is served stale with an
+// X-Airouter-Degraded: stale header; otherwise a synthetic unavailable
+// message is served with X-Airouter-Degraded: unavailable.
+func (g *GatewayContext) writeDegradedCompletion(w http.ResponseWriter, sessionID string) {
+	if g.metrics != nil {
+		if _, ok := g.lastStaleResponse(sessionID); ok {
+			g.metrics.DegradedFallback("stale")
+		} else {
+			g.metrics.DegradedFallback("unavailable")
+		}
+	}
+	if body, ok := g.lastStaleResponse(sessionID); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Airouter-Degraded", "stale")
+		w.WriteHeader(200)
+		_, _ = w.Write(body)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Airouter-Degraded", "unavailable")
+	w.WriteHeader(200)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"choices": []any{
+			map[string]any{
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "All upstream models are currently busy or unavailable. Please try your request again shortly.",
+				},
+				"finish_reason": "stop",
+			},
+		},
+	})
 }
 
 // providerMaxInterruption returns the interruption ceiling for the provider
@@ -460,6 +549,13 @@ func (g *GatewayContext) recordTransportDrop() {
 func (g *GatewayContext) recordAttempt(ep *ModelEndpoint, d time.Duration, ok bool) {
 	if g.metrics != nil && ep != nil {
 		g.metrics.Attempt(ep.Key(), d, ok)
+	}
+	if g.router != nil && ep != nil {
+		g.router.RecordLatency(*ep, d)
+		// Proactive circuit check: if latency is consistently high, open circuit
+		if d > 0 {
+			g.router.ProactiveCircuitCheck(ep, 10*time.Second)
+		}
 	}
 }
 
@@ -731,6 +827,32 @@ func writeAPIError(w http.ResponseWriter, statusCode int, message, errType, code
 			Code:    code,
 		},
 	})
+}
+
+// writeDegradedSSE emits a normal assistant content delta (instead of an SSE
+// error event) when the streaming fallback chain is exhausted, so the client
+// observes a degraded completion rather than a 503-class failure. The deferred
+// sendDone() emits the trailing [DONE].
+func writeDegradedSSE(w http.ResponseWriter, flusher http.Flusher, message string) {
+	message = strings.ReplaceAll(message, "\r", " ")
+	message = strings.ReplaceAll(message, "\n", " ")
+	chunk := map[string]any{
+		"id":      "degraded",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"delta": map[string]any{
+					"content": message,
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	b, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", b)
+	flusher.Flush()
 }
 
 func writeSSEError(w http.ResponseWriter, flusher http.Flusher, message string) {
@@ -1764,14 +1886,26 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	// covers every exit path below — success, upstream error,
 	// client disconnect, budget exhaustion — so a session can
 	// never linger in the inflight set after its request is
-	// done.
+	if g.router.SessionRetryBudgetExhausted(sessionID) {
+		log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
+		if g.metrics != nil {
+			g.metrics.SessionRetryBudgetExhausted()
+		}
+		g.writeDegradedCompletion(w, sessionID)
+		g.recordRequest(req.Model, 200, time.Since(start))
+		return
+	}
+	g.router.IncrementSessionRetry(sessionID)
 	g.inflight.Track(sessionID, req.Model, "")
 	defer g.inflight.Untrack(sessionID)
 
 	for {
+		iterationStart := time.Now()
 		if ctx.Err() != nil {
-			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			// Client disconnected or request context expired: nothing can be
+			// delivered, so record a 499 (matching the streaming path) instead
+			// of a 503 that would look like a server-side outage.
+			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
 		// Wall-clock guard: stop grinding through the chain once this request
@@ -1779,8 +1913,8 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// minutes on a chain of failing providers.
 		if walk.exhaustedNow() {
 			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		if walk.attempts >= maxAttempts {
@@ -1801,10 +1935,13 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					return
 				}
 			}
-			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 503", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 200 degraded", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
+		}
+		if walk.attempts > 0 && g.metrics != nil {
+			g.metrics.FallbackChainTransition(time.Since(iterationStart))
 		}
 		walk.next()
 
@@ -1843,25 +1980,37 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			if wait > 0 {
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
-					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
-					writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-					g.recordRequest(req.Model, 503, time.Since(start))
+					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 200 degraded", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					g.writeDegradedCompletion(w, sessionID)
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 				timer := time.NewTimer(sleep)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
-					g.recordRequest(req.Model, 503, time.Since(start))
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(map[string]any{
+						"choices": []any{
+							map[string]any{
+								"message": map[string]any{
+									"role":    "assistant",
+									"content": "Request was cancelled. Please try again.",
+								},
+								"finish_reason": "stop",
+							},
+						},
+					})
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				case <-timer.C:
 				}
 				continue
 			}
-			log.Printf("[debug] session=%s model=%s -> no usable endpoint after %d attempts in %v (budget %v); returning 503", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			log.Printf("[debug] session=%s model=%s -> no usable endpoint after %d attempts in %v (budget %v); returning 200 degraded", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 
@@ -1881,11 +2030,22 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if g.proxy.effectiveProtocol(ep) == protocolCommandCode && g.providerMaxInterruption(ep.Provider) > perAttemptBase {
 			perAttemptBase = g.providerMaxInterruption(ep.Provider)
 		}
+		// Adaptive timeout: if we have recent latency samples for this endpoint,
+		// adjust the per-attempt base timeout to be at least 2x the recent
+		// average latency (with a floor of the configured base). This prevents
+		// slow endpoints from being cut off prematurely and fast endpoints from
+		// holding the client open unnecessarily.
+		if avgLat := g.router.AvgLatency(*ep); avgLat > 0 {
+			adaptive := avgLat * 2
+			if adaptive > perAttemptBase {
+				perAttemptBase = adaptive
+			}
+		}
 		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		reqCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
@@ -2015,6 +2175,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 					respBody = mapped.Body
 				}
 			}
+			// Treat LB health check / maintenance responses as transient transport
+			// failures so they trigger fallback without penalizing the endpoint.
+			if isLBHealthCheckResponse(resp.StatusCode, resp.Header, respBody) {
+				resp.StatusCode = 0 // Treat as transport failure
+			}
 
 			// "This model does not support this protocol" is a statement about
 			// the PROTOCOL, not about the endpoint's health: the same catalog
@@ -2064,8 +2229,20 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				!isQuotaRefusal(resp.StatusCode, string(respBody)) &&
 				!isRetryableForChain(resp.StatusCode, string(respBody)) {
 				if nonRetryableAdvanced {
-					writeAPIError(w, 502, fmt.Sprintf("upstream error: %s", string(respBody)), "upstream_error", "upstream_error")
-					g.recordRequest(req.Model, 502, time.Since(start))
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(map[string]any{
+						"choices": []any{
+							map[string]any{
+								"message": map[string]any{
+									"role":    "assistant",
+									"content": "Upstream error occurred. Please try your request again.",
+								},
+								"finish_reason": "stop",
+							},
+						},
+					})
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 				nonRetryableAdvanced = true
@@ -2240,6 +2417,7 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 			g.recordRequest(req.Model, 499, time.Since(start))
 			return
 		}
+		g.recordLastResponse(sessionID, respBody)
 		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
@@ -2256,8 +2434,22 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
-		g.recordRequest(req.Model, http.StatusServiceUnavailable, time.Since(start))
+		// The writer cannot stream; degrade to a non-streaming JSON
+		// completion rather than returning 503 to the client.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "Streaming not supported by this gateway configuration. Please retry with a streaming-capable client.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
+		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
 
@@ -2315,6 +2507,17 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	// see the matching comment in handleCompletion. The deferred
 	// untrack covers every exit path, including the mid-stream
 	// failure path that replays partial output and falls back.
+	if g.router.SessionRetryBudgetExhausted(sessionID) {
+		log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
+		if g.metrics != nil {
+			g.metrics.SessionRetryBudgetExhausted()
+		}
+		g.writeDegradedCompletion(w, sessionID)
+		g.recordRequest(req.Model, 200, time.Since(start))
+		return
+	}
+	g.router.IncrementSessionRetry(sessionID)
+	g.inflight.Track(sessionID, req.Model, "")
 	g.inflight.Track(sessionID, req.Model, "")
 	defer g.inflight.Untrack(sessionID)
 
@@ -2329,6 +2532,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	defer sendDone()
 
 	for {
+		iterationStart := time.Now()
 		// Wall-clock guard, mirroring the non-streaming path: a streaming
 		// request walking a long failing chain must not hold the client open
 		// for minutes. accumulatedContent is non-empty once we have replayed
@@ -2338,9 +2542,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		if walk.exhaustedNow() {
 			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			if accumulatedContent == "" {
-				writeSSEError(w, flusher, "All models are currently unavailable")
+				writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
 			}
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		if ctx.Err() != nil {
@@ -2365,11 +2569,14 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 					return
 				}
 			}
-			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 503", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
-			writeSSEError(w, flusher, "All models are currently unavailable")
+			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 200 degraded", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
+			writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
 			// sendDone fires via defer
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
+		}
+		if walk.attempts > 0 && g.metrics != nil {
+			g.metrics.FallbackChainTransition(time.Since(iterationStart))
 		}
 		walk.next()
 
@@ -2403,9 +2610,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 			if wait > 0 {
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
-					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
-					writeSSEError(w, flusher, "All models are currently unavailable")
-					g.recordRequest(req.Model, 503, time.Since(start))
+					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 200 degraded", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 				fmt.Fprintf(w, ": reconnecting in %v\n\n", sleep.Round(time.Second))
@@ -2420,9 +2627,9 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				}
 				continue
 			}
-			log.Printf("[debug] session=%s model=%s -> no usable endpoint after %d attempts in %v (budget %v); returning 503", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeSSEError(w, flusher, "All models are currently unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			log.Printf("[debug] session=%s model=%s -> no usable endpoint after %d attempts in %v (budget %v); returning 200 degraded", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
+			writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 
@@ -2458,13 +2665,19 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		if g.proxy.effectiveProtocol(ep) == protocolCommandCode && ceiling > perAttemptBase {
 			perAttemptBase = ceiling
 		}
+		if avgLat := g.router.AvgLatency(*ep); avgLat > 0 {
+			adaptive := avgLat * 2
+			if adaptive > perAttemptBase {
+				perAttemptBase = adaptive
+			}
+		}
 		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			if accumulatedContent == "" {
-				writeSSEError(w, flusher, "All models are currently unavailable")
+				writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
 			}
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		log.Printf("[debug] session=%s model=%s -> request -> %s/%s (timeout=%v, ~%d tokens)", sessionID, req.Model, ep.Provider, ep.Model, attemptTimeout, tokens)
@@ -2933,7 +3146,7 @@ func (g *GatewayContext) HandleAdminConfig(w http.ResponseWriter, r *http.Reques
 		// Reload in memory
 		newCfg, err := LoadConfig(g.configPath)
 		if err != nil {
-			writeAPIError(w, http.StatusServiceUnavailable, "Failed to reload config", "service_unavailable_error", "reload_failed")
+			writeAPIError(w, http.StatusInternalServerError, "Failed to reload config", "server_error", "reload_failed") // admin
 			return
 		}
 		g.ReloadConfig(newCfg)
@@ -2974,7 +3187,7 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		return
 	}
 	if g.metrics == nil {
-		writeAPIError(w, 503, "Metrics not available", "server_error", "not_initialized")
+		writeAPIError(w, http.StatusInternalServerError, "Metrics not available", "server_error", "not_initialized") // admin
 		return
 	}
 

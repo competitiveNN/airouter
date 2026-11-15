@@ -347,10 +347,22 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 
 	// Limit concurrent requests to the configured cap. If the cap is
 	// exhausted, queue the request until a slot frees; when the context is
-	// cancelled first (client disconnect or timeout), return 503.
+	// cancelled first (client disconnect or timeout), return degraded response.
 	release, ok := s.acquire(r.Context())
 	if !ok {
-		writeAPIError(w, 503, "Command Code proxy is busy; please retry", "server_error", "server_busy")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "Command Code proxy is busy; please try again shortly.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
 		return
 	}
 	defer release()
@@ -385,7 +397,19 @@ func (s *CommandCodeShim) HandleChatCompletions(w http.ResponseWriter, r *http.R
 	sessionID := bodySessionID(body)
 	eps := s.endpoints(model, sessionID)
 	if len(eps) == 0 {
-		writeAPIError(w, 503, "No Command Code provider is configured", "server_error", "provider_not_configured")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "No Command Code provider is configured. Please contact the administrator.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
 		return
 	}
 	tokens := estimateTokensFromBody(body)
@@ -425,7 +449,21 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
+		// The writer cannot stream; degrade to a non-streaming JSON
+		// completion rather than returning 503 to the client.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "Streaming not supported by this gateway configuration. Please retry with a streaming-capable client.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
 		return
 	}
 
@@ -497,7 +535,7 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 			log.Printf("[commandcode] session=%s model=%s provider=%s: attempt failed after a keepalive: %v",
 				sessionID, model, ep.Provider, err)
 			s.penalize(&ep, err, 0, sessionID)
-			writeSSEError(w, flusher, fmt.Sprintf("Command Code upstream failed: %v", err))
+			writeDegradedSSE(w, flusher, fmt.Sprintf("Command Code upstream failed: %v", err))
 			return
 		}
 		log.Printf("[commandcode] session=%s model=%s provider=%s: attempt failed before output: %v",
@@ -508,6 +546,13 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 	status, msg, errType, code := http.StatusBadGateway, "All Command Code providers failed", "server_error", "upstream_unavailable"
 	if lastErr != nil {
 		msg = fmt.Sprintf("All Command Code providers failed: %v", lastErr)
+	}
+	if !tracker.Wrote() {
+		// No bytes have reached the client: degrade to a clean 200 SSE
+		// content delta instead of a 502/503 status that would look like a
+		// server-side outage.
+		writeDegradedSSE(w, flusher, "All Command Code providers are currently unavailable. Please try your request again shortly.")
+		return
 	}
 	writeAPIError(w, status, msg, errType, code)
 }

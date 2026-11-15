@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,7 +18,6 @@ import (
 	"time"
 )
 
-// VisionChainState describes the vision capability state of a logical model's
 // entire fallback chain.
 type VisionChainState int
 
@@ -260,10 +261,11 @@ func (c *cooldownSaveState) stop() {
 }
 
 type Router struct {
-	config    *atomic.Pointer[Config]
-	sessions  map[string]sessionEntry
-	cooldowns map[string]CooldownEntry
-	noVision  map[string]bool // endpoints that rejected an image request
+	config             *atomic.Pointer[Config]
+	sessions           map[string]sessionEntry
+	sessionRetryBudget map[string]int // per-session retry counter
+	cooldowns          map[string]CooldownEntry
+	noVision           map[string]bool // endpoints that rejected an image request
 
 	// learnedProtocol remembers, per endpoint, which wire shape actually
 	// works. It is populated only by an explicit
@@ -285,8 +287,9 @@ type Router struct {
 	// actually asking for.
 	learnedProtocol map[string]protocol
 
-	tps      map[string]float64
-	circuits map[string]*CircuitBreaker
+	tps       map[string]float64
+	latencies map[string][]time.Duration // recent latencies per endpoint
+	circuits  map[string]*CircuitBreaker
 	// hostCooldowns backs off a whole UPSTREAM (provider URL), not an
 	// endpoint, after an attempt fails with no HTTP response. Key groups make
 	// nvidia/nvidia2/nvidia3 adjacent so a 429 falls through to the sibling
@@ -420,7 +423,9 @@ func NewRouter(cfg *Config, cooldownPath string) *Router {
 		cooldowns:           make(map[string]CooldownEntry),
 		noVision:            make(map[string]bool),
 		learnedProtocol:     make(map[string]protocol),
+		sessionRetryBudget:  make(map[string]int),
 		tps:                 make(map[string]float64),
+		latencies:           make(map[string][]time.Duration),
 		circuits:            make(map[string]*CircuitBreaker),
 		hostCooldowns:       make(map[string]CooldownEntry),
 		cooldownPath:        cooldownPath,
@@ -509,6 +514,11 @@ func (r *Router) cleanupStaleEntries() {
 			delete(r.tps, k)
 		}
 	}
+	for k := range r.latencies {
+		if !valid[k] {
+			delete(r.latencies, k)
+		}
+	}
 	r.cleanupCircuitsLocked()
 }
 
@@ -564,6 +574,7 @@ func (r *Router) evictStaleSessions() {
 	for _, sid := range stale {
 		if se, ok := r.sessions[sid]; ok && now.Sub(se.lastUsed) > sessionTTL {
 			delete(r.sessions, sid)
+			delete(r.sessionRetryBudget, sid)
 		}
 	}
 	// Hard ceiling: drop least-recently-used sessions beyond the cap
@@ -815,13 +826,88 @@ func (r *Router) RecordTPS(ep ModelEndpoint, tps float64) {
 	key := ep.Key()
 	r.tps[key] = (r.tps[key] * 0.8) + (tps * 0.2)
 	r.mu.Unlock()
-	if r.store == nil {
-		return
+}
+
+// RecordLatency records a recent round-trip latency for an endpoint. It keeps
+// a rolling window of the last 10 samples so operators and adaptive timeout
+// logic can reason about the endpoint's current health without being skewed by
+// historical outliers.
+func (r *Router) RecordLatency(ep ModelEndpoint, d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ep.Key()
+	samples := r.latencies[key]
+	samples = append(samples, d)
+	if len(samples) > 10 {
+		samples = samples[len(samples)-10:]
 	}
-	// TPS is an estimate used for ordering, not durability-critical state.
-	// Coalesce it with the cooldown flush instead of issuing one write per
-	// completed response (which is what the old JSON priority file did).
-	r.cooldownSave.trigger(r.saveCooldowns, cooldownSaveInterval)
+	r.latencies[key] = samples
+}
+
+// AvgLatency returns the average of the recent latency samples for an endpoint.
+// Returns 0 if no samples have been recorded.
+func (r *Router) AvgLatency(ep ModelEndpoint) time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := ep.Key()
+	samples := r.latencies[key]
+	if len(samples) == 0 {
+		return 0
+	}
+	var total time.Duration
+	for _, s := range samples {
+		total += s
+	}
+	return total / time.Duration(len(samples))
+}
+
+// MaxLatency returns the maximum of the recent latency samples for an endpoint.
+func (r *Router) MaxLatency(ep ModelEndpoint) time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := ep.Key()
+	samples := r.latencies[key]
+	if len(samples) == 0 {
+		return 0
+	}
+	var max time.Duration
+	for _, s := range samples {
+		if s > max {
+			max = s
+		}
+	}
+	return max
+}
+
+// DNSHealthy performs a DNS resolution check for the endpoint's provider URL
+// hostname. It returns true if the hostname resolves successfully within a
+// short timeout, false otherwise. This allows proactive detection of DNS
+// failures before attempting a full request.
+func (r *Router) DNSHealthy(ep ModelEndpoint) bool {
+	cfg := r.Config()
+	if cfg == nil {
+		return true
+	}
+	pc, ok := cfg.Providers[ep.Provider]
+	if !ok {
+		return true
+	}
+	u, err := url.Parse(pc.URL)
+	if err != nil {
+		return true
+	}
+	host := u.Hostname()
+	if host == "" {
+		return true
+	}
+	// Quick DNS lookup with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return false
+	}
+	return len(ips) > 0
 }
 
 // isAvailableLocked reports whether ep can accept a request, considering both
@@ -917,12 +1003,123 @@ func (r *Router) IsAvailable(ep *ModelEndpoint) bool {
 	return r.isAvailableLocked(ep)
 }
 
-// ProbeAvailability reports whether ep is currently eligible, WITHOUT
-// advancing its state. It mirrors isAvailableLocked's decision but refuses to
-// mutate: where isAvailableLocked would transition an Open circuit to
-// half-open and admit a probe, this returns false, and where it would consume
-// a probe slot it reports the probe would succeed without consuming it.
-//
+// HealthScore returns a normalized health score for an endpoint from 0.0 (dead/open/cooling)
+// to 1.0 (fully healthy and available). Operators and proactive routing can use
+// this score to avoid routing traffic to degraded upstreams before they trip.
+func (r *Router) HealthScore(ep *ModelEndpoint) float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := ep.Key()
+	cd, hasCooldown := r.cooldowns[key]
+	cb := r.circuits[key]
+
+	if cb != nil && cb.State == CircuitOpen {
+		return 0.0
+	}
+	if hasCooldown && time.Now().Before(cd.Expiry) {
+		// Partially penalize based on remaining cooldown time ratio
+		remaining := time.Until(cd.Expiry)
+		if remaining > 30*time.Second {
+			return 0.1
+		}
+		return 0.3
+	}
+	if cb != nil && cb.State == CircuitHalfOpen {
+		return 0.5
+	}
+	if !r.DNSHealthy(*ep) {
+		return 0.0
+	}
+	return 1.0
+}
+
+// ProactiveCircuitCheck examines recent latency samples for an endpoint and
+// proactively opens the circuit if the p99 latency exceeds the given threshold.
+// This prevents slow endpoints from consuming the full attempt timeout budget
+// before the circuit breaker reacts to failures.
+// ProactiveCircuitCheck examines recent latency samples for an endpoint and
+// proactively opens the circuit if the p99 latency exceeds the given threshold.
+// This prevents slow endpoints from consuming the full attempt timeout budget
+// before the circuit breaker reacts to failures.
+func (r *Router) ProactiveCircuitCheck(ep *ModelEndpoint, latencyThreshold time.Duration) bool {
+	if r.circuitBreakerThreshold <= 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ep.Key()
+	samples := r.latencies[key]
+	if len(samples) < 3 {
+		return false // need enough samples
+	}
+	// Compute p99 (max of recent samples as approximation)
+	var max time.Duration
+	for _, s := range samples {
+		if s > max {
+			max = s
+		}
+	}
+	if max <= latencyThreshold {
+		return false
+	}
+	cb := r.circuits[key]
+	if cb == nil {
+		cb = &CircuitBreaker{State: CircuitClosed}
+		r.circuits[key] = cb
+	}
+	if cb.State == CircuitClosed {
+		r.emitCircuitTransition(CircuitClosed, CircuitOpen, key)
+		cb.State = CircuitOpen
+		cb.OpenedAt = time.Now()
+		log.Printf("[debug] circuit %s: proactive open due to high latency (max=%v, threshold=%v)", key, max, latencyThreshold)
+		return true
+	}
+	return false
+}
+
+// SessionRetryBudget is the maximum number of fallback retries a single session
+// may consume across its lifetime. Once exhausted, the session is immediately
+// degraded rather than retrying, preventing retry storms from a single
+// misbehaving client or upstream.
+const DefaultSessionRetryBudget = 20
+
+// SessionRetryCount returns the number of retries consumed by the session so
+// far.
+func (r *Router) SessionRetryCount(sessionID string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.sessionRetryBudget[sessionID]
+}
+
+// IncrementSessionRetry increments the retry counter for a session and returns
+// true if the session is still within its retry budget. Returns false if the
+// budget is exhausted.
+func (r *Router) IncrementSessionRetry(sessionID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sessionRetryBudget[sessionID] >= DefaultSessionRetryBudget {
+		return false
+	}
+	r.sessionRetryBudget[sessionID]++
+	return true
+}
+
+// ResetSessionRetryBudget clears the retry counter for a session (e.g., on
+// successful completion).
+func (r *Router) ResetSessionRetryBudget(sessionID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.sessionRetryBudget, sessionID)
+}
+
+// SessionRetryBudgetExhausted reports whether the session has consumed its
+// entire retry budget.
+func (r *Router) SessionRetryBudgetExhausted(sessionID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.sessionRetryBudget[sessionID] >= DefaultSessionRetryBudget
+}
+
 // Why this exists separately from IsAvailable: the dashboard's chain-status
 // card calls into the router on every 30s refresh, and calling
 // isAvailableLocked there would race the request path over circuit state —

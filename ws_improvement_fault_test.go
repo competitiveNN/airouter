@@ -142,6 +142,7 @@ func TestImprovementWebSocketFaultInjectionNo500(t *testing.T) {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		var sawError bool
 		var sawDone bool
+		var sawDegraded bool
 		for i := 0; i < 20; i++ {
 			_, data, err := conn.ReadMessage()
 			if err != nil {
@@ -154,13 +155,25 @@ func TestImprovementWebSocketFaultInjectionNo500(t *testing.T) {
 			if ev, _ := frame["event"].(string); ev == "error" {
 				sawError = true
 			}
-			if done, _ := frame["done"].(bool); done {
+			if ev, _ := frame["event"].(string); ev == "response.completed" {
 				sawDone = true
+			}
+			if ev, _ := frame["event"].(string); ev == "response.output_text.delta" {
+				if dMap, ok := frame["data"].(map[string]any); ok {
+					if deltaStr, _ := dMap["delta"].(string); strings.Contains(deltaStr, "unavailable") {
+						sawDegraded = true
+					}
+				}
+			}
+			if done, _ := frame["done"].(bool); done && sawDone {
 				break
 			}
 		}
-		if !sawError || !sawDone {
-			t.Fatalf("all-dead websocket turn did not report a terminal error")
+		if sawError {
+			t.Fatalf("websocket turn reported an error instead of degraded content")
+		}
+		if !sawDone || !sawDegraded {
+			t.Fatalf("all-dead websocket turn did not report degraded completed event (sawDone=%v, sawDegraded=%v)", sawDone, sawDegraded)
 		}
 	})
 }

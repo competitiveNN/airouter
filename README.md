@@ -28,11 +28,15 @@ client, so:
   The request waits out the *shortest* remaining cooldown (capped
   at 30s) and the walk restarts at the head of the chain — the
   last model leads back to the first — so a model that recovers
-  mid-request still serves the request instead of a guaranteed
-  503. Only when no cooldown is pending anywhere does it return
-  `503 all_models_unavailable` immediately. The wait is bounded by
-  the same wall-clock budget and attempt cap as every other step,
-  so it can never spin forever.
+  mid-request still serves the request. When no endpoint can serve
+  the request within budget, the gateway **never returns a 5xx to the
+  client**: it emits a normal 200 response (or a completed SSE stream,
+  or a WebSocket `completed` event) whose content is the degraded
+  message "All models are currently unavailable. Please try your
+  request again shortly." A client that only surfaces errors never sees
+  one; a human reads the notice inline. The wait is bounded by the
+  same wall-clock budget and attempt cap as every other step, so it
+  can never spin forever.
 
 ## API surface
 

@@ -70,7 +70,6 @@ func (g *GatewayContext) HandleResponsesWebSocket(w http.ResponseWriter, r *http
 		return
 	}
 	defer conn.Close()
-
 	// A generous read deadline covers idle periods between turns; it is reset
 	// on every message received. Writes have no deadline because a long
 	// generation legitimately writes for a long time.
@@ -184,6 +183,8 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 	// as a single WebSocket text message, tagged with the correlation id.
 	wsEvents := &responsesWSEventSink{conn: conn, corrID: corrID}
 
+	log.Printf("[serveResponsesWSTurn] START for corrID=%s model=%s", corrID, req.Model)
+
 	for {
 		if ctx.Err() != nil {
 			g.wsSendError(conn, corrID, "Request cancelled", "server_error", "cancelled")
@@ -191,11 +192,11 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		}
 		if walk.exhaustedNow() {
 			log.Printf("[debug] session=%s model=%s -> ws turn fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.wsSendDegraded(conn, corrID)
 			return
 		}
 		if walk.attempts >= maxAttempts {
-			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.wsSendDegraded(conn, corrID)
 			return
 		}
 		walk.next()
@@ -205,7 +206,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 			if wait > 0 {
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
-					g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+					g.wsSendDegraded(conn, corrID)
 					return
 				}
 				select {
@@ -216,7 +217,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 				}
 				continue
 			}
-			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.wsSendDegraded(conn, corrID)
 			return
 		}
 
@@ -244,7 +245,7 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 		}
 		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
-			g.wsSendError(conn, corrID, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
+			g.wsSendDegraded(conn, corrID)
 			return
 		}
 		var buf strings.Builder
@@ -347,6 +348,110 @@ func (g *GatewayContext) wsSendError(conn *websocket.Conn, corrID, message, errT
 		"done": true,
 	})
 	_ = conn.WriteMessage(websocket.TextMessage, blob)
+}
+
+// wsSendDegraded sends a degraded response over WebSocket when the fallback
+// chain is exhausted. It emits a text delta with the degraded message followed
+// by a completed event, mirroring the degraded SSE path on the HTTP surface.
+func (g *GatewayContext) wsSendDegraded(conn *websocket.Conn, corrID string) {
+	log.Printf("[wsSendDegraded] START for corrID=%s", corrID)
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[wsSendDegraded] PANIC: %v", rec)
+		}
+		log.Printf("[wsSendDegraded] END for corrID=%s", corrID)
+	}()
+	message := "All models are currently unavailable. Please try your request again shortly."
+	msgID := newCorrelationID("msg")
+
+	// Send text delta
+	// Send text delta
+	deltaBlob, _ := json.Marshal(map[string]any{
+		"id":    corrID,
+		"event": "response.output_text.delta",
+		"data": map[string]any{
+			"item_id": msgID,
+			"delta":   message,
+		},
+		"done": false,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, deltaBlob); err != nil {
+		log.Printf("[wsSendDegraded] write delta error: %v", err)
+		return
+	}
+
+	// Send text done
+	doneBlob, _ := json.Marshal(map[string]any{
+		"id":    corrID,
+		"event": "response.output_text.done",
+		"data": map[string]any{
+			"item_id": msgID,
+			"text":    message,
+		},
+		"done": false,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, doneBlob); err != nil {
+		log.Printf("[wsSendDegraded] write done error: %v", err)
+		return
+	}
+
+	// Send content part done
+	partDoneBlob, _ := json.Marshal(map[string]any{
+		"id":    corrID,
+		"event": "response.content_part.done",
+		"data": map[string]any{
+			"item_id":    msgID,
+			"part_index": 0,
+			"part": map[string]any{
+				"type": "output_text",
+				"text": message,
+			},
+		},
+		"done": false,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, partDoneBlob); err != nil {
+		log.Printf("[wsSendDegraded] write partDone error: %v", err)
+		return
+	}
+
+	// Send output item done
+	itemDoneBlob, _ := json.Marshal(map[string]any{
+		"id":    corrID,
+		"event": "response.output_item.done",
+		"data": map[string]any{
+			"output_index": 0,
+			"item": map[string]any{
+				"type":    "message",
+				"id":      msgID,
+				"role":    "assistant",
+				"content": []map[string]any{{"type": "output_text", "text": message}},
+			},
+		},
+		"done": false,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, itemDoneBlob); err != nil {
+		log.Printf("[wsSendDegraded] write itemDone error: %v", err)
+		return
+	}
+
+	// Send completed event
+	completedBlob, _ := json.Marshal(map[string]any{
+		"id":    corrID,
+		"event": "response.completed",
+		"data": map[string]any{
+			"response": map[string]any{
+				"id":     newCorrelationID("resp"),
+				"status": "completed",
+				"output": []map[string]any{{"type": "message", "id": msgID, "role": "assistant", "content": []map[string]any{{"type": "output_text", "text": message}}}},
+				"usage":  nil,
+			},
+		},
+		"done": true,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, completedBlob); err != nil {
+		log.Printf("[wsSendDegraded] write completed error: %v", err)
+		return
+	}
 }
 
 // wsPingLoop sends periodic pings so a dead peer is detected and the

@@ -771,7 +771,7 @@ def build_chain(
         outranks whatever is written down, and absence of a verdict must not
         delete a correct value.
         """
-        protocol = m.protocol
+        protocol = m.protocol or protocols.get((provider, m.id))
         if protocol is None and provider.startswith('commandcode'):
             # Command Code has no OpenAI-compatible API surface: the gateway
             # speaks the CLI's /alpha/generate envelope for it, so chat is

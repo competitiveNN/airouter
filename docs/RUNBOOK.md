@@ -409,9 +409,16 @@ config, sessions, cooldowns, provider URLs, or keys — safe for load balancers.
 
 ## Common failure modes
 
-- **"All models are currently unavailable" (503):** every endpoint in the
-  chain is in cooldown. Wait for the shortest cooldown to expire (the handler
-  sleeps, bounded by `maxAttempts`), or reset cooldowns via `/admin/cooldowns`.
+- **All models are currently unavailable (degraded content, not a 503):**
+  every endpoint in the chain is in cooldown and none could serve the
+  request within budget. The gateway does **not** return a 503 — the
+  client gets a normal `200` (or a completed SSE stream, or a WebSocket
+  `completed` event) whose content is the degraded notice "All models
+  are currently unavailable. Please try your request again shortly."
+  So a 200 with that message is the signal to investigate the chain, not
+  a generic success. Wait for the shortest cooldown to expire (the
+  handler sleeps, bounded by `maxAttempts`), or reset cooldowns via
+  `/admin/cooldowns`.
 
   ```sh
   # one endpoint
@@ -438,3 +445,116 @@ config, sessions, cooldowns, provider URLs, or keys — safe for load balancers.
   are deleted at startup and on every flush.
 - **Provider 429 with Retry-After ignored:** the header is parsed in
   `ParseRetryAfter` (delta-seconds and HTTP-date) and honored as a floor.
+
+## Alerting
+
+The gateway exports Prometheus metrics that expose fallback-chain health.
+Operators should alert on these conditions rather than waiting for users to
+report degraded output.
+
+### Fallback amplification (chain exhaustion)
+
+**Metric:** `airouter_degraded_fallbacks_total` (counter, per `model`, `reason`)
+
+**Alert:** sustained rate > 0.1/s over 5m on any model
+
+```promql
+sum by (model) (rate(airouter_degraded_fallbacks_total[5m])) > 0.1
+```
+
+A degraded fallback means *every* endpoint in the chain failed or was in
+cooldown within the request's budget, and the gateway emitted the degraded
+notice ("All models are currently unavailable…") as a clean 200. This is the
+primary signal that a logical model's capacity is saturated. A burst is
+expected during upstream incidents; a sustained rate means the chain is
+undersized or cooldowns are too aggressive.
+
+**Runbook:**
+1. `GET /v1/airouter/state` — check which endpoints are in cooldown and for
+   how long.
+2. If cooldowns dominate, verify the upstream is actually healthy
+   (the provider's status page, or a manual `curl` to the endpoint).
+3. If the upstream is healthy but the gateway still cooldowns it, the error
+   classification may be too aggressive: check `airouter_upstream_errors_total`
+   by `code` to see what error codes are driving cooldowns.
+4. If the upstream is genuinely down, either wait for recovery or add
+   alternative endpoints to the chain in `config.yaml` (then `POST /admin/config`).
+
+### Upstream saturation (gateway-wide backpressure)
+
+**Metric:** `airouter_upstream_saturated_total` (counter, per `provider`)
+
+**Alert:** rate > 0.5/s over 2m on any provider
+
+```promql
+sum by (provider) (rate(airouter_upstream_saturated_total[2m])) > 0.5
+```
+
+The gateway limits concurrent upstream requests per provider. When the
+semaphore is full, new attempts wait (up to `max_interruption`) or the
+request degrades. This alert fires when the gateway itself is the bottleneck
+because a provider's capacity is fully consumed.
+
+**Runbook:**
+1. Check `GET /v1/airouter/state` for that provider — if concurrency is at
+   the ceiling, the provider is the limiting factor.
+2. Increase the provider's concurrency ceiling in `config.yaml` (field
+   `max_concurrency` under the provider) or add another key/endpoint.
+3. If the provider is a free tier with a hard quota, consider lowering
+   `max_interruption` so the gateway fails over faster instead of queueing.
+
+### Session retry budget exhausted
+
+**Metric:** `airouter_session_retry_budget_exhausted_total` (counter, per `model`)
+
+**Alert:** any increase (rate > 0 over 1m)
+
+```promql
+sum by (model) (rate(airouter_session_retry_budget_exhausted_total[1m])) > 0
+```
+
+A session's fallback walk hit the attempt cap (`chainLen*3+1`) or the
+wall-clock budget (12s–30s+ depending on context size). The session was
+forced to degrade even though some endpoints might have been willing to
+serve. This means the budget is too tight for the chain depth or the
+upstream latency variance.
+
+**Runbook:**
+1. Compare `airouter_fallback_chain_length` (gauge, per model) with the
+   budget formula: the budget should allow at least `chainLen` full
+   attempts. If `chainLen > 5`, consider increasing the budget multiplier
+   in `requestAttemptTimeout` (api.go) or reducing the chain.
+2. Check `airouter_upstream_latency_seconds` quantiles for the model —
+   high p99 latency relative to the per-attempt timeout causes budget
+   exhaustion.
+
+### Fallback chain length (capacity planning)
+
+**Metric:** `airouter_fallback_chain_length` (gauge, per `model`)
+
+**Alert:** any model with chain length = 1
+
+```promql
+airouter_fallback_chain_length == 1
+```
+
+A chain of length 1 has no failover. A single endpoint failure degrades
+every request immediately. This is a configuration issue, not a runtime
+failure, but it should be visible in dashboards.
+
+### Recovery procedure for a degraded model
+
+1. **Identify the model:** the alert labels include `model`.
+2. **Check chain state:** `curl -H "Authorization: Bearer $KEY" http://gateway/v1/airouter/state | jq '.models["<model>"]'`
+   - Look for endpoints with `cooldown_remaining > 0` or `circuit_state = "open"`.
+3. **Test the upstream directly:** `curl -H "Authorization: Bearer $UPSTREAM_KEY" <endpoint_url>/chat/completions -d '{"model":"...","messages":[{"role":"user","content":"ping"}]}'`
+   - If the upstream responds 200, the cooldown is stale or the error was
+     transient. Clear it: `curl -X DELETE -H "Authorization: Bearer $KEY" 'http://gateway/admin/cooldowns?model=<provider>:<model>'`
+   - If the upstream is down, wait for the provider to recover or add
+     alternate endpoints.
+4. **Verify:** send a test request to the gateway's `/v1/chat/completions` or
+   `/v1/responses` with the affected model. The response should contain real
+   content (not the degraded notice) and the stats event/headers should show
+   normal TTFT.
+5. **If no upstream is available:** add new endpoints to `config.yaml` under
+   the model's chain and `POST /admin/config` to reload.

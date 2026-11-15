@@ -212,6 +212,11 @@ func main() {
 		go proxy.Warmup(ctx)
 	}
 
+	// Proactively warm the HTTP connection pool to upstream endpoints so the
+	// first user request does not pay a cold-start dial/TLS handshake penalty.
+	log.Println("Starting connection pool warmer (60s interval)...")
+	proxy.StartConnectionPoolWarmer(ctx, 60*time.Second)
+
 	// Start the dashboard attempt ring so the 1d/7d leaderboards are live
 	// from startup rather than only after the first dashboard scrape.
 	stopDashboard := gateway.metrics.StartDashboardTelemetry(journalPath)

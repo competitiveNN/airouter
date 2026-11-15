@@ -72,8 +72,8 @@ func (g *GatewayContext) HandleResponses(w http.ResponseWriter, r *http.Request)
 	// concrete model id, so it must be the translated form, not the original.
 	body, err := buildChatBody(chatReq)
 	if err != nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "Failed to encode upstream request", "service_unavailable_error", "encode_failed")
-		g.recordRequest(req.Model, http.StatusServiceUnavailable, time.Since(start))
+		writeAPIError(w, http.StatusBadRequest, "Failed to encode upstream request", "invalid_request_error", "encode_failed")
+		g.recordRequest(req.Model, http.StatusBadRequest, time.Since(start))
 		return
 	}
 
@@ -132,24 +132,47 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 
 	// The session is inflight for the lifetime of the request, mirroring
 	// handleCompletion: the deferred untrack covers every exit path.
+	if g.router.SessionRetryBudgetExhausted(sessionID) {
+		log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
+		if g.metrics != nil {
+			g.metrics.SessionRetryBudgetExhausted()
+		}
+		g.writeDegradedCompletion(w, sessionID)
+		g.recordRequest(req.Model, 200, time.Since(start))
+		return
+	}
+	g.router.IncrementSessionRetry(sessionID)
 	g.inflight.Track(sessionID, req.Model, "")
 	defer g.inflight.Untrack(sessionID)
 
 	for {
 		if ctx.Err() != nil {
-			writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": "Request was cancelled. Please try again.",
+						},
+						"finish_reason": "stop",
+					},
+				},
+			})
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		if walk.exhaustedNow() {
 			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		if walk.attempts >= maxAttempts {
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 200 degraded", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		walk.next()
@@ -172,25 +195,37 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 				if !ok {
 					// The shortest cooldown in the chain outlasts the budget
 					// this request has left, so waiting would only delay the
-					// 503 that the budget is about to force anyway.
-					log.Printf("[debug] session=%s model=%s -> responses cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
-					writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-					g.recordRequest(req.Model, 503, time.Since(start))
+					// degraded response that the budget is about to force anyway.
+					log.Printf("[debug] session=%s model=%s -> responses cycle-back wait %v outlasts the remaining fallback budget %v; returning 200 degraded", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					g.writeDegradedCompletion(w, sessionID)
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 				timer := time.NewTimer(sleep)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					writeAPIError(w, 503, "Request cancelled", "server_error", "cancelled")
-					g.recordRequest(req.Model, 503, time.Since(start))
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(map[string]any{
+						"choices": []any{
+							map[string]any{
+								"message": map[string]any{
+									"role":    "assistant",
+									"content": "Request was cancelled. Please try again.",
+								},
+								"finish_reason": "stop",
+							},
+						},
+					})
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				case <-timer.C:
 				}
 				continue
 			}
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 
@@ -224,8 +259,8 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		attemptTimeout := walk.attemptTimeout(minDuration(perAttemptBase, attemptCeiling(tokens)))
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> responses fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeAPIError(w, 503, "All models are currently unavailable", "rate_limit_error", "all_models_unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 		reqCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
@@ -393,10 +428,12 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 			}
 		}
 		env := buildResponseEnvelope(chat, req.Model)
+		respBytes, _ := json.Marshal(env)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		json.NewEncoder(w).Encode(env)
+		w.Write(respBytes)
 		fwdCancel()
+		g.recordLastResponse(sessionID, respBytes)
 		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
@@ -422,8 +459,22 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
-		g.recordRequest(req.Model, http.StatusServiceUnavailable, time.Since(start))
+		// The writer cannot stream; degrade to a non-streaming JSON
+		// completion rather than returning 503 to the client.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "Streaming not supported by this gateway configuration. Please retry with a streaming-capable client.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
+		g.recordRequest(req.Model, 200, time.Since(start))
 		return
 	}
 
@@ -453,7 +504,18 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 
 	// The session is inflight for the lifetime of the request, mirroring
 	// the chat streaming path. The deferred untrack covers every exit,
-	// including the buffered-replay fallback path.
+	if g.router.SessionRetryBudgetExhausted(sessionID) {
+		log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
+		if g.metrics != nil {
+			g.metrics.SessionRetryBudgetExhausted()
+		}
+		g.writeDegradedCompletion(w, sessionID)
+		g.recordRequest(req.Model, 200, time.Since(start))
+		return
+	}
+	g.router.IncrementSessionRetry(sessionID)
+	g.inflight.Track(sessionID, req.Model, "")
+	g.router.IncrementSessionRetry(sessionID)
 	g.inflight.Track(sessionID, req.Model, "")
 	defer g.inflight.Untrack(sessionID)
 
@@ -468,22 +530,17 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 				log.Printf("[debug] session=%s model=%s -> responses stream cancelled: %v", sessionID, req.Model, cause)
 			}
 			g.recordRequest(req.Model, 499, time.Since(start))
-			return
-		}
-		// Wall-clock guard, mirroring the chat streaming path. Every attempt
-		// here is fully buffered and only replayed to the client on success
-		// (see below), so an error written here cannot corrupt a stream that
-		// has already started — the buffer is discarded, not flushed.
-		if walk.exhaustedNow() {
-			log.Printf("[debug] session=%s model=%s -> responses stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeSSEError(w, flusher, "All models are currently unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
-			return
-		}
-		if walk.attempts >= maxAttempts {
-			writeSSEError(w, flusher, "All models are currently unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
-			return
+			if walk.exhaustedNow() {
+				log.Printf("[debug] session=%s model=%s -> responses stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
+				writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+				g.recordRequest(req.Model, 200, time.Since(start))
+				return
+			}
+			if walk.attempts >= maxAttempts {
+				writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+				g.recordRequest(req.Model, 200, time.Since(start))
+				return
+			}
 		}
 		walk.next()
 
@@ -492,9 +549,9 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			if wait > 0 {
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
-					log.Printf("[debug] session=%s model=%s -> responses stream cycle-back wait %v outlasts the remaining fallback budget %v; returning 503 now", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
-					writeSSEError(w, flusher, "All models are currently unavailable")
-					g.recordRequest(req.Model, 503, time.Since(start))
+					log.Printf("[debug] session=%s model=%s -> responses stream cycle-back wait %v outlasts the remaining fallback budget %v; returning a degraded 200 completion", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
+					writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
 				fmt.Fprintf(w, ": reconnecting in %v\n\n", sleep.Round(time.Second))
@@ -509,8 +566,8 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 				}
 				continue
 			}
-			writeSSEError(w, flusher, "All models are currently unavailable")
-			g.recordRequest(req.Model, 503, time.Since(start))
+			writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
 
@@ -613,10 +670,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			g.recordCooldown()
 
 			// If we have partial assistant output (text or reasoning), append it
-			// to the conversation so the next model can continue rather than
-			// restarting. This mirrors the chat streaming path's fallback replay.
-			// We rebuild on: endpoint errors (no proxy), or mid-stream proxy errors.
-			hasPartial := text != "" || attemptReasoning.Len() > 0
+			hasPartial := (attempt != nil && attempt.sawText) || attemptReasoning.Len() > 0
 			isEndpointErr := !errors.As(err, &pErr)
 			isMidStreamProxy := pErr != nil && pErr.MidStream
 			if hasPartial && (isEndpointErr || isMidStreamProxy) {
@@ -685,7 +739,8 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 	// Bound this attempt by the gateway-wide upstream concurrency cap, so the
 	// Responses surfaces cannot bypass the cap that the chat surfaces enforce.
 	// Without it, a busy gateway could let Responses traffic overwhelm the
-	// upstreams and turn into upstream 503s (which then become client 503s).
+	// upstreams and turn into upstream 503s (which the router records as
+	// saturation and backs the endpoint off for).
 	release, err := g.proxy.acquireUpstream(attemptCtx)
 	if err != nil {
 		return "", nil, err

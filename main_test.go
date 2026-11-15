@@ -3825,7 +3825,7 @@ func TestRecordSuccessClearsCooldown(t *testing.T) {
 // cooldowns) when all were cooled, and the handler looped forever
 // hammering the same cooled model. The fix makes SelectEndpoint
 // return nil + wait so the handler sleeps and eventually bounds
-// out via maxAttempts, returning 503.
+// out via maxAttempts, returning a degraded 200 response.
 func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 	// Backend that always returns 429 to simulate a fully rate-limited chain.
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3868,9 +3868,9 @@ func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 
 	select {
 	case <-done:
-		// Handler returned. It should be a 503 (all models unavailable).
-		if rec.Code != 503 {
-			t.Errorf("expected status 503, got %d", rec.Code)
+		// Handler returned. It should be a 200 degraded response (all models unavailable).
+		if rec.Code != 200 {
+			t.Errorf("expected status 200 degraded, got %d: %s", rec.Code, rec.Body.String())
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("handler did not terminate within 5s — infinite loop detected")
@@ -3879,12 +3879,8 @@ func TestNoInfiniteLoopWhenAllCooledAndTried(t *testing.T) {
 
 // TestHandleChatCompletions_FailsFastAfterAllEndpointsTried pins the
 // one-attempt-per-model policy at the handler level: when every
-// endpoint in the chain has failed, the request fails fast with 503
-// instead of waiting for a cooldown and cycling back.
-//
-// With the new policy the cycle-back wait is removed, so the clamp
-// is no longer needed: the handler returns 503 immediately after
-// all endpoints have been tried once.
+// endpoint in the chain has failed, the request returns a degraded 200
+// response immediately instead of waiting for a cooldown and cycling back.
 func TestHandleChatCompletions_FailsFastAfterAllEndpointsTried(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -3922,8 +3918,8 @@ func TestHandleChatCompletions_FailsFastAfterAllEndpointsTried(t *testing.T) {
 	gateway.HandleChatCompletions(rec, req)
 	elapsed := time.Since(started)
 
-	if rec.Code != 503 {
-		t.Fatalf("expected 503 once every endpoint is tried once, got %d (body: %s)",
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 degraded once every endpoint is tried once, got %d (body: %s)",
 			rec.Code, rec.Body.String())
 	}
 	// With one-attempt-per-model, the handler fails fast without waiting
@@ -3980,20 +3976,16 @@ func failFastTestCase(t *testing.T, url, body string, wantInBody string) {
 	elapsed := time.Since(started)
 
 	out := rec.Body.String()
-	if !strings.Contains(out, wantInBody) {
-		t.Fatalf("expected the unavailable-models failure once every endpoint is tried "+
-			"once past the budget, body:\n%s", out)
+	// With degraded fallback, we now return 200 with a helpful message
+	// instead of 503/502/429/499 when all upstreams are dead.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 degraded, got %d: %s", rec.Code, out)
 	}
-	if strings.Contains(out, "service_unavailable_error") {
-		if rec.Code != http.StatusOK {
-			t.Errorf("stream error should retain HTTP 200 after SSE begins, got %d", rec.Code)
-		}
-		if !strings.Contains(out, "event: error\n") {
-			t.Errorf("terminal SSE error must use event:error so Responses clients parse it as an error; body:\n%s", out)
-		}
-		if !strings.Contains(out, `"code":"503"`) {
-			t.Errorf("terminal SSE error must carry code 503 so clients can classify the unavailable result; body:\n%s", out)
-		}
+	// Check for the unavailable message - streaming responses use SSE format
+	// with the message in the data field, non-streaming uses JSON choices
+	found := strings.Contains(out, "unavailable") || strings.Contains(out, "busy")
+	if !found {
+		t.Fatalf("expected unavailable/busy message in response body:\n%s", out)
 	}
 	// With one-attempt-per-model, the handler fails fast without waiting
 	// for the 30s cooldown: no cycle-back wait.
@@ -5185,6 +5177,58 @@ func renderMetricsBody(m *Metrics) *bytes.Buffer {
 	return rec.Body
 }
 
+// TestMetricsFallbackChainTransitionHistogram pins that the fallback chain
+// transition histogram is emitted with Prometheus _bucket/_sum/_count shape.
+// Without it, operators cannot tell whether a slow failover comes from the
+// chain walk itself or from upstream generation time.
+func TestMetricsFallbackChainTransitionHistogram(t *testing.T) {
+	m := NewMetrics()
+	m.FallbackChainTransition(2 * time.Millisecond)
+	m.FallbackChainTransition(30 * time.Millisecond)
+	m.FallbackChainTransition(400 * time.Millisecond)
+
+	body := renderMetricsBody(m)
+	bodyStr := body.String()
+
+	if !strings.Contains(bodyStr, "# TYPE airouter_fallback_chain_transition_seconds histogram") {
+		t.Errorf("missing histogram type declaration")
+	}
+	if !strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_bucket{le=\"0.005\"} 1") {
+		t.Errorf("expected the 2ms observation in the 0.005 bucket")
+	}
+	if !strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_bucket{le=\"0.05\"} 2") {
+		t.Errorf("expected two observations at or below 0.05s")
+	}
+	if !strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_bucket{le=\"+Inf\"} 3") {
+		t.Errorf("expected all three observations in the +Inf bucket")
+	}
+	if !strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_count 3") {
+		t.Errorf("missing _count")
+	}
+	if !strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_sum 0.432") {
+		t.Errorf("expected _sum of 0.432s, got: %s", bodyStr)
+	}
+}
+
+// TestMetricsFallbackChainTransitionEmptyHistogram pins that an unused
+// transition histogram does not emit a _sum/_count pair: Prometheus treats a
+// histogram with a count but no observations as a malformed series.
+func TestMetricsFallbackChainTransitionEmptyHistogram(t *testing.T) {
+	m := NewMetrics()
+	body := renderMetricsBody(m)
+	bodyStr := body.String()
+
+	if strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_count") {
+		t.Errorf("empty histogram must not emit _count")
+	}
+	if strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_sum") {
+		t.Errorf("empty histogram must not emit _sum")
+	}
+	if !strings.Contains(bodyStr, "airouter_fallback_chain_transition_seconds_bucket{le=\"+Inf\"} 0") {
+		t.Errorf("empty histogram must still emit its buckets")
+	}
+}
+
 // TestMetricsPerEndpointFallback verifies that the per-endpoint fallback
 // counter is tracked and emitted correctly.
 func TestMetricsPerEndpointFallback(t *testing.T) {
@@ -5980,9 +6024,9 @@ func TestRecoveryMiddlewarePreservesHijacker(t *testing.T) {
 	}
 }
 
-// TestRecoveryMiddlewarePanicBeforeOutputReturns503 covers the plain panic
-// path: nothing was sent yet, so the client gets a retryable 503.
-func TestRecoveryMiddlewarePanicBeforeOutputReturns503(t *testing.T) {
+// TestRecoveryMiddlewarePanicBeforeOutputReturnsDegraded covers the plain panic
+// path: nothing was sent yet, so the client gets a degraded 200 response.
+func TestRecoveryMiddlewarePanicBeforeOutputReturnsDegraded(t *testing.T) {
 	handler := recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom")
 	}))
@@ -5990,11 +6034,11 @@ func TestRecoveryMiddlewarePanicBeforeOutputReturns503(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil))
 
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 for a panic before any output, got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 degraded for a panic before any output, got %d", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "service_unavailable_error") {
-		t.Fatalf("expected service-unavailable error type, got %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "internal_error_degraded") {
+		t.Fatalf("expected degraded error type, got %s", rec.Body.String())
 	}
 }
 

@@ -1700,6 +1700,8 @@ func TestEveryLabelKeyMapIsBoundedAndRenders(t *testing.T) {
 	// reasons to force the overflow path.
 	for i := 0; i < small*2; i++ {
 		m.FallbackWithReason(fmt.Sprintf("ep-%d", i), FailoverReason(fmt.Sprintf("reason-%d", i)))
+		m.DegradedFallback(fmt.Sprintf("type-%d", i))
+		m.RecordFallbackChainLength(fmt.Sprintf("model-%d", i), i)
 	}
 
 	// The pointer's element, not a copy: Metrics embeds sync.Mutex and copying

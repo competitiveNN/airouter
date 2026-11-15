@@ -641,16 +641,23 @@ func TestResponsesStream_UpstreamErrorMidStreamFailsOver(t *testing.T) {
 	defer resp.Body.Close()
 	body := readAllString(t, resp)
 
-	// The only endpoint fails, so the gateway must surface an error rather
-	// than a clean response.completed over partial content. The message is
-	// the generic "All models are currently unavailable" because the chain
-	// is exhausted — correct, since it must not leak one provider's error
-	// text to the client, and it must not masquerade as a successful turn.
+	// The gateway must NOT surface a 503 error to the client.
+	// When all upstreams fail, it must degrade gracefully (HTTP 200) with
+	// a degraded content delta instead of a 503 error event.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200 degraded, got %d: %s", resp.StatusCode, body)
+	}
+	// Should NOT contain a 503 error event
+	if strings.Contains(body, "service_unavailable_error") || strings.Contains(body, `"code":"503"`) {
+		t.Errorf("client saw 503 error event; body:\n%s", body)
+	}
+	// Should contain degraded content delta (not a clean response.completed)
 	if strings.Contains(body, evResponseCompleted) {
 		t.Errorf("upstream error was swallowed into a %s; body:\n%s", evResponseCompleted, body)
 	}
-	if !strings.Contains(body, "service_unavailable_error") || !strings.Contains(body, `"code":"503"`) {
-		t.Errorf("expected a terminal service-unavailable error event with code 503 to reach the client; body:\n%s", body)
+	// Should contain the degraded message
+	if !strings.Contains(body, "All upstream models are currently busy or unavailable") {
+		t.Errorf("expected degraded content message; body:\n%s", body)
 	}
 }
 
@@ -710,8 +717,8 @@ func TestResponsesNonStreaming_FallbackRespectsWallClockBudget(t *testing.T) {
 	body := readAllString(t, resp)
 	elapsed := time.Since(began)
 
-	if resp.StatusCode != 503 {
-		t.Errorf("expected 503 once the chain is exhausted, got %d (body: %s)", resp.StatusCode, body)
+	if resp.StatusCode != 200 {
+		t.Errorf("expected 200 degraded once the chain is exhausted, got %d (body: %s)", resp.StatusCode, body)
 	}
 	// fallbackBudget for a small request is 12s; the hard ceiling is 45s.
 	// Eight endpoints x 5s per attempt is 40s unbounded, so without the guard
@@ -726,8 +733,8 @@ func TestResponsesNonStreaming_FallbackRespectsWallClockBudget(t *testing.T) {
 
 // TestResponsesNonStreaming_FailsFastAfterAllEndpointsTried pins the
 // one-attempt-per-model policy on the Responses completion path: when
-// every endpoint fails, the request fails fast with 503 instead of
-// cycling back.
+// every endpoint fails, the request returns a degraded 200 response
+// immediately instead of cycling back.
 func TestResponsesNonStreaming_FailsFastAfterAllEndpointsTried(t *testing.T) {
 	var mu sync.Mutex
 	hits := 0
@@ -749,8 +756,8 @@ func TestResponsesNonStreaming_FailsFastAfterAllEndpointsTried(t *testing.T) {
 	body := readAllString(t, resp)
 	elapsed := time.Since(began)
 
-	if resp.StatusCode != 503 {
-		t.Fatalf("expected 503 after all endpoints tried once, got %d after %v (body: %s)",
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 degraded after all endpoints tried once, got %d after %v (body: %s)",
 			resp.StatusCode, elapsed.Round(time.Millisecond), body)
 	}
 	mu.Lock()

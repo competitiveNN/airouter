@@ -418,7 +418,7 @@ start=$(date +%s)
 # TERMINATES on a persistent failure and reports it, not how long it waits.
 run_harness --models smart --attempts 2
 elapsed=$(( $(date +%s) - start ))
-if [[ $RC -ne 0 && "$OUT" == *"non-stream HTTP"* ]]; then
+if [[ $RC -ne 0 && ( "$OUT" == *"non-stream HTTP"* || "$OUT" == *"degraded upstream response"* || "$OUT" == *"empty/unparseable content"* ) ]]; then
   pass "an unroutable upstream still fails after the retries"
 else
   fail "expected a hard failure against a dead upstream, got rc=$RC"

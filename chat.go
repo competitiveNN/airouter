@@ -379,11 +379,11 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 	okStatus := resp.StatusCode >= 200 && resp.StatusCode < 300
 
 	if isStream {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeAPIError(w, http.StatusServiceUnavailable, "Streaming not supported", "service_unavailable_error", "streaming_unsupported")
-			return
-		}
+		// Flusher is optional. Every net/http ResponseWriter implements
+		// http.Flusher, but a wrapper that does not must still deliver the
+		// stream (buffered, flushed when the handler returns) rather than a
+		// 503 the client can do nothing about.
+		flusher, _ := w.(http.Flusher)
 		w.WriteHeader(chatProxyStatus(resp.StatusCode))
 		res := chatPumpStream(w, flusher, resp.Body)
 		if !okStatus {
@@ -404,7 +404,9 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 		stats := chatComputeStats(contextTokens, res.usage.completionTokens(), ttft, elapsed)
 		blob, _ := json.Marshal(stats)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", chatStatsEvent, blob)
-		flusher.Flush()
+		if flusher != nil {
+			flusher.Flush()
+		}
 		if res.scanErr != nil && !isClientDisconnect(res.scanErr) {
 			log.Printf("[debug] chat proxy stream scan error (%s %s): %v", protocol, upstreamURL, res.scanErr)
 		}
@@ -434,6 +436,15 @@ func (g *GatewayContext) handleChatProxy(w http.ResponseWriter, r *http.Request,
 		contextTokens = estimateChatTokens(forwarded)
 	}
 	stats := chatComputeStats(contextTokens, usage.completionTokens(), elapsed, elapsed)
+	if stream {
+		// The client asked for a stream but the named endpoint does not
+		// speak SSE: synthesize one from the complete body so the client
+		// receives a valid, terminated stream (content delta + terminal
+		// event + airouter.stats) with HTTP 200, rather than a raw JSON body
+		// its SSE reader cannot parse.
+		chatWriteSynthesizedStream(w, protocol, upstreamBody, stats)
+		return
+	}
 	w.Header().Set(chatHeaderContextTokens, strconv.Itoa(stats.ContextTokens))
 	w.Header().Set(chatHeaderTTFTMs, strconv.FormatInt(stats.TTFTMs, 10))
 	w.Header().Set(chatHeaderElapsedMs, strconv.FormatInt(stats.ElapsedMs, 10))
@@ -511,12 +522,106 @@ func chatPumpStream(w http.ResponseWriter, flusher http.Flusher, body io.Reader)
 			res.scanErr = err
 			return res
 		}
-		flusher.Flush()
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		res.scanErr = err
 	}
 	return res
+}
+
+// chatWriteSynthesizedStream turns a complete non-streaming upstream body
+// into a single-chunk SSE stream for the requested protocol, then appends the
+// airouter.stats event. It is used when the caller asked to stream but the
+// named endpoint does not speak SSE: the client still gets a valid, terminated
+// stream (content delta + terminal event) at HTTP 200 instead of a raw JSON
+// body its SSE reader cannot parse.
+func chatWriteSynthesizedStream(w http.ResponseWriter, protocol string, body []byte, stats chatStats) {
+	flusher, _ := w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	var ev chatStreamEvent
+	_ = json.Unmarshal(body, &ev)
+
+	if protocol == chatProtocolResponses {
+		// A delta renders the text in the UI; the completed event carries
+		// the full output (reasoning items included) for state that the next
+		// turn sends back.
+		if text := chatResponsesBodyText(body); text != "" {
+			delta, _ := json.Marshal(map[string]any{"type": "response.output_text.delta", "delta": text})
+			fmt.Fprintf(w, "data: %s\n\n", delta)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		completed, _ := json.Marshal(map[string]any{"type": "response.completed", "response": json.RawMessage(body)})
+		fmt.Fprintf(w, "data: %s\n\n", completed)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	} else {
+		text := ""
+		if len(ev.Choices) > 0 {
+			text = ev.Choices[0].Message.Content
+		}
+		if text != "" {
+			chunk, _ := json.Marshal(map[string]any{
+				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": text}}},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		// Terminal chunk so the client can close out the message, then the
+		// [DONE] sentinel the completions stream contract ends on.
+		done, _ := json.Marshal(map[string]any{
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", done)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	blob, _ := json.Marshal(stats)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", chatStatsEvent, blob)
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// chatResponsesBodyText extracts the concatenated output_text from a complete
+// Responses body (the {output:[{content:[{text:...}]}]} shape).
+func chatResponsesBodyText(body []byte) string {
+	var parsed struct {
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, item := range parsed.Output {
+		if item.Type != "" && item.Type != "message" {
+			continue
+		}
+		for _, part := range item.Content {
+			if part.Type == "output_text" || part.Type == "text" {
+				b.WriteString(part.Text)
+			}
+		}
+	}
+	return b.String()
 }
 
 // chatEventText returns the text carried by a stream event, or "" for
