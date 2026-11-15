@@ -503,3 +503,187 @@ func TestProxyAttributionSparesTheProxyForTheClientsOwnDisconnect(t *testing.T) 
 		}
 	}
 }
+
+// TestProxyErrorNilProxyIsNoProxyInThePath pins the nil-safety of the error a
+// mandatory-proxy provider produces.
+//
+// attemptClient returns a nil client when it cannot honour proxies.mandatory,
+// and both streaming callers turn that into ProxyError{Proxy: nil} (see
+// StreamToClient and Forward). That error reaches four MarkProxyDown sites and
+// Error() itself, and the nil Proxy used to be dereferenced at all of them:
+// measured 2026-11-15, one such attempt panicked handleStream with "runtime
+// error: invalid memory address or nil pointer dereference" on
+// POST /v1/chat/completions (the panic the gateway's recovery middleware turned
+// into a degraded 200 for the client, after the log line
+// "[proxy] body 64 bytes exceeds 65536; sending ... direct" -- the body was
+// small, the retry was direct because the pool proxy had just failed).
+func TestProxyErrorNilProxyIsNoProxyInThePath(t *testing.T) {
+	noProxy := &ProxyError{Err: fmt.Errorf("mandatory proxy routing enabled but no proxy available for p/m")}
+	if got := noProxy.ProxyURL(); got != "" {
+		t.Errorf("ProxyURL() = %q, want empty: no proxy carried the attempt", got)
+	}
+	// Error() must render rather than panic: it is what lands in the fallback
+	// log line and in the cooldown record.
+	msg := noProxy.Error()
+	if !strings.Contains(msg, "mandatory proxy routing enabled") {
+		t.Errorf("Error() = %q, want the underlying cause named", msg)
+	}
+	if strings.Contains(msg, "(invalid proxy url)") {
+		t.Errorf("Error() = %q, want the no-proxy wording, not the invalid-url one", msg)
+	}
+
+	// A real proxy still renders, and still redacted: the URL may carry
+	// user:pass and must never reach a log line whole.
+	withProxy := &ProxyError{
+		Proxy: &ProxyInfo{URL: "http://user:pass@198.51.100.7:8080"},
+		Err:   fmt.Errorf("proxyconnect tcp: connection refused"),
+	}
+	if got := withProxy.ProxyURL(); got != "http://user:pass@198.51.100.7:8080" {
+		t.Errorf("ProxyURL() = %q, want the proxy's own URL", got)
+	}
+	msg = withProxy.Error()
+	if strings.Contains(msg, "pass") {
+		t.Errorf("Error() = %q leaked proxy credentials", msg)
+	}
+	if !strings.Contains(msg, "198.51.100.7:8080") {
+		t.Errorf("Error() = %q, want the redacted host:port", msg)
+	}
+}
+
+// TestHandleStream_MandatoryProxyRefusalFallsOverInsteadOfPanicking is the
+// end-to-end regression test for the panic above.
+//
+// The chain is: a provider configured proxies.mandatory (opencode2/3/4 are, in
+// config.yaml) whose pool proxy REFUSES the connection, so the attempt is
+// retried direct, which mandatory routing refuses with ProxyError{Proxy: nil}.
+// The only correct outcome is to advance to the next model in the chain and
+// answer the client. What happened instead was a nil pointer dereference before
+// any failover could be recorded.
+//
+// Re-adding the defect (reading pErr.Proxy.URL instead of pErr.ProxyURL() at
+// any of the four sites) fails this test.
+func TestHandleStream_MandatoryProxyRefusalFallsOverInsteadOfPanicking(t *testing.T) {
+	// A port with nothing listening, so the transport's CONNECT is REFUSED.
+	// Generating the real error matters: it arrives as a net.OpError, which is
+	// what proxyFault matches on to charge the proxy rather than the endpoint.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadProxyURL := "http://" + l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	// The endpoint behind the mandatory provider. A request through a proxy
+	// that refused the tunnel must never reach it: mandatory routing is the
+	// one configuration where going direct is not an option.
+	var backend1Hits atomic.Int32
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backend1Hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		fmt.Fprintf(w, "data: {\"id\":\"b1\",\"object\":\"chat.completion.chunk\","+
+			"\"created\":1,\"model\":\"m1\",\"choices\":[{\"index\":0,"+
+			"\"delta\":{\"role\":\"assistant\",\"content\":\"first\"},"+
+			"\"finish_reason\":null}]}\n\n")
+		flusher.Flush()
+	}))
+	defer backend1.Close()
+
+	// The next model in the chain: it must carry the request to completion.
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		fmt.Fprintf(w, "data: {\"id\":\"b2\",\"object\":\"chat.completion.chunk\","+
+			"\"created\":2,\"model\":\"m2\",\"choices\":[{\"index\":0,"+
+			"\"delta\":{\"role\":\"assistant\",\"content\":\"world\"},"+
+			"\"finish_reason\":null}]}\n\n")
+		flusher.Flush()
+		fmt.Fprintf(w, "data: {\"id\":\"b2\",\"object\":\"chat.completion.chunk\","+
+			"\"created\":2,\"model\":\"m2\",\"choices\":[{\"index\":0,\"delta\":{},"+
+			"\"finish_reason\":\"stop\"}]}\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer backend2.Close()
+
+	// Seeded by hand rather than through seedPool so the test can assert on the
+	// state the gateway wrote back (the dead proxy's cooldown).
+	svc := &ProxyService{pool: proxyPool{list: []*ProxyInfo{{
+		URL:      deadProxyURL,
+		Protocol: "https",
+	}}}}
+
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: new(int)},
+		Providers: map[string]ProviderConfig{
+			// Only this provider carries a proxy budget, so the router has
+			// exactly one proxied endpoint and picks it (see the relay test
+			// above for the same reliance).
+			"backend1": {
+				URL:     backend1.URL,
+				Proxies: ProxyConfig{Mandatory: true, Retries: 2},
+			},
+			"backend2": {URL: backend2.URL},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "backend1", Model: "m1"},
+				{Provider: "backend2", Model: "m2"},
+			}},
+		},
+	}
+
+	router := NewRouter(cfg, "")
+	proxy := NewProxy(cfg)
+	proxy.SetProxyService(svc)
+	gateway := NewGatewayContext(router, proxy, cfg, "", "", true)
+	gateway.SetTestCooldown(200 * time.Millisecond)
+
+	body := `{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	// Recovered on purpose: the defect this pins is a panic, and an
+	// unrecovered one would take the whole test binary down instead of
+	// reporting which invariant broke.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("HandleChatCompletions panicked: %v", r)
+			}
+		}()
+		gateway.HandleChatCompletions(rec, req)
+	}()
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.String()
+	// The fallback is the requirement: the next model in the chain answers.
+	if !strings.Contains(out, "world") {
+		t.Errorf("expected the next model's content, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Errorf("stream never completed, got:\n%s", out)
+	}
+	// Mandatory routing means the endpoint is not contacted directly either,
+	// so the pool proxy's refusal must not be answered by dialing the origin.
+	if hits := backend1Hits.Load(); hits != 0 {
+		t.Errorf("the endpoint behind a refused proxy was contacted %d times; "+
+			"mandatory routing must not fall back to a direct connection", hits)
+	}
+	// The proxy that refused the tunnel takes the penalty: that is the whole
+	// point of charging a proxy instead of the endpoint behind it.
+	if !svc.isDown(deadProxyURL) {
+		t.Error("the proxy that refused the attempt was not marked down")
+	}
+	// The endpoint never failed, so it must stay in rotation.
+	for key, cd := range router.GetAllCooldowns() {
+		if strings.Contains(key, "backend1") || strings.Contains(key, "m1") {
+			t.Errorf("endpoint %s was cooled down for a proxy fault: %+v", key, cd)
+		}
+	}
+}

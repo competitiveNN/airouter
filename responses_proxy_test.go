@@ -245,3 +245,98 @@ func assertProxyFaultEndpointsNotCooled(t *testing.T, router *Router) {
 		}
 	}
 }
+
+// TestResponsesStream_MandatoryProxyRefusalFallsOverInsteadOfPanicking is the
+// same defect as the chat-completions test in proxy_fault_test.go, on the
+// Responses surface: handleResponsesStream shares the four MarkProxyDown sites
+// that read pErr.Proxy.URL.
+//
+// The provider is configured proxies.mandatory (opencode2/3/4 are), so after
+// the pool proxy refuses the tunnel the direct re-attempt is refused too, and
+// StreamToClient returns ProxyError{Proxy: nil}. That error used to reach
+// MarkProxyDown(pErr.Proxy.URL) and panic the streaming Responses handler.
+func TestResponsesStream_MandatoryProxyRefusalFallsOverInsteadOfPanicking(t *testing.T) {
+	var proxiedHits int32
+	svc := NewProxyService("", time.Minute)
+	dead := deadProxyInfo(t)
+	svc.pool.set([]*ProxyInfo{dead})
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&proxiedHits, 1)
+		writeSSEChatReply(w, "c1", "first")
+	}))
+	t.Cleanup(backend1.Close)
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSSEChatReply(w, "c2", "recovered")
+	}))
+	t.Cleanup(backend2.Close)
+
+	noRotation := 0
+	cfg := &Config{
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Providers: map[string]ProviderConfig{
+			"proxied": {URL: backend1.URL, APIKeyEnv: "TEST_KEY", Proxies: ProxyConfig{Mandatory: true, Retries: 2}},
+			"direct":  {URL: backend2.URL, APIKeyEnv: "TEST_KEY"},
+		},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "proxied", Model: "m1"},
+				{Provider: "direct", Model: "m2"},
+			}},
+		},
+	}
+	t.Setenv("TEST_KEY", "sk-test")
+
+	proxy := NewProxy(cfg)
+	proxy.SetProxyService(svc)
+	router := NewRouter(cfg, "")
+	t.Cleanup(router.Close)
+	g := NewGatewayContext(router, proxy, cfg, "", testGatewayKey, false)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/responses", g.HandleResponses)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequest("POST", srv.URL+"/v1/responses", strings.NewReader(`{"model":"smart","input":"hi","stream":true}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testGatewayKey)
+
+	// Recovered on purpose: the defect this pins is a panic, and an
+	// unrecovered one would take the test binary down rather than report
+	// which invariant broke.
+	var resp *http.Response
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("HandleResponses panicked: %v", r)
+			}
+		}()
+		resp, err = srv.Client().Do(req)
+	}()
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (the request must survive the proxy fault): %s", resp.StatusCode, readAllString(t, resp))
+	}
+	body := readAllString(t, resp)
+	if !strings.Contains(body, "recovered") {
+		t.Errorf("expected the next model's content, got:\n%s", body)
+	}
+	// Mandatory routing forbids contacting the origin directly, and the
+	// tunnel was refused before anything was relayed.
+	if got := atomic.LoadInt32(&proxiedHits); got != 0 {
+		t.Errorf("the endpoint behind a refused proxy was hit %d times; "+
+			"mandatory routing must not fall back to a direct connection", got)
+	}
+	// The proxy that refused the tunnel takes the penalty.
+	if !svc.isDown(dead.URL) {
+		t.Errorf("dead proxy %s was not cooled down after its CONNECT was refused", dead.URL)
+	}
+	assertProxyFaultEndpointsNotCooled(t, router)
+}

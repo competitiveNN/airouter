@@ -991,6 +991,17 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 // transport/dial layer (the proxy itself is unreachable or misbehaving), as
 // distinct from the endpoint returning an HTTP error. The endpoint is not at
 // fault, so it must not be cooled down; the proxy is.
+//
+// Proxy is NIL when no proxy actually carried the attempt: a provider
+// configured proxies.mandatory whose pool cannot supply one fails the attempt
+// with ProxyError{Proxy: nil} (see attemptClient and its two callers, which
+// return it for a nil client). That error is still not the endpoint's fault --
+// the refusal is the proxy configuration's -- so it travels as a ProxyError, and
+// every consumer must treat a nil Proxy as "nothing to mark down" rather than
+// dereferencing it. Measured 2026-11-15: the nil case reached
+// handleStream's MarkProxyDown(pErr.Proxy.URL) and panicked with "invalid
+// memory address or nil pointer dereference" on POST /v1/chat/completions.
+// Use ProxyURL() instead of reading the field.
 type ProxyError struct {
 	Proxy *ProxyInfo
 	Err   error
@@ -1003,7 +1014,23 @@ type ProxyError struct {
 	MidStream bool
 }
 
+// ProxyURL is the URL of the proxy this error is charged to, or "" when no
+// proxy carried the attempt. It is the only safe way for a caller to reach the
+// proxy: reading e.Proxy.URL directly panics on the nil case documented on the
+// struct (a mandatory-proxy provider whose pool is empty).
+func (e *ProxyError) ProxyURL() string {
+	if e == nil || e.Proxy == nil {
+		return ""
+	}
+	return e.Proxy.URL
+}
+
 func (e *ProxyError) Error() string {
+	// A nil Proxy means no proxy carried the attempt, so there is no URL to
+	// redact and no proxy to blame: say so rather than dereferencing it.
+	if e.Proxy == nil {
+		return fmt.Sprintf("proxy (none: no proxy carried this attempt): %v", e.Err)
+	}
 	return fmt.Sprintf("proxy %s: %v", redactProxyURL(e.Proxy.URL), e.Err)
 }
 
