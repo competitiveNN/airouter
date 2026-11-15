@@ -441,7 +441,7 @@ func (g *GatewayContext) writeDegradedCompletion(w http.ResponseWriter, sessionI
 			map[string]any{
 				"message": map[string]any{
 					"role":    "assistant",
-					"content": "All upstream models are currently busy or unavailable. Please try your request again shortly.",
+					"content": "",
 				},
 				"finish_reason": "stop",
 			},
@@ -1887,13 +1887,18 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	// client disconnect, budget exhaustion — so a session can
 	// never linger in the inflight set after its request is
 	if g.router.SessionRetryBudgetExhausted(sessionID) {
-		log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
-		if g.metrics != nil {
-			g.metrics.SessionRetryBudgetExhausted()
+		if g.router.MigrateSessionOnBudgetExhaustion(sessionID, req.Model) {
+			// Session switched to an alternate chain; retry budget reset inside migration.
+			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; migrated to alternate chain", sessionID, req.Model)
+		} else {
+			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
+			if g.metrics != nil {
+				g.metrics.SessionRetryBudgetExhausted()
+			}
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
+			return
 		}
-		g.writeDegradedCompletion(w, sessionID)
-		g.recordRequest(req.Model, 200, time.Since(start))
-		return
 	}
 	g.router.IncrementSessionRetry(sessionID)
 	g.inflight.Track(sessionID, req.Model, "")
@@ -2087,9 +2092,14 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
 					// Proxy failure: mark the proxy down and try again with a
-					// different proxy on the same endpoint.
+					// different proxy on the same endpoint. A nil-Proxy error is a
+					// mandatory-proxy refusal with no proxy in the path: there is
+					// nothing to mark down, and the attempt still belongs to the
+					// proxy configuration rather than to the endpoint.
 					usedProxy = true
-					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					if url := pErr.ProxyURL(); url != "" {
+						g.proxy.MarkProxyDown(url, proxyCooldown)
+					}
 					fwdCancel()
 					lastErr = err
 					continue
@@ -2508,13 +2518,17 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	// untrack covers every exit path, including the mid-stream
 	// failure path that replays partial output and falls back.
 	if g.router.SessionRetryBudgetExhausted(sessionID) {
-		log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
-		if g.metrics != nil {
-			g.metrics.SessionRetryBudgetExhausted()
+		if g.router.MigrateSessionOnBudgetExhaustion(sessionID, req.Model) {
+			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; migrated to alternate chain", sessionID, req.Model)
+		} else {
+			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
+			if g.metrics != nil {
+				g.metrics.SessionRetryBudgetExhausted()
+			}
+			g.writeDegradedCompletion(w, sessionID)
+			g.recordRequest(req.Model, 200, time.Since(start))
+			return
 		}
-		g.writeDegradedCompletion(w, sessionID)
-		g.recordRequest(req.Model, 200, time.Since(start))
-		return
 	}
 	g.router.IncrementSessionRetry(sessionID)
 	g.inflight.Track(sessionID, req.Model, "")
@@ -2542,7 +2556,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		if walk.exhaustedNow() {
 			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
 			if accumulatedContent == "" {
-				writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+				writeDegradedSSE(w, flusher, "")
 			}
 			g.recordRequest(req.Model, 200, time.Since(start))
 			return
@@ -2570,7 +2584,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				}
 			}
 			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 200 degraded", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
-			writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+			writeDegradedSSE(w, flusher, "")
 			// sendDone fires via defer
 			g.recordRequest(req.Model, 200, time.Since(start))
 			return
@@ -2611,7 +2625,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
 					log.Printf("[debug] session=%s model=%s -> cycle-back wait %v outlasts the remaining fallback budget %v; returning 200 degraded", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
-					writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+					writeDegradedSSE(w, flusher, "")
 					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
@@ -2628,7 +2642,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				continue
 			}
 			log.Printf("[debug] session=%s model=%s -> no usable endpoint after %d attempts in %v (budget %v); returning 200 degraded", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-			writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+			writeDegradedSSE(w, flusher, "")
 			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}
@@ -2675,7 +2689,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		if attemptTimeout <= 0 {
 			log.Printf("[debug] session=%s model=%s -> stream fallback budget exhausted before attempt %d in %v (budget %v)", sessionID, req.Model, walk.attempts+1, walk.elapsed().Round(time.Millisecond), walk.budget)
 			if accumulatedContent == "" {
-				writeDegradedSSE(w, flusher, "All upstream models are currently busy or unavailable. Please try your request again shortly.")
+				writeDegradedSSE(w, flusher, "")
 			}
 			g.recordRequest(req.Model, 200, time.Since(start))
 			return
@@ -2750,7 +2764,13 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 				var pErr *ProxyError
 				if errors.As(err, &pErr) {
 					usedProxy = true
-					g.proxy.MarkProxyDown(pErr.Proxy.URL, proxyCooldown)
+					// ProxyURL() is "" when no proxy carried the attempt (a
+					// mandatory-proxy provider whose pool is empty): nothing to mark
+					// down, and the failure still belongs to the proxy configuration
+					// rather than to the endpoint.
+					if url := pErr.ProxyURL(); url != "" {
+						g.proxy.MarkProxyDown(url, proxyCooldown)
+					}
 					if pErr.MidStream {
 						break
 					}

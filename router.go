@@ -1120,6 +1120,67 @@ func (r *Router) SessionRetryBudgetExhausted(sessionID string) bool {
 	return r.sessionRetryBudget[sessionID] >= DefaultSessionRetryBudget
 }
 
+// MigrateSessionOnBudgetExhaustion switches a session that has exhausted its
+// retry budget to an alternate chain/subgroup known to work. It reuses the
+// existing cross-chain failover pattern (substituteChains, chainOrderLocked,
+// bindSessionLocked) to move the session durablely off the dead chain.
+func (r *Router) MigrateSessionOnBudgetExhaustion(sessionID string, logicalModel string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	se, known := r.sessions[sessionID]
+	if !known {
+		return false
+	}
+	cfg := r.config.Load()
+
+	currentChain := se.chain
+	if currentChain == "" {
+		currentChain = logicalModel
+	}
+
+	// Find the next candidate chain from substituteChains, skipping the
+	// current chain and the logical model to force a durable switch.
+	candidate := ""
+	for _, name := range substituteChains {
+		if name == currentChain || name == logicalModel {
+			continue
+		}
+		if mc, ok := cfg.Models[name]; ok && len(mc.Chain) > 0 {
+			candidate = name
+			break
+		}
+	}
+	// If no candidate found skipping logicalModel, allow switching to any
+	// substitute chain different from current.
+	if candidate == "" {
+		for _, name := range substituteChains {
+			if name == currentChain {
+				continue
+			}
+			if mc, ok := cfg.Models[name]; ok && len(mc.Chain) > 0 {
+				candidate = name
+				break
+			}
+		}
+	}
+	if candidate == "" {
+		return false
+	}
+
+	// Update session to point to the new chain and clear the sticky endpoint
+	// so the next SelectEndpoint rebinds to a working model in the new chain.
+	se.chain = candidate
+	se.model = logicalModel
+	se.lastUsed = time.Now()
+	se.ep = ModelEndpoint{}
+	r.sessions[sessionID] = se
+	r.persistSessionLocked(sessionID, se)
+	// Reset retry budget so the session gets a fresh allowance on the new chain.
+	delete(r.sessionRetryBudget, sessionID)
+	return true
+}
+
 // Why this exists separately from IsAvailable: the dashboard's chain-status
 // card calls into the router on every 30s refresh, and calling
 // isAvailableLocked there would race the request path over circuit state —
