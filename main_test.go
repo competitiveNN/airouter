@@ -3976,16 +3976,17 @@ func failFastTestCase(t *testing.T, url, body string, wantInBody string) {
 	elapsed := time.Since(started)
 
 	out := rec.Body.String()
-	// With degraded fallback, we now return 200 with a helpful message
+	// With degraded fallback, we now return 200 with empty content
 	// instead of 503/502/429/499 when all upstreams are dead.
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 degraded, got %d: %s", rec.Code, out)
 	}
-	// Check for the unavailable message - streaming responses use SSE format
-	// with the message in the data field, non-streaming uses JSON choices
-	found := strings.Contains(out, "unavailable") || strings.Contains(out, "busy")
-	if !found {
-		t.Fatalf("expected unavailable/busy message in response body:\n%s", out)
+	// Check that synthetic degraded message is removed and content is empty
+	if strings.Contains(out, "unavailable") || strings.Contains(out, "busy") {
+		t.Fatalf("synthetic degraded message should be removed; response body:\n%s", out)
+	}
+	if !strings.Contains(out, `"content":""`) {
+		t.Fatalf("expected empty content in degraded response body:\n%s", out)
 	}
 	// With one-attempt-per-model, the handler fails fast without waiting
 	// for the 30s cooldown: no cycle-back wait.
@@ -4002,7 +4003,7 @@ func failFastTestCase(t *testing.T, url, body string, wantInBody string) {
 func TestHandleChatCompletionsStreaming_FailsFastAfterAllEndpointsTired(t *testing.T) {
 	failFastTestCase(t, "/v1/chat/completions",
 		`{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}`,
-		"All models are currently unavailable")
+		"")
 }
 
 // TestHandleResponses_FailsFastAfterAllEndpointsTired pins the fail-fast
@@ -4011,7 +4012,7 @@ func TestHandleChatCompletionsStreaming_FailsFastAfterAllEndpointsTired(t *testi
 func TestHandleResponses_FailsFastAfterAllEndpointsTired(t *testing.T) {
 	failFastTestCase(t, "/v1/responses",
 		`{"model":"smart","input":"hi"}`,
-		"All models are currently unavailable")
+		"")
 }
 
 // TestHandleResponsesStreaming_FailsFastAfterAllEndpointsTired pins the
@@ -4019,7 +4020,7 @@ func TestHandleResponses_FailsFastAfterAllEndpointsTired(t *testing.T) {
 func TestHandleResponsesStreaming_FailsFastAfterAllEndpointsTired(t *testing.T) {
 	failFastTestCase(t, "/v1/responses",
 		`{"model":"smart","input":"hi","stream":true}`,
-		"All models are currently unavailable")
+		"")
 }
 
 // TestConcurrentStreamingSameSession verifies that multiple concurrent streaming

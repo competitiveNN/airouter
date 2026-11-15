@@ -413,12 +413,10 @@ config, sessions, cooldowns, provider URLs, or keys — safe for load balancers.
   every endpoint in the chain is in cooldown and none could serve the
   request within budget. The gateway does **not** return a 503 — the
   client gets a normal `200` (or a completed SSE stream, or a WebSocket
-  `completed` event) whose content is the degraded notice "All models
-  are currently unavailable. Please try your request again shortly."
-  So a 200 with that message is the signal to investigate the chain, not
-  a generic success. Wait for the shortest cooldown to expire (the
-  handler sleeps, bounded by `maxAttempts`), or reset cooldowns via
-  `/admin/cooldowns`.
+  `completed` event) whose content body is empty (degraded). The empty
+  response is the signal to investigate the chain, not a generic success.
+  Wait for the shortest cooldown to expire (the handler sleeps, bounded by
+  `maxAttempts`), or reset cooldowns via `/admin/cooldowns`.
 
   ```sh
   # one endpoint
@@ -463,11 +461,10 @@ sum by (model) (rate(airouter_degraded_fallbacks_total[5m])) > 0.1
 ```
 
 A degraded fallback means *every* endpoint in the chain failed or was in
-cooldown within the request's budget, and the gateway emitted the degraded
-notice ("All models are currently unavailable…") as a clean 200. This is the
-primary signal that a logical model's capacity is saturated. A burst is
-expected during upstream incidents; a sustained rate means the chain is
-undersized or cooldowns are too aggressive.
+cooldown within the request's budget, and the gateway emitted an empty
+degraded response as a clean 200. This is the primary signal that a logical
+model's capacity is saturated. A burst is expected during upstream incidents;
+a sustained rate means the chain is undersized or cooldowns are too aggressive.
 
 **Runbook:**
 1. `GET /v1/airouter/state` — check which endpoints are in cooldown and for

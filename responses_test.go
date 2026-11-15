@@ -655,9 +655,13 @@ func TestResponsesStream_UpstreamErrorMidStreamFailsOver(t *testing.T) {
 	if strings.Contains(body, evResponseCompleted) {
 		t.Errorf("upstream error was swallowed into a %s; body:\n%s", evResponseCompleted, body)
 	}
-	// Should contain the degraded message
-	if !strings.Contains(body, "All upstream models are currently busy or unavailable") {
-		t.Errorf("expected degraded content message; body:\n%s", body)
+	// Degraded response must NOT contain synthetic message and should have empty content
+	if strings.Contains(body, "All upstream models are currently busy or unavailable") {
+		t.Errorf("degraded synthetic message should be removed; body:\n%s", body)
+	}
+	// Expect empty content delta in degraded stream
+	if !strings.Contains(body, `"content":""`) {
+		t.Errorf("expected empty content delta in degraded response; body:\n%s", body)
 	}
 }
 

@@ -202,7 +202,7 @@ func TestE2DAllDeadNeverReturns500(t *testing.T) {
 	if rec.Code == http.StatusInternalServerError {
 		t.Fatalf("client saw 500 when all upstreams dead: %s", rec.Body.String())
 	}
-	// With degraded fallback, we now return 200 with a helpful message
+	// With degraded fallback, we now return 200 with empty content
 	// instead of 503/502/429/499 when all upstreams are dead.
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200 degraded response when all upstreams dead, got %d: %s", rec.Code, rec.Body.String())
@@ -220,8 +220,8 @@ func TestE2DAllDeadNeverReturns500(t *testing.T) {
 		t.Fatalf("expected message in choice: %v", choices[0])
 	}
 	content, ok := msg["content"].(string)
-	if !ok || !strings.Contains(content, "unavailable") {
-		t.Errorf("expected unavailable message, got: %v", content)
+	if !ok || content != "" {
+		t.Errorf("expected empty content in degraded response, got: %v", content)
 	}
 }
 
@@ -1672,9 +1672,22 @@ func TestE2EHTTP2GoAwayAndCascadeFailure(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected degraded status 200 on cascade failure, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "stale cached answer") && !strings.Contains(rec.Body.String(), "unavailable") {
-		t.Fatalf("expected degraded fallback content, got: %s", rec.Body.String())
+	bodyStr := rec.Body.String()
+	if strings.Contains(bodyStr, "unavailable") || strings.Contains(bodyStr, "busy") {
+		t.Fatalf("synthetic degraded message should be removed, got body: %s", bodyStr)
 	}
+	// Expect empty degraded content (stale cache not shared across gateway instances)
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(bodyStr), &resp); err == nil {
+		if choices, ok := resp["choices"].([]any); ok && len(choices) > 0 {
+			if msg, ok := choices[0].(map[string]any)["message"].(map[string]any); ok {
+				if c, _ := msg["content"].(string); c != "" {
+					t.Fatalf("expected empty degraded content, got: %s", c)
+				}
+			}
+		}
+	}
+
 }
 
 // TestE2EResponsesNonStreamingNeverReturns503 verifies that the /v1/responses

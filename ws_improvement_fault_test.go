@@ -160,8 +160,13 @@ func TestImprovementWebSocketFaultInjectionNo500(t *testing.T) {
 			}
 			if ev, _ := frame["event"].(string); ev == "response.output_text.delta" {
 				if dMap, ok := frame["data"].(map[string]any); ok {
-					if deltaStr, _ := dMap["delta"].(string); strings.Contains(deltaStr, "unavailable") {
+					deltaStr, _ := dMap["delta"].(string)
+					if deltaStr == "" {
 						sawDegraded = true
+					}
+					// Ensure synthetic message is not present
+					if strings.Contains(deltaStr, "unavailable") || strings.Contains(deltaStr, "busy") {
+						t.Fatalf("synthetic degraded message present in websocket delta: %s", deltaStr)
 					}
 				}
 			}

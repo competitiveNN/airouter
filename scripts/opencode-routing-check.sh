@@ -482,8 +482,6 @@ try:
     c = d['choices'][0]['message'].get('content') or ''
     if not c.strip():
         print('no content in choices[0].message')
-    elif 'All upstream models are currently busy or unavailable' in c:
-        print('degraded upstream response')
     else:
         print('')
 except Exception as exc:
@@ -568,8 +566,6 @@ PY
     # failure was undiagnosable without --verbose; the whole point of catching
     # it here is that the next occurrence can be read.
     bad "$model: empty/unparseable content: '$content'; body: $(head -c 300 "$resp_file" | tr -d '\n')"
-  elif [[ "$content" == *"All upstream models are currently busy or unavailable"* ]]; then
-    bad "$model: degraded upstream response: '$content'; body: $(head -c 300 "$resp_file" | tr -d '\n')"
   else
     note "non-stream ok: '$content'"
   fi
