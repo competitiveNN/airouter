@@ -106,7 +106,7 @@ providers:
 
   # Example: OpenCode gateway
   opencode:
-    url: https://opencode.ai/zen/v1
+    url: https://opencode.ai/inference/openai/v1
     api_key_env: OPENCODE_API_KEY      # set this in .envrc
 
   # Example: KiloCode gateway
