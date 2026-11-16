@@ -259,7 +259,6 @@ gate_report() {
   got=$(cat "$GATE_BATCH_DIR/$idx.rc" 2>/dev/null || echo 1)
   out=$(cat "$GATE_BATCH_DIR/$idx.out" 2>/dev/null || true)
   case "$mode" in
-    # fmt_ok: success is the ABSENCE of output.
     empty)
       if [ -z "$out" ]; then
         PASSED=$((PASSED + 1))

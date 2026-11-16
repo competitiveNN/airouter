@@ -992,7 +992,7 @@ global.fetch = async () => resp;
   // live baseline) would silently lose the metadata this card exists to
   // show. The span's data-base is what the one-second ticker advances.
   const lifeSpan = ihead.children.find(c => c.className === 'life');
-  if (!lifeSpan || !/^cumulative /.test(lifeSpan.textContent)) {
+  if (!lifeSpan || !/cum\. lifetime /.test(lifeSpan.textContent)) {
     console.error('inflight header ' + JSON.stringify(iheadText)
       + ' does not render cumulative session lifetime');
     process.exit(1);
