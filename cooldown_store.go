@@ -521,6 +521,88 @@ func (s *cooldownStore) loadPriorities() (map[string]float64, error) {
 	return out, rows.Err()
 }
 
+// loadMeta reads every key/value pair from the meta table. The meta table
+// holds small durable routing flags (for example the one-time legacy
+// migration marker) that the router needs to survive a restart.
+func (s *cooldownStore) loadMeta() (map[string]string, error) {
+	if s == nil || s.db == nil {
+		return map[string]string{}, nil
+	}
+	rows, err := s.db.Query(`SELECT key, value FROM meta`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
+
+// loadAllStats returns a read-only snapshot of every table in the state
+// database for the admin dashboard: the database path and on-disk size, the
+// priorities (observed tokens-per-second) table, every persisted sticky
+// session, and the meta key/values. It mutates nothing, so it is safe to call
+// from the dashboard scrape path.
+func (s *cooldownStore) loadAllStats() (map[string]interface{}, error) {
+	if s == nil || s.db == nil {
+		return map[string]interface{}{}, nil
+	}
+	priorities, err := s.loadPriorities()
+	if err != nil {
+		return nil, err
+	}
+	meta, err := s.loadMeta()
+	if err != nil {
+		return nil, err
+	}
+	sessRows, err := s.db.Query(`SELECT key, model, chain, provider, model_name, last_used FROM sessions`)
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]map[string]interface{}, 0)
+	for sessRows.Next() {
+		var key, model, chain, provider, modelName string
+		var lastUsed int64
+		if err := sessRows.Scan(&key, &model, &chain, &provider, &modelName, &lastUsed); err != nil {
+			sessRows.Close()
+			return nil, err
+		}
+		sessions = append(sessions, map[string]interface{}{
+			"key":        key,
+			"model":      model,
+			"chain":      chain,
+			"provider":   provider,
+			"model_name": modelName,
+			"last_used":  timeFromUnixNano(lastUsed),
+		})
+	}
+	if err := sessRows.Err(); err != nil {
+		sessRows.Close()
+		return nil, err
+	}
+	sessRows.Close()
+
+	var dbSize int64
+	if fi, err := os.Stat(s.path); err == nil {
+		dbSize = fi.Size()
+	}
+
+	return map[string]interface{}{
+		"path":            s.path,
+		"size_bytes":      dbSize,
+		"priorities":      priorities,
+		"sessions":        sessions,
+		"meta":            meta,
+		"cooldowns_count": len(priorities),
+	}, nil
+}
+
 // apply writes one diff in a single transaction. Statements are row-scoped:
 // a single endpoint failure updates one cooldown row and possibly one circuit
 // row, instead of rewriting every entry in the state file.

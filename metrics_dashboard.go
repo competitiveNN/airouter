@@ -211,6 +211,11 @@ type dashboardResponse struct {
 	// clear it without restarting the daemon.
 	Cooldowns map[string]CooldownEntry   `json:"cooldowns"`
 	Circuits  map[string]*CircuitBreaker `json:"circuits"`
+	// SqliteStats carries a read-only snapshot of every table in the state
+	// database (priorities/TPS, sticky sessions, meta) plus its path and
+	// on-disk size. Surfaced so the dashboard can render the persisted state
+	// without the operator opening cooldowns.db by hand.
+	SqliteStats map[string]interface{} `json:"sqlite_stats"`
 	// ConfigUpdatedAt is the modification time of the config file the
 	// gateway loaded, so the dashboard can show when the chains were
 	// last changed.

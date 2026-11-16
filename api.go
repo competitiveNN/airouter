@@ -3315,6 +3315,7 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		CircuitBreaker: g.router.CircuitBreakerEnabled(),
 		Cooldowns:      g.router.GetAllCooldowns(),
 		Circuits:       g.router.GetAllCircuits(),
+		SqliteStats:    g.router.GetAllSqliteStats(),
 	}
 
 	if g.configPath != "" {

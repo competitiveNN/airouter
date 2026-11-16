@@ -2894,6 +2894,47 @@ type CircuitStateSnapshot struct {
 	LastError      string        `json:"last_error,omitempty"`
 }
 
+// GetAllSqliteStats returns a read-only snapshot of every table in the
+// underlying SQLite state database (priorities/TPS, sticky sessions, meta,
+// plus the database path and on-disk size). It is surfaced on the admin
+// dashboard so an operator can see the persisted state without opening the
+// database by hand.
+func (r *Router) GetAllSqliteStats() map[string]interface{} {
+	if r == nil || r.store == nil {
+		return map[string]interface{}{}
+	}
+	stats, err := r.store.loadAllStats()
+	if err != nil {
+		return map[string]interface{}{"error": err.Error()}
+	}
+	return stats
+}
+
+// GetAllPriorities returns the persisted priorities (observed tokens-per-
+// second) map straight from the store.
+func (r *Router) GetAllPriorities() map[string]float64 {
+	if r == nil || r.store == nil {
+		return nil
+	}
+	p, err := r.store.loadPriorities()
+	if err != nil {
+		return nil
+	}
+	return p
+}
+
+// GetAllMeta returns the persisted meta key/values straight from the store.
+func (r *Router) GetAllMeta() map[string]string {
+	if r == nil || r.store == nil {
+		return nil
+	}
+	m, err := r.store.loadMeta()
+	if err != nil {
+		return nil
+	}
+	return m
+}
+
 // GetAllCircuitsState returns a combined snapshot of every endpoint's circuit
 // breaker and cooldown state, with the cooldown remaining computed against
 // the current wall clock. Used by the /v1/airouter/state endpoint.
