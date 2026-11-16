@@ -528,8 +528,6 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 	}
 	g.router.IncrementSessionRetry(sessionID)
 	g.inflight.Track(sessionID, req.Model, "")
-	g.router.IncrementSessionRetry(sessionID)
-	g.inflight.Track(sessionID, req.Model, "")
 	defer g.inflight.Untrack(sessionID)
 
 	// retryBody is the upstream body for the current attempt. After a
@@ -693,7 +691,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			isEndpointErr := !errors.As(err, &pErr)
 			isMidStreamProxy := pErr != nil && pErr.MidStream
 			if hasPartial && (isEndpointErr || isMidStreamProxy) {
-				retryBody = appendAssistantMessage(retryBody, text, nil, attemptReasoning.String())
+				retryBody = appendAssistantMessage(retryBody, text, toolCalls, attemptReasoning.String())
 			}
 			continue
 		}

@@ -361,7 +361,7 @@ func (g *GatewayContext) wsSendDegraded(conn *websocket.Conn, corrID string) {
 		}
 		log.Printf("[wsSendDegraded] END for corrID=%s", corrID)
 	}()
-	message := "All models are currently unavailable. Please try your request again shortly."
+	message := ""
 	msgID := newCorrelationID("msg")
 
 	// Send text delta
