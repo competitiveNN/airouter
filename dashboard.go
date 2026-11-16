@@ -151,14 +151,10 @@ details.tree[open]>summary{margin-bottom:.3rem}
   </div>
   <div class="card">
     <h2>SQLite Store Statistics (cooldowns.db)</h2>
-    <p>Read-only view of every persisted table: priorities (TPS), sticky sessions, and metadata.</p>
+    <p>Read-only view of the persisted priorities (TPS) table.</p>
     <div id="sqliteMeta" style="margin-bottom:1rem"></div>
     <h3>Priorities Table (TPS)</h3>
     <table><thead><tr><th class="clamp">Key</th><th>TPS</th></tr></thead><tbody id="sqlitePriorities"></tbody></table>
-    <h3 style="margin-top:1.5rem">Sticky Sessions Table</h3>
-    <table><thead><tr><th class="clamp">Key</th><th>Model / Chain</th><th>Provider / Model</th><th>Last Used</th></tr></thead><tbody id="sqliteSessions"></tbody></table>
-    <h3 style="margin-top:1.5rem">Metadata Table</h3>
-    <table><thead><tr><th class="clamp">Key</th><th>Value</th></tr></thead><tbody id="sqliteMetaTable"></tbody></table>
   </div>
 </div>
 
@@ -257,7 +253,9 @@ function renderInflight(inflight){
     const sessions=m.sessions||0;
     const lifeSec=m.cumulative_lifetime_seconds||0;
     const oldest=m.since?new Date(m.since).toLocaleTimeString():'—';
-    head.appendChild(el('span','sum',sessions+' session'+(sessions===1?'':'s')+' active  •  cum. lifetime '+humanLifetime(lifeSec)+'  •  oldest since '+oldest));
+    const lifeSpan = el('span','life',sessions+' session'+(sessions===1?'':'s')+' active  •  cum. lifetime '+humanLifetime(lifeSec)+'  •  oldest since '+oldest);
+    lifeSpan.dataset.base = lifeSec;
+    head.appendChild(lifeSpan);
     row.appendChild(head);
     const eps=el('div','eps');
     for(const e of (m.endpoints||[])){
@@ -374,90 +372,101 @@ function renderCooldowns(data){
   if(actions) actions.style.display='block';
 
   const grid=el('div','grid');
+  // Left: cooldown errors grouped by status code, expandable.
   const left=el('div');
-  left.appendChild(el('h3',null,'Cooldowns ('+cdKeys.length+')'));
-  if(cdKeys.length>0){
-    const totalCdPages=Math.max(1, Math.ceil(cdKeys.length/pageSize));
-    cooldownPage=Math.min(cooldownPage, totalCdPages-1);
-    const pageKeys=cdKeys.slice(cooldownPage*pageSize, cooldownPage*pageSize+pageSize);
+  left.appendChild(el('h3',null,'Cooldown errors'));
+  const cdRows=Object.entries(cdMap).map(([k,v])=>({model_key:k, expiry:v.expiry||null, status_code:v.status_code||0, error_count:v.error_count||0, last_error:v.last_error||'', state:''}));
+  const circRows=Object.entries(circMap).map(([k,v])=>({model_key:k, expiry:null, status_code:-1, error_count:v.probes_sent||0, last_error:'', state:'circuit '+v.state, probes:v.probes_sent||0, opened:v.opened_at||null}));
+  const pageSize=20;
+  const totalCdPages=Math.max(1, Math.ceil(cdRows.length/pageSize));
+  cooldownPage=Math.min(cooldownPage, totalCdPages-1);
+  const cdStart=cooldownPage*pageSize;
+  const pageCd=cdRows.slice(cdStart, cdStart+pageSize);
+  const groups={};
+  for(const r of pageCd){
+    let key = r.status_code>0 ? r.status_code : 'unknown';
+    if(r.status_code===0){
+      const le=(r.last_error||'').toLowerCase();
+      if(le.includes('timeout')||le.includes('timed out')||le.includes('timedout')||le.includes('upstream timedout')||le.includes('upstream timed out')||le.includes('upstream timeout')||le.includes('deadline exceeded')||le.includes('i/o timeout')||le.includes('tls handshake timeout')||le.includes('client.timeout exceeded')||le.includes('timeout awaiting response headers')){
+        key='timeout';
+      }
+    }
+    (groups[key]=groups[key]||[]).push(r);
+  }
+  const groupKeys=Object.keys(groups).sort();
+  if(!groupKeys.length){ left.appendChild(el('p',null,'No cooldown errors.')); }
+  for(const key of groupKeys){
+    const det=el('details','tree');
+    det.open=true;
+    const sum=el('summary',null,(key==='timeout'?'Timeout':'Error '+key)+' ('+groups[key].length+')');
+    det.appendChild(sum);
     const table=document.createElement('table');
     const thead=document.createElement('thead');
     const thr=document.createElement('tr');
-    for(const h of ['','Model','Expiry','Status','Errors','Last Error']){
+    for(const h of ['','Model','Expiry','Status','Errors','Last error']){
       const th=document.createElement('th'); th.textContent=h; thr.appendChild(th);
     }
     thead.appendChild(thr); table.appendChild(thead);
     const tbody=document.createElement('tbody');
-    for(const k of pageKeys){
-      const entry=cdMap[k];
+    for(const r of groups[key]){
       const tr=document.createElement('tr');
-      const tdSel=document.createElement('td');
-      const cb=document.createElement('input'); cb.type='checkbox'; cb.value=k; cb.checked=cooldownSelection.has(k);
-      cb.onchange=()=>{ if(cb.checked) cooldownSelection.add(k); else cooldownSelection.delete(k); updateClearButton(); };
-      tdSel.appendChild(cb); tr.appendChild(tdSel);
-      const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=k; td0.title=(entry.model_key||k); tr.appendChild(td0);
-      const td1=document.createElement('td');
-      let expText='—';
-      if(entry.expiry && typeof serverNow==='number'){
-        const leftSec=Math.max(0, Math.ceil((new Date(entry.expiry).getTime()-serverNow)/1000));
-        expText=leftSec+'s left';
-      }
-      td1.textContent=expText; tr.appendChild(td1);
-      const td2=document.createElement('td'); td2.textContent=entry.status_code||'—'; tr.appendChild(td2);
-      const td3=document.createElement('td'); td3.className='num'; td3.textContent=entry.error_count||0; tr.appendChild(td3);
-      const td4=document.createElement('td'); td4.className='clamp'; td4.textContent=entry.last_error||'—'; td4.title=entry.last_error||''; tr.appendChild(td4);
+      const cb=document.createElement('input'); cb.type='checkbox'; cb.value=r.model_key;
+      if(cooldownSelection.has(r.model_key)) cb.checked=true;
+      cb.onchange=e=>{ if(e.target.checked) cooldownSelection.add(r.model_key); else cooldownSelection.delete(r.model_key); updateClearButton(); };
+      const td0=document.createElement('td'); td0.appendChild(cb); tr.appendChild(td0);
+      const td1=document.createElement('td'); td1.className='clamp'; td1.textContent=r.model_key; td1.title=r.model_key; tr.appendChild(td1);
+      const td2=document.createElement('td'); td2.textContent=r.expiry?new Date(r.expiry).toLocaleString():'—'; tr.appendChild(td2);
+      const td3=document.createElement('td'); td3.textContent=(r.state||r.status_code); tr.appendChild(td3);
+      const td4=document.createElement('td'); td4.className='num'; td4.textContent=r.error_count||0; tr.appendChild(td4);
+      const td5=document.createElement('td'); td5.className='clamp'; td5.textContent=(r.last_error||'').slice(0,120); td5.title=r.last_error||''; tr.appendChild(td5);
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
-    left.appendChild(table);
-    if(cdKeys.length>pageSize){
-      const pag=el('div','pag');
-      const prev=el('button',null,'Prev'); prev.disabled=cooldownPage===0; prev.onclick=()=>{cooldownPage--; renderCooldowns(data);};
-      const info=el('span',null,(cooldownPage+1)+'/'+totalCdPages);
-      const next=el('button',null,'Next'); next.disabled=cooldownPage>=totalCdPages-1; next.onclick=()=>{cooldownPage++; renderCooldowns(data);};
-      pag.appendChild(prev); pag.appendChild(info); pag.appendChild(next);
-      left.appendChild(pag);
-    }
-  } else {
-    left.appendChild(el('p',null,'No active cooldowns.'));
+    det.appendChild(table);
+    left.appendChild(det);
+  }
+  if(cdRows.length>pageSize){
+    const pag=el('div','pag');
+    const prev=el('button',null,'Prev'); prev.disabled=cooldownPage===0; prev.onclick=()=>{cooldownPage--; renderCooldowns(data);};
+    const info=el('span',null,(cooldownPage+1)+'/'+totalCdPages);
+    const next=el('button',null,'Next'); next.disabled=cooldownPage>=totalCdPages-1; next.onclick=()=>{cooldownPage++; renderCooldowns(data);};
+    pag.appendChild(prev); pag.appendChild(info); pag.appendChild(next);
+    left.appendChild(pag);
   }
   grid.appendChild(left);
 
+  // Right: circuits separate table.
   const right=el('div');
-  right.appendChild(el('h3',null,'Circuits ('+circKeys.length+')'));
-  if(circKeys.length>0){
-    const totalCircPages=Math.max(1, Math.ceil(circKeys.length/pageSize));
-    circuitPage=Math.min(circuitPage, totalCircPages-1);
-    const pageCirc=circKeys.slice(circuitPage*pageSize, circuitPage*pageSize+pageSize);
-    const ctable=document.createElement('table');
-    const cthead=document.createElement('thead');
-    const cthr=document.createElement('tr');
-    for(const h of ['Model','State','Opened','Probes']){
-      const th=document.createElement('th'); th.textContent=h; cthr.appendChild(th);
-    }
-    cthead.appendChild(cthr); ctable.appendChild(cthead);
-    const ctbody=document.createElement('tbody');
-    for(const k of pageCirc){
-      const r=circMap[k];
-      const tr=document.createElement('tr');
-      const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=k; td0.title=k; tr.appendChild(td0);
-      const td1=document.createElement('td'); td1.textContent=r.state; tr.appendChild(td1);
-      const td2=document.createElement('td'); td2.textContent=r.opened_at?new Date(r.opened_at).toLocaleString():'—'; tr.appendChild(td2);
-      const td3=document.createElement('td'); td3.className='num'; td3.textContent=r.probes_sent||0; tr.appendChild(td3);
-      ctbody.appendChild(tr);
-    }
-    ctable.appendChild(ctbody);
-    right.appendChild(ctable);
-    if(circKeys.length>pageSize){
-      const pag=el('div','pag');
-      const prev=el('button',null,'Prev'); prev.disabled=circuitPage===0; prev.onclick=()=>{circuitPage--; renderCooldowns(data);};
-      const info=el('span',null,(circuitPage+1)+'/'+totalCircPages);
-      const next=el('button',null,'Next'); next.disabled=circuitPage>=totalCircPages-1; next.onclick=()=>{circuitPage++; renderCooldowns(data);};
-      pag.appendChild(prev); pag.appendChild(info); pag.appendChild(next);
-      right.appendChild(pag);
-    }
-  } else {
-    right.appendChild(el('p',null,'No circuits tracked.'));
+  right.appendChild(el('h3',null,'Circuits'));
+  const totalCircPages=Math.max(1, Math.ceil(circRows.length/pageSize));
+  circuitPage=Math.min(circuitPage, totalCircPages-1);
+  const circStart=circuitPage*pageSize;
+  const pageCirc=circRows.slice(circStart, circStart+pageSize);
+  const ctable=document.createElement('table');
+  const cthead=document.createElement('thead');
+  const cthr=document.createElement('tr');
+  for(const h of ['Model','State','Opened','Probes']){
+    const th=document.createElement('th'); th.textContent=h; cthr.appendChild(th);
+  }
+  cthead.appendChild(cthr); ctable.appendChild(cthead);
+  const ctbody=document.createElement('tbody');
+  for(const r of pageCirc){
+    const tr=document.createElement('tr');
+    const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=r.model_key; td0.title=r.model_key; tr.appendChild(td0);
+    const td1=document.createElement('td'); td1.textContent=r.state; tr.appendChild(td1);
+    const td2=document.createElement('td'); td2.textContent=r.opened?new Date(r.opened).toLocaleString():'—'; tr.appendChild(td2);
+    const td3=document.createElement('td'); td3.className='num'; td3.textContent=r.probes||0; tr.appendChild(td3);
+    ctbody.appendChild(tr);
+  }
+  ctable.appendChild(ctbody);
+  right.appendChild(ctable);
+  if(circRows.length>pageSize){
+    const pag=el('div','pag');
+    const prev=el('button',null,'Prev'); prev.disabled=circuitPage===0; prev.onclick=()=>{circuitPage--; renderCooldowns(data);};
+    const info=el('span',null,(circuitPage+1)+'/'+totalCircPages);
+    const next=el('button',null,'Next'); next.disabled=circuitPage>=totalCircPages-1; next.onclick=()=>{circuitPage++; renderCooldowns(data);};
+    pag.appendChild(prev); pag.appendChild(info); pag.appendChild(next);
+    right.appendChild(pag);
   }
   grid.appendChild(right);
   c.appendChild(grid);
@@ -486,39 +495,6 @@ function renderSqliteStats(stats){
         const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=k; td0.title=k; tr.appendChild(td0);
         const td1=document.createElement('td'); td1.className='num'; td1.textContent=Number(priMap[k]).toFixed(2); tr.appendChild(td1);
         pBody.appendChild(tr);
-      }
-    }
-  }
-  const sBody=document.getElementById('sqliteSessions');
-  if(sBody){
-    sBody.innerHTML='';
-    const sessList=stats.sessions||[];
-    if(!sessList.length){
-      const tr=document.createElement('tr'); const td=document.createElement('td'); td.colSpan=4; td.textContent='No persisted sessions.'; tr.appendChild(td); sBody.appendChild(tr);
-    } else {
-      for(const s of sessList){
-        const tr=document.createElement('tr');
-        const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=s.key; td0.title=s.key; tr.appendChild(td0);
-        const td1=document.createElement('td'); td1.textContent=(s.model||'—')+' / '+(s.chain||'—'); tr.appendChild(td1);
-        const td2=document.createElement('td'); td2.textContent=(s.provider||'—')+':'+(s.model_name||'—'); tr.appendChild(td2);
-        const td3=document.createElement('td'); td3.textContent=s.last_used?new Date(s.last_used).toLocaleString():'—'; tr.appendChild(td3);
-        sBody.appendChild(tr);
-      }
-    }
-  }
-  const mBody=document.getElementById('sqliteMetaTable');
-  if(mBody){
-    mBody.innerHTML='';
-    const metaMap=stats.meta||{};
-    const metaKeys=Object.keys(metaMap).sort();
-    if(!metaKeys.length){
-      const tr=document.createElement('tr'); const td=document.createElement('td'); td.colSpan=2; td.textContent='No metadata records.'; tr.appendChild(td); mBody.appendChild(tr);
-    } else {
-      for(const k of metaKeys){
-        const tr=document.createElement('tr');
-        const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=k; td0.title=k; tr.appendChild(td0);
-        const td1=document.createElement('td'); td1.textContent=metaMap[k]; tr.appendChild(td1);
-        mBody.appendChild(tr);
       }
     }
   }
