@@ -748,6 +748,23 @@ func (g *GatewayContext) streamResponsesAttempt(ctx context.Context, body []byte
 			len(body), maxProxiedBodyBytes, ep.Provider, ep.Model)
 	}
 	client, usedProxy := g.proxy.attemptClient(&ep, timeout, allowProxy)
+
+	// Record proxy routing decision telemetry in responses_api
+	if g.metrics != nil {
+		decision := "proxied"
+		if g.proxy.effectiveProtocol(&ep) == protocolCommandCode {
+			decision = "direct_command_code"
+		} else if !allowProxy {
+			if g.proxy.proxyTries(&ep) <= 0 {
+				decision = "direct_no_proxy"
+			} else {
+				decision = "direct_body_exceeded"
+			}
+		} else if usedProxy == nil {
+			decision = "direct_pool_unavailable"
+		}
+		g.metrics.ProxyRequestDecision(decision)
+	}
 	if client == nil {
 		// Mandatory proxy routing is enabled but no proxy is available.
 		return "", nil, &ProxyError{

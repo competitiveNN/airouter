@@ -150,6 +150,10 @@ type Metrics struct {
 	// started, so the dashboard can distinguish "no data yet" from "the ring
 	// is empty because nothing has been recorded".
 	attemptRingStarted bool
+	// proxyRequestsTotal counts requests categorized by proxy usage decision
+	// (e.g. "proxied" vs "direct_body_exceeded" vs "direct_no_proxy" vs "direct_command_code").
+	// Bounded series keyed by decision name.
+	proxyRequestsTotal map[labelKey]*atomic.Int64
 	// labelsCap bounds the number of distinct label values any single
 	// label-value map may hold. See boundedAttemptKeyLocked for why this exists and
 	// why the cap is enforced on the stored keys rather than on the output.
@@ -271,6 +275,7 @@ func NewMetrics() *Metrics {
 		attemptLatencyNSByEnd:        make(map[labelKey]*atomic.Int64),
 		attemptHistByEnd:             make(map[labelKey][]atomic.Int64),
 		attemptIndex:                 make(map[labelKey]int),
+		proxyRequestsTotal:           make(map[labelKey]*atomic.Int64),
 		labelsCap:                    defaultMaxLabelValues,
 		overflowKey:                  overflowLabelKey,
 		attemptRing:                  make([]*attemptTick, dashboardRingLen),
@@ -534,6 +539,26 @@ func (m *Metrics) TransportDrop() {
 // Cooldown records a model cooldown application.
 func (m *Metrics) Cooldown() {
 	m.cooldownsApplied.Add(1)
+}
+
+// ProxyRequestDecision records whether an attempt used the proxy pool or went direct
+// and why (e.g. proxied, direct_body_exceeded, direct_no_proxy, direct_command_code).
+func (m *Metrics) ProxyRequestDecision(decision string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := singleLabelKey("decision", decision)
+	if _, ok := m.proxyRequestsTotal[key]; !ok {
+		if len(m.proxyRequestsTotal) >= m.labelsCap-1 {
+			key = overflowKeyFor("decision")
+		}
+		if _, ok := m.proxyRequestsTotal[key]; !ok {
+			m.proxyRequestsTotal[key] = &atomic.Int64{}
+		}
+	}
+	m.proxyRequestsTotal[key].Add(1)
 }
 
 // CircuitTransition records a circuit breaker state change for an endpoint.
@@ -1164,6 +1189,14 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.mu.RLock()
 	for k, c := range m.fallbacksByFromEndpoint {
 		writeSample(w, "airouter_fallbacks_total_by_endpoint", k, c.Load())
+	}
+	m.mu.RUnlock()
+
+	fmt.Fprintln(w, "# HELP airouter_proxy_requests_total Total upstream requests categorized by proxy routing decision")
+	fmt.Fprintln(w, "# TYPE airouter_proxy_requests_total counter")
+	m.mu.RLock()
+	for k, c := range m.proxyRequestsTotal {
+		writeSample(w, "airouter_proxy_requests_total", k, c.Load())
 	}
 	m.mu.RUnlock()
 

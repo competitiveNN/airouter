@@ -1277,22 +1277,13 @@ func TestEveryBoundedMapHasAWellFormedKeyShape(t *testing.T) {
 	for i := 0; i <= small; i++ {
 		name := fmt.Sprintf("ep-%d", i)
 		m.Attempt(name, time.Millisecond, i%2 == 0)
-		// A distinct status code per iteration, so requests_by_status and
-		// failures_by_status both receive more distinct labels than the cap.
-		// Alternating between two statuses would leave those two maps with a
-		// single key that could never overflow, and the test would then assert
-		// nothing about them.
 		status := 400 + i
 		m.Request(name, status, time.Millisecond)
 		m.Fallback(name)
 		m.CircuitTransition(CircuitClosed, CircuitOpen, name)
+		m.ProxyRequestDecision(fmt.Sprintf("decision-%d", i))
 	}
-	// One hostile value per map, to prove the round-trip property on the inputs
-	// that actually stress escaping rather than only on tidy ones.
-	m.Attempt(hostile, time.Millisecond, true)
-	m.Request(hostile, 200, time.Millisecond)
-	m.Fallback(hostile)
-	m.CircuitTransition(CircuitClosed, CircuitOpen, hostile)
+	m.ProxyRequestDecision(hostile)
 
 	// checkKey is the shared definition of "well-formed" for a key. A label set
 	// is one or more `identifier="value"` pairs separated by commas, where the
@@ -1348,6 +1339,7 @@ func TestEveryBoundedMapHasAWellFormedKeyShape(t *testing.T) {
 		{"fallbacksByFromEndpoint", "fallbacksByFromEndpoint", m.fallbacksByFromEndpoint, "endpoint"},
 		{"circuitTransitions", "circuitTransitions", m.circuitTransitions, "endpoint"},
 		{"attemptsByEndpoint", "attemptsByEndpoint", m.attemptsByEndpoint, "endpoint"},
+		{"proxyRequestsTotal", "proxyRequestsTotal", m.proxyRequestsTotal, "decision"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if len(tc.store) == 0 {
@@ -1379,6 +1371,7 @@ func TestEveryBoundedMapHasAWellFormedKeyShape(t *testing.T) {
 		{m.fallbacksByFromEndpoint, "fallbacksByFromEndpoint", "endpoint"},
 		{m.circuitTransitions, "circuitTransitions", "endpoint"},
 		{m.attemptsByEndpoint, "attemptsByEndpoint", "endpoint"},
+		{m.proxyRequestsTotal, "proxyRequestsTotal", "decision"},
 	} {
 		found := false
 		for k := range tc.store {
@@ -1682,10 +1675,10 @@ func TestEveryLabelKeyMapIsBoundedAndRenders(t *testing.T) {
 		m.Request(name, 400+i, time.Millisecond)
 		m.Fallback(name)
 		m.CircuitTransition(CircuitClosed, CircuitOpen, name)
+		m.ProxyRequestDecision(fmt.Sprintf("decision-%d", i))
 	}
-	// Hostile values too: a key that is only well-formed for tidy input is not
-	// well-formed.
 	m.Attempt(hostile, time.Millisecond, true)
+	m.ProxyRequestDecision(hostile)
 	for i := 0; i <= small; i++ {
 		name := fmt.Sprintf("ep-%d", i)
 		m.Attempt(name, time.Duration(i+1)*time.Millisecond, i%2 == 0)

@@ -336,12 +336,13 @@ func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 // budget, and the request 503'd. The same body DIRECT to the same kilocode
 // model answered in ~1s at 134KB and ~3s at 600KB.
 //
-// 64KB, not 256KB: the second live failure (14:19, 116k tokens) had a body
-// just under the old limit and still lost 12.5s of a 30s budget to
-// 165.154.162.73:8888. Token counts and body bytes diverge (dense code/tool
-// JSON is ~2 bytes per token), so the cut has to be low enough to catch a
-// prefill-sized upload in either unit.
-const maxProxiedBodyBytes = 64 << 10
+// 256KB: the limit used to be 64KB, which pushed dense code/tool JSON bodies
+// (measured around 84KB) out of the proxy pool and produced a steady stream
+// of "body exceeds ...; sending direct" fallbacks. 256KB keeps those requests
+// on the rotating proxies while still routing truly prefill-sized uploads
+// direct. Token counts and body bytes diverge (dense code/tool JSON is ~2
+// bytes per token), so the cut is a body-byte budget, not a token estimate.
+const maxProxiedBodyBytes = 256 << 10
 
 // proxyAllowedForBody reports whether an attempt carrying a body of n bytes
 // may use the proxy pool. Large prefill uploads go direct.
@@ -1259,6 +1260,23 @@ func (p *Proxy) forwardUncoalesced(ctx context.Context, body []byte, endpoint Mo
 		}
 	}
 
+	// Record proxy routing decision telemetry
+	if p.metrics != nil {
+		decision := "proxied"
+		if p.effectiveProtocol(&endpoint) == protocolCommandCode {
+			decision = "direct_command_code"
+		} else if !allowProxy {
+			if p.proxyTries(&endpoint) <= 0 {
+				decision = "direct_no_proxy"
+			} else {
+				decision = "direct_body_exceeded"
+			}
+		} else if usedProxy == nil {
+			decision = "direct_pool_unavailable"
+		}
+		p.metrics.ProxyRequestDecision(decision)
+	}
+
 	// Enforce mandatory proxy routing: if the provider requires proxy
 	// routing and no proxy was selected, fail the attempt instead of
 	// falling back to a direct connection.
@@ -1634,6 +1652,25 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 			len(body), maxProxiedBodyBytes, endpoint.Provider, endpoint.Model)
 	}
 	client, usedProxy := p.attemptClient(&endpoint, timeout, allowProxy)
+
+	// Record proxy routing decision telemetry
+	if p.metrics != nil {
+		decision := "proxied"
+		if p.effectiveProtocol(&endpoint) == protocolCommandCode {
+			decision = "direct_command_code"
+		} else if opts.Direct {
+			decision = "direct_explicit"
+		} else if !allowProxy {
+			if p.proxyTries(&endpoint) <= 0 {
+				decision = "direct_no_proxy"
+			} else {
+				decision = "direct_body_exceeded"
+			}
+		} else if usedProxy == nil {
+			decision = "direct_pool_unavailable"
+		}
+		p.metrics.ProxyRequestDecision(decision)
+	}
 	if client == nil {
 		// Mandatory proxy routing is enabled but no proxy is available.
 		// Fail this attempt so the fallback chain can advance.

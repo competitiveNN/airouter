@@ -7,8 +7,14 @@ import "testing"
 // burns the attempt budget; direct works (measured: 134KB in ~1s, 600KB in
 // ~3s to kilocode).
 func TestProxyAllowedForBody(t *testing.T) {
+	if maxProxiedBodyBytes != 256<<10 {
+		t.Fatalf("maxProxiedBodyBytes = %d, want %d", maxProxiedBodyBytes, 256<<10)
+	}
 	if !proxyAllowedForBody(16 << 10) {
 		t.Fatal("small requests keep the proxy rotation")
+	}
+	if !proxyAllowedForBody(84 << 10) {
+		t.Fatal("dense code/tool bodies around 84KB keep the proxy rotation")
 	}
 	if proxyAllowedForBody(maxProxiedBodyBytes + 1) {
 		t.Fatal("a body above the limit must go direct")
