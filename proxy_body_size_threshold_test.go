@@ -21,12 +21,12 @@ func TestProxyAllowedForBodyBoundary(t *testing.T) {
 // TestProxyAllowedForBodySmallBodies verifies small bodies (e.g., 16KB) still use proxy rotation.
 func TestProxyAllowedForBodySmallBodies(t *testing.T) {
 	sizes := []int{
-		1024,      // 1KB
-		4096,      // 4KB
-		16384,     // 16KB
-		65536,     // 64KB
-		262144,    // 256KB (the limit)
-		262145,    // 256KB + 1 (over limit)
+		1024,   // 1KB
+		4096,   // 4KB
+		16384,  // 16KB
+		65536,  // 64KB
+		262144, // 256KB (the limit)
+		262145, // 256KB + 1 (over limit)
 	}
 
 	for _, size := range sizes {

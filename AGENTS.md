@@ -61,7 +61,7 @@ go vet clean, and pass `go test -race -count=1 ./...`.
 - Retry budget: `maxAttempts = chainLen*3 + 1`. All four fallback loops (chat 
   non-stream, chat stream, Responses non-stream, Responses stream) and the 
   WebSocket turn loop are bounded by `maxAttempts` AND a shared wall-clock budget 
-  (`maxFallbackWallClock = 45s`). Per-attempt timeout uses `firstByteReader` 
+  (`maxFallbackWallClock = 30s`, equal to `maxSessionInterruption`). Per-attempt timeout uses `firstByteReader` 
   (time-to-first-token guard only); the parent context stays alive for the rest of 
   generation.
 - On retry-budget exhaustion, migrate the session to the substitute chain instead 

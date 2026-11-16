@@ -85,5 +85,16 @@
       "status_code": 404
     }
   },
-  "pending": {}
+  "pending": {
+    "ollama-cloud:gemma4:31b": {
+      "first_seen": "2026-11-16",
+      "last_seen": "2026-11-16",
+      "streak": 1
+    },
+    "ollama-cloud:nemotron-3-super": {
+      "first_seen": "2026-11-16",
+      "last_seen": "2026-11-16",
+      "streak": 1
+    }
+  }
 }

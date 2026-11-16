@@ -1831,15 +1831,37 @@ func TestHandleChatCompletionsNonStreaming(t *testing.T) {
 	}
 }
 
-func TestHandleChatCompletionsVisionNotSupported(t *testing.T) {
+func TestHandleChatCompletionsVisionSwitchesToVisionModel(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID:      "chatcmpl-1",
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   "vision-model",
+			Choices: []ChatCompletionChoice{{
+				Index: 0,
+				Message: ChatCompletionMessage{
+					Role:    "assistant",
+					Content: "I see the image",
+				},
+				FinishReason: strPtr("stop"),
+			}},
+		})
+	}))
+	defer backend.Close()
+
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
-			"p": {URL: "https://example.com/v1"},
+			"p": {URL: backend.URL},
 		},
 		Models: map[string]ModelConfig{
 			"smart": {Chain: []ModelEndpoint{
-				{Provider: "p", Model: "a", Vision: boolPtr(false)},
-				{Provider: "p", Model: "b", Vision: boolPtr(false)},
+				{Provider: "p", Model: "text-a", Vision: boolPtr(false), Intelligence: floatPtr(40)},
+			}},
+			"work": {Chain: []ModelEndpoint{
+				{Provider: "p", Model: "vision-b", Vision: boolPtr(true), Intelligence: floatPtr(40)},
 			}},
 		},
 	}
@@ -1858,20 +1880,31 @@ func TestHandleChatCompletionsVisionNotSupported(t *testing.T) {
 
 	var result ChatCompletionResponse
 	json.NewDecoder(rec.Body).Decode(&result)
-	if result.Choices[0].Message.Content != "Vision not supported" {
-		t.Errorf("expected 'Vision not supported', got %q", result.Choices[0].Message.Content)
+	if result.Choices[0].Message.Content != "I see the image" {
+		t.Errorf("expected 'I see the image', got %q", result.Choices[0].Message.Content)
 	}
 }
 
-func TestHandleChatCompletionsVisionUnavailableCooldown(t *testing.T) {
+func TestHandleChatCompletionsVisionSwitchesWhenCooledDown(t *testing.T) {
 	requestCount := 0
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(429)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"error": map[string]string{"message": "rate limited"},
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(ChatCompletionResponse{
+			ID:      "chatcmpl-1",
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   "vision-model",
+			Choices: []ChatCompletionChoice{{
+				Index: 0,
+				Message: ChatCompletionMessage{
+					Role:    "assistant",
+					Content: "I see the image from fallback",
+				},
+				FinishReason: strPtr("stop"),
+			}},
 		})
 	}))
 	defer backend.Close()
@@ -1881,17 +1914,19 @@ func TestHandleChatCompletionsVisionUnavailableCooldown(t *testing.T) {
 		Providers: map[string]ProviderConfig{
 			"test": {URL: backend.URL},
 		},
-	}
-	cfg.Models = map[string]ModelConfig{
-		"smart": {Chain: []ModelEndpoint{
-			{Provider: "test", Model: "a", Vision: &falseVal},
-			{Provider: "test", Model: "b"}, // vision: nil = supported
-		}},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "test", Model: "text-a", Vision: &falseVal, Intelligence: floatPtr(30)},
+				{Provider: "test", Model: "vision-b"}, // vision: nil = supported, intelligence unknown
+			}},
+			"work": {Chain: []ModelEndpoint{
+				{Provider: "test", Model: "vision-c", Vision: boolPtr(true), Intelligence: floatPtr(30)},
+			}},
+		},
 	}
 	router := NewRouter(cfg, "")
-	// Cool down the only vision-capable endpoint long enough to make it
-	// unavailable for this test.
-	ep := &ModelEndpoint{Provider: "test", Model: "b"}
+	// Cool down the vision-capable endpoint in smart chain.
+	ep := &ModelEndpoint{Provider: "test", Model: "vision-b"}
 	router.ApplyCooldown(ep, 429, "rate limited")
 
 	proxy := NewProxy(cfg)
@@ -1908,13 +1943,17 @@ func TestHandleChatCompletionsVisionUnavailableCooldown(t *testing.T) {
 
 	var result ChatCompletionResponse
 	json.NewDecoder(rec.Body).Decode(&result)
-	if result.Choices[0].Message.Content != "Vision currently not available" {
-		t.Errorf("expected 'Vision currently not available', got %q", result.Choices[0].Message.Content)
+	if result.Choices[0].Message.Content != "I see the image from fallback" {
+		t.Errorf("expected fallback response, got %q", result.Choices[0].Message.Content)
 	}
 }
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+func floatPtr(f float64) *float64 {
+	return &f
 }
 
 func TestHandleChatCompletionsWithFallback(t *testing.T) {

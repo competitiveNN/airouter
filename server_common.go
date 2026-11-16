@@ -9,6 +9,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log"
 	"net"
@@ -101,29 +103,29 @@ func recoveryMiddleware(h http.Handler) http.Handler {
 func watchConfig(ctx context.Context, path string, gateway *GatewayContext) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	var lastMod int64
-	var lastSize int64
+	var lastHash string
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			fi, err := os.Stat(path)
+			data, err := os.ReadFile(path)
 			if err != nil {
 				continue
 			}
-			if fi.ModTime().UnixNano() == lastMod && fi.Size() == lastSize {
+			h := sha256.Sum256(data)
+			hash := hex.EncodeToString(h[:])
+			if hash == lastHash {
 				continue
 			}
-			newMod, newSize := fi.ModTime().UnixNano(), fi.Size()
 			cfg, err := LoadConfig(path)
 			if err != nil {
 				log.Printf("[debug] hot reload skipped: config parse error: %v", err)
-				// Don't update lastMod/lastSize — retry on next tick so a
+				// Don't update lastHash — retry on next tick so a
 				// transient write (e.g. editor saving) doesn't get stuck.
 				continue
 			}
-			lastMod, lastSize = newMod, newSize
+			lastHash = hash
 			gateway.ReloadConfig(cfg)
 			log.Printf("Config hot-reloaded from %s", path)
 		}

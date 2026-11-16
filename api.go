@@ -1028,8 +1028,6 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	sessionID := bodySessionID(body)
-
 	// Inject default max_tokens if the client omitted it. The default is
 	// the smaller of: (profile's min context window / 2), or a positive
 	// value from config.DEFAULT_MAX_TOKENS. A value of 0 means "never
@@ -1040,6 +1038,8 @@ func (g *GatewayContext) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 			body = injectMaxTokens(body, def)
 		}
 	}
+
+	sessionID := bodySessionID(body)
 
 	tokens := estimateTokensFromBody(body)
 
@@ -1924,22 +1924,21 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 		if walk.attempts >= maxAttempts {
 			if requestHasVision(body) {
-				// Instead of returning "Vision not supported" / "Vision currently
-				// not available", try to find a vision-capable model and re-pin
-				// the session to it. The priority is toward a model whose
-				// intelligence score matches the current session model.
-				if ep, migrated := g.router.FindBestVisionEndpoint(req.Model, sessionID, tokens); migrated && ep != nil {
-					// The session has been re-pinned to a vision-capable model.
-					// Reset the attempt budget so the new model gets a full walk.
-					log.Printf("[debug] session=%s -> migrated to vision-capable model %s/%s for vision request", sessionID, ep.Provider, ep.Model)
-					walk.attempts = 0
-					walk.budget = fallbackBudget(timeout)
-					walk.lastProgress = time.Now()
-					walk.exhausted = false
-					continue
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				switch state {
+				case VisionUnsupported:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision not supported"))
+					g.recordRequest(req.Model, 200, time.Since(start))
+					return
+				case VisionUnavailable:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision currently not available"))
+					g.recordRequest(req.Model, 200, time.Since(start))
+					return
 				}
-				// If migration failed (no vision-capable model found anywhere),
-				// fall through to the degraded completion path.
 			}
 			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 200 degraded", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
 			g.writeDegradedCompletion(w, sessionID)
@@ -1955,19 +1954,20 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
-				// Instead of returning "Vision not supported" / "Vision currently
-				// not available", try to find a vision-capable model and re-pin
-				// the session to it. The priority is toward a model whose
-				// intelligence score matches the current session model.
-				if ep2, migrated := g.router.FindBestVisionEndpoint(req.Model, sessionID, tokens); migrated && ep2 != nil {
-					// The session has been re-pinned to a vision-capable model.
-					// Reset the attempt budget so the new model gets a full walk.
-					log.Printf("[debug] session=%s -> migrated to vision-capable model %s/%s for vision request (ep nil fallback)", sessionID, ep2.Provider, ep2.Model)
-					// Update ep and wait so the loop can continue with the new model
-					ep = ep2
-					wait = 0
-				} else {
-					// No vision-capable model found; fall through to the nil-ep handling below.
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				switch state {
+				case VisionUnsupported:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision not supported"))
+					g.recordRequest(req.Model, 200, time.Since(start))
+					return
+				case VisionUnavailable:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(200)
+					json.NewEncoder(w).Encode(visionRejectionReply(req.Model, "Vision currently not available"))
+					g.recordRequest(req.Model, 200, time.Since(start))
+					return
 				}
 			}
 			// Every endpoint in the chain is on cooldown (or otherwise
@@ -2568,21 +2568,19 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		}
 		if walk.attempts >= maxAttempts {
 			if requestHasVision(body) {
-				// Instead of returning "Vision not supported" / "Vision currently
-				// not available", try to find a vision-capable model and re-pin
-				// the session to it. The priority is toward a model whose
-				// intelligence score matches the current session model.
-				if ep, migrated := g.router.FindBestVisionEndpoint(req.Model, sessionID, tokens); migrated && ep != nil {
-					// The session has been re-pinned to a vision-capable model.
-					// Reset the attempt budget so the new model gets a full walk.
-					log.Printf("[debug] session=%s -> migrated to vision-capable model %s/%s for vision request (streaming maxAttempts)", sessionID, ep.Provider, ep.Model)
-					walk.attempts = 0
-					walk.budget = fallbackBudget(timeout)
-					walk.lastProgress = time.Now()
-					walk.exhausted = false
-					continue
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				switch state {
+				case VisionUnsupported:
+					writeVisionRejectionSSE(w, flusher, req.Model, "Vision not supported")
+					doneSent = true
+					g.recordRequest(req.Model, 200, time.Since(start))
+					return
+				case VisionUnavailable:
+					writeVisionRejectionSSE(w, flusher, req.Model, "Vision currently not available")
+					doneSent = true
+					g.recordRequest(req.Model, 200, time.Since(start))
+					return
 				}
-				// If migration failed, fall through to the degraded SSE path.
 			}
 			log.Printf("[debug] session=%s model=%s -> fallback attempt limit (%d) reached in %v; returning 200 degraded", sessionID, req.Model, maxAttempts, walk.elapsed().Round(time.Millisecond))
 			writeDegradedSSE(w, flusher, "")
@@ -2599,18 +2597,19 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		if ep == nil {
 			requireVision := requestHasVision(body)
 			if requireVision {
-				// Instead of returning "Vision not supported" / "Vision currently
-				// not available", try to find a vision-capable model and re-pin
-				// the session to it. The priority is toward a model whose
-				// intelligence score matches the current session model.
-				if ep2, migrated := g.router.FindBestVisionEndpoint(req.Model, sessionID, tokens); migrated && ep2 != nil {
-					// The session has been re-pinned to a vision-capable model.
-					// Reset the attempt budget so the new model gets a full walk.
-					log.Printf("[debug] session=%s -> migrated to vision-capable model %s/%s for vision request (streaming ep nil fallback)", sessionID, ep2.Provider, ep2.Model)
-					ep = ep2
-					wait = 0
-				} else {
-					// No vision-capable model found; fall through to the nil-ep handling below.
+				state, _ := g.router.VisionChainStatus(req.Model, sessionID)
+				var msg string
+				switch state {
+				case VisionUnsupported:
+					msg = "Vision not supported"
+				case VisionUnavailable:
+					msg = "Vision currently not available"
+				}
+				if msg != "" {
+					writeVisionRejectionSSE(w, flusher, req.Model, msg)
+					doneSent = true
+					g.recordRequest(req.Model, 200, time.Since(start))
+					return
 				}
 			}
 			// Every endpoint in the chain is on cooldown (or otherwise
