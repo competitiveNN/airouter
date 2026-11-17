@@ -385,30 +385,6 @@ def sort_models(
     return models
 
 
-def stride_models(models: list[Model]) -> list[Model]:
-    """Interleave high- and lower-intelligence models so smart models recur
-    throughout the chain instead of clustering at the head.
-
-    With models sorted descending by intelligence, split into a smarter half
-    and a less-smart half, then interleave: high[0], low[0], high[1], low[1], ...
-    A session that settles at depth N still encounters a near-top model at
-    depth N+2, so no stretch of the chain is left without smart coverage.
-    """
-    n = len(models)
-    if n <= 2:
-        return models
-    mid = (n + 1) // 2
-    high = models[:mid]
-    low = models[mid:]
-    result = []
-    for i in range(max(len(high), len(low))):
-        if i < len(high):
-            result.append(high[i])
-        if i < len(low):
-            result.append(low[i])
-    return result
-
-
 def filter_smart(models: list[Model]) -> list[Model]:
     """smart: strongest generalists, intelligence >= 25, any context length"""
     return [m for m in models
@@ -787,14 +763,16 @@ def build_chain(
             'comment': m.get_comment(),
         }
 
-    chain = []
+    # Sort in process by serving priority: intelligence descending (large is
+    # context-first). Key groups are expanded per model below, so sorting the
+    # models first keeps every provider key of a higher-scoring model ahead of
+    # any key of a lower-scoring one.
+    if profile == 'large':
+        models = sort_models(list(models), newest_first_on_tie=True, context_first=True)
+    else:
+        models = sort_models(list(models), newest_first_on_tie=True)
 
-    # Stride models per chain so smart models recur throughout the chain
-    # instead of clustering at the head. A session settling at depth N still
-    # encounters a near-top model at depth N+2. `large` is excluded because
-    # it sorts by context_length, not intelligence.
-    if profile != 'large':
-        models = stride_models(models)
+    chain = []
 
     for m in models:
         if m.mapped_provider == 'nvidia':

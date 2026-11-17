@@ -747,6 +747,31 @@ def _load_checker():
 cr = _load_checker()
 
 
+def _model_list_has_usable_verdict(path="/tmp/free-models.json"):
+    """True when the fetched list carries a live/dead probe verdict for an
+    auto router.
+
+    The data-dependent rule6 tests below assume the probe actually reached the
+    router. A fetch that was rate-limited records `verdict: unknown` (HTTP
+    429), which is a fact about the free-tier window, not about the config; the
+    checker is then RIGHT to report that the file's "probed live" claim cannot
+    be verified, and asserting "no problems" would fail for an environmental
+    reason. Skip in that case, exactly as these tests already skip when the
+    file is absent.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return False
+    for item in data:
+        if item.get("id") not in ("kilo-auto/free", "big-pickle"):
+            continue
+        verdict = str((item.get("auto_probe") or {}).get("verdict") or "").lower()
+        if item.get("verified") in ("live", "dead") or verdict in ("live", "dead"):
+            return True
+    return False
+
+
 def _checker_problems(config_text=None, models_path="/tmp/free-models.json"):
     text = config_text if config_text is not None else CONFIG.read_text()
     index = (
@@ -839,8 +864,8 @@ def _inject_protocol(config_text, value, provider=None):
 
 
 def test_checker_passes_the_real_config_and_its_real_model_list():
-    if not Path("/tmp/free-models.json").exists():
-        pytest.skip("no fetched model list on this machine")
+    if not _model_list_has_usable_verdict():
+        pytest.skip("no fetched model list with a live/dead probe verdict on this machine")
     assert _checker_problems() == []
 
 
@@ -871,8 +896,8 @@ def test_checker_catches_a_terminator_comment_that_contradicts_the_probe():
     Without this, a stale or hand-edited comment reads as verified evidence for
     as long as nobody re-runs the checker against the model list.
     """
-    if not Path("/tmp/free-models.json").exists():
-        pytest.skip("no fetched model list on this machine")
+    if not _model_list_has_usable_verdict():
+        pytest.skip("no fetched model list with a live/dead probe verdict on this machine")
     text = CONFIG.read_text().replace(
         "auto router probed live; opencode auto",
         "auto router not probed (unknown verdict); opencode auto", 1,
@@ -882,8 +907,8 @@ def test_checker_catches_a_terminator_comment_that_contradicts_the_probe():
 
 
 def test_checker_catches_a_flipped_terminator():
-    if not Path("/tmp/free-models.json").exists():
-        pytest.skip("no fetched model list on this machine")
+    if not _model_list_has_usable_verdict():
+        pytest.skip("no fetched model list with a live/dead probe verdict on this machine")
     text = CONFIG.read_text().replace(
         "      - provider: kilocode\n        model: kilo-auto/free  # last: kilocode",
         "      - provider: opencode\n        model: big-pickle  # last: opencode", 1,
@@ -1311,14 +1336,9 @@ def _record_json(model_id, provider, score, *, vision=False, ctx=262144):
     }
 
 
-def test_a_regenerated_chain_strides_smart_models_throughout(tmp_path):
-    """Striding interleaves smart and lower-intelligence models so no stretch
-    of the chain lacks a strong model. The head is always the smartest, and
-    smart models recur at roughly every other position.
-
-    Replaces the old 'non-increasing by score' test, which is incompatible
-    with striding by design.
-    """
+def test_a_regenerated_chain_is_sorted_by_intelligence_desc(tmp_path):
+    """Chains are best-first by intelligence descending: each model's key group
+    is emitted consecutively, then the next-lower model. No striding."""
     text = _run_cli(tmp_path, {"kilocode": True, "opencode": False},
                     extra=[_record_json("order/a:free", "kilocode", 30.0, vision=True),
                            _record_json("order/b:free", "kilocode", 20.0, vision=False)])
@@ -1330,18 +1350,20 @@ def test_a_regenerated_chain_strides_smart_models_throughout(tmp_path):
         scores = [e["intelligence"] for e in chain if "intelligence" in e]
         if not scores:
             continue
+        # Collapse consecutive duplicate scores (key groups) into model blocks.
+        block_scores = []
+        prev = None
+        for s in scores:
+            if s != prev:
+                block_scores.append(s)
+                prev = s
+        assert block_scores == sorted(block_scores, reverse=True), \
+            f"{name} is not ordered by intelligence descending: {scores}"
         # Head is always the smartest
         assert scores[0] == max(scores), f"{name} head is not the smartest: {scores}"
         # No model appears twice
         ids = [e["model"] for e in chain]
         assert len(ids) == len(set(ids)), f"{name} has duplicate models: {ids}"
-        # With >= 3 models, a second smart model should recur within the first
-        # few positions (striding property)
-        if len(scores) >= 3:
-            top_score = scores[0]
-            # Another model within 5 points of the top should appear by index 2
-            near_top = [s for s in scores[1:3] if s >= top_score - 5]
-            assert near_top, f"{name} lacks a near-top model within first 3 positions: {scores}"
 
 
 if __name__ == "__main__":
