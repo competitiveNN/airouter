@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"sync"
 	"time"
 )
 
@@ -162,6 +163,12 @@ func (m *Metrics) restoreDashboardJournalLocked(path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Clear every slot first so stale entries from a previous process
+	// (or from a journal that no longer covers a given minute) cannot
+	// leak into the restored window and be reported as recent data.
+	for i := range m.attemptRing {
+		m.attemptRing[i] = nil
+	}
 	for minute, line := range lines {
 		slot := journalSlot(minute)
 		if slot < 0 || slot >= dashboardRingLen {
@@ -211,7 +218,10 @@ func (m *Metrics) StartDashboardTelemetry(journalPath string) func() {
 	m.mu.Unlock()
 
 	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		// Align to the minute boundary so a tick never straddles a wall-clock
 		// minute: the first wait is to the next boundary, then every 60s.
 		now := time.Now()
@@ -246,7 +256,7 @@ func (m *Metrics) StartDashboardTelemetry(journalPath string) func() {
 			}
 		}
 	}()
-	return func() { close(stop) }
+	return func() { close(stop); wg.Wait() }
 }
 
 // RecordDashboardTokens records completion tokens for an endpoint in the

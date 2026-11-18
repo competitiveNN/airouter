@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -321,7 +322,9 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel stri
 		released = true
 		if buffered.Len() > 0 {
 			// Re-interpret the buffered prefix as a text delta.
-			sw.textDelta(buffered.String())
+			sText := buffered.String()
+			acc.WriteString(sText)
+			sw.textDelta(sText)
 			buffered.Reset()
 		}
 	}
@@ -415,13 +418,14 @@ func translateChatSSE(r io.Reader, sw *responsesStreamWriter, upstreamModel stri
 			if !released {
 				buffered.WriteString(d)
 				// Fire onProgress on first text delta so the interruption
-				// budget resets during prefill. The delta event itself is
-				// held until release(), but the budget must reset now.
+				// budget resets during prefill.
 				if !sw.sawText && sw.onProgress != nil {
 					sw.onProgress()
 					sw.onProgress = nil
 				}
 				sw.sawText = true
+				// Release the buffered prefix so it is not omitted from the output.
+				release()
 				continue
 			}
 			acc.WriteString(d)
@@ -559,4 +563,84 @@ func accumulateResponsesToolCall(tcs *[]streamToolCall, idx int, id, typ, name, 
 	if args != "" {
 		target.Arguments += args
 	}
+}
+
+// writeDegradedResponsesSSE emits a degraded Responses completion when the
+// streaming fallback chain is exhausted. It sends a minimal Responses event
+// sequence: output_text.delta (empty) -> output_text.done -> content_part.done ->
+// output_item.done -> response.completed, so the client receives a valid
+// terminal event instead of hanging or seeing a chat-shaped chunk.
+func writeDegradedResponsesSSE(w http.ResponseWriter, flusher http.Flusher, logicalModel string) {
+	respID := responseIDPrefix + newCorrelationID("")
+	msgID := newCorrelationID("msg")
+	now := time.Now().Unix()
+
+	// Send a minimal delta so clients waiting on output_text.delta unblock.
+	delta := map[string]any{
+		"type":            evOutputTextDelta,
+		"sequence_number": 0,
+		"item_id":         msgID,
+		"delta":           "",
+	}
+	blob, _ := json.Marshal(delta)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evOutputTextDelta, blob)
+	flusher.Flush()
+
+	// output_text.done
+	done := map[string]any{
+		"type":            evOutputTextDone,
+		"sequence_number": 1,
+		"item_id":         msgID,
+		"text":            "",
+	}
+	blob, _ = json.Marshal(done)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evOutputTextDone, blob)
+	flusher.Flush()
+
+	// content_part.done
+	partDone := map[string]any{
+		"type":            evContentPartDone,
+		"sequence_number": 2,
+		"item_id":         msgID,
+		"part_index":      0,
+		"part":            map[string]any{"type": "output_text", "text": ""},
+	}
+	blob, _ = json.Marshal(partDone)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evContentPartDone, blob)
+	flusher.Flush()
+
+	// output_item.done
+	itemDone := map[string]any{
+		"type":            evOutputItemDone,
+		"sequence_number": 3,
+		"output_index":    0,
+		"item": map[string]any{
+			"type":    "message",
+			"id":      msgID,
+			"role":    "assistant",
+			"content": []map[string]any{{"type": "output_text", "text": ""}},
+		},
+	}
+	blob, _ = json.Marshal(itemDone)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evOutputItemDone, blob)
+	flusher.Flush()
+
+	// response.completed (terminal sentinel)
+	completed := map[string]any{
+		"type":            evResponseCompleted,
+		"sequence_number": 4,
+		"response": map[string]any{
+			"id":         respID,
+			"object":     "response",
+			"created_at": now,
+			"status":     "completed",
+			"model":      logicalModel,
+			"output": []map[string]any{
+				{"type": "message", "id": msgID, "role": "assistant", "content": []map[string]any{{"type": "output_text", "text": ""}}},
+			},
+		},
+	}
+	blob, _ = json.Marshal(completed)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evResponseCompleted, blob)
+	flusher.Flush()
 }

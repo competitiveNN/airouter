@@ -15,9 +15,10 @@ import "time"
 // writing to the next slot while holding the same lock. A read lock would
 // race with that write: the query could observe a half-advanced ring where
 // the current tick is nil but the previous one has not been cleared, or
-// vice versa, and the sums would be off by one tick's worth of data. The
-// cost is a brief write-lock hold on every dashboard scrape, which is
-// negligible — a scrape is a few map reads over at most 43200 ticks.
+// vice versa, and the sums would be off by one tick's worth of data. The lock
+// is held only long enough to copy the current tick (the only one still being
+// mutated) and to capture pointers to the completed ticks; aggregation then
+// runs outside the lock so a dashboard scrape cannot stall the request path.
 //
 // The latency histogram is summed across ticks alongside the counters, and
 // the p50/p95/p99 percentiles are computed from the cumulative distribution
@@ -26,9 +27,6 @@ import "time"
 // handler having to re-derive them, and so the three leaderboards cannot
 // disagree about what a percentile means.
 func (m *Metrics) DashboardQuery(w dashboardWindow) []dashboardEndpointAgg {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	seconds := dashboardWindowSeconds(w)
 	if seconds <= 0 {
 		return nil
@@ -38,18 +36,33 @@ func (m *Metrics) DashboardQuery(w dashboardWindow) []dashboardEndpointAgg {
 	if ticks <= 0 {
 		ticks = 1
 	}
-	// The window includes the current tick, so we walk back ticks-1 from
-	// the current position plus the current itself.
 	if ticks > dashboardRingLen {
 		ticks = dashboardRingLen
 	}
+
+	// Snapshot the ring under a brief lock, then aggregate OUTSIDE the lock
+	// so a dashboard scrape cannot stall behind (or stall) the ticker and
+	// other writers. Completed ticks are never mutated after the ring advances
+	// past them, so their pointers can be read outside the lock. The CURRENT
+	// tick is still receiving observations, so it must be deep-copied under
+	// the lock; sharing it would race the request path's map writes.
+	m.mu.Lock()
+	now := m.attemptRingNow
+	snap := make([]*attemptTick, ticks)
+	for i := 0; i < ticks; i++ {
+		idx := (now - i + dashboardRingLen) % dashboardRingLen
+		snap[i] = m.attemptRing[idx]
+	}
+	if snap[0] != nil {
+		snap[0] = snap[0].clone()
+	}
+	m.mu.Unlock()
 
 	agg := make(map[labelKey]*dashboardEndpointAgg)
 	endpoints := make(map[labelKey]string)
 
 	for i := 0; i < ticks; i++ {
-		idx := (m.attemptRingNow - i + dashboardRingLen) % dashboardRingLen
-		t := m.attemptRing[idx]
+		t := snap[i]
 		if t == nil {
 			continue
 		}
@@ -184,4 +197,47 @@ func DashboardChainStatus(
 		out = append(out, cs)
 	}
 	return out
+}
+
+// clone returns a deep copy of a tick suitable for aggregation outside the
+// metrics lock. The current ring tick is mutated in place by every recorded
+// attempt, so the dashboard must never iterate it after releasing the lock;
+// completed ticks are immutable, but cloning the current one is the only way
+// to include the still-filling minute in the window without a race.
+func (t *attemptTick) clone() *attemptTick {
+	if t == nil {
+		return nil
+	}
+	c := &attemptTick{
+		attempts:    cloneInt64Map(t.attempts),
+		failures:    cloneInt64Map(t.failures),
+		latencyNS:   cloneInt64Map(t.latencyNS),
+		tokens:      cloneInt64Map(t.tokens),
+		activeTicks: cloneInt64Map(t.activeTicks),
+		endpoints:   make(map[labelKey]string, len(t.endpoints)),
+		start:       t.start,
+	}
+	for k, v := range t.endpoints {
+		c.endpoints[k] = v
+	}
+	if t.hist != nil {
+		c.hist = make(map[labelKey][]int64, len(t.hist))
+		for k, v := range t.hist {
+			cp := make([]int64, len(v))
+			copy(cp, v)
+			c.hist[k] = cp
+		}
+	}
+	return c
+}
+
+func cloneInt64Map(src map[labelKey]int64) map[labelKey]int64 {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[labelKey]int64, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }

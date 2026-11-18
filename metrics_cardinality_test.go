@@ -3218,3 +3218,126 @@ func truncate(body string) string {
 	}
 	return body[:max] + fmt.Sprintf("\n... (%d more bytes)", len(body)-max)
 }
+
+// FuzzMetricsCardinalityEviction feeds arbitrary endpoint/label sequences into a
+// Metrics registry with the smallest allowed cap and asserts the invariants the
+// whole cardinality design exists to provide:
+//
+//   - no single bounded map ever holds more than cap+1 series (cap real labels
+//     plus the overflow bucket; the implementation reserves a slot so it in
+//     practice stays at cap, but cap+1 is the loose ceiling we promise),
+//   - the eviction and overflow counters only ever move forward,
+//   - every Attempt observation is accounted for exactly once, either under its
+//     own label or rolled into the overflow bucket,
+//   - and none of that panics or races under concurrent ingestion.
+//
+// The window is pre-filled to cap-1 so a novel fuzz label forces the eviction
+// and collapse paths rather than trivially being admitted.
+func FuzzMetricsCardinalityEviction(f *testing.F) {
+	const cap = minLabelValues // 16, the smallest configurable cap
+
+	seeds := [][3]string{
+		{"p:m", "p:m", ""},
+		{overflowLabelValue, "a:b", "a:b"},
+		{"", "", ""},
+		{`q"uote`, "new\nline", `back\slash`},
+		{strings.Repeat("x", 256), "y", "z"},
+		{"pre:0", "pre:1", "pre:2"},
+	}
+	for _, s := range seeds {
+		f.Add(s[0], s[1], s[2])
+	}
+
+	f.Fuzz(func(t *testing.T, a, b, c string) {
+		labels := []string{a, b, c}
+
+		m := NewMetrics()
+		m.SetLabelCap(cap)
+
+		// Fill the admission window just below the cap so any novel label in
+		// the fuzz input has to recycle a slot (attempt maps) or collapse
+		// (single-key maps).
+		const prefill = cap - 1
+		for i := 0; i < prefill; i++ {
+			name := "prefill:" + strconv.Itoa(i)
+			m.Attempt(name, time.Millisecond, i%2 == 0)
+			m.Request(name, 200+i%2, time.Millisecond)
+			m.Fallback(name)
+			m.CircuitTransition(CircuitClosed, CircuitOpen, name)
+		}
+
+		overflowBefore := m.labelsOverflowed.Load()
+		evictedBefore := m.labelsEvicted.Load()
+
+		// Concurrent ingestion: several workers hammer the same registry with
+		// the fuzz labels. Attempt is skipped for the empty label because it is
+		// deliberately ignored; the other maps accept it. The race detector
+		// turns any unsynchronised map access into a failure.
+		const workers = 4
+		const perWorker = 4
+		var observed atomic.Int64
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < perWorker; i++ {
+					label := labels[(w+i)%len(labels)]
+					if label != "" {
+						m.Attempt(label, time.Millisecond, i%2 == 0)
+						observed.Add(1)
+					}
+					m.Request(label, 200, time.Millisecond)
+					m.Fallback(label)
+					m.CircuitTransition(CircuitClosed, CircuitOpen, label)
+				}
+			}(w)
+		}
+		wg.Wait()
+
+		// Bound every bounded map. cap+1 is the promised ceiling; the live maps
+		// should be at or below cap because the overflow slot is reserved.
+		bounded := map[string]int{
+			"attemptsByEndpoint":      len(m.attemptsByEndpoint),
+			"attemptFailuresByEnd":    len(m.attemptFailuresByEnd),
+			"attemptLatencyNSByEnd":   len(m.attemptLatencyNSByEnd),
+			"attemptHistByEnd":        len(m.attemptHistByEnd),
+			"requestsByModel":         len(m.requestsByModel),
+			"requestsByStatus":        len(m.requestsByStatus),
+			"fallbacksByFromEndpoint": len(m.fallbacksByFromEndpoint),
+			"circuitTransitions":      len(m.circuitTransitions),
+		}
+		for name, n := range bounded {
+			if n > cap+1 {
+				t.Fatalf("%s holds %d series, above the cap+1 (%d) invariant", name, n, cap+1)
+			}
+		}
+
+		// Eviction/overflow counters are monotonic.
+		if got := m.labelsOverflowed.Load(); got < overflowBefore {
+			t.Fatalf("labelsOverflowed went backwards: %d -> %d", overflowBefore, got)
+		}
+		if got := m.labelsEvicted.Load(); got < evictedBefore {
+			t.Fatalf("labelsEvicted went backwards: %d -> %d", evictedBefore, got)
+		}
+
+		// Every Attempt is accounted for exactly once: the prefill attempts plus
+		// the concurrent observations, with evicted labels rolled into the
+		// overflow bucket rather than dropped.
+		var total int64
+		for _, c := range m.attemptsByEndpoint {
+			total += c.Load()
+		}
+		if want := int64(prefill) + observed.Load(); total != want {
+			t.Fatalf("attempt total = %d, want %d: an observation was dropped or double-counted", total, want)
+		}
+
+		// An endpoint with a histogram must have an attempt counter; otherwise
+		// the exporter prints a zeroed duration distribution for it.
+		for k := range m.attemptHistByEnd {
+			if _, ok := m.attemptsByEndpoint[k]; !ok {
+				t.Fatalf("endpoint %q has a histogram but no attempt counter", k)
+			}
+		}
+	})
+}

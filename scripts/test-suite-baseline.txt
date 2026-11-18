@@ -3,8 +3,15 @@
 # toolchain. Adding tests does not require editing this file;
 # losing one fails and names the test and its last file.
 BenchmarkFallbackLatency	main_test.go
+FuzzBodySessionID	api_fuzz_test.go
+FuzzCircuitBreakerStateTransitions	router_fuzz_test.go
+FuzzConfigValidation	config_fuzz_test.go
 FuzzExpositionRoundTrip	metrics_cardinality_test.go
 FuzzHistogramInvariantsSurviveGarbage	metrics_cardinality_test.go
+FuzzMetricsCardinalityEviction	metrics_cardinality_test.go
+FuzzPromptParsing	chat_fuzz_test.go
+FuzzRetryAfterParsing	router_fuzz_test.go
+FuzzSSEEventParsing	proxy_fuzz_test.go
 TestAClientErrorGetsNoCooldown	cooldown_classification_test.go
 TestAClientErrorIgnoresRetryAfter	cooldown_classification_test.go
 TestAClientErrorIsStillRecorded	cooldown_classification_test.go

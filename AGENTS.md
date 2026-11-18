@@ -52,9 +52,13 @@ go vet clean, and pass `go test -race -count=1 ./...`.
 - A session is always routed to the same model. Sticky session is updated only on 
   initial selection (`len(tried)==0`) so concurrent same-session requests do not 
   stomp each other's fallback routing.
-- Tried endpoints are tracked per request (`tried` map) and per session (`triedKeys` 
-  on `sessionEntry`). `SelectEndpoint` excludes tried keys; on exhaustion, picks the 
-  first endpoint even if all are tried/cooled. `RecordSuccess` clears the tried set.
+- Tried endpoints are tracked PER REQUEST only (`tried` map, local to the
+  request goroutine). There is intentionally NO `triedKeys` on `sessionEntry`:
+  a shared per-session tried set let one request's failures block another
+  concurrent request's fallback choices (see TestConcurrentStreamingSameSession).
+  `SelectEndpoint` excludes the request's tried keys; on exhaustion, picks the
+  first endpoint even if all are tried/cooled. `RecordSuccess` clears the
+  endpoint's cooldown (tried is request-local and discarded with the request).
 - When all endpoints in a chain are cooled, `SelectEndpoint` returns `nil` + 
   `minCooldownWait` (never the first endpoint with zero wait — that caused infinite 
   429 retry loops).

@@ -2991,11 +2991,26 @@ func (e *ProviderError) Unwrap() error {
 	return e.Err
 }
 
+// maxRetryAfter is the ceiling on a parsed Retry-After value.
+//
+// It exists to keep ParseRetryAfter's contract total: secs*time.Second can
+// overflow int64 once the delta exceeds ~292 years, and an overflowed product is
+// a NEGATIVE Duration, which callers read as "no hint" and silently ignore.
+// A hostile or buggy upstream could therefore erase its own backoff floor just
+// by sending a huge integer. Clamping to the largest cooldown the gateway can
+// already impose (the 7-day escalation cap) keeps the value honest, positive,
+// and bounded, so honouring it can never overflow downstream arithmetic.
+const maxRetryAfter = 7 * 24 * time.Hour
+
 // ParseRetryAfter parses an HTTP Retry-After header value into a Duration.
 // It accepts both the delta-seconds form (an integer, e.g. "120") and the
 // HTTP-date form (RFC 1123 / RFC 7231). On any parse failure it returns 0 so
 // callers can fall back to their own backoff. A negative or zero value is
 // treated as "no useful hint" and also returns 0.
+//
+// The returned Duration is always non-negative and never exceeds maxRetryAfter,
+// including for absurd delta-seconds values that would otherwise overflow
+// time.Duration and come back negative.
 func ParseRetryAfter(raw string) time.Duration {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -3006,6 +3021,12 @@ func ParseRetryAfter(raw string) time.Duration {
 		if secs <= 0 {
 			return 0
 		}
+		// Compare before multiplying: int64(secs)*int64(time.Second) would
+		// overflow here, and the overflowed (negative) result would be
+		// indistinguishable from "no hint".
+		if int64(secs) > int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
 		return time.Duration(secs) * time.Second
 	}
 	// HTTP-date form: "Wed, 21 Oct 2015 07:28:00 GMT"
@@ -3013,6 +3034,9 @@ func ParseRetryAfter(raw string) time.Duration {
 		d := time.Until(t)
 		if d <= 0 {
 			return 0
+		}
+		if d > maxRetryAfter {
+			return maxRetryAfter
 		}
 		return d
 	}

@@ -179,6 +179,22 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 	}
 	tried := map[string]bool{}
 
+	if g.router.SessionRetryBudgetExhausted(sessionID) {
+		if g.router.MigrateSessionOnBudgetExhaustion(sessionID, req.Model) {
+			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; migrated to alternate chain", sessionID, req.Model)
+		} else {
+			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning degraded", sessionID, req.Model)
+			if g.metrics != nil {
+				g.metrics.SessionRetryBudgetExhausted()
+			}
+			g.wsSendDegraded(conn, corrID)
+			return
+		}
+	}
+	g.router.IncrementSessionRetry(sessionID)
+	g.inflight.Track(sessionID, req.Model, "")
+	defer g.inflight.Untrack(sessionID)
+
 	// wsEvents is a flushWriter that ships each Responses event to the client
 	// as a single WebSocket text message, tagged with the correlation id.
 	wsEvents := &responsesWSEventSink{conn: conn, corrID: corrID}
@@ -220,6 +236,8 @@ func (g *GatewayContext) serveResponsesWSTurn(conn *websocket.Conn, r *http.Requ
 			g.wsSendDegraded(conn, corrID)
 			return
 		}
+
+		g.inflight.UpdateEndpoint(sessionID, ep.Key())
 
 		// Buffer this attempt: if it fails before producing output, nothing has
 		// reached the client and the turn can still fail over cleanly.

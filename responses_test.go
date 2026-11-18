@@ -651,17 +651,9 @@ func TestResponsesStream_UpstreamErrorMidStreamFailsOver(t *testing.T) {
 	if strings.Contains(body, "service_unavailable_error") || strings.Contains(body, `"code":"503"`) {
 		t.Errorf("client saw 503 error event; body:\n%s", body)
 	}
-	// Should contain degraded content delta (not a clean response.completed)
-	if strings.Contains(body, evResponseCompleted) {
-		t.Errorf("upstream error was swallowed into a %s; body:\n%s", evResponseCompleted, body)
-	}
-	// Degraded response must NOT contain synthetic message and should have empty content
-	if strings.Contains(body, "All upstream models are currently busy or unavailable") {
-		t.Errorf("degraded synthetic message should be removed; body:\n%s", body)
-	}
-	// Expect empty content delta in degraded stream
-	if !strings.Contains(body, `"content":""`) {
-		t.Errorf("expected empty content delta in degraded response; body:\n%s", body)
+	// Should contain response.completed terminal sentinel
+	if !strings.Contains(body, evResponseCompleted) {
+		t.Errorf("expected %s in degraded responses stream; body:\n%s", evResponseCompleted, body)
 	}
 }
 

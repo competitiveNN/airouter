@@ -543,12 +543,12 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 			g.recordRequest(req.Model, 499, time.Since(start))
 			if walk.exhaustedNow() {
 				log.Printf("[debug] session=%s model=%s -> responses stream fallback budget exhausted after %d attempts in %v (budget %v)", sessionID, req.Model, walk.attempts, walk.elapsed().Round(time.Millisecond), walk.budget)
-				writeDegradedSSE(w, flusher, "")
+				writeDegradedResponsesSSE(w, flusher, req.Model)
 				g.recordRequest(req.Model, 200, time.Since(start))
 				return
 			}
 			if walk.attempts >= maxAttempts {
-				writeDegradedSSE(w, flusher, "")
+				writeDegradedResponsesSSE(w, flusher, req.Model)
 				g.recordRequest(req.Model, 200, time.Since(start))
 				return
 			}
@@ -561,7 +561,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 				sleep, ok := cycleBackSleep(wait, walk, g.router.MaxInterruptionFor(req.Model))
 				if !ok {
 					log.Printf("[debug] session=%s model=%s -> responses stream cycle-back wait %v outlasts the remaining fallback budget %v; returning a degraded 200 completion", sessionID, req.Model, wait.Round(time.Millisecond), walk.remaining().Round(time.Millisecond))
-					writeDegradedSSE(w, flusher, "")
+					writeDegradedResponsesSSE(w, flusher, req.Model)
 					g.recordRequest(req.Model, 200, time.Since(start))
 					return
 				}
@@ -577,7 +577,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 				}
 				continue
 			}
-			writeDegradedSSE(w, flusher, "")
+			writeDegradedResponsesSSE(w, flusher, req.Model)
 			g.recordRequest(req.Model, 200, time.Since(start))
 			return
 		}

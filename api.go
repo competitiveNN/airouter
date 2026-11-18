@@ -3092,6 +3092,10 @@ func (g *GatewayContext) HandleAdminCooldowns(w http.ResponseWriter, r *http.Req
 // carries no secrets — only operational state. Operators that need auth on
 // every endpoint should sit a reverse proxy in front.
 func (g *GatewayContext) HandleAirouterState(w http.ResponseWriter, r *http.Request) {
+	if !g.checkAuth(r) {
+		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeAPIError(w, 405, "Method not allowed", "invalid_request_error", "method_not_allowed")
 		return

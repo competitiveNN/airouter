@@ -4024,8 +4024,14 @@ func failFastTestCase(t *testing.T, url, body string, wantInBody string) {
 	if strings.Contains(out, "unavailable") || strings.Contains(out, "busy") {
 		t.Fatalf("synthetic degraded message should be removed; response body:\n%s", out)
 	}
-	if !strings.Contains(out, `"content":""`) {
-		t.Fatalf("expected empty content in degraded response body:\n%s", out)
+	if strings.Contains(body, `"stream":true`) && url == "/v1/responses" {
+		if !strings.Contains(out, `event: response.completed`) {
+			t.Fatalf("expected response.completed event in responses stream degraded output:\n%s", out)
+		}
+	} else {
+		if !strings.Contains(out, `"content":""`) {
+			t.Fatalf("expected empty content in degraded response body:\n%s", out)
+		}
 	}
 	// With one-attempt-per-model, the handler fails fast without waiting
 	// for the 30s cooldown: no cycle-back wait.
