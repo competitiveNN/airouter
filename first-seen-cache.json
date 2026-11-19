@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-18T05:10:24.529080Z",
+  "fetched_at": "2026-11-19T05:07:40.481575Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
@@ -45,10 +45,10 @@
     "pulse-alpha-free": "2026-11-04",
     "recursive/flint-v1.0:free": "2026-11-18",
     "reflection/beam:free": "2026-10-17",
-    "space-bunny-free": "2026-09-26",
     "stealth/crouton-alpha": "2026-11-04",
     "stealth/glyph-cluster:free": "2026-10-08",
     "stepfun-ai/step-5-preview": "2026-10-16",
+    "tidepool-alpha-free": "2026-11-19",
     "z-ai/glm-5.3-flash": "2026-11-06"
   },
   "missing_since": {
@@ -58,6 +58,7 @@
     "databricks/dbrx-instruct": "2026-11-16",
     "deepseek-ai/deepseek-coder-6.7b-instruct": "2026-11-16",
     "deepseek-ai/deepseek-v4.1-flash": "2026-11-18",
+    "glm-5.3-flash-free": "2026-11-19",
     "ibm/granite-3.0-3b-a800m-instruct": "2026-11-16",
     "ibm/granite-3.0-8b-instruct": "2026-11-16",
     "jev-1.13-free": "2026-10-30",
@@ -69,7 +70,6 @@
     "poolside/laguna-xs-2.1:free": "2026-10-31",
     "pulse-alpha-free": "2026-11-07",
     "reflection/beam:free": "2026-11-10",
-    "space-bunny-free": "2026-10-20",
     "stealth/crouton-alpha": "2026-11-11"
   }
 }
