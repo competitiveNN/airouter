@@ -437,7 +437,13 @@ type trackWriter struct {
 
 func (t *trackWriter) Write(p []byte) (int, error) {
 	n, err := t.w.Write(p)
-	t.n += int64(n)
+	// Keepalive comments (": keepalive\n\n") must not count as committed
+	// client-visible output: they carry no content, so an attempt that only
+	// emitted keepalives before timing out can still be retried on the next
+	// API key without duplicating output.
+	if string(p) != ": keepalive\n\n" {
+		t.n += int64(n)
+	}
 	return n, err
 }
 
