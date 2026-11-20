@@ -982,6 +982,12 @@ type Preferences struct {
 	MaxUpstreamConcurrency *int `yaml:"max_upstream_concurrency,omitempty"`
 	// Alias key accepted from config headers.
 	MaxConcurrentUpstreams *int `yaml:"max_concurrent_upstreams,omitempty"`
+
+	// TorInstances is how many Tor daemons (outbound IPs) to spawn for the
+	// proxy pool. 0 disables Tor and falls back to the HTTP proxy sources.
+	// Exit nodes are restricted to the Americas and Europe and routing is
+	// tuned for fewer hops (faster circuits).
+	TorInstances int `yaml:"tor_instances,omitempty"`
 }
 
 // MaxLabelCardinalityValue returns the effective per-map label cap, clamped to
@@ -1041,6 +1047,17 @@ func (p *Preferences) RotationWindow() int {
 
 // CooldownJitterFraction returns the jitter fraction to apply to transient
 // cooldowns, clamped to [0, 0.25]. Nil preferences or an unset value yields 0.
+// TorInstancesValue returns the configured number of Tor outbound IPs (0 = disabled).
+func (p *Preferences) TorInstancesValue() int {
+	if p == nil {
+		return 0
+	}
+	if p.TorInstances < 0 {
+		return 0
+	}
+	return p.TorInstances
+}
+
 func (p *Preferences) CooldownJitterFraction() float64 {
 	if p == nil {
 		// Absent preferences block: built-in default spread so a freshly

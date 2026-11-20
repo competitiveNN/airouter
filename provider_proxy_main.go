@@ -556,11 +556,19 @@ func main() {
 	// whenever any provider needs it (opencode2/3/4 in the shipped config).
 	proxySourcesPath := filepath.Join(filepath.Dir(*configPath), "proxy_sources.txt")
 	proxySvc := NewProxyService(proxySourcesPath, 15*time.Minute)
-	if proxyEnabled(cfg) {
+	if ti := cfg.Preferences.TorInstancesValue(); ti > 0 {
+		proxySvc.EnableTor(ti)
+	}
+	if proxyEnabled(cfg) || proxySvc.TorMode() {
 		proxy.SetProxyService(proxySvc)
 		proxy.UpdateRequiredReady()
 		go proxySvc.Start(ctx)
-		log.Printf("Proxy service enabled (%d proxies must be ready)", proxySvc.RequiredReady())
+	defer proxySvc.Stop()
+		if proxySvc.TorMode() {
+			log.Printf("Proxy service enabled (tor mode, %d instances)", proxySvc.TorInstances())
+		} else {
+			log.Printf("Proxy service enabled (%d proxies must be ready)", proxySvc.RequiredReady())
+		}
 	}
 
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)

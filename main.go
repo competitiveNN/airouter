@@ -94,14 +94,20 @@ func main() {
 	// extra source they had configured.
 	proxySourcesPath := filepath.Join(filepath.Dir(*configPath), "proxy_sources.txt")
 	proxySvc := NewProxyService(proxySourcesPath, 15*time.Minute)
-	if proxyEnabled(cfg) {
+	if ti := cfg.Preferences.TorInstancesValue(); ti > 0 {
+		proxySvc.EnableTor(ti)
+	}
+	if proxyEnabled(cfg) || proxySvc.TorMode() {
 		proxy.SetProxyService(proxySvc)
-		// Seed the ready-pool requirement before the loop starts so the first
-		// top-up already knows how many proxies must be proven reachable.
 		proxy.UpdateRequiredReady()
 		go proxySvc.Start(ctx)
-		log.Printf("Proxy service enabled (pool refresh every 15 min, %d proxies must be ready)",
-			proxySvc.RequiredReady())
+	defer proxySvc.Stop()
+		if proxySvc.TorMode() {
+			log.Printf("Proxy service enabled (tor mode, %d instances)", proxySvc.TorInstances())
+		} else {
+			log.Printf("Proxy service enabled (pool refresh every 15 min, %d proxies must be ready)",
+				proxySvc.RequiredReady())
+		}
 	}
 
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)

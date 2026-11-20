@@ -188,6 +188,10 @@ preferences:
   #   another request is blocked. Omitting uses the built-in default.
   circuit_half_open_probes: 1
   # default_max_tokens: 0   # uncomment + set to override the auto behavior
+  #
+  # tor_instances: 4   # number of Tor daemons (outbound IPs) to spawn for the
+  #   proxy pool. 0 (default) disables Tor and uses HTTP proxy sources.
+  #   Exit nodes restricted to Americas + Europe; routing tuned for speed.
   #   Controls the output-token ceiling applied to requests that omit
   #   max_tokens. nil (absent) = auto (half of profile context window);
   #   0 = never default (send to provider as-is); positive = absolute value.

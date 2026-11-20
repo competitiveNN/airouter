@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
+
+	"github.com/nao1215/tornago"
 )
 
 // ProxyInfo describes a single proxy server in the pool.
@@ -158,6 +161,13 @@ type ProxyService struct {
 	// needs N proxies has N ready to draw on. Pushed in from the config by
 	// Proxy.UpdateRequiredReady on startup and on every hot reload.
 	required atomic.Int32
+
+	// Tor mode: when torInstances > 0 the pool is backed by that many Tor
+	// daemons instead of fetched HTTP proxy lists.
+	torInstances int
+	torMode      bool
+	torMu        sync.Mutex
+	torProcesses []*tornago.TorProcess
 
 	// probeTargets are the real provider base URLs the readiness probe tunnels
 	// through the proxy and performs a TLS handshake against, so an MITM or
@@ -1184,6 +1194,36 @@ func (s *ProxyService) SetRequiredReady(n int) {
 // RequiredReady returns the current minimum.
 func (s *ProxyService) RequiredReady() int { return int(s.required.Load()) }
 
+// EnableTor switches the service into Tor-backed mode: instead of fetching HTTP
+// proxy lists it spawns n Tor daemons, each providing one outbound IP (exit
+// node). Exit nodes are restricted to the Americas and Europe and routing is
+// tuned for fewer hops. n <= 0 disables Tor mode.
+func (s *ProxyService) EnableTor(n int) {
+	s.torMu.Lock()
+	defer s.torMu.Unlock()
+	if n <= 0 {
+		s.torInstances = 0
+		s.torMode = false
+		return
+	}
+	s.torInstances = n
+	s.torMode = true
+}
+
+// TorMode reports whether the service is backed by Tor.
+func (s *ProxyService) TorMode() bool {
+	s.torMu.Lock()
+	defer s.torMu.Unlock()
+	return s.torMode
+}
+
+// TorInstances returns the configured number of Tor daemons.
+func (s *ProxyService) TorInstances() int {
+	s.torMu.Lock()
+	defer s.torMu.Unlock()
+	return s.torInstances
+}
+
 // SetProbeTargets stores the provider base URLs the readiness probe tunnels
 // through each proxy and verifies TLS against. Only HTTPS targets are useful
 // for catching MITM proxies; non-HTTPS (or empty) targets are ignored, and
@@ -1378,10 +1418,28 @@ func (s *ProxyService) Start(ctx context.Context) {
 	}
 	defer s.running.Store(false)
 
+	// Tor-backed mode: spawn N tor daemons and use them as the proxy pool.
+	// No HTTP source fetching or refresh loop.
+	if s.TorMode() {
+		s.startTorInstances(ctx)
+		// keep alive until stopped
+		for {
+			select {
+			case <-ctx.Done():
+				s.stopTorInstances()
+				return
+			case <-s.stopCh:
+				s.stopTorInstances()
+				return
+			}
+		}
+	}
+
 	// Immediate refresh so the pool is populated before the first request, then
 	// an immediate top-up so the ready pool is already at its required size
 	// instead of getting there one slow request at a time.
 	s.refresh(ctx)
+	s.topUpReady(ctx)
 	s.topUpReady(ctx)
 
 	refreshTicker := time.NewTicker(s.refreshInterval)
@@ -1410,6 +1468,114 @@ func (s *ProxyService) Start(ctx context.Context) {
 // Stop signals the refresh loop to exit.
 func (s *ProxyService) Stop() {
 	close(s.stopCh)
+}
+
+// torExitNodes is the set of exit-node country codes (Americas + Europe) Tor
+// is restricted to, keeping circuits on fast, nearby exits.
+var torExitNodes = "{us},{ca},{mx},{ar},{br},{cl},{co},{pe},{ve},{de},{fr},{gb},{nl},{se},{ch},{it},{es},{pl},{pt},{be},{at},{cz},{dk},{fi},{no},{ie},{gr},{hu},{ro}"
+
+// startTorInstances spawns s.torInstances Tor daemons and registers their SOCKS5
+// endpoints in the pool as ready proxies.
+func (s *ProxyService) startTorInstances(ctx context.Context) {
+	n := s.torInstances
+	if n <= 0 {
+		return
+	}
+	s.torMu.Lock()
+	defer s.torMu.Unlock()
+
+	var list []*ProxyInfo
+	for i := 0; i < n; i++ {
+		dataDir := filepath.Join(os.TempDir(), fmt.Sprintf("airouter-tor-%d", i))
+		if err := os.MkdirAll(dataDir, 0o700); err != nil {
+			log.Printf("[tor] cannot create data dir: %v", err)
+			continue
+		}
+		// resolve free ports
+		socksAddr, err := resolveFreeAddr()
+		if err != nil {
+			log.Printf("[tor] socks addr: %v", err)
+			continue
+		}
+		controlAddr, err := resolveFreeAddr()
+		if err != nil {
+			log.Printf("[tor] control addr: %v", err)
+			continue
+		}
+		cookiePath := filepath.Join(dataDir, "control_auth_cookie")
+		torrcPath := filepath.Join(dataDir, "torrc")
+		torrc := fmt.Sprintf(`SocksPort %s
+ControlPort %s
+DataDirectory %s
+CookieAuthentication 1
+CookieAuthFile %s
+ClientUseIPv6 0
+RunAsDaemon 0
+Log notice stdout
+ExitNodes %s
+StrictNodes 1
+NumEntryGuards 1
+`, socksAddr, controlAddr, dataDir, cookiePath, torExitNodes)
+		if err := os.WriteFile(torrcPath, []byte(torrc), 0o600); err != nil {
+			log.Printf("[tor] write torrc: %v", err)
+			continue
+		}
+		cfg, err := tornago.NewTorLaunchConfig(
+			tornago.WithTorSocksAddr(socksAddr),
+			tornago.WithTorControlAddr(controlAddr),
+			tornago.WithTorDataDir(dataDir),
+			tornago.WithTorConfigFile(torrcPath),
+			tornago.WithTorStartupTimeout(90*time.Second),
+		)
+		if err != nil {
+			log.Printf("[tor] launch config error: %v", err)
+			continue
+		}
+		proc, err := tornago.StartTorDaemon(cfg)
+		if err != nil {
+			log.Printf("[tor] failed to start daemon %d: %v", i, err)
+			continue
+		}
+		s.torProcesses = append(s.torProcesses, proc)
+		host, port, err := net.SplitHostPort(proc.SocksAddr())
+		if err != nil {
+			log.Printf("[tor] bad socks addr %q: %v", proc.SocksAddr(), err)
+			continue
+		}
+		list = append(list, &ProxyInfo{
+			URL:      "socks5://" + net.JoinHostPort(host, port),
+			Protocol: "socks5",
+			IP:       host,
+			Port:     port,
+		})
+	}
+	s.pool.set(list)
+	for _, p := range list {
+		s.markReady(p.URL, 0)
+	}
+	log.Printf("[tor] started %d/%d instances", len(list), n)
+}
+
+// resolveFreeAddr returns a 127.0.0.1:0-resolved listen address string.
+func resolveFreeAddr() (string, error) {
+	lc := net.ListenConfig{}
+	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return addr, nil
+}
+
+// stopTorInstances terminates all spawned Tor daemons.
+func (s *ProxyService) stopTorInstances() {
+	s.torMu.Lock()
+	defer s.torMu.Unlock()
+	for _, p := range s.torProcesses {
+		_ = p.Stop()
+	}
+	s.torProcesses = nil
 }
 
 // TransportFor returns an http.Transport configured to route through the given
