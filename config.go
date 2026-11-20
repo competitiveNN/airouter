@@ -1093,10 +1093,10 @@ const DefaultCircuitHalfOpenProbes = 1
 
 // DefaultCommandCodeProxyMaxConcurrent is the built-in default cap for
 // concurrent Command Code proxy requests when neither the config nor the
-// CLI flag set one. 4 matches the rate-limit profile of the upstream
-// (4 concurrent, 30 req/min) so the gateway never outpaces what the
+// CLI flag set one. 16 matches the rate-limit profile of the upstream
+// (16 concurrent, 30 req/min) so the gateway never outpaces what the
 // provider tolerates.
-const DefaultCommandCodeProxyMaxConcurrent = 4
+const DefaultCommandCodeProxyMaxConcurrent = 16
 
 // CircuitBreakerThresholdValue returns the effective threshold. nil (absent)
 // falls back to DefaultCircuitBreakerThreshold; an explicit 0 disables the
