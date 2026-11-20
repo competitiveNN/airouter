@@ -371,6 +371,35 @@ func (p *Proxy) MarkProxyDown(proxyURL string, d time.Duration) {
 	}
 }
 
+func (p *Proxy) BlacklistProxy(proxyURL string) {
+	p.proxyMu.RLock()
+	svc := p.proxySvc
+	p.proxyMu.RUnlock()
+	if svc != nil {
+		svc.Blacklist(proxyURL)
+	}
+}
+func (p *Proxy) MarkProxyBlacklisted(proxyURL string) { p.BlacklistProxy(proxyURL) }
+func (p *Proxy) IsProxyBlacklisted(proxyURL string) bool {
+	p.proxyMu.RLock()
+	svc := p.proxySvc
+	p.proxyMu.RUnlock()
+	if svc == nil {
+		return false
+	}
+	return svc.IsBlacklisted(proxyURL)
+}
+
+func (p *Proxy) ProxySourceStats() []ProxySourceStat {
+	p.proxyMu.RLock()
+	svc := p.proxySvc
+	p.proxyMu.RUnlock()
+	if svc == nil {
+		return nil
+	}
+	return svc.ProxySourceStats()
+}
+
 // MarkProxyReady records that a proxy was just proven usable, so it counts
 // against the ready-pool requirement. Called only on a real success through the
 // proxy, which is the strongest evidence available.
@@ -517,11 +546,28 @@ func (p *Proxy) UpdateRequiredReady() {
 	}
 	p.proxyMu.RLock()
 	svc := p.proxySvc
+	cfg := p.config.Load()
 	p.proxyMu.RUnlock()
 	if svc == nil {
 		return
 	}
 	svc.SetRequiredReady(p.requiredProxyTries())
+	// Keep the readiness probe's target list in sync with the configured
+	// providers, so proxies are verified against the real origins they will
+	// carry traffic for.
+	if cfg != nil {
+		seen := make(map[string]bool)
+		var targets []string
+		for _, pc := range cfg.Providers {
+			u := strings.TrimSpace(pc.URL)
+			if u == "" || seen[u] {
+				continue
+			}
+			seen[u] = true
+			targets = append(targets, u)
+		}
+		svc.SetProbeTargets(targets)
+	}
 }
 
 // commandCodeClient returns the HTTP client Command Code upstreams

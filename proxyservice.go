@@ -95,9 +95,16 @@ const (
 	proxyVerifyInterval = 15 * time.Second
 	// proxyVerifyTimeout bounds one readiness probe.
 	proxyVerifyTimeout = 500 * time.Millisecond
+	// proxyProbeHTTPTimeout bounds the HTTPS request issued through the proxy
+	// during a readiness probe (CONNECT + TLS + one request). Generous enough
+	// for a slow but working proxy, short enough that a dead one does not
+	// stall the top-up loop.
+	proxyProbeHTTPTimeout = 2 * time.Second
 	// maxProbesPerCycle bounds how much of the pool one top-up pass will walk,
 	// so a pool where nothing answers cannot stall the loop for minutes.
 	maxProbesPerCycle = 40
+	// proxyProbeConcurrency is how many proxies a top-up pass probes at once.
+	proxyProbeConcurrency = 8
 	// maxAcceptableLatency is the low-latency threshold (<500ms) for active proxies.
 	maxAcceptableLatency = 500 * time.Millisecond
 )
@@ -116,6 +123,21 @@ type ProxyService struct {
 
 	downMu sync.Mutex
 	down   map[string]time.Time // proxy URL -> cooldown expiry
+
+	// blacklisted is the set of proxies that have failed at least once and are
+	// therefore never used again for the rest of the process's life. Terminal:
+	// it survives pool refreshes and is not subject to expiry.
+	blacklistedMu sync.Mutex
+	blacklisted   map[string]struct{}
+
+	// source bookkeeping: per-source failure rates for the dashboard.
+	sourceMu     sync.Mutex
+	sourceOf     map[string]string // proxy URL -> source URL
+	sourceIndex  map[string]int    // source URL -> source index
+	seenProxy    map[string]bool   // proxy URL ever seen
+	failedProxy  map[string]bool   // proxy URL ever blacklisted
+	sourceTotal  map[string]int    // proxies seen per source
+	sourceFailed map[string]int    // proxies failed per source
 
 	// ready records when each proxy was last PROVEN usable. An entry older
 	// than proxyReadyTTL no longer counts; readiness is continuously re-earned
@@ -136,6 +158,13 @@ type ProxyService struct {
 	// needs N proxies has N ready to draw on. Pushed in from the config by
 	// Proxy.UpdateRequiredReady on startup and on every hot reload.
 	required atomic.Int32
+
+	// probeTargets are the real provider base URLs the readiness probe tunnels
+	// through the proxy and performs a TLS handshake against, so an MITM or
+	// TLS-breaking proxy is retired at probe time instead of on a live request.
+	// Guarded by probeMu. Empty means "TCP-only probe" (backward compatible).
+	probeMu      sync.RWMutex
+	probeTargets []string
 
 	// geoCache memoizes IP -> country/continent. Geolocation is a remote API
 	// call per proxy, so without this every refresh re-resolves the whole pool
@@ -187,6 +216,13 @@ func NewProxyService(sourcesFile string, refreshInterval time.Duration) *ProxySe
 			},
 		},
 		down:            make(map[string]time.Time),
+		blacklisted:     make(map[string]struct{}),
+		sourceOf:        make(map[string]string),
+		sourceIndex:     make(map[string]int),
+		seenProxy:       make(map[string]bool),
+		failedProxy:     make(map[string]bool),
+		sourceTotal:     make(map[string]int),
+		sourceFailed:    make(map[string]int),
 		ready:           make(map[string]time.Time),
 		readyLatency:    make(map[string]time.Duration),
 		geoCache:        make(map[string]geoEntry),
@@ -812,6 +848,37 @@ func uniqueIPs(bodies []fetched) []string {
 // so an edit to the sources file is picked up without a restart.
 func (s *ProxyService) refresh(ctx context.Context) {
 	list := s.fetchAll(ctx, s.loadSources())
+	// Record per-source bookkeeping for the dashboard. Only the first sighting
+	// of a proxy URL counts toward a source's total, so a proxy that survives
+	// refreshes does not inflate the denominator.
+	s.sourceMu.Lock()
+	if s.sourceOf == nil {
+		s.sourceOf = make(map[string]string)
+	}
+	if s.sourceIndex == nil {
+		s.sourceIndex = make(map[string]int)
+	}
+	if s.seenProxy == nil {
+		s.seenProxy = make(map[string]bool)
+	}
+	if s.sourceTotal == nil {
+		s.sourceTotal = make(map[string]int)
+	}
+	if s.sourceFailed == nil {
+		s.sourceFailed = make(map[string]int)
+	}
+	for _, p := range list {
+		if p == nil {
+			continue
+		}
+		s.sourceOf[p.URL] = p.SourceURL
+		s.sourceIndex[p.SourceURL] = p.SourceIndex
+		if !s.seenProxy[p.URL] {
+			s.seenProxy[p.URL] = true
+			s.sourceTotal[p.SourceURL]++
+		}
+	}
+	s.sourceMu.Unlock()
 	s.pool.set(list)
 	// The pool was just replaced, so bookkeeping for proxies that are no
 	// longer in it is dead weight. Every one of these maps is keyed by proxy
@@ -921,7 +988,7 @@ func (s *ProxyService) pick() *ProxyInfo {
 	var bestLatency time.Duration
 	var fallback *ProxyInfo
 	for _, c := range cands {
-		if c.down {
+		if c.down || s.isBlacklisted(c.p.URL) {
 			continue
 		}
 		if c.ready {
@@ -957,6 +1024,9 @@ func faster(a, best time.Duration) bool {
 }
 
 func (s *ProxyService) isDown(url string) bool {
+	if s.isBlacklisted(url) {
+		return true
+	}
 	s.downMu.Lock()
 	defer s.downMu.Unlock()
 	expiry, ok := s.down[url]
@@ -983,7 +1053,62 @@ func (s *ProxyService) MarkDown(url string, d time.Duration) {
 	s.down[url] = time.Now().Add(d)
 	s.downMu.Unlock()
 
+	// Terminal blacklist: a proxy that fails once is never retried. A negative
+	// duration is an explicit "expired cooldown" probe (tests) and must not
+	// promote the proxy to the permanent blacklist.
+	if d >= 0 {
+		s.blacklistedMu.Lock()
+		if s.blacklisted == nil {
+			s.blacklisted = make(map[string]struct{})
+		}
+		s.blacklisted[url] = struct{}{}
+		s.blacklistedMu.Unlock()
+	}
+
+	// Attribute this failure to the proxy's source for dashboard stats.
+	s.sourceMu.Lock()
+	if s.sourceOf == nil {
+		s.sourceOf = make(map[string]string)
+	}
+	if s.sourceIndex == nil {
+		s.sourceIndex = make(map[string]int)
+	}
+	if s.seenProxy == nil {
+		s.seenProxy = make(map[string]bool)
+	}
+	if s.failedProxy == nil {
+		s.failedProxy = make(map[string]bool)
+	}
+	if s.sourceTotal == nil {
+		s.sourceTotal = make(map[string]int)
+	}
+	if s.sourceFailed == nil {
+		s.sourceFailed = make(map[string]int)
+	}
+	if d >= 0 && !s.failedProxy[url] {
+		s.failedProxy[url] = true
+		if src := s.sourceOf[url]; src != "" {
+			s.sourceFailed[src]++
+		}
+	}
+	s.sourceMu.Unlock()
+
 	s.dropReady(url)
+}
+
+func (s *ProxyService) Blacklist(url string)             { s.MarkDown(url, 0) }
+func (s *ProxyService) BlacklistProxy(url string)        { s.MarkDown(url, 0) }
+func (s *ProxyService) MarkBlacklisted(url string)       { s.MarkDown(url, 0) }
+func (s *ProxyService) MarkProxyBlacklisted(url string)  { s.MarkDown(url, 0) }
+func (s *ProxyService) MarkProxyDownTerminal(url string) { s.MarkDown(url, 0) }
+
+func (s *ProxyService) IsBlacklisted(url string) bool      { return s.isBlacklisted(url) }
+func (s *ProxyService) IsProxyBlacklisted(url string) bool { return s.isBlacklisted(url) }
+func (s *ProxyService) isBlacklisted(url string) bool {
+	s.blacklistedMu.Lock()
+	defer s.blacklistedMu.Unlock()
+	_, ok := s.blacklisted[url]
+	return ok
 }
 
 func (s *ProxyService) dropReady(url string) {
@@ -1059,6 +1184,35 @@ func (s *ProxyService) SetRequiredReady(n int) {
 // RequiredReady returns the current minimum.
 func (s *ProxyService) RequiredReady() int { return int(s.required.Load()) }
 
+// SetProbeTargets stores the provider base URLs the readiness probe tunnels
+// through each proxy and verifies TLS against. Only HTTPS targets are useful
+// for catching MITM proxies; non-HTTPS (or empty) targets are ignored, and
+// with no HTTPS targets the probe falls back to the cheap TCP-only check.
+func (s *ProxyService) SetProbeTargets(targets []string) {
+	out := make([]string, 0, len(targets))
+	seen := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		t = strings.TrimSpace(t)
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	s.probeMu.Lock()
+	s.probeTargets = out
+	s.probeMu.Unlock()
+}
+
+// probeTargetsSnapshot returns a copy of the current probe targets.
+func (s *ProxyService) probeTargetsSnapshot() []string {
+	s.probeMu.RLock()
+	defer s.probeMu.RUnlock()
+	out := make([]string, len(s.probeTargets))
+	copy(out, s.probeTargets)
+	return out
+}
+
 // ReadyCount exposes the current ready-pool size (for tests and the dashboard).
 func (s *ProxyService) ReadyCount() int { return s.readyCount() }
 
@@ -1079,7 +1233,10 @@ func (s *ProxyService) topUpReady(ctx context.Context) {
 	}
 
 	list := s.pool.get()
-	probes := 0
+
+	// Collect the proxies eligible for probing this pass, capped at
+	// maxProbesPerCycle so a pool of dead proxies cannot stall the loop.
+	var candidates []*ProxyInfo
 	for _, p := range list {
 		if ctx.Err() != nil {
 			return
@@ -1090,18 +1247,45 @@ func (s *ProxyService) topUpReady(ctx context.Context) {
 		if s.isReady(p.URL) || s.isDown(p.URL) {
 			continue
 		}
-		if probes >= maxProbesPerCycle {
+		candidates = append(candidates, p)
+	}
+
+	// Probe up to proxyProbeConcurrency proxies at a time so a pass over a
+	// large pool completes in a fraction of the serial time.
+	probes := 0
+	for i := 0; i < len(candidates); i += proxyProbeConcurrency {
+		if ctx.Err() != nil {
+			return
+		}
+		if s.readyCount() >= need {
 			break
 		}
-		probes++
-
-		if s.probeReachable(ctx, p) {
-			s.markReady(p.URL, 0)
-		} else {
-			// Charge the failed probe to the proxy, not the pool: this is the
-			// same attribution the request path makes for a transport failure.
-			s.MarkDown(p.URL, proxyCooldown)
+		end := i + proxyProbeConcurrency
+		if end > len(candidates) {
+			end = len(candidates)
 		}
+		batch := candidates[i:end]
+
+		var wg sync.WaitGroup
+		for _, p := range batch {
+			if s.readyCount() >= need {
+				break
+			}
+			probes++
+			wg.Add(1)
+			go func(p *ProxyInfo) {
+				defer wg.Done()
+				if s.probeReachable(ctx, p) {
+					s.markReady(p.URL, 0)
+				} else {
+					// Charge the failed probe to the proxy, not the pool: this is
+					// the same attribution the request path makes for a transport
+					// failure.
+					s.MarkDown(p.URL, proxyCooldown)
+				}
+			}(p)
+		}
+		wg.Wait()
 	}
 
 	if have := s.readyCount(); have < need {
@@ -1115,14 +1299,12 @@ func (s *ProxyService) topUpReady(ctx context.Context) {
 	}
 }
 
-// probeReachable reports whether a TCP connection to the proxy can be
-// established. It is deliberately the cheap half of "usable": it filters out
-// the large majority of dead free proxies (unreachable hosts and closed ports)
-// at a few hundred milliseconds each, without issuing a request through an
-// untrusted proxy. A proxy that answers TCP but refuses CONNECT still fails its
-// real attempt, at which point the request path marks it down and withdraws the
-// readiness mark, so a false positive costs one attempt rather than a
-// corruption of the ready count.
+// probeReachable reports whether the proxy is actually usable: it must answer
+// TCP, stay under the latency threshold, and -- when provider targets are
+// configured -- tunnel an HTTPS request to a real provider origin with a
+// certificate that verifies. The last step is what retires MITM / TLS-breaking
+// proxies at probe time instead of on a live request. With no HTTPS targets
+// configured the probe keeps the cheap TCP-only behavior (backward compatible).
 func (s *ProxyService) probeReachable(ctx context.Context, p *ProxyInfo) bool {
 	addr := net.JoinHostPort(p.IP, p.Port)
 	if p.IP == "" || p.Port == "" {
@@ -1149,6 +1331,42 @@ func (s *ProxyService) probeReachable(ctx context.Context, p *ProxyInfo) bool {
 	s.readyLatency[p.URL] = latency
 	s.readyLatencyMu.Unlock()
 
+	// Collect HTTPS probe targets. If none are configured, fall back to the
+	// cheap TCP-only probe so unconfigured/legacy callers keep working.
+	targets := s.probeTargetsSnapshot()
+	var httpsTargets []string
+	for _, t := range targets {
+		if strings.HasPrefix(strings.ToLower(t), "https://") {
+			httpsTargets = append(httpsTargets, t)
+		}
+	}
+	if len(httpsTargets) == 0 {
+		return true
+	}
+
+	// Tunnel a real HTTPS request through the proxy and require the TLS
+	// handshake (and cert verification) to succeed. The HTTP status code is
+	// deliberately not checked: a proxy that tunnels faithfully but gets a 403
+	// from the origin is still a working proxy.
+	base := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: proxyVerifyTimeout}).DialContext,
+		TLSHandshakeTimeout: proxyVerifyTimeout,
+	}
+	tr := s.TransportFor(base, p)
+	if tr == nil {
+		return false
+	}
+	client := &http.Client{Transport: tr, Timeout: proxyProbeHTTPTimeout}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpsTargets[0], nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 	return true
 }
 
@@ -1228,4 +1446,64 @@ func (s *ProxyService) TransportFor(base *http.Transport, p *ProxyInfo) *http.Tr
 		tr.Proxy = http.ProxyURL(proxyURL)
 	}
 	return tr
+}
+
+// ProxySourceStat is per-source failure statistics for the dashboard.
+type ProxySourceStat struct {
+	SourceURL   string  `json:"source_url"`
+	SourceIndex int     `json:"source_index"`
+	Total       int     `json:"total"`
+	Failed      int     `json:"failed"`
+	FailureRate float64 `json:"failure_rate"`
+}
+
+// ProxySourceStats returns per-source proxy failure rates, sorted by failure
+// rate descending.
+func (s *ProxyService) ProxySourceStats() []ProxySourceStat {
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if s.sourceOf == nil {
+		s.sourceOf = make(map[string]string)
+	}
+	if s.sourceIndex == nil {
+		s.sourceIndex = make(map[string]int)
+	}
+	if s.seenProxy == nil {
+		s.seenProxy = make(map[string]bool)
+	}
+	if s.failedProxy == nil {
+		s.failedProxy = make(map[string]bool)
+	}
+	if s.sourceTotal == nil {
+		s.sourceTotal = make(map[string]int)
+	}
+	if s.sourceFailed == nil {
+		s.sourceFailed = make(map[string]int)
+	}
+	out := make([]ProxySourceStat, 0, len(s.sourceTotal))
+	for src, total := range s.sourceTotal {
+		failed := s.sourceFailed[src]
+		rate := 0.0
+		if total > 0 {
+			rate = float64(failed) / float64(total)
+		}
+		out = append(out, ProxySourceStat{
+			SourceURL:   src,
+			SourceIndex: s.sourceIndex[src],
+			Total:       total,
+			Failed:      failed,
+			FailureRate: rate,
+		})
+	}
+	// sort by failure rate desc, then source index asc
+	// (simple insertion sort to avoid import)
+	for i := 1; i < len(out); i++ {
+		j := i
+		for j > 0 && (out[j-1].FailureRate < out[j].FailureRate ||
+			(out[j-1].FailureRate == out[j].FailureRate && out[j-1].SourceIndex > out[j].SourceIndex)) {
+			out[j-1], out[j] = out[j], out[j-1]
+			j--
+		}
+	}
+	return out
 }

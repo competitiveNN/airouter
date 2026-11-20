@@ -210,6 +210,8 @@ type dashboardResponse struct {
 	// way to see the backoff the chains card only summarises, and no way to
 	// clear it without restarting the daemon.
 	Cooldowns map[string]CooldownEntry   `json:"cooldowns"`
+	// ProxySources carries per-source proxy failure rates for the dashboard.
+	ProxySources []ProxySourceStat `json:"proxy_sources"`
 	Circuits  map[string]*CircuitBreaker `json:"circuits"`
 	// SqliteStats carries a read-only snapshot of every table in the state
 	// database (priorities/TPS, sticky sessions, meta) plus its path and

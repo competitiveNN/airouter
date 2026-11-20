@@ -3319,6 +3319,7 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		Cooldowns:      g.router.GetAllCooldowns(),
 		Circuits:       g.router.GetAllCircuits(),
 		SqliteStats:    g.router.GetAllSqliteStats(),
+		ProxySources:    g.proxy.ProxySourceStats(),
 	}
 
 	if g.configPath != "" {

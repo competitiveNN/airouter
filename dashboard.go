@@ -136,6 +136,11 @@ details.tree[open]>summary{margin-bottom:.3rem}
       </div>
     </div>
   </div>
+<div class="card">
+  <h2>Proxy sources (highest failure rate)</h2>
+  <p>Proxy list sources ranked by the share of their proxies that have failed.</p>
+  <table><thead><tr><th class="clamp">Source</th><th>Total</th><th>Failed</th><th>Fail %</th></tr></thead><tbody id="proxySources"></tbody></table>
+</div>
 </div>
 
 <!-- PAGE 3: Errors, Cooldowns & SQLite Stats -->
@@ -500,6 +505,24 @@ function renderSqliteStats(stats){
   }
 }
 
+
+function renderProxySources(rows){
+  const tbody=document.getElementById('proxySources');
+  if(!tbody) return;
+  tbody.innerHTML='';
+  if(!rows || !rows.length){
+    const tr=document.createElement('tr'); const td=document.createElement('td'); td.colSpan=4; td.textContent='No proxy source data.'; tr.appendChild(td); tbody.appendChild(tr); return;
+  }
+  for(const r of rows){
+    const tr=document.createElement('tr');
+    const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=r.source_url||r.source||'—'; td0.title=r.source_url||''; tr.appendChild(td0);
+    const td1=document.createElement('td'); td1.className='num'; td1.textContent=r.total||0; tr.appendChild(td1);
+    const td2=document.createElement('td'); td2.className='num'; td2.textContent=r.failed||0; tr.appendChild(td2);
+    const td3=document.createElement('td'); td3.className='num'; td3.textContent=((r.failure_rate||0)*100).toFixed(1)+'%'; tr.appendChild(td3);
+    tbody.appendChild(tr);
+  }
+}
+
 function updateClearButton(){
   const btn=document.getElementById('clearSelected');
   if(btn) btn.disabled=cooldownSelection.size===0;
@@ -544,6 +567,7 @@ async function refresh(){
     renderBoard('sessions', sessRows, [[r=>r.sessions,v=>v]]);
     if(d.cooldowns||d.circuits) renderCooldowns(d);
     if(d.sqlite_stats) renderSqliteStats(d.sqlite_stats);
+    if(d.proxy_sources) renderProxySources(d.proxy_sources);
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
 }

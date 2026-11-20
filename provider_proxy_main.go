@@ -23,6 +23,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -368,6 +369,12 @@ func (s *providerServer) forwardChat(w http.ResponseWriter, r *http.Request, bod
 		if err != nil {
 			lastErr = err
 			log.Printf("[provider-proxy] %s/%s (key %d) forward failed: %v", endpoint.Provider, endpoint.Model, idx, err)
+			var pErr *ProxyError
+			if errors.As(err, &pErr) {
+				if url := pErr.ProxyURL(); url != "" {
+					s.gateway.proxy.MarkProxyDown(url, proxyCooldown)
+				}
+			}
 			continue
 		}
 
@@ -485,6 +492,12 @@ func (s *providerServer) streamChat(w http.ResponseWriter, r *http.Request, body
 			return
 		}
 		log.Printf("[provider-proxy] %s/%s (key %d) stream failed: %v", endpoint.Provider, endpoint.Model, idx, err)
+		var pErr *ProxyError
+		if errors.As(err, &pErr) {
+			if url := pErr.ProxyURL(); url != "" {
+				s.gateway.proxy.MarkProxyDown(url, proxyCooldown)
+			}
+		}
 		// If bytes already reached the client we cannot transparently retry
 		// on another key without duplicating output; stop here.
 		if tw.n > 0 {
@@ -565,6 +578,9 @@ func main() {
 	mux.HandleFunc("/models", ps.handleModels)
 	mux.HandleFunc("/v1/chat/completions", ps.handleChatCompletions)
 	mux.HandleFunc("/metrics", gateway.HandleMetrics)
+	mux.HandleFunc("/admin/dashboard", gateway.HandleAdminDashboard)
+	mux.HandleFunc("/admin/dashboard/data", gateway.HandleAdminDashboardData)
+	mux.HandleFunc("/admin/", gateway.HandleAdminDashboard)
 
 	server := &http.Server{
 		Addr:              ":" + *port,
