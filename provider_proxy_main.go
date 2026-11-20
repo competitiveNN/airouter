@@ -308,31 +308,123 @@ func (s *providerServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 	s.forwardChat(w, r, body, endpoint, sessionID)
 }
 
+// retryableProxyStatus reports whether an upstream HTTP status should cause a
+// retry on the next API key of a multi-key provider. Rate limits, auth
+// failures and server errors are key-specific or transient; other 4xx are
+// request-level and won't improve by switching keys.
+func retryableProxyStatus(code int) bool {
+	if code == http.StatusUnauthorized || code == http.StatusForbidden || code == http.StatusTooManyRequests {
+		return true
+	}
+	return code >= 500
+}
+
+func providerAPIKeyCount(cfg *Config, provider string) int {
+	if cfg != nil {
+		if pc, ok := cfg.Providers[provider]; ok {
+			if n := pc.NumAPIKeys(); n > 0 {
+				return n
+			}
+		}
+	}
+	return 1
+}
+
 func (s *providerServer) forwardChat(w http.ResponseWriter, r *http.Request, body []byte, endpoint ModelEndpoint, sessionID string) {
 	// Proxy.Forward applies the provider's configured timeout itself; the
 	// outer deadline only prevents an unbounded hang when the provider has no
 	// timeout of its own.
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
 	defer cancel()
-	resp, release, err := s.gateway.proxy.Forward(ctx, body, endpoint, sessionID)
-	if err != nil {
-		log.Printf("[provider-proxy] %s/%s forward failed: %v", endpoint.Provider, endpoint.Model, err)
-		writeAPIError(w, http.StatusBadGateway, "Upstream error", "upstream_error", "upstream_unavailable")
-		return
-	}
-	defer resp.Body.Close()
-	defer release()
 
-	for k, v := range resp.Header {
-		if isHopByHopHeader(k) {
+	cfg := s.gateway.config.Load()
+	numKeys := providerAPIKeyCount(cfg, endpoint.Provider)
+
+	// Rotate the starting key by session so load spreads across keys
+	// (round-robin) instead of always hammering key 0 first.
+	start := 0
+	if sessionID != "" && numKeys > 1 {
+		h := 0
+		for _, c := range sessionID {
+			h = h*31 + int(c)
+		}
+		if h < 0 {
+			h = -h
+		}
+		start = h % numKeys
+	}
+
+	var lastErr error
+	var lastStatus int
+	var lastHeaders http.Header
+	var lastBody []byte
+
+	for i := 0; i < numKeys; i++ {
+		idx := (start + i) % numKeys
+		ep := endpoint
+		ep.APIKeyIndex = idx
+
+		resp, release, err := s.gateway.proxy.Forward(ctx, body, ep, sessionID)
+		if err != nil {
+			lastErr = err
+			log.Printf("[provider-proxy] %s/%s (key %d) forward failed: %v", endpoint.Provider, endpoint.Model, idx, err)
 			continue
 		}
-		w.Header()[k] = v
+
+		// Read the body up front so we can either forward it (success or a
+		// non-retryable client error) or retry on the next key.
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes+1))
+		resp.Body.Close()
+		release()
+
+		if readErr != nil {
+			lastErr = readErr
+			lastStatus = http.StatusBadGateway
+			log.Printf("[provider-proxy] %s/%s (key %d) response read failed: %v", endpoint.Provider, endpoint.Model, idx, readErr)
+			continue
+		}
+
+		if resp.StatusCode < 400 || !retryableProxyStatus(resp.StatusCode) {
+			// Success, or a non-retryable client error: forward verbatim.
+			for k, v := range resp.Header {
+				if isHopByHopHeader(k) {
+					continue
+				}
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+			if _, err := w.Write(raw); err != nil {
+				log.Printf("[provider-proxy] %s/%s response write failed: %v", endpoint.Provider, endpoint.Model, err)
+			}
+			return
+		}
+
+		// Retryable HTTP failure: remember it in case every key fails, then
+		// try the next key.
+		lastStatus = resp.StatusCode
+		lastHeaders = resp.Header.Clone()
+		lastBody = raw
+		log.Printf("[provider-proxy] %s/%s (key %d) returned %d, retrying next key", endpoint.Provider, endpoint.Model, idx, resp.StatusCode)
 	}
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("[provider-proxy] %s/%s response copy failed: %v", endpoint.Provider, endpoint.Model, err)
+
+	// All keys exhausted.
+	if lastStatus != 0 {
+		for k, v := range lastHeaders {
+			if isHopByHopHeader(k) {
+				continue
+			}
+			w.Header()[k] = v
+		}
+		w.WriteHeader(lastStatus)
+		if _, err := w.Write(lastBody); err != nil {
+			log.Printf("[provider-proxy] %s/%s response write failed: %v", endpoint.Provider, endpoint.Model, err)
+		}
+		return
 	}
+	if lastErr != nil {
+		log.Printf("[provider-proxy] %s/%s all keys failed: %v", endpoint.Provider, endpoint.Model, lastErr)
+	}
+	writeAPIError(w, http.StatusBadGateway, "Upstream error", "upstream_error", "upstream_unavailable")
 }
 
 // trackWriter counts bytes that reach the client so a streaming attempt that
@@ -361,12 +453,38 @@ func (s *providerServer) streamChat(w http.ResponseWriter, r *http.Request, body
 	}
 
 	tw := &trackWriter{w: w}
-	opts := StreamAttemptOptions{KeepaliveInterval: prefillKeepalive}
-	_, _, _, err := s.gateway.proxy.StreamToClient(r.Context(), tw, flusher, body, endpoint, 0, sessionID, opts)
-	if err == nil {
-		return
+
+	cfg := s.gateway.config.Load()
+	numKeys := providerAPIKeyCount(cfg, endpoint.Provider)
+
+	start := 0
+	if sessionID != "" && numKeys > 1 {
+		h := 0
+		for _, c := range sessionID {
+			h = h*31 + int(c)
+		}
+		if h < 0 {
+			h = -h
+		}
+		start = h % numKeys
 	}
-	log.Printf("[provider-proxy] %s/%s stream failed: %v", endpoint.Provider, endpoint.Model, err)
+
+	for i := 0; i < numKeys; i++ {
+		idx := (start + i) % numKeys
+		ep := endpoint
+		ep.APIKeyIndex = idx
+		opts := StreamAttemptOptions{KeepaliveInterval: prefillKeepalive}
+		_, _, _, err := s.gateway.proxy.StreamToClient(r.Context(), tw, flusher, body, ep, 0, sessionID, opts)
+		if err == nil {
+			return
+		}
+		log.Printf("[provider-proxy] %s/%s (key %d) stream failed: %v", endpoint.Provider, endpoint.Model, idx, err)
+		// If bytes already reached the client we cannot transparently retry
+		// on another key without duplicating output; stop here.
+		if tw.n > 0 {
+			break
+		}
+	}
 	if tw.n == 0 {
 		// Nothing has been committed to the wire yet: return a normal error
 		// response, clearing the SSE headers set above.
