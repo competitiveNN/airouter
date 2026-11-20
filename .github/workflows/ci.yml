@@ -268,6 +268,15 @@ jobs:
       - name: shell lint self-test
         run: bash scripts/shell-lint-control.sh
 
+      # Nomenclature guard: prevent "airrouter" misspelling (must be "airouter").
+      # Runs in both go and config jobs so any new occurrence is caught at PR time.
+      - name: check nomenclature (no airrouter misspelling)
+        run: |
+          if git ls-files -z ':!:.github/workflows/' | xargs -0 grep -l -i 'airrouter' 2>/dev/null; then
+            echo "::error::found 'airrouter' misspelling in tracked files — must be 'airouter'"
+            exit 1
+          fi
+
   config:
     runs-on: ubuntu-latest
     continue-on-error: false
@@ -317,6 +326,15 @@ jobs:
 
       - name: compile python scripts
         run:           python3 -m py_compile fetch-free-models.py regenerate_config.py model_utils.py scripts/validate-config.py scripts/check-rules.py scripts/sse-check.py scripts/fake-sse-upstream.py scripts/audit-drift-check.py scripts/audit-attribution-check.py
+
+      # Nomenclature guard: prevent "airrouter" misspelling (must be "airouter").
+      # Runs in both go and config jobs so any new occurrence is caught at PR time.
+      - name: check nomenclature (no airrouter misspelling)
+        run: |
+          if git ls-files -z ':!:.github/workflows/' | xargs -0 grep -l -i 'airrouter' 2>/dev/null; then
+            echo "::error::found 'airrouter' misspelling in tracked files — must be 'airouter'"
+            exit 1
+          fi
 
   # End-to-end assertion of the SSE termination contract. The bug this guards
   # (a `data: [DONE]` released ahead of the real chunks, so the client silently

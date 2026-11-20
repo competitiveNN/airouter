@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -681,7 +683,31 @@ func TestMetricsLabelValuesCannotForgeSeries(t *testing.T) {
 	}
 }
 
-// TestMetricsCardinalityBoundIsRaceFree exercises the bound under concurrency.
+// TestNomenclatureNoMisspelling asserts that no tracked file contains the legacy
+// misspelling "airrouter" (with two r's instead of one).
+func TestNomenclatureNoMisspelling(t *testing.T) {
+	cmd := exec.Command("git", "ls-files", "-z")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Skipf("git ls-files not available: %v", err)
+	}
+	var violations []string
+	for _, file := range strings.Split(string(out), "\x00") {
+		if file == "" || file == "metrics_cardinality_test.go" || file == ".github/workflows/ci.yml" {
+			continue
+		}
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		if bytes.Contains(bytes.ToLower(data), []byte("airrouter")) {
+			violations = append(violations, file)
+		}
+	}
+	if len(violations) > 0 {
+		t.Errorf("found forbidden misspelling 'airouter' (two r's) in tracked files: %v", violations)
+	}
+}
 // The cap check and the insert happen in one critical section, so N goroutines
 // racing on brand-new endpoints could each see "room" before any of them
 // inserts. This asserts the stronger property that matters operationally, namely
