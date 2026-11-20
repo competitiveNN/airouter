@@ -24,24 +24,29 @@ type ProxyConfig struct {
 	// direct connections for this provider.
 	Retries int `yaml:"retries,omitempty"`
 
-	// Mandatory forces all outgoing connections for this provider to route
-	// through a proxy. When true, an unavailable or failing proxy does not fall
-	// back to a direct connection; the request errors so the fallback chain
-	// advances to the next model.
-	Mandatory bool `yaml:"mandatory,omitempty"`
+	// MandatoryIndex is the index (1-based) in the provider's API key list at
+	// which proxying becomes mandatory. For example:
+	//   - 0 or omitted: proxy is never mandatory (direct connections allowed for all keys)
+	//   - 1: proxy is mandatory from the first API key
+	//   - 2: proxy is mandatory from the second API key onwards (first key can go direct)
+	//   - N: proxy is mandatory from the Nth API key onwards
+	// This allows a gradual transition where early keys (e.g., primary keys) can
+	// connect directly while fallback keys must go through a proxy.
+	MandatoryIndex int `yaml:"mandatory_index,omitempty"`
 }
 
 type ProviderConfig struct {
-	URL       string            `yaml:"url"`
-	APIKeyEnv string            `yaml:"api_key_env"`
-	Headers   map[string]string `yaml:"headers,omitempty"`
+	URL        string            `yaml:"url"`
+	APIKeyEnvs []string          `yaml:"api_key_envs,omitempty"`
+	APIKeyEnv  string            `yaml:"api_key_env,omitempty"` // Deprecated: single key, kept for backward compatibility
+	Headers    map[string]string `yaml:"headers,omitempty"`
 
 	// Proxies is the provider-wide nested proxy configuration. It groups the
 	// proxy budget and the mandatory-routing flag under one key so the common
 	// case stays a couple of lines instead of scattered top-level keys:
 	//
 	//   proxies:
-	//     mandatory: true
+	//     mandatory_index: 2
 	//     retries: 3
 	//
 	// Retries is the maximum number of different proxies to try on any endpoint
@@ -51,12 +56,14 @@ type ProviderConfig struct {
 	// precedence over Retries (a per-model override for the rare chain entry
 	// that needs a different budget).
 	//
-	// Mandatory forces all outgoing connections for this provider to route
-	// through a proxy. If no proxy is available or the proxy fails, the request
-	// will not fall back to a direct connection but will instead trigger an
-	// error that advances the fallback chain to the next model. Set to false
-	// (or omitted) to keep the existing behaviour where direct connections are
-	// used when proxy is unavailable.
+	// MandatoryIndex is the index (1-based) in the provider's API key list at
+	// which proxying becomes mandatory. For example:
+	//   - 0 or omitted: proxy is never mandatory (direct connections allowed for all keys)
+	//   - 1: proxy is mandatory from the first API key
+	//   - 2: proxy is mandatory from the second API key onwards (first key can go direct)
+	//   - N: proxy is mandatory from the Nth API key onwards
+	// This allows a gradual transition where early keys (e.g., primary keys) can
+	// connect directly while fallback keys must go through a proxy.
 	Proxies ProxyConfig `yaml:"proxies,omitempty"`
 
 	// MaxInterruption is the maximum time this provider's endpoint may
@@ -708,15 +715,58 @@ func opencodeAggregateStream(body []byte, model string, created int64) ([]byte, 
 }
 
 func (p ProviderConfig) APIKey() string {
+	// Backward compatibility: if api_key_envs is set, return the first key.
+	// Otherwise fall back to the deprecated api_key_env.
+	if len(p.APIKeyEnvs) > 0 {
+		return os.Getenv(p.APIKeyEnvs[0])
+	}
 	if p.APIKeyEnv == "" {
 		return ""
 	}
 	return os.Getenv(p.APIKeyEnv)
 }
 
+// APIKeyAt returns the API key at the given index (0-based).
+// Returns empty string if index is out of bounds.
+func (p ProviderConfig) APIKeyAt(index int) string {
+	keys := p.APIKeyEnvs
+	if len(keys) == 0 && p.APIKeyEnv != "" {
+		keys = []string{p.APIKeyEnv}
+	}
+	if index < 0 || index >= len(keys) {
+		return ""
+	}
+	return os.Getenv(keys[index])
+}
+
+// NumAPIKeys returns the number of configured API keys for this provider.
+func (p ProviderConfig) NumAPIKeys() int {
+	if len(p.APIKeyEnvs) > 0 {
+		return len(p.APIKeyEnvs)
+	}
+	if p.APIKeyEnv != "" {
+		return 1
+	}
+	return 0
+}
+
+// IsProxyMandatoryAt returns true if proxy is mandatory for the given API key index (0-based).
+func (p ProviderConfig) IsProxyMandatoryAt(index int) bool {
+	if p.Proxies.MandatoryIndex <= 0 {
+		return false
+	}
+	// MandatoryIndex is 1-based, so index >= MandatoryIndex-1 means mandatory
+	return index >= p.Proxies.MandatoryIndex-1
+}
+
 type ModelEndpoint struct {
 	Provider string `yaml:"provider"`
 	Model    string `yaml:"model"`
+	// APIKeyIndex is the index (0-based) of the API key to use for this provider.
+	// When a provider has multiple API keys configured, the router will iterate
+	// through them on failure. This field is set at runtime during endpoint selection.
+	APIKeyIndex int `yaml:"api_key_index,omitempty"`
+
 	// Vision marks whether this endpoint can accept image (multimodal)
 	// content. It is optional: when nil the gateway assumes vision is
 	// supported. Set it to false for known text-only models so vision
@@ -796,6 +846,16 @@ func (e ModelEndpoint) IntelligenceEqual(other ModelEndpoint) bool {
 }
 
 func (e ModelEndpoint) Key() string {
+	if e.APIKeyIndex > 0 {
+		return fmt.Sprintf("%s:%s:%d", e.Provider, e.Model, e.APIKeyIndex)
+	}
+	return e.Provider + ":" + e.Model
+}
+
+// ModelKey returns a key that identifies the model regardless of which API key
+// is used. This is used for properties that are model-level (vision support,
+// protocol) rather than key-level (cooldowns, circuits).
+func (e ModelEndpoint) ModelKey() string {
 	return e.Provider + ":" + e.Model
 }
 
@@ -806,7 +866,7 @@ func (e ModelEndpoint) SupportsVision() bool {
 }
 
 func (e ModelEndpoint) Equal(other ModelEndpoint) bool {
-	return e.Provider == other.Provider && e.Model == other.Model
+	return e.Provider == other.Provider && e.Model == other.Model && e.APIKeyIndex == other.APIKeyIndex
 }
 
 // ContextWindow reports the advertised context window in tokens. A zero
@@ -1160,6 +1220,10 @@ func (c *Config) validate() error {
 		if !strings.HasPrefix(p.URL, "http://") && !strings.HasPrefix(p.URL, "https://") {
 			return fmt.Errorf("provider %s URL must start with http:// or https://: %q", name, p.URL)
 		}
+		// Validate API keys: either api_key_envs (new) or api_key_env (deprecated) must be present
+		if len(p.APIKeyEnvs) == 0 && p.APIKeyEnv == "" {
+			return fmt.Errorf("provider %s has no api_key_envs or api_key_env", name)
+		}
 		// max_interruption shortens the per-provider interruption window but
 		// can never widen it past maxSessionInterruption — that is the hard
 		// client contract and a provider that tries to exceed it is a config
@@ -1169,6 +1233,13 @@ func (c *Config) validate() error {
 		}
 		if p.MaxInterruption > maxSessionInterruption {
 			return fmt.Errorf("provider %s max_interruption %v exceeds the gateway ceiling %v", name, p.MaxInterruption, maxSessionInterruption)
+		}
+		// Validate mandatory_index is within bounds
+		if p.Proxies.MandatoryIndex < 0 {
+			return fmt.Errorf("provider %s proxies.mandatory_index must not be negative, got %d", name, p.Proxies.MandatoryIndex)
+		}
+		if p.Proxies.MandatoryIndex > p.NumAPIKeys() {
+			return fmt.Errorf("provider %s proxies.mandatory_index %d exceeds number of API keys (%d)", name, p.Proxies.MandatoryIndex, p.NumAPIKeys())
 		}
 	}
 	for name, model := range c.Models {
@@ -1342,7 +1413,7 @@ func proxyEnabled(cfg *Config) bool {
 		return false
 	}
 	for _, provider := range cfg.Providers {
-		if provider.Proxies.Retries > 0 {
+		if provider.Proxies.Retries > 0 || provider.Proxies.MandatoryIndex > 0 {
 			return true
 		}
 	}

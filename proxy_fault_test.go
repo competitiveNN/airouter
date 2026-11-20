@@ -623,10 +623,11 @@ func TestHandleStream_MandatoryProxyRefusalFallsOverInsteadOfPanicking(t *testin
 			// exactly one proxied endpoint and picks it (see the relay test
 			// above for the same reliance).
 			"backend1": {
-				URL:     backend1.URL,
-				Proxies: ProxyConfig{Mandatory: true, Retries: 2},
+				URL:        backend1.URL,
+				APIKeyEnvs: []string{"TEST_KEY"},
+				Proxies:    ProxyConfig{MandatoryIndex: 1, Retries: 2},
 			},
-			"backend2": {URL: backend2.URL},
+			"backend2": {URL: backend2.URL, APIKeyEnvs: []string{"TEST_KEY"}},
 		},
 		Models: map[string]ModelConfig{
 			"smart": {Chain: []ModelEndpoint{

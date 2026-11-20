@@ -275,8 +275,8 @@ func TestResponsesStream_MandatoryProxyRefusalFallsOverInsteadOfPanicking(t *tes
 	cfg := &Config{
 		Preferences: &Preferences{InitialRotationWindow: &noRotation},
 		Providers: map[string]ProviderConfig{
-			"proxied": {URL: backend1.URL, APIKeyEnv: "TEST_KEY", Proxies: ProxyConfig{Mandatory: true, Retries: 2}},
-			"direct":  {URL: backend2.URL, APIKeyEnv: "TEST_KEY"},
+			"proxied": {URL: backend1.URL, APIKeyEnvs: []string{"TEST_KEY"}, Proxies: ProxyConfig{MandatoryIndex: 1, Retries: 2}},
+			"direct":  {URL: backend2.URL, APIKeyEnvs: []string{"TEST_KEY"}},
 		},
 		Models: map[string]ModelConfig{
 			"smart": {Chain: []ModelEndpoint{

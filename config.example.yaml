@@ -80,7 +80,7 @@ providers:
   #
   # Example:
   #   proxies:
-  #     mandatory: true
+  #     mandatory_index: 1
   #     retries: 3
   #
   # A chain entry may override its provider with its own `proxy: <N>` (same
@@ -92,7 +92,7 @@ providers:
   #   api_key_env: NVIDIA_API_KEY
   #   proxies:
   #     retries: 3
-  #     mandatory: true
+  #     mandatory_index: 1
 
   # Example: NVIDIA NIM
   nvidia:

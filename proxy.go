@@ -439,17 +439,18 @@ func (p *Proxy) attemptClient(ep *ModelEndpoint, timeout time.Duration, allowPro
 	}
 
 	// Enforce mandatory proxy routing: when the provider requires proxy routing
-	// and no proxy was selected, fail the attempt (nil client) so the caller
-	// advances the fallback chain instead of silently going direct. This mirrors
-	// Forward, which does the same check inline. attemptClient backs the two
-	// streaming surfaces (StreamToClient, streamResponsesAttempt), both of which
-	// treat a nil client as "mandatory proxy unavailable". The check must run
-	// after the selection block: a non-empty pool whose pick() returns nil, or a
-	// transport that could not be built, otherwise leaves usedProxy nil and would
-	// fall through to a direct connection, defeating the mandatory flag.
+	// for the current API key index and no proxy was selected, fail the attempt
+	// (nil client) so the caller advances the fallback chain instead of silently
+	// going direct. This mirrors Forward, which does the same check inline.
+	// attemptClient backs the two streaming surfaces (StreamToClient,
+	// streamResponsesAttempt), both of which treat a nil client as "mandatory
+	// proxy unavailable". The check must run after the selection block: a
+	// non-empty pool whose pick() returns nil, or a transport that could not be
+	// built, otherwise leaves usedProxy nil and would fall through to a direct
+	// connection, defeating the mandatory flag.
 	if usedProxy == nil && p.config != nil {
 		if cfg := p.config.Load(); cfg != nil {
-			if provider := cfg.Providers[ep.Provider]; provider.Proxies.Mandatory {
+			if provider := cfg.Providers[ep.Provider]; provider.IsProxyMandatoryAt(ep.APIKeyIndex) {
 				return nil, nil
 			}
 		}
@@ -882,8 +883,8 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	// the session id is derived from the request content so one logical
 	// conversation pins to one upstream thread (prompt-cache affinity).
 	var ccSessionID string
+	apiKey := providerCfg.APIKeyAt(endpoint.APIKeyIndex)
 	if proto == protocolCommandCode {
-		apiKey := providerCfg.APIKey()
 		envelope, sid, terr := ccBuildEnvelope(backendBody, endpoint.Model, apiKey, nil)
 		if terr != nil {
 			return nil, terr
@@ -914,8 +915,8 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	if providerCfg.APIKey() != "" {
-		req.Header.Set("Authorization", "Bearer "+providerCfg.APIKey())
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
@@ -977,7 +978,7 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 	// config still wins, exactly as for the OpenCode attribution
 	// headers above.
 	if proto == protocolCommandCode {
-		ccSetRequestHeaders(req, providerCfg.APIKey(), ccSessionID)
+		ccSetRequestHeaders(req, apiKey, ccSessionID)
 	}
 	// Provider-level header overrides from config take precedence over the
 	// synthesized OpenCode attribution headers.
@@ -1278,9 +1279,9 @@ func (p *Proxy) forwardUncoalesced(ctx context.Context, body []byte, endpoint Mo
 	}
 
 	// Enforce mandatory proxy routing: if the provider requires proxy
-	// routing and no proxy was selected, fail the attempt instead of
-	// falling back to a direct connection.
-	if usedProxy == nil && providerCfg.Proxies.Mandatory {
+	// routing for the current API key index and no proxy was selected, fail the
+	// attempt instead of falling back to a direct connection.
+	if usedProxy == nil && providerCfg.IsProxyMandatoryAt(endpoint.APIKeyIndex) {
 		cancel()
 		return nil, nil, func() {}, &ProxyError{
 			Proxy: nil,

@@ -138,6 +138,7 @@ def test_validate_rejects_broken_configs(mutation, expect_problem):
     elif mutation == "drop_api_key_env":
         for prov in parsed["providers"].values():
             prov.pop("api_key_env", None)
+            prov.pop("api_key_envs", None)
     elif mutation == "empty_chain":
         parsed["models"]["smart"]["chain"] = []
 

@@ -53,7 +53,7 @@ func (r *Router) VisionChainStatus(logicalModel, sessionID string) (VisionChainS
 	stickyBlocks := false
 	if se, ok := r.sessions[sessionID]; ok {
 		bound := se.ep
-		if !bound.SupportsVision() || r.noVision[bound.Key()] {
+		if !bound.SupportsVision() || r.noVision[bound.ModelKey()] {
 			stickyBlocks = true
 		}
 	}
@@ -67,7 +67,7 @@ func (r *Router) VisionChainStatus(logicalModel, sessionID string) (VisionChainS
 			continue
 		}
 		hasVisionSupport = true
-		if r.noVision[ep.Key()] {
+		if r.noVision[ep.ModelKey()] {
 			continue
 		}
 		// A sticky session is allowed to fall through to any vision-capable
@@ -1256,7 +1256,7 @@ func (r *Router) minCooldownWait(chain []ModelEndpoint, requireVision bool) time
 		// A model that can never serve a vision request (either marked noVision
 		// at runtime or configured with vision:false) is irrelevant to the
 		// wait calculation for vision requests.
-		if requireVision && (!ep.SupportsVision() || r.noVision[ep.Key()]) {
+		if requireVision && (!ep.SupportsVision() || r.noVision[ep.ModelKey()]) {
 			continue
 		}
 		if cd, ok := r.cooldowns[ep.Key()]; ok {
@@ -1363,6 +1363,36 @@ func contextFits(ep *ModelEndpoint, promptTokens int) bool {
 // When no endpoint anywhere can hold the prompt, the caller should reject the
 // request up front with a context_length_exceeded error rather than walk a
 // chain that cannot succeed; see ContextCapacity.
+// expandChainWithAPIKeys expands a chain by creating virtual endpoints for each
+// API key index of providers that have multiple keys. Returns a slice of
+// ModelEndpoint where each entry has APIKeyIndex set appropriately.
+func (r *Router) expandChainWithAPIKeys(cfg *Config, chain []ModelEndpoint) []ModelEndpoint {
+	expanded := make([]ModelEndpoint, 0, len(chain)*3) // rough estimate
+	for _, ep := range chain {
+		providerCfg, ok := cfg.Providers[ep.Provider]
+		if !ok {
+			// Provider not found, keep as-is with index 0
+			expanded = append(expanded, ep)
+			continue
+		}
+		numKeys := providerCfg.NumAPIKeys()
+		if numKeys <= 1 {
+			// Single key (or none), keep as-is with index 0
+			e := ep
+			e.APIKeyIndex = 0
+			expanded = append(expanded, e)
+		} else {
+			// Multiple keys: create one entry per key index
+			for idx := 0; idx < numKeys; idx++ {
+				e := ep
+				e.APIKeyIndex = idx
+				expanded = append(expanded, e)
+			}
+		}
+	}
+	return expanded
+}
+
 func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, requireVision bool, tried map[string]bool, promptTokens int) (*ModelEndpoint, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1403,7 +1433,8 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 		if !hasChain || len(nextChain.Chain) == 0 {
 			continue
 		}
-		endpoints := nextChain.Chain
+		// Expand the chain to include all API key indices for multi-key providers
+		endpoints := r.expandChainWithAPIKeys(cfg, nextChain.Chain)
 
 		// The chain this session is currently pinned to. Only this chain may
 		// serve the session's sticky endpoint; every other chain is a
@@ -1512,8 +1543,10 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 		if !hasChain {
 			continue
 		}
-		for i := range mc.Chain {
-			cand := &mc.Chain[i]
+		// Check cooldowns on expanded chain
+		endpoints := r.expandChainWithAPIKeys(cfg, mc.Chain)
+		for i := range endpoints {
+			cand := &endpoints[i]
 			if tried[cand.Key()] || !r.visionEligible(cand, requireVision) || !contextFits(cand, promptTokens) {
 				continue
 			}
@@ -1566,7 +1599,19 @@ func (r *Router) SkipSameHost(ep ModelEndpoint, tried map[string]bool) {
 	if url == "" {
 		return
 	}
-	tried[ep.Key()] = true
+	// Mark all API key indices for the failing endpoint's provider+model.
+	numKeys := pc.NumAPIKeys()
+	if numKeys <= 1 {
+		tried[ep.Key()] = true
+	} else {
+		for idx := 0; idx < numKeys; idx++ {
+			k := ep.ModelKey()
+			if idx > 0 {
+				k = fmt.Sprintf("%s:%d", k, idx)
+			}
+			tried[k] = true
+		}
+	}
 	for _, mc := range cfg.Models {
 		for i := range mc.Chain {
 			cand := mc.Chain[i]
@@ -1575,7 +1620,19 @@ func (r *Router) SkipSameHost(ep ModelEndpoint, tried map[string]bool) {
 				continue
 			}
 			if normalizeUpstreamURL(other.URL) == url {
-				tried[cand.Key()] = true
+				// Mark all API key indices for this provider+model on the same host.
+				numKeys := other.NumAPIKeys()
+				if numKeys <= 1 {
+					tried[cand.Key()] = true
+				} else {
+					for idx := 0; idx < numKeys; idx++ {
+						k := cand.ModelKey()
+						if idx > 0 {
+							k = fmt.Sprintf("%s:%d", k, idx)
+						}
+						tried[k] = true
+					}
+				}
 			}
 		}
 	}
@@ -1834,6 +1891,7 @@ func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *Mo
 		for i := range chain.Chain {
 			if eligible(i) {
 				ep := chain.Chain[i]
+				ep.APIKeyIndex = 0
 				return &ep
 			}
 		}
@@ -1863,6 +1921,7 @@ func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *Mo
 		for i := limit; i < len(chain.Chain); i++ {
 			if eligible(i) {
 				ep := chain.Chain[i]
+				ep.APIKeyIndex = 0
 				return &ep
 			}
 		}
@@ -1901,6 +1960,9 @@ func (r *Router) selectInitialEndpoint(logicalModel, sessionID string, chain *Mo
 	pos := int(h.Sum64() % uint64(len(candidates)))
 
 	ep := chain.Chain[candidates[pos]]
+	// A multi-key provider always starts on its first key; the remaining keys
+	// are reached by the fallback walk, not by the rotation.
+	ep.APIKeyIndex = 0
 	return &ep
 }
 
@@ -2054,7 +2116,7 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 	cd.LastError = truncateErr(errMsg, 200)
 	r.cooldowns[key] = cd
 	if isVisionUnsupported(errMsg) {
-		r.noVision[key] = true
+		r.noVision[ep.ModelKey()] = true
 	}
 	r.recordCircuitFailureLocked(ep, statusCode, &cd)
 	r.mu.Unlock()
@@ -2096,7 +2158,7 @@ func (r *Router) ApplyCooldownWithDuration(ep *ModelEndpoint, statusCode int, er
 	cd.LastError = truncateErr(errMsg, 200)
 	r.cooldowns[key] = cd
 	if isVisionUnsupported(errMsg) {
-		r.noVision[key] = true
+		r.noVision[ep.ModelKey()] = true
 	}
 	r.mu.Unlock()
 }
@@ -2764,14 +2826,14 @@ func (r *Router) ResetCooldown(ep *ModelEndpoint) {
 func (r *Router) LearnProtocol(ep *ModelEndpoint, p protocol) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.learnedProtocol[ep.Key()] = p
+	r.learnedProtocol[ep.ModelKey()] = p
 }
 
 // ProtocolFor returns the protocol to address ep with: a learned one if the
 // endpoint has proved which shape it speaks, otherwise the configured one.
 func (r *Router) ProtocolFor(ep *ModelEndpoint) protocol {
 	r.mu.Lock()
-	learned, ok := r.learnedProtocol[ep.Key()]
+	learned, ok := r.learnedProtocol[ep.ModelKey()]
 	r.mu.Unlock()
 	if ok {
 		// A learned protocol outranks the configured one in BOTH directions.
@@ -2786,7 +2848,7 @@ func (r *Router) ProtocolFor(ep *ModelEndpoint) protocol {
 func (r *Router) MarkNoVision(ep *ModelEndpoint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.noVision[ep.Key()] = true
+	r.noVision[ep.ModelKey()] = true
 }
 
 // ResetAllCooldowns clears every cooldown and circuit-breaker entry. It is a
@@ -2808,7 +2870,7 @@ func (r *Router) visionEligible(ep *ModelEndpoint, requireVision bool) bool {
 	if !requireVision {
 		return true
 	}
-	return ep.SupportsVision() && !r.noVision[ep.Key()]
+	return ep.SupportsVision() && !r.noVision[ep.ModelKey()]
 }
 
 // isEligibleLocked combines cooldown availability with capability eligibility.
