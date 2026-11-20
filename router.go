@@ -2109,6 +2109,14 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 			duration += time.Duration(float64(duration) * r.cooldownJitter)
 		}
 	}
+	// Command Code upstreams are free-tier and rate-limit aggressively; cap
+	// their 429 cooldown at 1 minute so a single 429 does not park the
+	// endpoint for the full escalation ladder (which reaches 30 minutes).
+	if statusCode == 429 && (ep.Provider == "commandcode" || strings.HasPrefix(ep.Provider, "commandcode")) {
+		if duration > time.Minute {
+			duration = time.Minute
+		}
+	}
 	cd.Expiry = time.Now().Add(duration)
 	cd.StatusCode = statusCode
 	// Truncate the error message so a verbose provider error body (e.g.
