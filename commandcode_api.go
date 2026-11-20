@@ -535,7 +535,8 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 			log.Printf("[commandcode] session=%s model=%s provider=%s: attempt failed after a keepalive: %v",
 				sessionID, model, ep.Provider, err)
 			s.penalize(&ep, err, 0, sessionID)
-			writeDegradedSSE(w, flusher, fmt.Sprintf("Command Code upstream failed: %v", err))
+			writeSSEError(w, flusher, fmt.Sprintf("Command Code upstream failed: %v", err))
+			doneSent = true
 			return
 		}
 		log.Printf("[commandcode] session=%s model=%s provider=%s: attempt failed before output: %v",
@@ -547,13 +548,7 @@ func (s *CommandCodeShim) stream(w http.ResponseWriter, r *http.Request, body []
 	if lastErr != nil {
 		msg = fmt.Sprintf("All Command Code providers failed: %v", lastErr)
 	}
-	if !tracker.Wrote() {
-		// No bytes have reached the client: degrade to a clean 200 SSE
-		// content delta instead of a 502/503 status that would look like a
-		// server-side outage.
-		writeDegradedSSE(w, flusher, "All Command Code providers are currently unavailable. Please try your request again shortly.")
-		return
-	}
+	doneSent = true
 	writeAPIError(w, status, msg, errType, code)
 }
 
