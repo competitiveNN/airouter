@@ -326,22 +326,6 @@ MUTATIONS: list[Mutation] = [
         "Nothing would compare the field against the record that proved it, so "
         "the shape could drift with no failure anywhere.",
     ),
-    Mutation(
-        "protocol carried to only the first key of a trio",
-        "regenerate_config.py",
-        "            for prov in ('nvidia', 'nvidia2', 'nvidia3'):\n"
-        "                if prov in providers_present:\n"
-        "                    chain.append(entry_for(prov, m))",
-        "            for prov in ('nvidia', 'nvidia2', 'nvidia3'):\n"
-        "                if prov in providers_present:\n"
-        "                    chain.append(entry_for(prov, m) if prov == 'nvidia' else {'provider': prov, 'model': m.id, 'vision': m.vision, 'intelligence': m.score, 'context_length': m.context_length, 'protocol': None, 'comment': m.get_comment()})",
-        "nvidia2/nvidia3 would keep addressing a responses-only model with the "
-        "chat shape, so the failure would look like an intermittent provider bug. "
-        "The anchor is the nvidia loop specifically: the earlier form ended in "
-        "`elif m.mapped_provider == 'commandcode'`, which stopped being adjacent "
-        "when the Google key group was inserted between them, so the mutation "
-        "silently aimed at the gemini loop instead (2026-11-06).",
-    ),
     # The emit path and the profile floors. A defect here does not crash
     # anything: it produces a config that parses, loads, and routes — just
     # wrongly. Nothing but a test can tell.

@@ -1843,7 +1843,7 @@ func (r *Router) minCooldownWaitAcrossChains(cfg *Config, chains []string, requi
 		if !ok {
 			continue
 		}
-		w := r.minCooldownWait(chain.Chain, requireVision)
+		w := r.minCooldownWait(r.expandChainWithAPIKeys(cfg, chain.Chain), requireVision)
 		if w > 0 && (minWait == 0 || w < minWait) {
 			minWait = w
 		}
@@ -1975,7 +1975,8 @@ func (r *Router) ChainLength(logicalModel string) int {
 	if !ok {
 		return 0
 	}
-	return len(chain.Chain)
+	cfg := r.config.Load()
+	return len(r.expandChainWithAPIKeys(cfg, chain.Chain))
 }
 
 // MaxInterruptionFor returns the effective interruption ceiling for a logical
