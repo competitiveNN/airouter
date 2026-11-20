@@ -59,12 +59,12 @@ func TestMultiKeyFallbackOrder(t *testing.T) {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
 			"multi": {
-				URL:         "https://multi",
-				APIKeyEnvs:  []string{"K1", "K2", "K3"},
+				URL:        "https://multi",
+				APIKeyEnvs: []string{"K1", "K2", "K3"},
 			},
 			"next": {
-				URL:         "https://next",
-				APIKeyEnvs:  []string{"K1"},
+				URL:        "https://next",
+				APIKeyEnvs: []string{"K1"},
 			},
 		},
 		Models: map[string]ModelConfig{
@@ -86,9 +86,9 @@ func TestMultiKeyFallbackOrder(t *testing.T) {
 
 	// Expected order: multi/model-a@idx0, multi/model-a@idx1, multi/model-a@idx2, next/model-b@idx0
 	expected := []struct {
-		provider   string
-		model      string
-		apiKeyIdx  int
+		provider  string
+		model     string
+		apiKeyIdx int
 	}{
 		{"multi", "model-a", 0},
 		{"multi", "model-a", 1},
@@ -203,8 +203,8 @@ func TestMandatoryProxyPerKeyIndex(t *testing.T) {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
 			"test": {
-				URL:         "https://test",
-				APIKeyEnvs:  []string{"K1", "K2", "K3"},
+				URL:        "https://test",
+				APIKeyEnvs: []string{"K1", "K2", "K3"},
 				Proxies: ProxyConfig{
 					MandatoryIndex: 2, // mandatory from index 1 onwards (2nd key, 1-based)
 				},
@@ -240,8 +240,8 @@ func TestSelectEndpointSkipsTriedAPIKeyPerRequest(t *testing.T) {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
 			"multi": {
-				URL:         "https://multi",
-				APIKeyEnvs:  []string{"K1", "K2", "K3"},
+				URL:        "https://multi",
+				APIKeyEnvs: []string{"K1", "K2", "K3"},
 			},
 		},
 		Models: map[string]ModelConfig{

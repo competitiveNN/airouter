@@ -708,6 +708,7 @@ func TestNomenclatureNoMisspelling(t *testing.T) {
 		t.Errorf("found forbidden misspelling 'airouter' (two r's) in tracked files: %v", violations)
 	}
 }
+
 // The cap check and the insert happen in one critical section, so N goroutines
 // racing on brand-new endpoints could each see "room" before any of them
 // inserts. This asserts the stronger property that matters operationally, namely
