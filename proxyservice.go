@@ -162,6 +162,8 @@ type ProxyService struct {
 	// Proxy.UpdateRequiredReady on startup and on every hot reload.
 	required atomic.Int32
 
+	stopOnce sync.Once
+
 	// Tor mode: when torInstances > 0 the pool is backed by that many Tor
 	// daemons instead of fetched HTTP proxy lists.
 	torInstances int
@@ -1467,7 +1469,7 @@ func (s *ProxyService) Start(ctx context.Context) {
 
 // Stop signals the refresh loop to exit.
 func (s *ProxyService) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() { close(s.stopCh) })
 }
 
 // torExitNodes is the set of exit-node country codes (Americas + Europe) Tor

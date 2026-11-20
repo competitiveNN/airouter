@@ -23,8 +23,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -563,7 +563,7 @@ func main() {
 		proxy.SetProxyService(proxySvc)
 		proxy.UpdateRequiredReady()
 		go proxySvc.Start(ctx)
-	defer proxySvc.Stop()
+		defer proxySvc.Stop()
 		if proxySvc.TorMode() {
 			log.Printf("Proxy service enabled (tor mode, %d instances)", proxySvc.TorInstances())
 		} else {

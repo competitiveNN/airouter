@@ -1299,7 +1299,7 @@ func TestLargeContextAttemptAndBudget(t *testing.T) {
 	if got, want := requestAttemptTimeout(350_000), 2*time.Minute; got != want {
 		t.Fatalf("350k-token attempt timeout = %v, want %v", got, want)
 	}
-	if got, want := fallbackBudget(requestAttemptTimeout(350_000)), 4*time.Minute + 10*time.Second; got != want {
+	if got, want := fallbackBudget(requestAttemptTimeout(350_000)), 4*time.Minute+10*time.Second; got != want {
 		t.Fatalf("350k-token walk budget = %v, want %v", got, want)
 	}
 	walk := newBudgetState(time.Now(), requestAttemptTimeout(350_000))
