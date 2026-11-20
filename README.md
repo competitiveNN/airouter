@@ -92,17 +92,16 @@ every past chat.
 ## Running it
 
 ```sh
-make build               # ./airouter
-make commandcode-proxy   # ./commandcode-proxy, the standalone shim
+make build             # ./airouter
+make provider-proxy    # ./provider-proxy, the standalone per-provider proxy
 ./airouter -config config.yaml -port 8080 -api-key "$AIROUTER_API_KEY"
 ```
 
-`make` with no target builds both. `make commandcode-proxy` compiles the same
-package with the `commandcode_proxy` build tag, which swaps the gateway entry
-point for the shim-only one: the result serves `/v1/chat/completions`,
-`/v1/models` and `/health` on port 3050 and nothing else. It reads the same
-config and shares `cooldowns.db`, so it can run instead of the gateway's
-built-in endpoint, or alongside it on a different port.
+`make` with no target builds `airouter` and `provider-proxy`. `make commandcode-proxy`
+compiles the same package with the `commandcode_proxy` build tag if you still need
+the standalone Command Code shim; `make provider-proxy` compiles with the
+`provider_proxy` tag and serves every configured provider as prefixed model ids
+(opencode1/<model>, opencode2/<model>, ...) on one OpenAI-compatible endpoint.
 
 | Flag | Default | What it does |
 |---|---|---|
