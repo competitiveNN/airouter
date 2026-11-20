@@ -68,7 +68,7 @@ type CommandCodeShim struct {
 // NewCommandCodeShim builds the shim. providerNames is a comma-separated list
 // of provider names from the config (for example "commandcode,commandcode2"),
 // in failover order. An optional maxConcurrent value overrides the CLI flag
-// (0, or omitted, means the config decides, or the built-in default of 4).
+// (0, or omitted, means the config decides, or the built-in default of 16).
 func NewCommandCodeShim(g *GatewayContext, providerNames []string, maxConcurrent ...int) *CommandCodeShim {
 	names := make([]string, 0, len(providerNames))
 	for _, name := range providerNames {

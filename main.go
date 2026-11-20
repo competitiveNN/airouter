@@ -26,7 +26,7 @@ func main() {
 	pruneStats := flag.String("prune-stats", "", "Prune the dashboard stats journal at PATH to the 30-day retention window, then exit")
 	commandCodePort := flag.String("commandcode-port", "3050", "Port for the built-in Command Code API endpoint (empty string disables it)")
 	commandCodeProviders := flag.String("commandcode-providers", "commandcode,commandcode2", "Command Code providers exposed on that endpoint, in failover order")
-	maxConcurrentRequests := flag.Int("max-concurrent-requests", 0, "Maximum concurrent Command Code proxy requests (0 = use config or default of 4; negative disables the cap)")
+	maxConcurrentRequests := flag.Int("max-concurrent-requests", 0, "Maximum concurrent Command Code proxy requests (0 = use config or default of 16; negative disables the cap)")
 	flag.IntVar(maxConcurrentRequests, "max-concurrent", 0, "Same as -max-concurrent-requests")
 	flag.IntVar(maxConcurrentRequests, "max-inflight", 0, "Same as -max-concurrent-requests")
 	flag.IntVar(maxConcurrentRequests, "commandcode-max-concurrent", 0, "Same as -max-concurrent-requests")
