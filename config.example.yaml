@@ -3,7 +3,10 @@
 # Providers: OpenAI-compatible backend endpoints
 # Each provider has:
 #   url: The base URL for the OpenAI-compatible API
-#   api_key_env: Environment variable name containing the API key
+#   api_key_envs: List of environment variable names containing the API keys
+#            (use api_key_env for a single key). The gateway automatically
+#            falls back through all listed keys before moving to the next
+#            model in the chain.
 #   headers: Optional map of extra HTTP headers to send to this provider
 #            (e.g. {"HTTP-Referer": "...", "X-Title": "..."}).
 #
@@ -23,9 +26,9 @@
 #       fast   intelligence < 25 or an id containing flash-lite / lightning /
 #              nano / gemma / lfm / laguna-xs, capped at 10 distinct models
 #       large  context_length >= 200000 only
-#   - Every NVIDIA NIM model is emitted as a consecutive nvidia / nvidia2 / nvidia3
-#     trio (same model id, three API keys) so a 429 on one key falls through to the
-#     next key on the same model instead of failing the request.
+#   - Multi-key providers (nvidia, gemini, opencode, commandcode) are emitted
+#     once per model in the chain. The gateway expands the chain at runtime to
+#     try every configured API key before moving to the next model.
 #   - The LAST entry of every chain is that profile's "auto" fallback.
 #
 # Copy this file to config.yaml and fill in your API keys and model choices before
@@ -34,13 +37,11 @@
 # `preferences:` are yours to edit and are preserved across syncs.
 
 providers:
-  # To rotate API keys, add a numbered entry with the same url and its own
-  # *_API_KEY_N env var (nvidia2, gemini2, commandcode2, ...). A rate limit on
-  # one key then falls through to the next key on the same model instead of
-  # failing the request. One entry per provider is kept here so the example
-  # stays short -- add more as you need them.
+  # To rotate API keys, list them under api_key_envs in order. The gateway
+  # tries them in order on rate-limit failures. One entry per provider keeps
+  # the example short -- add more as you need them.
   #
-  # Optional keys, on top of url / api_key_env / headers:
+  # Optional keys, on top of url / api_key_envs / headers:
   #
   #   timeout: <duration>   Per-provider request timeout for upstream calls
   #                (e.g. 30s, 60s, 120s). Omitting or setting 0 uses the
@@ -58,11 +59,13 @@ providers:
   #                global 30s ceiling. Cannot exceed 30s.
   #
   #   proxies:   Nested provider-wide proxy configuration:
-  #     mandatory: <bool>   When true, all outgoing connections for this
-  #                provider must route through a proxy. If no proxy is
-  #                available or the proxy fails, the request does NOT fall back
-  #                to a direct connection; instead it fails so the fallback
-  #                chain advances to the next model. Defaults to false.
+  #     mandatory_index: <N>   Index (1-based) in the api_key_envs list at
+  #                which proxying becomes mandatory. 0 or omitted = never
+  #                mandatory. 1 = mandatory from the first key. 2 = mandatory
+  #                from the second key onwards (first key can go direct).
+  #                When mandatory and no proxy is available, the request does
+  #                NOT fall back to a direct connection; instead it fails so
+  #                the fallback chain advances to the next model.
   #     retries: <N>   Route this provider's upstream traffic through the proxy
   #                pool (public HTTP CONNECT and SOCKS5 proxies, refreshed every
   #                15 minutes from the built-in source list in proxysources.go).
@@ -80,19 +83,20 @@ providers:
   #
   # Example:
   #   proxies:
-  #     mandatory_index: 1
+  #     mandatory_index: 2
   #     retries: 3
   #
   # A chain entry may override its provider with its own `proxy: <N>` (same
   # meaning, this endpoint only) -- see the models: section below.
 
-  # Example: NVIDIA NIM with mandatory proxy (fails if proxy unavailable/fails, no direct fallback)
+  # Example: NVIDIA NIM with multiple API keys (falls through automatically)
   # nvidia:
   #   url: https://integrate.api.nvidia.com/v1
-  #   api_key_env: NVIDIA_API_KEY
-  #   proxies:
-  #     retries: 3
-  #     mandatory_index: 1
+  #   api_key_envs:
+  #     - NVIDIA_API_KEY
+  #     - NVIDIA_API_KEY_2
+  #     - NVIDIA_API_KEY_3
+  #   timeout: 60s
 
   # Example: NVIDIA NIM
   nvidia:
@@ -104,6 +108,17 @@ providers:
     url: https://ollama.com/v1
     api_key_env: OLLAMA_API_KEY        # set this in .envrc
 
+  # Example: OpenCode gateway with mandatory proxy from second key
+  # opencode:
+  #   url: https://opencode.ai/inference/openai/v1
+  #   api_key_envs:
+  #     - OPENCODE_API_KEY
+  #     - OPENCODE_API_KEY_2
+  #     - OPENCODE_API_KEY_3
+  #   proxies:
+  #     mandatory_index: 2
+  #     retries: 2
+
   # Example: OpenCode gateway
   opencode:
     url: https://opencode.ai/inference/openai/v1
@@ -114,6 +129,16 @@ providers:
     url: https://api.kilo.ai/api/gateway/v1
     api_key_env: KILOCODE_API_KEY      # set this in .envrc
 
+  # Example: Google AI Studio (Gemini) with multiple API keys
+  # gemini:
+  #   url: https://generativelanguage.googleapis.com/v1beta/openai
+  #   api_key_envs:
+  #     - GEMINI_API_KEY
+  #     - GEMINI_API_KEY_2
+  #     - GEMINI_API_KEY_3
+  #     - GEMINI_API_KEY_4
+  #     - GEMINI_API_KEY_5
+
   # Example: Google AI Studio (Gemini)
   gemini:
     url: https://generativelanguage.googleapis.com/v1beta/openai
@@ -123,6 +148,15 @@ providers:
   # provider straight at the upstream and mark every endpoint that uses it
   # with `protocol: commandcode`. The gateway then speaks /alpha/generate
   # itself, so no separate commandcode-proxy process is needed.
+  # Use api_key_envs for multiple CommandCode keys.
+  # commandcode:
+  #   url: https://api.commandcode.ai
+  #   api_key_envs:
+  #     - COMMANDCODE_API_KEY
+  #     - COMMANDCODE_API_KEY_2
+  #   timeout: 60s
+
+  # Example: CommandCode
   commandcode:
     url: https://api.commandcode.ai
     api_key_env: COMMANDCODE_API_KEY   # set this in .envrc
@@ -158,7 +192,7 @@ preferences:
   #   max_tokens. nil (absent) = auto (half of profile context window);
   #   0 = never default (send to provider as-is); positive = absolute value.
   #   max_label_cardinality: 512   # uncomment to override the default
-      # commandcode_proxy_max_concurrent: 4   # uncomment to override the default concurrency cap
+  # commandcode_proxy_max_concurrent: 4   # uncomment to override the default concurrency cap
   #   Bounds how many distinct provider/model labels the metrics registry
   #   tracks. Must be between 16 and 65536.
 

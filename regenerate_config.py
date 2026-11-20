@@ -731,10 +731,11 @@ def build_chain(
     if providers_present is None:
         providers_present = set(
             (
-                "nvidia", "nvidia2", "nvidia3",
-                "gemini", "gemini2", "gemini3", "gemini4", "gemini5",
-                "commandcode", "commandcode2",
-                "kilocode", "opencode", "opencode2", "opencode3", "opencode4",
+                "nvidia",
+                "gemini",
+                "commandcode",
+                "kilocode",
+                "opencode",
                 "ollama",
             )
         )
@@ -775,37 +776,11 @@ def build_chain(
     chain = []
 
     for m in models:
-        if m.mapped_provider == 'nvidia':
-            # Emit trio: nvidia, nvidia2, nvidia3, but only for keys that exist.
-            for prov in ('nvidia', 'nvidia2', 'nvidia3'):
-                if prov in providers_present:
-                    chain.append(entry_for(prov, m))
-        elif m.mapped_provider == 'gemini':
-            # Emit the key group: every configured Google key is a separate
-            # quota bucket on the same upstream, so a throttled key (429 on one
-            # project) falls through to a sibling instead of the model being
-            # unavailable. Same rule as nvidia: only keys that are declared.
-            for prov in ('gemini', 'gemini2', 'gemini3', 'gemini4', 'gemini5'):
-                if prov in providers_present:
-                    chain.append(entry_for(prov, m))
-        elif m.mapped_provider == 'commandcode':
-            # Emit pair: commandcode, commandcode2 (two API keys on the same
-            # upstream proxy) so a rate-limited key falls through to the next.
-            # Emit commandcode2 only when it is actually configured: commenting
-            # a provider out in config.yaml must be respected by regeneration.
-            for prov in ('commandcode', 'commandcode2'):
-                if prov in providers_present:
-                    chain.append(entry_for(prov, m))
-        elif m.mapped_provider == 'opencode':
-            # Emit the key group: every configured OpenCode key is a separate
-            # quota bucket on the same upstream, so a rate-limited key (429 on
-            # one project) falls through to a sibling instead of the model being
-            # unavailable. Same rule as nvidia/gemini: only keys that are
-            # declared are emitted.
-            for prov in ('opencode', 'opencode2', 'opencode3', 'opencode4'):
-                if prov in providers_present:
-                    chain.append(entry_for(prov, m))
-        else:
+        # With multi-key providers, each provider appears once in the chain.
+        # The gateway expands the chain at runtime to try every configured API
+        # key before moving to the next model, so emitting one entry per model
+        # is enough. The provider must be declared in config.yaml.
+        if m.mapped_provider in providers_present:
             chain.append(entry_for(m.mapped_provider, m))
 
     # The last-resort endpoint must itself be callable, so the choice is a

@@ -153,11 +153,13 @@ def build_source_index(rc, models_path: Path) -> dict[tuple[str, str], object]:
     entries on N keys and each of those entries has to resolve to the same
     source record.
     """
+    # With multi-key providers, each model appears under one provider. Index
+    # under the mapped provider only.
     index: dict[tuple[str, str], object] = {}
     for m in rc.load_models(str(models_path)):
-        for provider in PROVIDER_GROUPS.get(m.provider, (m.mapped_provider,)):
-            if provider:
-                index[(provider, m.id)] = m
+        provider = m.mapped_provider
+        if provider:
+            index[(provider, m.id)] = m
     return index
 
 
@@ -475,32 +477,10 @@ def check(
                 ):
                     problems.append(f"rule5: {profile} entry {ep.get('model')} is neither small nor cheap")
 
-        # rule 3 / 10: every key of a group carries the same model id, in
-        # consecutive entries, so a rate-limited key falls through to the next.
-        # A provider disabled in config.yaml (commented out, so absent from
-        # `providers`) must not be scored as "missing" its sibling keys.
-        for group, provs in PROVIDER_GROUPS.items():
-            active = tuple(p for p in provs if p in providers)
-            if len(active) <= 1:
-                continue
-            per = {p: [e.get("model") for e in chain if e.get("provider") == p] for p in active}
-            union = {m for mids in per.values() for m in mids} - AUTO_MODELS
-            for p in active:
-                missing = union - set(per[p])
-                if missing:
-                    problems.append(
-                        f"rule3: {profile} {p} is missing {sorted(missing)} present on its "
-                        f"other {group} provider(s)"
-                    )
-            for mid in sorted(union):
-                positions = [
-                    i for i, e in enumerate(chain)
-                    if e.get("model") == mid and e.get("provider") in active
-                ]
-                if positions != list(range(positions[0], positions[0] + len(active))):
-                    problems.append(
-                        f"rule3: {profile} {mid} keys are not consecutive (positions {positions})"
-                    )
+        # rule 3 / 10 (legacy): with multi-key providers, each provider appears
+        # once in the chain and the gateway expands API keys at runtime. The
+        # key-group consecutiveness check no longer applies.
+        pass
 
         # rule 3: every id served through a commandcode provider must be one the
         # fetcher PROVED free, not one a list once declared free. (Ids are not a

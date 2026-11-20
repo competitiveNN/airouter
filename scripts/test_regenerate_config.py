@@ -498,15 +498,12 @@ def test_key_groups_are_emitted_whole_and_in_order():
         _model("qwen/qwen3.8-27b:free", "kilocode", 33.7, ctx=262144),
     ]
     chain = gen.build_chain(models, "fast", catalog)[:-1]
-    # Striding interleaves: high[0]=nvidia(44.8), low[0]=kilocode(33.7), high[1]=commandcode(25.0)
-    # Key groups stay consecutive within each model.
+    # Multi-key providers emit one entry per model; the gateway expands the
+    # chain at runtime to try every API key.
     assert [(e["provider"], e["model"]) for e in chain] == [
         ("nvidia", "z-ai/glm-5.3"),
-        ("nvidia2", "z-ai/glm-5.3"),
-        ("nvidia3", "z-ai/glm-5.3"),
         ("kilocode", "qwen/qwen3.8-27b:free"),
         ("commandcode", "poolside/laguna-s-2.1-free"),
-        ("commandcode2", "poolside/laguna-s-2.1-free"),
     ]
 
 
@@ -819,7 +816,7 @@ def _inject_protocol(config_text, value, provider=None):
     entry = None
     for i, line in enumerate(lines):
         if provider is None:
-            if line.startswith("      - "):
+            if line.startswith("      - provider:"):
                 entry = i
                 break
         elif line.startswith(f"      - provider: {provider}"):
@@ -1477,13 +1474,13 @@ def test_an_unprobed_commandcode_record_keeps_the_configured_protocol():
 
 
 def test_the_protocol_reaches_every_key_of_a_multi_key_group():
-    """nvidia-nim is one model id on three config providers. A protocol attached
-    to only one of them is a bug that only shows up on one key."""
+    """nvidia-nim is one model id on one config provider (multi-key). A
+    protocol attached to it must be emitted on the single chain entry."""
     models = [_model("some/nim-model", "nvidia-nim", 40.0, protocol="responses")]
     chain = gen.build_chain(models, "work")
-    trio = [e for e in chain if e["model"] == "some/nim-model"]
-    assert len(trio) == 3, trio
-    assert all("protocol: responses" in _entry_yaml(e) for e in trio)
+    entries = [e for e in chain if e["model"] == "some/nim-model"]
+    assert len(entries) == 1, entries
+    assert "protocol: responses" in _entry_yaml(entries[0])
 
 
 def test_google_keys_are_emitted_as_one_group():
@@ -1492,21 +1489,23 @@ def test_google_keys_are_emitted_as_one_group():
     dark while the other quota buckets sit idle (measured 2026-11-04)."""
     models = [_model("gemini-flash-lite-latest", "google-ai-studio", 40.0,
                      ctx=1048576)]
+    # Multi-key providers emit one entry per model; the gateway expands the
+    # chain at runtime to try every API key.
     chain = gen.build_chain(models, "large")
     providers = [e["provider"] for e in chain
                  if e["model"] == "gemini-flash-lite-latest"]
-    assert providers == ["gemini", "gemini2", "gemini3", "gemini4", "gemini5"], providers
+    assert providers == ["gemini"], providers
 
 
 def test_a_disabled_google_key_is_not_reemitted():
-    """Commenting a key out of `providers:` must be honored, like nvidia3."""
+    """Commenting a key out of `providers:` must be honored."""
     models = [_model("gemini-flash-lite-latest", "google-ai-studio", 40.0,
                      ctx=1048576)]
     chain = gen.build_chain(models, "large",
-                            providers_present={"gemini", "gemini2"})
+                            providers_present={"gemini"})
     providers = [e["provider"] for e in chain
                  if e["model"] == "gemini-flash-lite-latest"]
-    assert providers == ["gemini", "gemini2"], providers
+    assert providers == ["gemini"], providers
 
 
 def test_protocol_is_the_last_field_so_the_order_check_stays_honest():
@@ -1742,13 +1741,14 @@ def _a_commandcode_config():
                   "        model: kilo-auto/free  # last: kilocode "
                   "(auto router probed live)\n"
                   "        vision: true\n")
-    chain = "".join([entry("commandcode"), entry("commandcode2"), terminator])
+    chain = "".join([entry("commandcode"), terminator])
     return (
         "providers:\n"
         "  commandcode:\n"
         "    url: https://api.commandcode.ai\n"
-        "  commandcode2:\n"
-        "    url: https://api.commandcode.ai\n"
+        "    api_key_envs:\n"
+        "      - COMMANDCODE_API_KEY\n"
+        "      - COMMANDCODE_API_KEY_2\n"
         "  kilocode:\n"
         "    url: https://kilocode.ai/v1\n"
         "models:\n"
