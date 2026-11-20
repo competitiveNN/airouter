@@ -11,7 +11,7 @@ GOFLAGS      ?=
 
 .PHONY: all build commandcode-proxy provider-proxy test vet clean
 
-all: build commandcode-proxy provider-proxy
+all: build provider-proxy
 
 build:
 	$(GO) build $(GOFLAGS) -o $(BIN) .

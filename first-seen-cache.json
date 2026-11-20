@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-19T05:07:40.481575Z",
+  "fetched_at": "2026-11-20T11:44:03.954312Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
@@ -10,6 +10,7 @@
     "deepseek-ai/deepseek-v4.1-flash": "2026-11-06",
     "deepseek-v4.1-flash-free": "2026-11-06",
     "dots-studio/dots-3-note-preview:free": "2026-09-26",
+    "fastino/gliner2-pii": "2026-11-20",
     "flint-40b-free": "2026-10-26",
     "gemini-flash-lite-latest": "2026-11-06",
     "gemma-4-26b-a4b-it": "2026-11-06",
@@ -18,6 +19,8 @@
     "gemma-4-9b-it": "2026-09-26",
     "gemma4:31b": "2026-11-06",
     "glm-5.3-flash-free": "2026-11-06",
+    "gpt-live-1": "2026-11-20",
+    "grok-imagine-image-2.0": "2026-11-20",
     "hy4-flash-free": "2026-11-16",
     "ibm/granite-3.0-3b-a800m-instruct": "2026-09-26",
     "ibm/granite-3.0-8b-instruct": "2026-09-26",
@@ -61,7 +64,6 @@
     "glm-5.3-flash-free": "2026-11-19",
     "ibm/granite-3.0-3b-a800m-instruct": "2026-11-16",
     "ibm/granite-3.0-8b-instruct": "2026-11-16",
-    "jev-1.13-free": "2026-10-30",
     "longcat-2.5-preview-free": "2026-10-22",
     "meta/llama2-70b": "2026-11-16",
     "nvidia/nemotron-3.5-content-safety:free": "2026-11-04",
