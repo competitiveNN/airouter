@@ -488,7 +488,10 @@ SUITE_TEST_FLOORS = {
     # an HTTP error (410) falls back to the last scored snapshot (2026-11-06).
     # 86 -- the 84 above plus 2 for the parameter-count guesstimate used by the
     # smart floor (2026-11-07).
-    "scripts/test_fetch_free_models.py": 86,
+    # 88 -- the 86 above plus 2 for specialized-task-model blacklisting tests
+    # (PII/image-gen/voice) added while filtering those models out of the
+    # fetch output (2026-11-20).
+    "scripts/test_fetch_free_models.py": 88,
     "scripts/test_mutation_check.py": 19,
     # 48 through the distribution rules and the terminator/comment machinery,
     # plus the 11 covering the `protocol:` field: emitted when a probe proved a
