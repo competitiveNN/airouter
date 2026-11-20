@@ -685,7 +685,7 @@ func TestCommandCodeAttemptTimeoutScalesForLargeContexts(t *testing.T) {
 	}
 	// 350k tokens: 30s floor + 2s for each of the 30 ten-thousand-token
 	// blocks above the 50k threshold.
-	if got, want := commandCodeAttemptTimeout(350_000), 90*time.Second; got != want {
+	if got, want := commandCodeAttemptTimeout(350_000), 2*time.Minute; got != want {
 		t.Fatalf("350k-token timeout = %v, want %v", got, want)
 	}
 	if got := commandCodeAttemptTimeout(10_000_000); got != maxLargeContextAttemptTimeout {

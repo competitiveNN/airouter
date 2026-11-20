@@ -345,8 +345,8 @@ func TestFallbackWallClockBoundIsSane(t *testing.T) {
 	if maxFallbackWallClock != maxSessionInterruption {
 		t.Errorf("maxFallbackWallClock = %v, want the session interruption ceiling %v", maxFallbackWallClock, maxSessionInterruption)
 	}
-	if maxFallbackWallClock > 30*time.Second {
-		t.Errorf("maxFallbackWallClock = %v, want <= 30s", maxFallbackWallClock)
+	if maxFallbackWallClock > 60*time.Second {
+		t.Errorf("maxFallbackWallClock = %v, want <= 60s", maxFallbackWallClock)
 	}
 }
 
@@ -1087,8 +1087,8 @@ func TestBudgetStateScaledByRequestSize(t *testing.T) {
 // larger allowance, but never one that can consume the whole client-visible
 // interruption budget by itself.
 func TestRequestTimeoutIsCappedByTheInterruptionBudget(t *testing.T) {
-	if got := requestTimeout(200_000); got != maxRequestAttemptTimeout {
-		t.Errorf("200k-token timeout = %v, want the capped %v", got, maxRequestAttemptTimeout)
+	if got := requestTimeout(600_000); got != maxRequestAttemptTimeout {
+		t.Errorf("600k-token timeout = %v, want the capped %v", got, maxRequestAttemptTimeout)
 	}
 	if got := requestTimeout(2_000_000); got != maxRequestAttemptTimeout {
 		t.Errorf("2M-token timeout = %v, want the capped %v", got, maxRequestAttemptTimeout)
@@ -1109,10 +1109,10 @@ func TestBudgetAttemptTimeoutUsesTheRemainingInterruption(t *testing.T) {
 	}
 	walk.lastProgress = time.Now().Add(-20 * time.Second)
 	got := walk.attemptTimeout(18 * time.Second)
-	if got > 10*time.Second || got <= 0 {
-		t.Fatalf("attempt timeout = %v, want the ~10s left in the 30s budget", got)
+	if got > 18*time.Second || got <= 0 {
+		t.Fatalf("attempt timeout = %v, want the ~18s left (capped by attempt) in the 60s budget", got)
 	}
-	walk.lastProgress = time.Now().Add(-31 * time.Second)
+	walk.lastProgress = time.Now().Add(-61 * time.Second)
 	if got := walk.attemptTimeout(18 * time.Second); got != 0 {
 		t.Fatalf("attempt timeout with no budget left = %v, want 0", got)
 	}
@@ -1267,16 +1267,16 @@ func TestCooldownDBCloseCheckpointsWAL(t *testing.T) {
 // timeout left zero room for a fallback and the request 503'd after a single
 // attempt (measured 2026-11-04).
 func TestFirstAttemptCannotSpendTheWholeBudget(t *testing.T) {
-	walk := newBudgetState(time.Now(), 25*time.Second) // budget 30s
+	walk := newBudgetState(time.Now(), 25*time.Second) // budget 60s
 	walk.next()
-	if got := walk.attemptTimeout(30 * time.Second); got != 20*time.Second {
-		t.Fatalf("first attempt timeout = %v, want 20s (two thirds of the 30s budget)", got)
+	if got := walk.attemptTimeout(60 * time.Second); got != 40*time.Second {
+		t.Fatalf("first attempt timeout = %v, want 40s (two thirds of the 60s budget)", got)
 	}
 
 	// After the first attempt burns its cap, the fallback gets what is left.
-	walk.lastProgress = time.Now().Add(-20 * time.Second)
+	walk.lastProgress = time.Now().Add(-40 * time.Second)
 	walk.next()
-	if got := walk.attemptTimeout(30 * time.Second); got > 10*time.Second {
+	if got := walk.attemptTimeout(60 * time.Second); got > 20*time.Second {
 		t.Fatalf("fallback timeout = %v, want at most the remaining 10s", got)
 	}
 
@@ -1296,16 +1296,16 @@ func TestLargeContextAttemptAndBudget(t *testing.T) {
 	if got, want := requestAttemptTimeout(4), requestTimeout(4); got != want {
 		t.Fatalf("small prompt timeout = %v, want the unchanged %v", got, want)
 	}
-	if got, want := requestAttemptTimeout(350_000), 90*time.Second; got != want {
+	if got, want := requestAttemptTimeout(350_000), 2*time.Minute; got != want {
 		t.Fatalf("350k-token attempt timeout = %v, want %v", got, want)
 	}
-	if got, want := fallbackBudget(requestAttemptTimeout(350_000)), 190*time.Second; got != want {
+	if got, want := fallbackBudget(requestAttemptTimeout(350_000)), 4*time.Minute + 10*time.Second; got != want {
 		t.Fatalf("350k-token walk budget = %v, want %v", got, want)
 	}
 	walk := newBudgetState(time.Now(), requestAttemptTimeout(350_000))
 	walk.next()
-	if got := walk.attemptTimeout(90 * time.Second); got != 90*time.Second {
-		t.Fatalf("first large-context attempt = %v, want the full 90s", got)
+	if got := walk.attemptTimeout(2 * time.Minute); got != 2*time.Minute {
+		t.Fatalf("first large-context attempt = %v, want the full 2m", got)
 	}
 	if got := requestAttemptTimeout(10_000_000); got != maxLargeContextAttemptTimeout {
 		t.Fatalf("huge prompt timeout = %v, want the %v ceiling", got, maxLargeContextAttemptTimeout)

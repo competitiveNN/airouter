@@ -93,7 +93,7 @@ const proxyCooldown = 30 * time.Second
 //
 // It is also the hard ceiling on the per-provider `max_interruption` setting:
 // a provider may shorten the window, never lengthen it past this.
-const maxSessionInterruption = 30 * time.Second
+const maxSessionInterruption = 60 * time.Second
 
 type ChatCompletionRequest struct {
 	Model            string                  `json:"model"`
