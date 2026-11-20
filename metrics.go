@@ -1228,8 +1228,8 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	m.mu.RUnlock()
 
-	fmt.Fprintln(w, "# HELP airrouter_transport_drops_total Number of responses abandoned because the client disconnected")
-	fmt.Fprintln(w, "# TYPE airrouter_transport_drops_total counter")
+	fmt.Fprintln(w, "# HELP airouter_transport_drops_total Number of responses abandoned because the client disconnected")
+	fmt.Fprintln(w, "# TYPE airouter_transport_drops_total counter")
 	fmt.Fprintf(w, "airouter_transport_drops_total %d\n", m.transportDropsTotal.Load())
 
 	fmt.Fprintln(w, "# HELP airouter_upstream_saturated_total Number of requests rejected due to upstream concurrency cap")
@@ -1245,7 +1245,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE airouter_midstream_fallbacks_total_by_endpoint counter")
 	m.mu.RLock()
 	for k, c := range m.midstreamFallbacksByEndpoint {
-		writeSample(w, "airrouter_midstream_fallbacks_total_by_endpoint", k, c.Load())
+		writeSample(w, "airouter_midstream_fallbacks_total_by_endpoint", k, c.Load())
 	}
 	m.mu.RUnlock()
 
