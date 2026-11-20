@@ -36,6 +36,13 @@
       "released": "2024-03-27",
       "status_code": 404
     },
+    "nvidia-nim:fastino/gliner2-pii": {
+      "blacklisted_at": "2026-11-20T15:09:03.205300Z",
+      "date": "2026-11-20",
+      "model_id": "fastino/gliner2-pii",
+      "provider": "nvidia-nim",
+      "reason": "specialized model (not generalist LLM/VLM/multimodal)"
+    },
     "nvidia-nim:google/gemma-3-12b-it": {
       "blacklisted_at": "2026-10-29T05:10:19.600834Z",
       "cooldown_keys": [
@@ -83,6 +90,20 @@
       "reason": "not found (older than 2 weeks)",
       "released": "2026-03-01",
       "status_code": 404
+    },
+    "opencode:gpt-live-1": {
+      "blacklisted_at": "2026-11-20T15:09:03.205309Z",
+      "date": "2026-11-20",
+      "model_id": "gpt-live-1",
+      "provider": "opencode",
+      "reason": "specialized model (not generalist LLM/VLM/multimodal)"
+    },
+    "opencode:grok-imagine-image-2.0": {
+      "blacklisted_at": "2026-11-20T15:09:03.205306Z",
+      "date": "2026-11-20",
+      "model_id": "grok-imagine-image-2.0",
+      "provider": "opencode",
+      "reason": "specialized model (not generalist LLM/VLM/multimodal)"
     }
   },
   "pending": {

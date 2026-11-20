@@ -102,6 +102,31 @@ def test_unreadable_body_is_unknown_not_live():
     assert ff.classify_probe_status(200, b"<html>gateway</html>") == "unknown"
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "fastino/gliner2-pii",
+        "nvidia/gliner-PII",
+        "grok-imagine-image-2.0",
+        "opencode/gpt-live-1",
+    ],
+)
+def test_specialized_task_specific_models_are_blacklisted(model_id):
+    """PII, image-generation, voice and similar task models are not routable.
+
+    A free-tier endpoint is still not a generalist LLM/VLM: the sync must filter
+    task-specific models out of the output instead of handing them to the
+    router.
+    """
+    assert ff.is_blacklisted_model(model_id), model_id
+
+
+def test_generalist_models_are_not_blacklisted():
+    """The specialized blacklist must not swallow real generalist models."""
+    for model_id in ("gpt-4o", "gemini-2.5-pro", "particle-ai/particle-1"):
+        assert not ff.is_blacklisted_model(model_id), model_id
+
+
 def _record(**over):
     base = {
         "id": "kilo-auto/free",

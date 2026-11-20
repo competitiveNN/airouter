@@ -286,6 +286,22 @@ BLACKLISTED_MODEL_PATTERNS: tuple[str, ...] = (
     "granite",
     "nemotron-3.5-bolt-e4b",  # deprecated/blocked: does not meet quality bar for routing
     "deepseek-coder-6.7b-instruct",  # deprecated/blocked: superseded by newer deepseek models
+    # Specialized (non-generalist) task models are not routable generalist
+    # LLMs/VLMs and must never appear in the output.
+    "ocr",
+    "imagine",  # image generation (e.g. grok-imagine-image-2.0)
+    "text-to-image",
+    "text2image",
+    "imagegen",
+    "tts",
+    "speech",
+    "audio",
+    "voice",
+    "transcri",
+    "translat",
+    "gliner",  # PII / entity-extraction encoders (e.g. fastino/gliner2-pii)
+    "pii",     # PII detection / redaction models
+    "gpt-live",  # full-duplex voice models (e.g. opencode gpt-live-1)
 )
 BLACKLISTED_MODEL_REGEXES: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE) for pattern in BLACKLISTED_MODEL_PATTERNS
@@ -474,6 +490,7 @@ GOOGLE_AI_STUDIO_FREE_MODELS: set[str] = {
 NVIDIA_NIM_CTX: dict[str, int] = {
     "nemotron-3-ultra": 1_000_000,
     "nemotron-3-super": 262_144,
+    "nemotron-3.5-super-vl": 262_144,
     "nemotron-3-nano": 262_144,
     "nemotron-4-340b": 1_000_000,
     "nemotron-mini": 131_072,
@@ -689,7 +706,7 @@ def normalize_kilo(model: dict[str, Any]) -> dict[str, Any] | None:
         "id": model.get("id"),
         "name": model.get("name"),
         "provider": "kilocode",
-        "context_length": model.get("context_length", 0),
+        "context_length": model.get("context_length", 0) or 262_144,
         "intelligence": None,
         "elo": None,
         "released": None,
@@ -728,7 +745,7 @@ def normalize_opencode(model: dict[str, Any]) -> dict[str, Any] | None:
         "id": model_id,
         "name": model_id,
         "provider": "opencode",
-        "context_length": ctx or OPENCODE_FREE_MODELS_CTX.get(model_id, 0),
+        "context_length": (ctx or OPENCODE_FREE_MODELS_CTX.get(model_id, 0)) or 262_144,
         "intelligence": None,
         "elo": None,
         "released": None,
@@ -758,7 +775,7 @@ def normalize_ollama(model_id: str) -> dict[str, Any] | None:
         "id": model_id,
         "name": model_id,
         "provider": "ollama-cloud",
-        "context_length": OLLAMA_FREE_MODELS_CTX.get(model_id, 0),
+        "context_length": OLLAMA_FREE_MODELS_CTX.get(model_id, 0) or 262_144,
         "intelligence": None,
         "elo": None,
         "released": None,
@@ -811,7 +828,7 @@ def normalize_google_ai_studio_curated(model_id: str) -> dict[str, Any] | None:
         "id": model_id,
         "name": model_id,
         "provider": "google-ai-studio",
-        "context_length": GOOGLE_AI_STUDIO_FREE_MODELS_CTX.get(model_id, 0),
+        "context_length": GOOGLE_AI_STUDIO_FREE_MODELS_CTX.get(model_id, 0) or 262_144,
         "intelligence": None,
         "elo": None,
         "released": None,
@@ -841,6 +858,8 @@ def is_nvidia_nim_recent_coding(model_id: str) -> bool:
     # Outdated models are handled by HIDE_MODELS + recency check in is_model_hidden.
     exclude_patterns = (
         "embed",
+        "gliner",
+        "pii",
         "nemoretriever",
         "nemoguard",
         "safety",
@@ -899,6 +918,9 @@ def normalize_nvidia_nim(model: dict[str, Any], model_id: str) -> dict[str, Any]
             if key in model_lower:
                 ctx = val
                 break
+    if ctx == 0:
+        # Models with no ctx entry default to 256k (262144) instead of 0.
+        ctx = 262_144
 
     # Determine capabilities
     has_reasoning = any(x in model_lower for x in ["nemotron", "reasoning", "thinking", "r1", "r1-", "super", "ultra", "nano-omni", "qwen3", "deepseek", "glm-5", "kimi-k2", "step-3"])
@@ -2037,7 +2059,7 @@ def normalize_commandcode(model: dict[str, Any]) -> dict[str, Any] | None:
         "id": model_id,
         "name": model.get("name") or model_id,
         "provider": "commandcode",
-        "context_length": model.get("context_length") or 0,
+        "context_length": model.get("context_length") or 262_144,
         "intelligence": None,
         "elo": None,
         "released": None,
