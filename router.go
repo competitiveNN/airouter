@@ -1436,6 +1436,23 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 		// Expand the chain to include all API key indices for multi-key providers
 		endpoints := r.expandChainWithAPIKeys(cfg, nextChain.Chain)
 
+		// Sort endpoints by intelligence descending so cross-chain failover
+		// always prioritizes smarter models by capability ranking, regardless
+		// of their order in config.yaml. Stable sort preserves the original
+		// key-index grouping for multi-key providers. Nil intelligence is
+		// treated as the lowest possible score so known-quality models are
+		// tried first.
+		sort.SliceStable(endpoints, func(i, j int) bool {
+			iv, jv := 0.0, 0.0
+			if endpoints[i].Intelligence != nil {
+				iv = *endpoints[i].Intelligence
+			}
+			if endpoints[j].Intelligence != nil {
+				jv = *endpoints[j].Intelligence
+			}
+			return iv > jv
+		})
+
 		// The chain this session is currently pinned to. Only this chain may
 		// serve the session's sticky endpoint; every other chain is a
 		// substitute and is walked in configured order.

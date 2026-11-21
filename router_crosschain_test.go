@@ -302,3 +302,44 @@ func TestFailoverDoesNotReEnterTheDeadChainWithinARequest(t *testing.T) {
 		t.Fatalf("the walk left the chain the session had moved to: %s -> %s", served, got)
 	}
 }
+
+// TestCrossChainFailoverPrioritizesSmarterModels pins the requirement that
+// when a session fails over from one chain to another, the substitute chain's
+// endpoints are tried in intelligence-descending order, regardless of their
+// order in config.yaml. Regression: out-of-order entries could cause a lower-
+// intelligence model to be tried before a higher-intelligence one.
+func TestCrossChainFailoverPrioritizesSmarterModels(t *testing.T) {
+	cfg := &Config{
+		Providers:   map[string]ProviderConfig{},
+		Preferences: &Preferences{InitialRotationWindow: &noRotation},
+		Models: map[string]ModelConfig{
+			"smart": {Chain: []ModelEndpoint{
+				{Provider: "smart", Model: "smart-0", Intelligence: f64(10.0)},
+			}},
+			"large": {Chain: []ModelEndpoint{
+				{Provider: "large", Model: "low", Intelligence: f64(5.0)},
+				{Provider: "large", Model: "high", Intelligence: f64(15.0)},
+			}},
+		},
+	}
+	for _, m := range cfg.Models {
+		for _, ep := range m.Chain {
+			cfg.Providers[ep.Provider] = ProviderConfig{URL: "https://x", APIKeyEnv: "K"}
+		}
+	}
+	r := NewRouter(cfg, "")
+	defer r.Close()
+
+	// Cool the smart chain so the session fails over to large.
+	xcCoolChain(r, "smart")
+
+	ep, _ := r.SelectEndpoint("smart", "swap-smart", false, nil)
+	if ep == nil {
+		t.Fatal("expected failover to large, got nil")
+	}
+	if ep.Model != "high" {
+		t.Fatalf("expected smarter model 'high' (15.0) to be tried first, got %q (intelligence %.1f)",
+			ep.Model, *ep.Intelligence)
+	}
+}
+

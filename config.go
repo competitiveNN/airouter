@@ -781,11 +781,11 @@ type ModelEndpoint struct {
 	// "unknown", and the router then treats the endpoint as incomparable and
 	// falls back to strict chain order.
 	//
-	// The router uses this only to decide which endpoints are equally good
+	// The router uses this to decide which endpoints are equally good
 	// enough to be treated as interchangeable for a new session's first pick
-	// (see Router.selectInitialEndpoint). It never uses it to reorder a
-	// fallback: once a request is in flight the chain is walked strictly in
-	// configured order, so quality ordering is preserved.
+	// (see Router.selectInitialEndpoint), and to sort endpoints by
+	// intelligence descending within a chain so cross-chain failover always
+	// prioritizes smarter models by capability ranking.
 	Intelligence *float64 `yaml:"intelligence,omitempty"`
 
 	// ContextLength is the model's advertised context window in tokens, as
