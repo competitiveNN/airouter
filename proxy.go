@@ -624,9 +624,9 @@ func NewProxy(cfg *Config) *Proxy {
 		client: &http.Client{
 			Timeout: 0,
 			Transport: &http.Transport{
-				MaxIdleConns:        200,
-				MaxIdleConnsPerHost: 50,
-				MaxConnsPerHost:     100,
+				MaxIdleConns:        1000,
+				MaxIdleConnsPerHost: 200,
+				MaxConnsPerHost:     500,
 				IdleConnTimeout:     90 * time.Second,
 				// Disable HTTP/2 to avoid head-of-line blocking on multiplexed
 				// streams when upstream fails mid-request. HTTP/1.1 with

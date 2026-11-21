@@ -87,8 +87,9 @@ type chatEndpointRef struct {
 
 var chatHTTPClient = &http.Client{
 	Transport: &http.Transport{
-		MaxConnsPerHost:       100,
-		MaxIdleConnsPerHost:   50,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   200,
+		MaxConnsPerHost:       500,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		ResponseHeaderTimeout: 300 * time.Second,
 	},

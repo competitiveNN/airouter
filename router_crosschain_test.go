@@ -342,4 +342,3 @@ func TestCrossChainFailoverPrioritizesSmarterModels(t *testing.T) {
 			ep.Model, *ep.Intelligence)
 	}
 }
-

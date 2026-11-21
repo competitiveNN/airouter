@@ -1419,7 +1419,6 @@ func (r *Router) SelectEndpointForTokens(logicalModel, sessionID string, require
 		// background sweeper while it is still in use.
 		se.lastUsed = time.Now()
 		r.sessions[sessionID] = se
-		r.persistSessionLocked(sessionID, se)
 	}
 
 	// The chains this selection may consult, in order: the requested chain
