@@ -187,18 +187,18 @@ preferences:
   # circuit_half_open_probes: max probes allowed in half-open state before
   #   another request is blocked. Omitting uses the built-in default.
   circuit_half_open_probes: 1
-  # default_max_tokens: 0   # uncomment + set to override the auto behavior
-  #
-  # tor_instances: 4   # number of Tor daemons (outbound IPs) to spawn for the
-  #   proxy pool. 0 (default) disables Tor and uses HTTP proxy sources.
-  #   Exit nodes restricted to Americas + Europe; routing tuned for speed.
-  #   Controls the output-token ceiling applied to requests that omit
+  # default_max_tokens: 0   # Controls the output-token ceiling applied to requests that omit
   #   max_tokens. nil (absent) = auto (half of profile context window);
   #   0 = never default (send to provider as-is); positive = absolute value.
-  #   max_label_cardinality: 512   # uncomment to override the default
-  # commandcode_proxy_max_concurrent: 16   # uncomment to override the default concurrency cap
-  #   Bounds how many distinct provider/model labels the metrics registry
-  #   tracks. Must be between 16 and 65536.
+  #
+  # tor_instances: 0   # number of Tor daemons (outbound IPs) to spawn for the
+  #   proxy pool. 0 (default) disables Tor and uses HTTP proxy sources.
+  #   Exit nodes restricted to Americas + Europe; routing tuned for speed.
+  #
+  # max_label_cardinality: 512   # Bounds how many distinct provider/model labels the
+  #   metrics registry tracks. Must be between 16 and 65536.
+  #
+  # commandcode_proxy_max_concurrent: 16   # default concurrency cap
 
 models:
   smart:
