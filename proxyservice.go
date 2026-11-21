@@ -1488,7 +1488,17 @@ func (s *ProxyService) startTorInstances(ctx context.Context) {
 
 	var list []*ProxyInfo
 	for i := 0; i < n; i++ {
-		dataDir := filepath.Join(os.TempDir(), fmt.Sprintf("airouter-tor-%d", i))
+		baseDir := ""
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			baseDir = filepath.Join(home, ".local", "state", "airouter")
+		} else {
+			baseDir = os.TempDir()
+		}
+		if err := os.MkdirAll(baseDir, 0o700); err != nil {
+			log.Printf("[tor] cannot create base dir: %v", err)
+			continue
+		}
+		dataDir := filepath.Join(baseDir, fmt.Sprintf("airouter-tor-%d", i))
 		if err := os.MkdirAll(dataDir, 0o700); err != nil {
 			log.Printf("[tor] cannot create data dir: %v", err)
 			continue
