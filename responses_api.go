@@ -147,7 +147,11 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 		}
 	}
 	g.router.IncrementSessionRetry(sessionID)
-	g.inflight.Track(sessionID, req.Model, "")
+	servingModel := g.router.ServingChain(sessionID)
+	if servingModel == "" {
+		servingModel = req.Model
+	}
+	g.inflight.Track(sessionID, servingModel, "")
 	defer g.inflight.Untrack(sessionID)
 
 	for {
@@ -236,8 +240,10 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 
 		// Refresh which endpoint is generating for this session before
 		// the upstream call, so a mid-request fallback shows the
-		// correct endpoint in the dashboard's inflight panel.
+		// correct endpoint in the dashboard's inflight panel. Re-key under the
+		// serving chain so cross-chain failover is reflected correctly.
 		g.inflight.UpdateEndpoint(sessionID, ep.Key())
+		g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 
 		// attemptStart times this single upstream call; `start` above is the
 		// request-level clock every recordRequest below measures against.
@@ -516,6 +522,7 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 	// the chat streaming path. The deferred untrack covers every exit,
 	if g.router.SessionRetryBudgetExhausted(sessionID) {
 		if g.router.MigrateSessionOnBudgetExhaustion(sessionID, req.Model) {
+			g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; migrated to alternate chain", sessionID, req.Model)
 		} else {
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
@@ -528,7 +535,11 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		}
 	}
 	g.router.IncrementSessionRetry(sessionID)
-	g.inflight.Track(sessionID, req.Model, "")
+	servingModel := g.router.ServingChain(sessionID)
+	if servingModel == "" {
+		servingModel = req.Model
+	}
+	g.inflight.Track(sessionID, servingModel, "")
 	defer g.inflight.Untrack(sessionID)
 
 	// retryBody is the upstream body for the current attempt. After a
@@ -589,8 +600,10 @@ func (g *GatewayContext) handleResponsesStream(w http.ResponseWriter, r *http.Re
 		// attempt fails before producing anything, nothing has been sent and
 		// we can fall back cleanly.
 		// Refresh which endpoint is generating for this session before
-		// the attempt, mirroring the completion path.
+		// the attempt, mirroring the completion path. Re-key under the
+		// serving chain so cross-chain failover is reflected correctly.
 		g.inflight.UpdateEndpoint(sessionID, ep.Key())
+		g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 
 		var buf strings.Builder
 		var attempt *responsesStreamWriter

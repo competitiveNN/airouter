@@ -1906,7 +1906,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		}
 	}
 	g.router.IncrementSessionRetry(sessionID)
-	g.inflight.Track(sessionID, req.Model, "")
+	servingModel := g.router.ServingChain(sessionID)
+	if servingModel == "" {
+		servingModel = req.Model
+	}
+	g.inflight.Track(sessionID, servingModel, "")
 	defer g.inflight.Untrack(sessionID)
 
 	for {
@@ -2028,8 +2032,10 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 		// session right now. A mid-request fallback moves the
 		// session to the next endpoint in the chain, and the
 		// dashboard should show where it is being served now,
-		// not where it started.
+		// not where it started. Re-key under the serving chain so
+		// cross-chain failover never appears as an impossible model/endpoint pair.
 		g.inflight.UpdateEndpoint(sessionID, ep.Key())
+		g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 
 		// The provider's own interruption ceiling bounds how much silence
 		// this endpoint may put in front of the client. It is the smaller of
@@ -2537,7 +2543,11 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 		}
 	}
 	g.router.IncrementSessionRetry(sessionID)
-	g.inflight.Track(sessionID, req.Model, "")
+	servingModel := g.router.ServingChain(sessionID)
+	if servingModel == "" {
+		servingModel = req.Model
+	}
+	g.inflight.Track(sessionID, servingModel, "")
 	defer g.inflight.Untrack(sessionID)
 
 	sendDone := func() {
@@ -2654,8 +2664,10 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 
 		// See the matching comment in handleCompletion: refresh
 		// which endpoint is generating for this session before
-		// the upstream call that may fall back mid-stream.
+		// the upstream call that may fall back mid-stream. Re-key under the
+		// serving chain so cross-chain failover is reflected in the dashboard.
 		g.inflight.UpdateEndpoint(sessionID, ep.Key())
+		g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 
 		// StreamToClient buffers the start of the stream and only flushes to the
 		// client once the first content token (or tool call) arrives, so an early

@@ -341,3 +341,40 @@ func TestDashboardPageReadsTheCooldownFieldsThePayloadEmits(t *testing.T) {
 		}
 	}
 }
+
+// TestInflightTrackerUpdateServingModelRekeysOnCrossChainFailover pins the
+// bug where a session migrated from its requested logical model (e.g. smart)
+// to a substitute chain (e.g. large) stayed grouped under the requested model
+// in the dashboard inflight panel. That produced impossible rows like
+// "smart / gemini:gemini-flash-lite-latest" when gemini-flash-lite-latest
+// only exists in the large chain.
+func TestInflightTrackerUpdateServingModelRekeysOnCrossChainFailover(t *testing.T) {
+	tr := newInflightTracker()
+	defer tr.Stop()
+
+	tr.Track("s1", "smart", "gemini:gemini-flash-lite-latest")
+	tr.UpdateServingModel("s1", "large")
+
+	snap := tr.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("snapshot rows = %d, want 1: %+v", len(snap), snap)
+	}
+	if snap[0].Model != "large" {
+		t.Fatalf("model = %q, want large (re-keyed serving chain)", snap[0].Model)
+	}
+	if snap[0].Sessions != 1 {
+		t.Fatalf("sessions = %d, want 1", snap[0].Sessions)
+	}
+	if len(snap[0].Endpoints) != 1 || snap[0].Endpoints[0].Endpoint != "gemini:gemini-flash-lite-latest" {
+		t.Fatalf("endpoints = %+v, want gemini:gemini-flash-lite-latest", snap[0].Endpoints)
+	}
+
+	// No-op / safety: unknown session and empty args must not panic or create rows.
+	tr.UpdateServingModel("missing", "smart")
+	tr.UpdateServingModel("s1", "")
+	tr.UpdateServingModel("", "large")
+	snap = tr.Snapshot()
+	if len(snap) != 1 || snap[0].Model != "large" {
+		t.Fatalf("after no-op updates: %+v", snap)
+	}
+}
