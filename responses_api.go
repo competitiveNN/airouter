@@ -134,6 +134,7 @@ func (g *GatewayContext) handleResponsesCompletion(w http.ResponseWriter, r *htt
 	// handleCompletion: the deferred untrack covers every exit path.
 	if g.router.SessionRetryBudgetExhausted(sessionID) {
 		if g.router.MigrateSessionOnBudgetExhaustion(sessionID, req.Model) {
+			g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; migrated to alternate chain", sessionID, req.Model)
 		} else {
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)

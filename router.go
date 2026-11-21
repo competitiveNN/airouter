@@ -2917,6 +2917,22 @@ func (r *Router) GetAllSessions() map[string]ModelEndpoint {
 	return result
 }
 
+// ServingChain returns the chain name a session is currently bound to —
+// the chain actually serving its traffic after any cross-chain failover —
+// falling back to the logical model for legacy session entries.
+func (r *Router) ServingChain(sessionID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	se, ok := r.sessions[sessionID]
+	if !ok {
+		return ""
+	}
+	if se.chain == "" {
+		return se.model
+	}
+	return se.chain
+}
+
 func (r *Router) GetAllCooldowns() map[string]CooldownEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

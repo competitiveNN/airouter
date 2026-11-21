@@ -119,6 +119,23 @@ func (t *inflightTracker) UpdateEndpoint(sessionID, endpoint string) {
 	}
 }
 
+// UpdateServingModel re-keys a live session under the model (logical
+// profile) that is actually serving it right now. A cross-chain failover
+// keeps the client-requested logical model on the session entry but moves
+// it onto a substitute chain; without this the inflight panel would show
+// an impossible pair like `smart` + gemini-flash-lite-latest.
+func (t *inflightTracker) UpdateServingModel(sessionID, model string) {
+	if t == nil || sessionID == "" || model == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s, ok := t.sessions[sessionID]; ok {
+		s.model = model
+		s.lastUsed = time.Now()
+	}
+}
+
 // Untrack marks one request as no longer actively streaming for a session.
 // It no longer removes the session: the conversation is alive until it has
 // been idle for sessionTTL, matching the router's session map. Calling it

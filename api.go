@@ -1889,6 +1889,11 @@ func (g *GatewayContext) handleCompletion(w http.ResponseWriter, r *http.Request
 	if g.router.SessionRetryBudgetExhausted(sessionID) {
 		if g.router.MigrateSessionOnBudgetExhaustion(sessionID, req.Model) {
 			// Session switched to an alternate chain; retry budget reset inside migration.
+			// Re-key the inflight tracker under the chain actually serving the session,
+			// so the dashboard groups it under the correct logical profile instead of
+			// the client-requested one (which would show impossible pairs like
+			// smart + gemini-flash-lite-latest).
+			g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; migrated to alternate chain", sessionID, req.Model)
 		} else {
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
@@ -2519,6 +2524,7 @@ func (g *GatewayContext) handleStream(w http.ResponseWriter, r *http.Request, bo
 	// failure path that replays partial output and falls back.
 	if g.router.SessionRetryBudgetExhausted(sessionID) {
 		if g.router.MigrateSessionOnBudgetExhaustion(sessionID, req.Model) {
+			g.inflight.UpdateServingModel(sessionID, g.router.ServingChain(sessionID))
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; migrated to alternate chain", sessionID, req.Model)
 		} else {
 			log.Printf("[debug] session=%s model=%s -> session retry budget exhausted; returning 200 degraded", sessionID, req.Model)
