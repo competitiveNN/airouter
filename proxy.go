@@ -1382,8 +1382,14 @@ func (p *Proxy) forwardUncoalesced(ctx context.Context, body []byte, endpoint Mo
 		if usedProxy != nil {
 			proxyTag = redactProxyURL(usedProxy.URL)
 		}
-		log.Printf("[debug] upstream error provider=%s model=%s status=%d proxy=%s body=%s",
-			endpoint.Provider, endpoint.Model, resp.StatusCode, proxyTag, truncateErr(string(respBody), 600))
+		keyPrefix := "***"
+		if k := providerCfg.APIKeyAt(endpoint.APIKeyIndex); len(k) >= 6 {
+			keyPrefix = k[:6] + "..."
+		} else if k != "" {
+			keyPrefix = k[:1] + "..."
+		}
+		log.Printf("[debug] upstream error provider=%s model=%s key=%d apikey=%s status=%d proxy=%s body=%s",
+			endpoint.Provider, endpoint.Model, endpoint.APIKeyIndex, keyPrefix, resp.StatusCode, proxyTag, truncateErr(string(respBody), 600))
 	}
 	return resp, respBody, cancel, nil
 }
@@ -1778,8 +1784,14 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		if usedProxy != nil {
 			proxyTag = redactProxyURL(usedProxy.URL)
 		}
-		log.Printf("[debug] upstream error provider=%s model=%s status=%d proxy=%s body=%s",
-			endpoint.Provider, endpoint.Model, resp.StatusCode, proxyTag, truncateErr(string(bodyBytes), 600))
+		keyPrefix := "***"
+		if k := providerCfg.APIKeyAt(endpoint.APIKeyIndex); len(k) >= 6 {
+			keyPrefix = k[:6] + "..."
+		} else if k != "" {
+			keyPrefix = k[:1] + "..."
+		}
+		log.Printf("[debug] upstream error provider=%s model=%s key=%d apikey=%s status=%d proxy=%s body=%s",
+			endpoint.Provider, endpoint.Model, endpoint.APIKeyIndex, keyPrefix, resp.StatusCode, proxyTag, truncateErr(string(bodyBytes), 600))
 		// Command Code error statuses go through the same CC_STATUS_MAP
 		// the non-streaming path applies (api.go), so the cooldown
 		// classifier sees the OpenAI-equivalent status on streaming
