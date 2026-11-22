@@ -24,7 +24,7 @@ const dashboardHTML = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>AI Router Dashboard</title>
+<title id="pageTitle">AI Router Dashboard</title>
 <style>
 body{font-family:system-ui,sans-serif;margin:0;padding:0;background:#f6f7fb;color:#111}
 header{background:#0f172a;color:#fff;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center}
@@ -87,7 +87,7 @@ details.tree[open]>summary{margin-bottom:.3rem}
 </head>
 <body>
 <header>
-  <h1>AI Router Dashboard</h1>
+  <h1 id="pageHeader">AI Router Dashboard</h1>
   <div style="display:flex;align-items:center;gap:1rem">
     <span id="configUpdated" style="font-size:.85rem;color:#cbd5e1"></span>
     <span id="status" style="font-size:.85rem;color:#94a3b8"></span>
@@ -607,6 +607,13 @@ async function clearSelectedCooldowns(){
 }
 
 let serverNow=Date.now();
+function setProxyTitle(isProxy){
+  const suffix = isProxy ? ' — Provider Proxy' : '';
+  const t = document.getElementById('pageTitle');
+  const h = document.getElementById('pageHeader');
+  if(t) t.textContent = 'AI Router Dashboard' + suffix;
+  if(h) h.textContent = 'AI Router Dashboard' + suffix;
+}
 let searchQuery='';
 let searchDebounceTimer=null; // debounced error-log search (filter by 'q')
 
@@ -669,6 +676,7 @@ async function refresh(){
     const ecEl=document.getElementById('errorCount');
     if(ecEl) ecEl.textContent = errCount + ' error' + (errCount===1 ? '' : 's') + (searchQuery.trim() ? ' matching' : '');
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
+    if(typeof d.is_proxy !== 'undefined') setProxyTitle(d.is_proxy);
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
 }
 

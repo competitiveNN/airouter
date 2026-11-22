@@ -14,9 +14,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -170,6 +172,14 @@ type ProxyService struct {
 	torMode      bool
 	torMu        sync.Mutex
 	torProcesses []*tornago.TorProcess
+	// torState tracks the observed bootstrap state of every spawned Tor
+	// daemon: the control port and cookie used to query it, the last
+	// bootstrap percentage reported by Tor, and the last error seen while
+	// querying. Surfaced on the dashboard so an operator can tell whether a
+	// proxy routing failure is because a Tor instance is still building its
+	// first circuit or because of something else.
+	torStateMu sync.Mutex
+	torState   map[string]*torInstanceState
 
 	// probeTargets are the real provider base URLs the readiness probe tunnels
 	// through the proxy and performs a TLS handshake against, so an MITM or
@@ -210,6 +220,16 @@ const geoCacheMaxEntries = 8192
 // collapses that while keeping the request burst modest.
 const geoWorkers = 4
 
+// torStatusInterval is how often each Tor daemon's bootstrap state is
+// refreshed from its control port for the dashboard. It is intentionally
+// short: an operator watching proxy failures needs to see within a few
+// seconds whether Tor has finished bootstrapping.
+const torStatusInterval = 5 * time.Second
+
+// torControlTimeout bounds each control-port bootstrap query so a hung Tor
+// control port cannot block the dashboard poller or a request path.
+const torControlTimeout = 5 * time.Second
+
 // NewProxyService builds a proxy service from the sources file. If no sources
 // are configured or the API key is missing, the service is still created but
 // geolocation will treat every proxy as non-preferred (backup).
@@ -238,6 +258,7 @@ func NewProxyService(sourcesFile string, refreshInterval time.Duration) *ProxySe
 		ready:           make(map[string]time.Time),
 		readyLatency:    make(map[string]time.Duration),
 		geoCache:        make(map[string]geoEntry),
+		torState:        make(map[string]*torInstanceState),
 		refreshInterval: refreshInterval,
 		stopCh:          make(chan struct{}),
 	}
@@ -1067,8 +1088,10 @@ func (s *ProxyService) MarkDown(url string, d time.Duration) {
 
 	// Terminal blacklist: a proxy that fails once is never retried. A negative
 	// duration is an explicit "expired cooldown" probe (tests) and must not
-	// promote the proxy to the permanent blacklist.
-	if d >= 0 {
+	// promote the proxy to the permanent blacklist. Tor daemons are exempt:
+	// they are long-running and recover from intermittent failures, so a
+	// transient failure only earns them a cooldown, not a permanent ban.
+	if d >= 0 && !s.isTorProxy(url) {
 		s.blacklistedMu.Lock()
 		if s.blacklisted == nil {
 			s.blacklisted = make(map[string]struct{})
@@ -1097,7 +1120,7 @@ func (s *ProxyService) MarkDown(url string, d time.Duration) {
 	if s.sourceFailed == nil {
 		s.sourceFailed = make(map[string]int)
 	}
-	if d >= 0 && !s.failedProxy[url] {
+	if d >= 0 && !s.isTorProxy(url) && !s.failedProxy[url] {
 		s.failedProxy[url] = true
 		if src := s.sourceOf[url]; src != "" {
 			s.sourceFailed[src]++
@@ -1116,7 +1139,24 @@ func (s *ProxyService) MarkProxyDownTerminal(url string) { s.MarkDown(url, 0) }
 
 func (s *ProxyService) IsBlacklisted(url string) bool      { return s.isBlacklisted(url) }
 func (s *ProxyService) IsProxyBlacklisted(url string) bool { return s.isBlacklisted(url) }
+
+// isTorProxy reports whether url names one of the Tor daemons this service
+// spawned. Tor instances are long-running and recover from intermittent
+// failures, so they must never be placed on the terminal blacklist.
+func (s *ProxyService) isTorProxy(url string) bool {
+	s.torStateMu.Lock()
+	defer s.torStateMu.Unlock()
+	if s.torState == nil {
+		return false
+	}
+	_, ok := s.torState[url]
+	return ok
+}
+
 func (s *ProxyService) isBlacklisted(url string) bool {
+	if s.isTorProxy(url) {
+		return false
+	}
 	s.blacklistedMu.Lock()
 	defer s.blacklistedMu.Unlock()
 	_, ok := s.blacklisted[url]
@@ -1224,6 +1264,232 @@ func (s *ProxyService) TorInstances() int {
 	s.torMu.Lock()
 	defer s.torMu.Unlock()
 	return s.torInstances
+}
+
+// torInstanceState tracks one spawned Tor daemon's observed bootstrap state.
+// It is keyed by SOCKS URL in s.torState.
+type torInstanceState struct {
+	// URL is the SOCKS5 URL the pool hands out for this instance.
+	URL string
+	// ControlAddr is the Tor control port used to query bootstrap status.
+	ControlAddr string
+	// CookiePath is the control-port cookie file used for authentication.
+	CookiePath string
+	// DataDir is the Tor data directory (used for restarts).
+	DataDir string
+	// TorrcPath is the torrc file path (used for restarts).
+	TorrcPath string
+	// SocksAddr is the Tor SOCKS port address.
+	SocksAddr string
+	// StartedAt is when tornago launched the daemon.
+	StartedAt time.Time
+	// Progress is the last bootstrap percentage reported by Tor (0-100).
+	Progress int
+	// Err is the last error seen while querying the control port.
+	Err string
+	// CheckedAt is when the state was last refreshed.
+	CheckedAt time.Time
+	// Process is the running Tor daemon (may be nil if exited).
+	Process *tornago.TorProcess
+	// PID is the OS process ID of the Tor daemon.
+	PID int
+}
+
+// TorInstanceStatus is the dashboard-facing view of one Tor daemon.
+type TorInstanceStatus struct {
+	URL         string    `json:"url"`
+	Progress    int       `json:"progress"`
+	State       string    `json:"state"`
+	Down        bool      `json:"down"`
+	DownUntil   time.Time `json:"down_until,omitempty"`
+	Blacklisted bool      `json:"blacklisted,omitempty"`
+	Error       string    `json:"error,omitempty"`
+	LastChecked time.Time `json:"last_checked"`
+	StartedAt   time.Time `json:"started_at"`
+}
+
+// TorStatus is the dashboard-facing view of the Tor-backed proxy pool. When
+// Tor mode is disabled, Enabled is false and Instances is empty.
+type TorStatus struct {
+	Enabled       bool                `json:"enabled"`
+	Configured    int                 `json:"configured"`
+	Running       bool                `json:"running"`
+	Ready         int                 `json:"ready"`
+	RequiredReady int                 `json:"required_ready"`
+	Instances     []TorInstanceStatus `json:"instances"`
+}
+
+// TorStatus snapshots the Tor-backed proxy pool for the dashboard. It tells
+// an operator whether Tor mode is on, how many daemons were configured, how
+// many are currently proven ready, and -- per instance -- whether Tor has
+// finished bootstrapping its first circuit ("ready") or is still booting
+// ("bootstrapping"). A Tor instance whose control port cannot be queried
+// shows "unreachable".
+func (s *ProxyService) TorStatus() TorStatus {
+	s.torMu.Lock()
+	enabled := s.torMode
+	configured := s.torInstances
+	s.torMu.Unlock()
+
+	out := TorStatus{
+		Enabled:       enabled,
+		Configured:    configured,
+		Running:       s.running.Load(),
+		Ready:         s.readyCount(),
+		RequiredReady: int(s.required.Load()),
+		Instances:     []TorInstanceStatus{},
+	}
+	if !enabled {
+		return out
+	}
+
+	s.torStateMu.Lock()
+	instances := make([]*torInstanceState, 0, len(s.torState))
+	for _, st := range s.torState {
+		instances = append(instances, st)
+	}
+	s.torStateMu.Unlock()
+
+	for _, st := range instances {
+		item := TorInstanceStatus{
+			URL:         st.URL,
+			Progress:    st.Progress,
+			Error:       st.Err,
+			LastChecked: st.CheckedAt,
+			StartedAt:   st.StartedAt,
+		}
+		switch {
+		case st.Err != "":
+			item.State = "unreachable"
+		case st.Progress >= 100:
+			item.State = "ready"
+		default:
+			item.State = "bootstrapping"
+		}
+		s.downMu.Lock()
+		expiry, down := s.down[st.URL]
+		s.downMu.Unlock()
+		if down && !time.Now().After(expiry) {
+			item.Down = true
+			item.DownUntil = expiry
+		}
+		item.Blacklisted = s.isBlacklisted(st.URL)
+		out.Instances = append(out.Instances, item)
+	}
+	sort.Slice(out.Instances, func(i, j int) bool {
+		return out.Instances[i].URL < out.Instances[j].URL
+	})
+	return out
+}
+
+// torStatusLoop periodically refreshes each Tor daemon's bootstrap state
+// from its control port until the process shuts down.
+func (s *ProxyService) torStatusLoop(ctx context.Context) {
+	ticker := time.NewTicker(torStatusInterval)
+	defer ticker.Stop()
+	s.refreshTorStatus(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.refreshTorStatus(ctx)
+		}
+	}
+}
+
+// refreshTorStatus queries every spawned Tor daemon for its bootstrap phase
+// and stores the observed state. It is safe to call concurrently; Tor's
+// control port is queried one instance at a time so a slow daemon cannot
+// pile up queries. If a daemon has exited, it is reported as unreachable.
+func (s *ProxyService) refreshTorStatus(ctx context.Context) {
+	s.torStateMu.Lock()
+	instances := make([]*torInstanceState, 0, len(s.torState))
+	for _, st := range s.torState {
+		instances = append(instances, st)
+	}
+	s.torStateMu.Unlock()
+
+	for _, st := range instances {
+		// Check if the Tor process is still alive.
+		if !torProcessAlive(st.PID) {
+			s.torStateMu.Lock()
+			cur := s.torState[st.URL]
+			if cur == st {
+				cur.Err = "tor process exited"
+				cur.CheckedAt = time.Now()
+			}
+			s.torStateMu.Unlock()
+			continue
+		}
+
+		progress, err := torBootstrapProgress(ctx, st.ControlAddr, st.CookiePath)
+		s.torStateMu.Lock()
+		cur := s.torState[st.URL]
+		if cur == st {
+			cur.Progress = progress
+			cur.CheckedAt = time.Now()
+			if err != nil {
+				cur.Err = err.Error()
+			} else {
+				cur.Err = ""
+			}
+		}
+		s.torStateMu.Unlock()
+	}
+}
+
+// torProcessAlive reports whether the process with the given PID is still
+// running. A PID of 0 or a process that cannot be found is treated as dead.
+func torProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// On Unix, FindProcess always succeeds; signal 0 checks existence.
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// torBootstrapProgress returns the bootstrap percentage reported by the Tor
+// control port at addr, authenticated with cookiePath. A zero progress with
+// no error means Tor has just started and is building its first circuit.
+func torBootstrapProgress(ctx context.Context, controlAddr, cookiePath string) (int, error) {
+	if controlAddr == "" || cookiePath == "" {
+		return 0, fmt.Errorf("no control port configured")
+	}
+	client, err := tornago.NewControlClient(controlAddr, tornago.ControlAuthFromCookie(cookiePath), torControlTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer client.Close()
+	qctx, cancel := context.WithTimeout(ctx, torControlTimeout)
+	defer cancel()
+	raw, err := client.GetInfo(qctx, "status/bootstrap-phase")
+	if err != nil {
+		return 0, err
+	}
+	return parseTorBootstrapProgress(raw), nil
+}
+
+// parseTorBootstrapProgress extracts the integer progress from a Tor
+// bootstrap-phase line such as:
+//
+//	NOTICE BOOTSTRAP PROGRESS=100 TAG=done SUMMARY="Done"
+func parseTorBootstrapProgress(raw string) int {
+	for _, field := range strings.Fields(raw) {
+		if v, ok := strings.CutPrefix(field, "PROGRESS="); ok {
+			if n, err := strconv.Atoi(v); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
 }
 
 // SetProbeTargets stores the provider base URLs the readiness probe tunnels
@@ -1424,7 +1690,10 @@ func (s *ProxyService) Start(ctx context.Context) {
 	// No HTTP source fetching or refresh loop.
 	if s.TorMode() {
 		s.startTorInstances(ctx)
-		// keep alive until stopped
+		// Keep alive until stopped, and periodically refresh each daemon's
+		// bootstrap state so the dashboard can distinguish a still-booting
+		// instance from a broken one.
+		go s.torStatusLoop(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -1476,6 +1745,29 @@ func (s *ProxyService) Stop() {
 // is restricted to, keeping circuits on fast, nearby exits.
 var torExitNodes = "{us},{ca},{mx},{ar},{br},{cl},{co},{pe},{ve},{de},{fr},{gb},{nl},{se},{ch},{it},{es},{pl},{pt},{be},{at},{cz},{dk},{fi},{no},{ie},{gr},{hu},{ro}"
 
+// cleanStaleTorDataDirs removes data directories from previous runs that are
+// older than 1 hour. This prevents conflicts with orphaned Tor processes
+// from previous runs.
+func cleanStaleTorDataDirs(baseDir string) {
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "airouter-tor-") {
+			continue
+		}
+		dir := filepath.Join(baseDir, e.Name())
+		info, err := os.Stat(dir)
+		if err != nil {
+			continue
+		}
+		if time.Since(info.ModTime()) > time.Hour {
+			_ = os.RemoveAll(dir)
+		}
+	}
+}
+
 // startTorInstances spawns s.torInstances Tor daemons and registers their SOCKS5
 // endpoints in the pool as ready proxies.
 func (s *ProxyService) startTorInstances(ctx context.Context) {
@@ -1483,22 +1775,26 @@ func (s *ProxyService) startTorInstances(ctx context.Context) {
 	if n <= 0 {
 		return
 	}
+
+	// Clean up stale data directories from previous runs.
+	baseDir := ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		baseDir = filepath.Join(home, ".local", "state", "airouter")
+	} else {
+		baseDir = os.TempDir()
+	}
+	cleanStaleTorDataDirs(baseDir)
+
 	s.torMu.Lock()
 	defer s.torMu.Unlock()
 
 	var list []*ProxyInfo
 	for i := 0; i < n; i++ {
-		baseDir := ""
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			baseDir = filepath.Join(home, ".local", "state", "airouter")
-		} else {
-			baseDir = os.TempDir()
-		}
 		if err := os.MkdirAll(baseDir, 0o700); err != nil {
 			log.Printf("[tor] cannot create base dir: %v", err)
 			continue
 		}
-		dataDir := filepath.Join(baseDir, fmt.Sprintf("airouter-tor-%d", i))
+		dataDir := filepath.Join(baseDir, fmt.Sprintf("airouter-tor-%d-%d", os.Getpid(), i))
 		if err := os.MkdirAll(dataDir, 0o700); err != nil {
 			log.Printf("[tor] cannot create data dir: %v", err)
 			continue
@@ -1560,6 +1856,23 @@ NumEntryGuards 1
 			IP:       host,
 			Port:     port,
 		})
+		s.torStateMu.Lock()
+		if s.torState == nil {
+			s.torState = make(map[string]*torInstanceState)
+		}
+		socksURL := "socks5://" + net.JoinHostPort(host, port)
+		s.torState[socksURL] = &torInstanceState{
+			URL:         socksURL,
+			ControlAddr: controlAddr,
+			CookiePath:  cookiePath,
+			DataDir:     dataDir,
+			TorrcPath:   torrcPath,
+			SocksAddr:   socksAddr,
+			StartedAt:   time.Now(),
+			Process:     proc,
+			PID:         proc.PID(),
+		}
+		s.torStateMu.Unlock()
 	}
 	s.pool.set(list)
 	for _, p := range list {
@@ -1588,6 +1901,15 @@ func (s *ProxyService) stopTorInstances() {
 		_ = p.Stop()
 	}
 	s.torProcesses = nil
+	// Clean up data directories.
+	s.torStateMu.Lock()
+	for _, st := range s.torState {
+		if st.DataDir != "" {
+			_ = os.RemoveAll(st.DataDir)
+		}
+	}
+	s.torState = make(map[string]*torInstanceState)
+	s.torStateMu.Unlock()
 }
 
 // TransportFor returns an http.Transport configured to route through the given

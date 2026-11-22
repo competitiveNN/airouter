@@ -311,6 +311,7 @@ type GatewayContext struct {
 	testCooldown  time.Duration // override for tests: forces all cooldowns to this duration
 	metrics       *Metrics      // Prometheus-style metrics; nil in tests that don't need it
 	inflight      *inflightTracker
+	isProxy       bool // true for airouter-proxy (standalone provider proxy)
 	// Stale-while-revalidate cache: the last successful response body per
 	// session, served when the entire fallback chain is exhausted so the
 	// client still gets a usable answer instead of a degraded message.
@@ -319,6 +320,10 @@ type GatewayContext struct {
 }
 
 func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string, allowNoAuth ...bool) *GatewayContext {
+	return NewGatewayContextWithProxy(router, proxy, cfg, configPath, gatewayAPIKey, false, allowNoAuth...)
+}
+
+func NewGatewayContextWithProxy(router *Router, proxy *Proxy, cfg *Config, configPath, gatewayAPIKey string, isProxy bool, allowNoAuth ...bool) *GatewayContext {
 	g := &GatewayContext{
 		router:        router,
 		proxy:         proxy,
@@ -327,6 +332,7 @@ func NewGatewayContext(router *Router, proxy *Proxy, cfg *Config, configPath, ga
 		metrics:       NewMetrics(),
 		inflight:      newInflightTracker(),
 		lastResp:      make(map[string]*cachedResponse),
+		isProxy:       isProxy,
 	}
 	if len(allowNoAuth) > 0 {
 		g.allowNoAuth = allowNoAuth[0]
@@ -3389,6 +3395,7 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		SqliteStats:    g.router.GetAllSqliteStats(),
 		ProxySources:   g.proxy.ProxySourceStats(),
 		Tor:            g.proxy.ProxyTorStatus(),
+		IsProxy:        g.isProxy,
 	}
 
 	if g.configPath != "" {

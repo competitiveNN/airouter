@@ -211,8 +211,12 @@ type dashboardResponse struct {
 	// clear it without restarting the daemon.
 	Cooldowns map[string]CooldownEntry `json:"cooldowns"`
 	// ProxySources carries per-source proxy failure rates for the dashboard.
-	ProxySources []ProxySourceStat          `json:"proxy_sources"`
-	Circuits     map[string]*CircuitBreaker `json:"circuits"`
+	ProxySources []ProxySourceStat `json:"proxy_sources"`
+	// Tor carries the Tor-backed proxy pool state for the dashboard: whether
+	// Tor mode is on, how many instances are configured and ready, and each
+	// instance's bootstrap state (ready, still bootstrapping, unreachable).
+	Tor      TorStatus                  `json:"tor"`
+	Circuits map[string]*CircuitBreaker `json:"circuits"`
 	// SqliteStats carries a read-only snapshot of every table in the state
 	// database (priorities/TPS, sticky sessions, meta) plus its path and
 	// on-disk size. Surfaced so the dashboard can render the persisted state
@@ -222,6 +226,10 @@ type dashboardResponse struct {
 	// gateway loaded, so the dashboard can show when the chains were
 	// last changed.
 	ConfigUpdatedAt time.Time `json:"config_updated_at"`
+	// IsProxy indicates whether this is the airouter-proxy (standalone
+	// provider proxy) rather than the full airouter gateway. The dashboard
+	// uses this to adjust its title.
+	IsProxy bool `json:"is_proxy"`
 }
 
 // dashboardWindowSeconds maps a dashboard window name onto the number of

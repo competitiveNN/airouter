@@ -571,7 +571,7 @@ func main() {
 		}
 	}
 
-	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
+	gateway := NewGatewayContextWithProxy(router, proxy, cfg, *configPath, *gatewayAPIKey, true, *allowNoAuth)
 	router.SetMetrics(gateway.metrics)
 	proxy.SetMetrics(gateway.metrics)
 	defer gateway.Close()

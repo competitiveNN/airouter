@@ -400,6 +400,18 @@ func (p *Proxy) ProxySourceStats() []ProxySourceStat {
 	return svc.ProxySourceStats()
 }
 
+// ProxyTorStatus snapshots the Tor-backed proxy pool for the dashboard. A
+// nil service means Tor mode is not in use: Enabled stays false.
+func (p *Proxy) ProxyTorStatus() TorStatus {
+	p.proxyMu.RLock()
+	svc := p.proxySvc
+	p.proxyMu.RUnlock()
+	if svc == nil {
+		return TorStatus{}
+	}
+	return svc.TorStatus()
+}
+
 // MarkProxyReady records that a proxy was just proven usable, so it counts
 // against the ready-pool requirement. Called only on a real success through the
 // proxy, which is the strongest evidence available.
