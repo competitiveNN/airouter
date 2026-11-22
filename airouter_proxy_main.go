@@ -368,13 +368,15 @@ func (s *providerServer) forwardChat(w http.ResponseWriter, r *http.Request, bod
 		resp, release, err := s.gateway.proxy.Forward(ctx, body, ep, sessionID)
 		if err != nil {
 			lastErr = err
-			log.Printf("[airouter-proxy] %s/%s (key %d) forward failed: %v", endpoint.Provider, endpoint.Model, idx, err)
 			var pErr *ProxyError
+			proxyTag := "direct"
 			if errors.As(err, &pErr) {
 				if url := pErr.ProxyURL(); url != "" {
+					proxyTag = "proxied via " + url
 					s.gateway.proxy.MarkProxyDown(url, proxyCooldown)
 				}
 			}
+			log.Printf("[airouter-proxy] %s/%s (key %d) forward failed (%s): %v", endpoint.Provider, endpoint.Model, idx, proxyTag, err)
 			continue
 		}
 
@@ -491,13 +493,15 @@ func (s *providerServer) streamChat(w http.ResponseWriter, r *http.Request, body
 		if err == nil {
 			return
 		}
-		log.Printf("[airouter-proxy] %s/%s (key %d) stream failed: %v", endpoint.Provider, endpoint.Model, idx, err)
 		var pErr *ProxyError
+		proxyTag := "direct"
 		if errors.As(err, &pErr) {
 			if url := pErr.ProxyURL(); url != "" {
+				proxyTag = "proxied via " + url
 				s.gateway.proxy.MarkProxyDown(url, proxyCooldown)
 			}
 		}
+		log.Printf("[airouter-proxy] %s/%s (key %d) stream failed (%s): %v", endpoint.Provider, endpoint.Model, idx, proxyTag, err)
 		// If bytes already reached the client we cannot transparently retry
 		// on another key without duplicating output; stop here.
 		if tw.n > 0 {
