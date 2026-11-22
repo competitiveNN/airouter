@@ -3075,6 +3075,11 @@ type ProviderError struct {
 	// (parsed from the Retry-After header). The cooldown logic honors it as a
 	// floor so we never wait less than the provider asked.
 	RetryAfter time.Duration
+	// Proxy, when non-nil, is the proxy (Tor instance) that carried this
+	// attempt far enough to receive an HTTP response. It is informational:
+	// the proxy itself did not fail, so it is not marked down. Used only to
+	// attribute upstream HTTP errors to the Tor instance that served them.
+	Proxy *ProxyInfo
 }
 
 func (e *ProviderError) Error() string {
@@ -3092,6 +3097,15 @@ func (e *ProviderError) Error() string {
 
 func (e *ProviderError) Unwrap() error {
 	return e.Err
+}
+
+// ProxyURL is the URL of the proxy that carried this attempt, or "" when the
+// attempt went direct (or no proxy is recorded). Mirrors ProxyError.ProxyURL.
+func (e *ProviderError) ProxyURL() string {
+	if e == nil || e.Proxy == nil {
+		return ""
+	}
+	return e.Proxy.URL
 }
 
 // maxRetryAfter is the ceiling on a parsed Retry-After value.

@@ -1359,7 +1359,7 @@ func (p *Proxy) forwardUncoalesced(ctx context.Context, body []byte, endpoint Mo
 			return nil, nil, func() {}, &ProxyError{Proxy: usedProxy, Err: err}
 		}
 		cancel()
-		return nil, nil, func() {}, &ProviderError{Err: err}
+		return nil, nil, func() {}, &ProviderError{Err: err, Proxy: usedProxy}
 	}
 	// The proxy carried this request as far as a response header. That is the
 	// strongest evidence of usability we ever get for a proxy, so it renews the
@@ -1372,11 +1372,19 @@ func (p *Proxy) forwardUncoalesced(ctx context.Context, body []byte, endpoint Mo
 	resp.Body.Close()
 	if readErr != nil {
 		cancel()
-		return nil, nil, func() {}, &ProviderError{Err: readErr}
+		return nil, nil, func() {}, &ProviderError{Err: readErr, Proxy: usedProxy}
 	}
 	// Re-create the response with the body we just read
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 	resp.ContentLength = int64(len(respBody))
+	if resp.StatusCode >= 400 {
+		proxyTag := "direct"
+		if usedProxy != nil {
+			proxyTag = redactProxyURL(usedProxy.URL)
+		}
+		log.Printf("[debug] upstream error provider=%s model=%s status=%d proxy=%s body=%s",
+			endpoint.Provider, endpoint.Model, resp.StatusCode, proxyTag, truncateErr(string(respBody), 600))
+	}
 	return resp, respBody, cancel, nil
 }
 
@@ -1752,7 +1760,7 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		if proxyAttribution(err, usedProxy != nil) {
 			return "", nil, 0, &ProxyError{Proxy: usedProxy, Err: err}
 		}
-		return "", nil, 0, &ProviderError{Err: err}
+		return "", nil, 0, &ProviderError{Err: err, Proxy: usedProxy}
 	}
 	// The proxy carried this request as far as a response header, so it counts
 	// as proven usable and renews its readiness mark.
@@ -1766,8 +1774,12 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		// Keep the upstream's own words in the log. A "reason=unknown" with a
 		// body truncated to its first two bytes is what made the Google 400s
 		// undiagnosable: the message that names the offending field is in there.
-		log.Printf("[debug] upstream error provider=%s model=%s status=%d body=%s",
-			endpoint.Provider, endpoint.Model, resp.StatusCode, truncateErr(string(bodyBytes), 600))
+		proxyTag := "direct"
+		if usedProxy != nil {
+			proxyTag = redactProxyURL(usedProxy.URL)
+		}
+		log.Printf("[debug] upstream error provider=%s model=%s status=%d proxy=%s body=%s",
+			endpoint.Provider, endpoint.Model, resp.StatusCode, proxyTag, truncateErr(string(bodyBytes), 600))
 		// Command Code error statuses go through the same CC_STATUS_MAP
 		// the non-streaming path applies (api.go), so the cooldown
 		// classifier sees the OpenAI-equivalent status on streaming
@@ -1785,9 +1797,9 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		// Treat LB health check / maintenance responses as transient transport
 		// failures so they trigger fallback without penalizing the endpoint.
 		if isLBHealthCheckResponse(resp.StatusCode, resp.Header, bodyBytes) {
-			return "", nil, 0, &ProviderError{StatusCode: 0, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
+			return "", nil, 0, &ProviderError{StatusCode: 0, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After")), Proxy: usedProxy}
 		}
-		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
+		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After")), Proxy: usedProxy}
 	}
 
 	// A 200 without an SSE content type means the provider ignored stream:true
@@ -1800,9 +1812,9 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
 		resp.Body.Close()
 		if isLBHealthCheckResponse(resp.StatusCode, resp.Header, bodyBytes) {
-			return "", nil, 0, &ProviderError{StatusCode: 0, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
+			return "", nil, 0, &ProviderError{StatusCode: 0, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After")), Proxy: usedProxy}
 		}
-		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"))}
+		return "", nil, 0, &ProviderError{StatusCode: resp.StatusCode, Body: bodyBytes, RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After")), Proxy: usedProxy}
 	}
 
 	// Guard only the first byte with the size-based timeout. Once the stream

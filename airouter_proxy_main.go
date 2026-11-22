@@ -369,11 +369,16 @@ func (s *providerServer) forwardChat(w http.ResponseWriter, r *http.Request, bod
 		if err != nil {
 			lastErr = err
 			var pErr *ProxyError
+			var provErr *ProviderError
 			proxyTag := "direct"
 			if errors.As(err, &pErr) {
 				if url := pErr.ProxyURL(); url != "" {
 					proxyTag = "proxied via " + url
 					s.gateway.proxy.MarkProxyDown(url, proxyCooldown)
+				}
+			} else if errors.As(err, &provErr) {
+				if url := provErr.ProxyURL(); url != "" {
+					proxyTag = "proxied via " + url
 				}
 			}
 			log.Printf("[airouter-proxy] %s/%s (key %d) forward failed (%s): %v", endpoint.Provider, endpoint.Model, idx, proxyTag, err)
@@ -494,11 +499,16 @@ func (s *providerServer) streamChat(w http.ResponseWriter, r *http.Request, body
 			return
 		}
 		var pErr *ProxyError
+		var provErr *ProviderError
 		proxyTag := "direct"
 		if errors.As(err, &pErr) {
 			if url := pErr.ProxyURL(); url != "" {
 				proxyTag = "proxied via " + url
 				s.gateway.proxy.MarkProxyDown(url, proxyCooldown)
+			}
+		} else if errors.As(err, &provErr) {
+			if url := provErr.ProxyURL(); url != "" {
+				proxyTag = "proxied via " + url
 			}
 		}
 		log.Printf("[airouter-proxy] %s/%s (key %d) stream failed (%s): %v", endpoint.Provider, endpoint.Model, idx, proxyTag, err)
