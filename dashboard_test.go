@@ -1005,6 +1005,131 @@ func TestDashboardPageReadsTheFieldsThePayloadEmits(t *testing.T) {
 	}
 }
 
+// TestDashboardPageReadsTheErrorSearchFields pins the client-side error-log
+// search UI: a search input, a clear button, a matching counter, debounced
+// fetching of the data endpoint with a q parameter, real-time results, and
+// Escape-key clear state. A rename on either side would leave operators
+// unable to filter the cooldowns table.
+func TestDashboardPageReadsTheErrorSearchFields(t *testing.T) {
+	cfg := &Config{Models: map[string]ModelConfig{}}
+	g := dashboardTestGateway(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/admin/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	w := httptest.NewRecorder()
+	g.HandleAdminDashboard(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	html := w.Body.String()
+	for _, want := range []string{
+		"errorSearch", "errorSearchClear", "errorCount",
+		"Filter errors by model, provider, or error text",
+		"searchQuery", "searchDebounceTimer", "setTimeout", "clearTimeout",
+		"encodeURIComponent", "&q=", "Escape", "setupSearch()",
+	} {
+		if !contains(html, want) {
+			t.Errorf("dashboard page missing %q — the error-log search UI is gone", want)
+		}
+	}
+}
+
+// TestDashboardErrorMatches pins the error-log match semantics: case-insensitive
+// substring matching against provider, model, and error string, with an empty
+// query matching everything.
+func TestDashboardErrorMatches(t *testing.T) {
+	cases := []struct {
+		name    string
+		q       string
+		key     string
+		lastErr string
+		want    bool
+	}{
+		{"empty query matches everything", "", "prov:model", "boom", true},
+		{"provider match", "prov", "prov:model", "boom", true},
+		{"provider case-insensitive", "PROV", "prov:model", "boom", true},
+		{"model match", "model", "prov:model", "boom", true},
+		{"model substring", "del", "prov:my-model", "boom", true},
+		{"error string match", "rate limited", "prov:model", "rate limited: try again", true},
+		{"error case-insensitive", "RATE", "prov:model", "Rate Limited", true},
+		{"no match", "nomatch", "prov:model", "boom", false},
+		{"bare model key (no colon)", "bare", "baremodel", "boom", true},
+		{"bare model key no match", "nope", "baremodel", "boom", false},
+		{"whitespace trimmed query", "  prov  ", "prov:model", "boom", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := dashboardErrorMatches(c.q, c.key, c.lastErr); got != c.want {
+				t.Fatalf("dashboardErrorMatches(%q, %q, %q) = %v, want %v", c.q, c.key, c.lastErr, got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandleAdminDashboardDataFiltersErrorLogs pins the server-side ?q=
+// filter on /admin/dashboard/data: cooldowns and circuits are filtered by
+// provider, model name, or error string; an empty query returns everything.
+func TestHandleAdminDashboardDataFiltersErrorLogs(t *testing.T) {
+	cfg := &Config{Models: map[string]ModelConfig{}}
+	g := dashboardTestGateway(t, cfg)
+	stop := g.metrics.StartDashboardTelemetry("")
+	defer stop()
+
+	g.router.ApplyCooldown(&ModelEndpoint{Provider: "anthropic", Model: "claude-3-5-sonnet"}, 429, "rate limited")
+	g.router.ApplyCooldown(&ModelEndpoint{Provider: "google", Model: "gemini-2.5-pro"}, 500, "upstream timeout")
+	g.router.ApplyCooldown(&ModelEndpoint{Provider: "openai", Model: "gpt-4o"}, 404, "model not found")
+
+	data := func(q string) map[string]CooldownEntry {
+		path := "/admin/dashboard/data?window=1d"
+		if q != "" {
+			path += "&q=" + q
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		w := httptest.NewRecorder()
+		g.HandleAdminDashboardData(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (q=%q)", w.Code, q)
+		}
+		var payload struct {
+			Cooldowns map[string]CooldownEntry `json:"cooldowns"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("payload not JSON: %v", err)
+		}
+		return payload.Cooldowns
+	}
+
+	all := data("")
+	if len(all) != 3 {
+		t.Fatalf("unfiltered cooldowns = %d, want 3", len(all))
+	}
+
+	byProvider := data("anthropic")
+	if len(byProvider) != 1 || !cooldownMapHas(byProvider, "anthropic:claude-3-5-sonnet") {
+		t.Fatalf("provider filter = %v, want anthropic:claude-3-5-sonnet only", byProvider)
+	}
+
+	byModel := data("gemini")
+	if len(byModel) != 1 || !cooldownMapHas(byModel, "google:gemini-2.5-pro") {
+		t.Fatalf("model filter = %v, want google:gemini-2.5-pro only", byModel)
+	}
+
+	byError := data("timeout")
+	if len(byError) != 1 || !cooldownMapHas(byError, "google:gemini-2.5-pro") {
+		t.Fatalf("error filter = %v, want google:gemini-2.5-pro only", byError)
+	}
+
+	none := data("does-not-exist-anywhere")
+	if len(none) != 0 {
+		t.Fatalf("no-match filter = %v, want empty", none)
+	}
+}
+
+func cooldownMapHas(m map[string]CooldownEntry, key string) bool {
+	_, ok := m[key]
+	return ok
+}
+
 // TestDashboardRingLenCovers7d is the memory-bound guarantee for the
 // retained ring: it must hold 10081 slots (7d + 1 spare), matching the
 // retention chosen in afc50dc (memory-ceiling audit). A ring shorter than

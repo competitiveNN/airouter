@@ -49,6 +49,12 @@ td.clamp:hover{overflow:visible;white-space:normal;word-break:break-all}
 .pag{display:flex;gap:.5rem;align-items:center;margin-top:.5rem;font-size:.8rem}
 .pag button{background:transparent;color:#2563eb;border:1px solid #cbd5e1;padding:.2rem .6rem;border-radius:6px;cursor:pointer}
 .pag button:disabled{opacity:.4;cursor:default}
+.search-bar{display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem}
+.search-bar input[type=search]{flex:1;padding:.45rem .75rem;border:1px solid #cbd5e1;border-radius:8px;outline:none;font:inherit;background:#fff}
+.search-bar input[type=search]:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+#errorSearchClear{display:none;background:transparent;color:#94a3b8;border:none;padding:.15rem .5rem;border-radius:6px;cursor:pointer;font-size:1.2rem;line-height:1}
+#errorSearchClear:hover{color:#dc2626}
+@media(max-width:600px){.search-bar{flex-direction:column;align-items:stretch}#errorSearchClear{align-self:flex-end}}
 details.tree{margin:.4rem 0}
 details.tree>summary{cursor:pointer;font-weight:600;padding:.3rem 0}
 details.tree[open]>summary{margin-bottom:.3rem}
@@ -63,6 +69,10 @@ details.tree[open]>summary{margin-bottom:.3rem}
 .pill.no{background:#fee2e2;color:#991b1b}
 .pill.cooldown{background:#fef9c3;color:#854d0e}
 .pill.circuit{background:#f3e8ff;color:#6b21a8}
+.pill.tor-ready{background:#dcfce7;color:#166534}
+.pill.tor-bootstrap{background:#fef9c3;color:#854d0e}
+.pill.tor-unreachable{background:#fee2e2;color:#991b1b}
+.pill.tor-disabled{background:#e2e8f0;color:#64748b}
 .sum{color:#64748b;font-size:.85rem;margin-left:auto}
 .life{color:#475569;font-size:.8rem}
 .sessions{margin:.4rem 0 .8rem 1rem;padding-left:.75rem;border-left:2px solid #e2e8f0;display:none}
@@ -141,6 +151,12 @@ details.tree[open]>summary{margin-bottom:.3rem}
   <p>Proxy list sources ranked by the share of their proxies that have failed.</p>
   <table><thead><tr><th class="clamp">Source</th><th>Total</th><th>Failed</th><th>Fail %</th></tr></thead><tbody id="proxySources"></tbody></table>
 </div>
+
+<div class="card">
+  <h2>Tor instances</h2>
+  <p>Each spawned Tor daemon and its bootstrap state. When instances are not <code>ready</code>, proxied requests route through circuits Tor has not finished building and may fail or hang; that is expected for the first minutes after startup.</p>
+  <table><thead><tr><th class="clamp">Instance</th><th>State</th><th>Bootstrap</th><th>Down until</th><th>Last error</th><th>Started</th></tr></thead><tbody id="torInstances"></tbody></table>
+</div>
 </div>
 
 <!-- PAGE 3: Errors, Cooldowns & SQLite Stats -->
@@ -148,6 +164,11 @@ details.tree[open]>summary{margin-bottom:.3rem}
   <div class="card">
     <h2>Cooldowns &amp; Circuits</h2>
     <p>Endpoints currently on cooldown or with open circuits. Check entries to clear.</p>
+    <div class="search-bar" id="errorSearchBar">
+      <input type="search" id="errorSearch" placeholder="Filter errors by model, provider, or error text" autocomplete="off" spellcheck="false">
+      <button id="errorSearchClear" class="wsel" title="Clear search">×</button>
+      <span id="errorCount" class="life"></span>
+    </div>
     <div id="cooldowns"></div>
     <div id="cooldownActions" style="margin-top:.75rem;display:none">
       <button id="clearSelected" class="action" disabled>Clear selected</button>
@@ -523,6 +544,45 @@ function renderProxySources(rows){
   }
 }
 
+function pillClass(state){
+  if(state==='ready') return 'pill tor-ready';
+  if(state==='bootstrapping') return 'pill tor-bootstrap';
+  if(state==='unreachable') return 'pill tor-unreachable';
+  return 'pill tor-disabled';
+}
+
+function renderTorStatus(tor){
+  const tbody=document.getElementById('torInstances');
+  if(!tbody) return;
+  tbody.innerHTML='';
+  if(!tor){
+    const tr=document.createElement('tr'); const td=document.createElement('td'); td.colSpan=6; td.textContent='Tor data not available.'; tr.appendChild(td); tbody.appendChild(tr); return;
+  }
+  if(!tor.enabled){
+    const tr=document.createElement('tr'); const td=document.createElement('td'); td.colSpan=6; td.textContent='Tor mode disabled (tor_instances not set).'; tr.appendChild(td); tbody.appendChild(tr); return;
+  }
+  const inst=tor.instances||[];
+  if(!inst.length){
+    const tr=document.createElement('tr'); const td=document.createElement('td'); td.colSpan=6; td.textContent='No Tor instances yet.'; tr.appendChild(td); tbody.appendChild(tr); return;
+  }
+  for(const r of inst){
+    const tr=document.createElement('tr');
+    const td0=document.createElement('td'); td0.className='clamp'; td0.textContent=r.url||'—'; td0.title=r.url||''; tr.appendChild(td0);
+    const td1=document.createElement('td'); td1.className=pillClass(r.state); td1.textContent=(r.state||'?')+(r.down?' (down)':'')+(r.blacklisted?' (blacklisted)':''); tr.appendChild(td1);
+    const td2=document.createElement('td'); td2.className='num';
+    if(r.progress>=100) td2.textContent='100%';
+    else if(r.progress>0) td2.textContent=r.progress+'%';
+    else td2.textContent='—';
+    tr.appendChild(td2);
+    const td3=document.createElement('td'); td3.className='num';
+    if(r.down_until) td3.textContent=new Date(r.down_until).toLocaleTimeString(); else td3.textContent='—';
+    tr.appendChild(td3);
+    const td4=document.createElement('td'); td4.className='clamp'; td4.textContent=r.error||'—'; td4.title=r.error||''; tr.appendChild(td4);
+    const td5=document.createElement('td'); td5.className='num'; td5.textContent=r.started_at?new Date(r.started_at).toLocaleTimeString():'—'; tr.appendChild(td5);
+    tbody.appendChild(tr);
+  }
+}
+
 function updateClearButton(){
   const btn=document.getElementById('clearSelected');
   if(btn) btn.disabled=cooldownSelection.size===0;
@@ -547,9 +607,44 @@ async function clearSelectedCooldowns(){
 }
 
 let serverNow=Date.now();
+let searchQuery='';
+let searchDebounceTimer=null; // debounced error-log search (filter by 'q')
+
+function setupSearch(){
+  const input=document.getElementById('errorSearch');
+  const clearBtn=document.getElementById('errorSearchClear');
+  if(!input || !clearBtn) return;
+  input.value=searchQuery;
+  clearBtn.style.display=searchQuery?'block':'none';
+
+  input.oninput=(e)=>{
+    searchQuery=e.target.value;
+    clearBtn.style.display=searchQuery?'block':'none';
+    if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer=setTimeout(()=>{
+      refresh();
+    }, 250);
+  };
+
+  clearBtn.onclick=()=>{
+    searchQuery='';
+    input.value='';
+    clearBtn.style.display='none';
+    if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    refresh();
+  };
+
+  input.onkeydown=(e)=>{
+    if(e.key==='Escape'){
+      e.preventDefault();
+      clearBtn.onclick();
+    }
+  };
+}
+
 async function refresh(){
   try{
-    const d=await req('/admin/dashboard/data?window='+activeWindow);
+    const d=await req('/admin/dashboard/data?window='+encodeURIComponent(activeWindow)+(searchQuery.trim()?'&q='+encodeURIComponent(searchQuery.trim()):''));
     if(d.now) serverNow = new Date(d.now).getTime();
     if(d.config_updated_at){
       const elc=document.getElementById('configUpdated');
@@ -566,8 +661,13 @@ async function refresh(){
     sessRows.sort((a,b)=>b.sessions-a.sessions);
     renderBoard('sessions', sessRows, [[r=>r.sessions,v=>v]]);
     if(d.cooldowns||d.circuits) renderCooldowns(d);
+    setupSearch();
     if(d.sqlite_stats) renderSqliteStats(d.sqlite_stats);
     if(d.proxy_sources) renderProxySources(d.proxy_sources);
+    if(d.tor) renderTorStatus(d.tor);
+    const errCount = (d.cooldowns ? Object.keys(d.cooldowns).length : 0) + (d.circuits ? Object.keys(d.circuits).length : 0);
+    const ecEl=document.getElementById('errorCount');
+    if(ecEl) ecEl.textContent = errCount + ' error' + (errCount===1 ? '' : 's') + (searchQuery.trim() ? ' matching' : '');
     document.getElementById('status').textContent='Updated '+new Date(d.generated).toLocaleTimeString();
   }catch(e){ document.getElementById('status').textContent='Error: '+e; }
 }
@@ -580,6 +680,7 @@ function openConfigEditor(){
 }
 const clearBtn=document.getElementById('clearSelected');
 if(clearBtn) clearBtn.onclick=clearSelectedCooldowns;
+setupSearch();
 refresh();
 setInterval(refresh, 30000);
 </script>

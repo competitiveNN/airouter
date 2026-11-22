@@ -3214,10 +3214,48 @@ func (g *GatewayContext) HandleAdminDashboard(w http.ResponseWriter, r *http.Req
 	w.Write([]byte(dashboardHTML))
 }
 
+// splitModelKey splits a cooldown/circuit map key ("provider:model") into its
+// provider and model parts. Keys without a colon are treated as a bare model.
+func splitModelKey(key string) (provider, model string) {
+	if i := strings.IndexByte(key, ':'); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return "", key
+}
+
+// dashboardErrorMatches reports whether an error entry matches the dashboard's
+// error-log search query against its provider, model, or error string. Matching
+// is case-insensitive substring matching; an empty query matches everything.
+func dashboardErrorMatches(q, key, lastError string) bool {
+	q = strings.ToLower(strings.TrimSpace(q))
+	if q == "" {
+		return true
+	}
+	provider, model := splitModelKey(key)
+	return strings.Contains(strings.ToLower(provider), q) ||
+		strings.Contains(strings.ToLower(model), q) ||
+		strings.Contains(strings.ToLower(lastError), q)
+}
+
+// filterMap returns a copy of m containing only the entries for which keep
+// returns true.
+func filterMap[V any](m map[string]V, keep func(string, V) bool) map[string]V {
+	out := make(map[string]V, len(m))
+	for k, v := range m {
+		if keep(k, v) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // HandleAdminDashboardData serves the JSON payload the dashboard page fetches.
 // It bundles chain status and the three leaderboards (speed, volume, failures)
 // so a single request populates the page, and it rejects unknown windows
 // rather than silently defaulting.
+//
+// The optional ?q= query filters the cooldowns and circuits tables by provider,
+// model name, or error string — the error-log search used by the dashboard.
 func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http.Request) {
 	if !g.checkAuth(r) {
 		writeAPIError(w, 401, "Invalid API key", "authentication_error", "invalid_api_key")
@@ -3322,6 +3360,18 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 	sort.Slice(tokens, func(i, j int) bool { return tokens[i].Rate > tokens[j].Rate })
 	sort.Slice(latency, func(i, j int) bool { return latency[i].Rate > latency[j].Rate })
 
+	cooldowns := g.router.GetAllCooldowns()
+	circuits := g.router.GetAllCircuits()
+	q := r.URL.Query().Get("q")
+	if q != "" {
+		cooldowns = filterMap(cooldowns, func(k string, cd CooldownEntry) bool {
+			return dashboardErrorMatches(q, k, cd.LastError)
+		})
+		circuits = filterMap(circuits, func(k string, cb *CircuitBreaker) bool {
+			return dashboardErrorMatches(q, k, "")
+		})
+	}
+
 	resp := dashboardResponse{
 		Chains:         chains,
 		Speed:          speed,
@@ -3334,10 +3384,11 @@ func (g *GatewayContext) HandleAdminDashboardData(w http.ResponseWriter, r *http
 		Now:            time.Now(),
 		Generated:      time.Now(),
 		CircuitBreaker: g.router.CircuitBreakerEnabled(),
-		Cooldowns:      g.router.GetAllCooldowns(),
-		Circuits:       g.router.GetAllCircuits(),
+		Cooldowns:      cooldowns,
+		Circuits:       circuits,
 		SqliteStats:    g.router.GetAllSqliteStats(),
 		ProxySources:   g.proxy.ProxySourceStats(),
+		Tor:            g.proxy.ProxyTorStatus(),
 	}
 
 	if g.configPath != "" {
