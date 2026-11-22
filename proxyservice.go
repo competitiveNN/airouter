@@ -164,6 +164,12 @@ type ProxyService struct {
 	// Proxy.UpdateRequiredReady on startup and on every hot reload.
 	required atomic.Int32
 
+	// pickCounter is a monotonic counter used to round-robin among proxies
+	// that tie on readiness/latency, so a pool of equal-cost proxies (notably
+	// Tor instances, which all report latency 0) is actually distributed
+	// across instead of always landing on the first entry.
+	pickCounter atomic.Uint64
+
 	stopOnce sync.Once
 
 	// Tor mode: when torInstances > 0 the pool is backed by that many Tor
@@ -1017,27 +1023,45 @@ func (s *ProxyService) pick() *ProxyInfo {
 	// fast: treating it as fast pinned every request to whichever proxy
 	// happened to gain its readiness mark from a successful request rather
 	// than from a probe, which is the proxy most likely to be busy.
-	var best *ProxyInfo
+	//
+	// Proxies that tie on latency (notably Tor instances, which all report
+	// 0 because their readiness is never re-measured) are distributed
+	// round-robin via pickCounter instead of always landing on the first one
+	// in pool order, so load spreads across the pool.
+	var readyBest []cand
 	var bestLatency time.Duration
-	var fallback *ProxyInfo
+	hasBest := false
+	var fallbacks []cand
 	for _, c := range cands {
 		if c.down || s.isBlacklisted(c.p.URL) {
 			continue
 		}
 		if c.ready {
-			if best == nil || faster(c.latency, bestLatency) {
-				best = c.p
+			if !hasBest || faster(c.latency, bestLatency) {
+				readyBest = readyBest[:0]
+				readyBest = append(readyBest, c)
 				bestLatency = c.latency
+				hasBest = true
+			} else if c.latency == bestLatency {
+				readyBest = append(readyBest, c)
 			}
-		} else if fallback == nil {
-			fallback = c.p
+		} else {
+			fallbacks = append(fallbacks, c)
 		}
 	}
 
-	if best != nil {
-		return best
+	if len(readyBest) > 0 {
+		if len(readyBest) == 1 {
+			return readyBest[0].p
+		}
+		idx := int(s.pickCounter.Add(1)-1) % len(readyBest)
+		return readyBest[idx].p
 	}
-	return fallback
+	if len(fallbacks) > 0 {
+		idx := int(s.pickCounter.Add(1)-1) % len(fallbacks)
+		return fallbacks[idx].p
+	}
+	return nil
 }
 
 // faster reports whether candidate latency a should displace the incumbent.
@@ -1435,6 +1459,13 @@ func (s *ProxyService) refreshTorStatus(ctx context.Context) {
 				cur.Err = err.Error()
 			} else {
 				cur.Err = ""
+				// A fully bootstrapped Tor daemon stays in the ready pool so
+				// round-robin selection keeps distributing across instances
+				// instead of letting their readiness TTLs lapse and falling
+				// back to the unproven path.
+				if progress >= 100 {
+					s.markReady(st.URL, 0)
+				}
 			}
 		}
 		s.torStateMu.Unlock()
