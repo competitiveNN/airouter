@@ -311,6 +311,18 @@ func (p *Proxy) proxyTries(ep *ModelEndpoint) int {
 	if p != nil && p.effectiveProtocol(ep) == protocolCommandCode {
 		return 0
 	}
+	// mandatory_index is 1-based: proxying is mandatory only from that API
+	// key onwards. Keys before the threshold go direct (no proxy attempt),
+	// so an explicit per-endpoint Proxy override still wins.
+	if ep.Proxy <= 0 && p != nil && p.config != nil {
+		if cfg := p.config.Load(); cfg != nil {
+			if provider, ok := cfg.Providers[ep.Provider]; ok {
+				if provider.Proxies.MandatoryIndex > 0 && ep.APIKeyIndex < provider.Proxies.MandatoryIndex-1 {
+					return 0
+				}
+			}
+		}
+	}
 	if ep.Proxy > 0 {
 		return ep.Proxy
 	}
