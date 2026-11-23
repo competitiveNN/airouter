@@ -1,4 +1,4 @@
-//go:build !commandcode_proxy && !airouter_proxy && !provider_proxy
+//go:build !commandcode_proxy && !airouter_proxy
 
 package main
 
