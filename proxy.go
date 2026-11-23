@@ -1770,6 +1770,18 @@ func (p *Proxy) StreamToClient(ctx context.Context, w io.Writer, flusher http.Fl
 		if errors.Is(context.Cause(attemptCtx), attemptTimeoutCause) {
 			err = fmt.Errorf("upstream attempt timed out after %v: %w", timeout, context.DeadlineExceeded)
 		}
+		proxyTag := "direct"
+		if usedProxy != nil {
+			proxyTag = redactProxyURL(usedProxy.URL)
+		}
+		keyPrefix := "***"
+		if k := providerCfg.APIKeyAt(endpoint.APIKeyIndex); len(k) >= 6 {
+			keyPrefix = k[:6] + "..."
+		} else if k != "" {
+			keyPrefix = k[:1] + "..."
+		}
+		log.Printf("[debug] upstream error provider=%s model=%s key=%d apikey=%s status=0 (transport) proxy=%s err=%v",
+			endpoint.Provider, endpoint.Model, endpoint.APIKeyIndex, keyPrefix, proxyTag, err)
 		// Nothing has reached the client yet, so a proxy fault here is safe to
 		// retry on the same endpoint with a different proxy. See proxyAttribution
 		// for why every transport-layer failure on a proxied attempt belongs to
