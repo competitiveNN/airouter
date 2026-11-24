@@ -1321,7 +1321,7 @@ def probe_auto_fallbacks(
 # https://registry.npmjs.org/opencode-ai/latest, and keep it equal to the
 # User-Agent in config.go: test_opencode_ua_matches_the_gateway asserts the two
 # agree, because nothing else stops them drifting apart.
-OPENCODE_UA = "opencode/1.19.6"
+OPENCODE_UA = "opencode/2.4.1"
 
 # Where the published version is read from. The dist-tags endpoint, NOT the
 # package document: https://registry.npmjs.org/opencode-ai is ~5MB of every
