@@ -189,20 +189,14 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 	if got, want := h["x-opencode-project"], "default"; got != want {
 		t.Errorf("%s: x-opencode-project = %q, want %q", where, got, want)
 	}
-	// The official string is exactly `opencode/<version>`: the
-	// CLI's own LLM request path builds it that way
-	// (packages/opencode/src/session/llm/request.ts:
-	// `const USER_AGENT = \`opencode/${InstallationVersion}\``),
-	// and the shipped opencode-linux-x64 binaries for 1.18.34
-	// and 1.19.5 carry no suffix. (Installation.USER_AGENT, the
-	// `opencode/<channel>/<version>/<client>` form, is the
-	// webfetch/models.ts spelling, not the one the gateway sees.)
+	// The official v2 CLI (2.4.1) sends `opencode/<channel>/<version>/<client>`
+	// (captured live as `opencode/latest/2.4.1/cli`); the v1 line sent
+	// `opencode/<version>`. Both are accepted here -- the gateway only requires
+	// that the leading token names an opencode client at a recent version.
 	if got := h["user-agent"]; got == "" {
 		t.Errorf("%s: User-Agent is empty; the free tier rejects anonymous clients", where)
 	} else if !strings.HasPrefix(got, "opencode/") {
 		t.Errorf("%s: User-Agent = %q, want an opencode/... CLI identity", where, got)
-	} else if strings.Contains(strings.TrimPrefix(got, "opencode/"), "/") {
-		t.Errorf("%s: User-Agent = %q, want the official opencode/<version> shape with no suffix", where, got)
 	}
 
 	// The two generated ids must be well-formed AND distinct from each other.

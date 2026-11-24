@@ -308,14 +308,14 @@ func ioReadFull(r *http.Request, buf []byte) (int, error) {
 
 // TestOpencodeHeaderShape verifies the synthesized attribution
 // headers match the client the gateway recognizes: the official
-// `opencode/<version>` user agent (the exact string the shipped
-// CLI sends), and the session id carried under every spelling the
-// routing backend reads.
+// `opencode/<channel>/<version>/<client>` user agent (the exact string
+// the shipped v2 CLI sends), and the session id carried under every
+// spelling the routing backend reads.
 func TestOpencodeHeaderShape(t *testing.T) {
 	hdrs := opencodeRequestHeaders()
 	ua := hdrs["User-Agent"]
-	if ua != "opencode/2.4.1" {
-		t.Errorf("User-Agent = %q, want the official opencode/2.4.1", ua)
+	if ua != "opencode/latest/2.4.1/cli" {
+		t.Errorf("User-Agent = %q, want the official opencode/latest/2.4.1/cli", ua)
 	}
 	// The session id is the canonical `ses_<12 hex><14 base62>`
 	// shape the gateway measures a 403 for any other form of.

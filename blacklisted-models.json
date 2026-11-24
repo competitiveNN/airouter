@@ -107,6 +107,11 @@
     }
   },
   "pending": {
+    "kilocode:dots-studio/dots-3-note-preview:free": {
+      "first_seen": "2026-11-23",
+      "last_seen": "2026-11-23",
+      "streak": 1
+    },
     "ollama-cloud:gemma4:31b": {
       "first_seen": "2026-11-16",
       "last_seen": "2026-11-16",

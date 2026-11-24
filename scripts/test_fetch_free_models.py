@@ -928,7 +928,9 @@ def test_opencode_ua_version_parses_the_shape():
     """The parser must not invent a version out of a string it cannot read."""
     assert ff.opencode_ua_version("opencode/1.19.5") == "1.19.5"
     assert ff.opencode_ua_version("opencode/1.18.34/cli") == "1.18.34"
-    assert ff.opencode_ua_version(ff.OPENCODE_UA) == ff.OPENCODE_UA.split("/")[1]
+    # v2 channel form: opencode/<channel>/<version>/<client>
+    assert ff.opencode_ua_version("opencode/latest/2.4.1/cli") == "2.4.1"
+    assert ff.opencode_ua_version(ff.OPENCODE_UA) == "2.4.1"
     for bad in ("", "Go-http-client/1.1", "opencode/", "opencode"):
         assert ff.opencode_ua_version(bad) == "", bad
 

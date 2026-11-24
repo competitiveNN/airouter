@@ -359,12 +359,11 @@ func opencodeConversationID(body []byte) string {
 // the first is treated as having no session, which loses routing and cache
 // affinity even though the free-tier check passes. Both are set from one value
 // in buildRequest so they cannot drift apart.
-// The User-Agent is the official client string, `opencode/<version>`
-// -- the exact form the published CLI sends, built in the shipped
-// binaries as `opencode/${version}` with no suffix (verified in the
-// opencode-linux-x64 packages for 1.18.34 and 1.19.5). The gateway's
-// edge verifies the client identity, not just the header names,
-// measured live against opencode.ai/zen/v1:
+// The User-Agent is the official client string. The shipped v2 CLI (2.4.1)
+// sends `opencode/<channel>/<version>/<client>` -- captured live as
+// `opencode/latest/2.4.1/cli` -- while the v1 line sent `opencode/<version>`.
+// The gateway's edge verifies the client identity, not just the header names,
+// measured live against opencode.ai:
 //
 //   - a user agent that is not an opencode client is refused by the
 //     Cloudflare edge with `403 error code: 1010` before the request
@@ -372,7 +371,7 @@ func opencodeConversationID(body []byte) string {
 //   - a user agent naming an old CLI build is refused with
 //     `426 UpgradeRequired`.
 //
-// The version is pinned to the current npm release and kept equal to
+// The version is pinned to the installed release and kept equal to
 // OPENCODE_UA in fetch-free-models.py: the gateway asks third-party
 // gateways for "the correct, official User-Agent string (matching
 // opencode/<version>)", and test_opencode_ua_matches_the_gateway
@@ -382,7 +381,7 @@ const opencodeCLIName = "cli"
 func opencodeRequestHeaders() map[string]string {
 	sess := opencodeSessionID()
 	return map[string]string{
-		"User-Agent": "opencode/2.4.1",
+		"User-Agent": "opencode/latest/2.4.1/cli",
 		// `x-opencode-client` is the client name the gateway logs
 		// per request. The session id is carried under every
 		// spelling the shipped client and the routing backend

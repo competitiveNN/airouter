@@ -1315,13 +1315,13 @@ def probe_auto_fallbacks(
 # correct, official User-Agent string (matching opencode/<version>)", and the
 # fix it documents for its own frontends is "update past <version>" -- so a UA
 # that trails the published release is not the official string. The official
-# string is exactly `opencode/<version>`: the shipped CLI builds it that way
-# (verified in the opencode-linux-x64 packages for 1.18.34 and 1.19.5, where
-# the template is `opencode/${version}` with no suffix). Bump the version from
-# https://registry.npmjs.org/opencode-ai/latest, and keep it equal to the
-# User-Agent in config.go: test_opencode_ua_matches_the_gateway asserts the two
-# agree, because nothing else stops them drifting apart.
-OPENCODE_UA = "opencode/2.4.1"
+# string the shipped CLI sends. The v2 CLI (2.4.1) sends
+# `opencode/<channel>/<version>/<client>` -- captured live as
+# `opencode/latest/2.4.1/cli` -- while the v1 line sent `opencode/<version>`.
+# Keep it equal to the User-Agent in config.go:
+# test_opencode_ua_matches_the_gateway asserts the two agree, because nothing
+# else stops them drifting apart.
+OPENCODE_UA = "opencode/latest/2.4.1/cli"
 
 # Where the published version is read from. The dist-tags endpoint, NOT the
 # package document: https://registry.npmjs.org/opencode-ai is ~5MB of every
@@ -1334,15 +1334,19 @@ OPENCODE_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/opencode-ai/dist-
 
 
 def opencode_ua_version(ua: str = OPENCODE_UA) -> str:
-    """The `opencode/<version>` version out of a User-Agent string.
+    """The version out of an OpenCode User-Agent string.
 
-    Tolerates the surrounding shape rather than assuming it: a legacy
-    `opencode/<version>/cli` spelling still parses, and a string that is
-    ever edited into something this cannot parse reports "unknown"
-    instead of claiming a version that was never there.
+    Handles both shapes the shipped CLI has used: the v1 `opencode/<version>`
+    (optionally `opencode/<version>/cli`) and the v2
+    `opencode/<channel>/<version>/<client>` (captured live as
+    `opencode/latest/2.4.1/cli`). The version is the first dotted-numeric token
+    after the `opencode/` prefix; a string without that prefix, or without a
+    version, reports "unknown" instead of claiming one that was never there.
     """
-    m = re.match(r"^opencode/([^/]+)", ua or "")
-    return m.group(1) if m else ""
+    if not ua or not ua.startswith("opencode/"):
+        return ""
+    m = re.search(r"\d+(?:\.\d+)+", ua[len("opencode/"):])
+    return m.group(0) if m else ""
 
 
 def check_opencode_ua_version() -> str | None:
@@ -1387,6 +1391,16 @@ def check_opencode_ua_version() -> str | None:
         return None
 
     if latest == have:
+        return None
+
+    # The npm `latest` dist-tag tracks the v1 line (1.x); the installed v2 CLI
+    # (2.x) is a different product line with its own versioning. Never nag a v2
+    # client about a v1 "latest": 2.4.1 is not behind 1.19.6.
+    def _vtuple(v: str) -> tuple[int, ...]:
+        parts = re.findall(r"\d+", v or "")
+        return tuple(int(p) for p in parts) if parts else (0,)
+
+    if _vtuple(have) >= _vtuple(latest):
         return None
 
     # Only ever nag about being behind. A newer-looking `latest` (a rollback, a

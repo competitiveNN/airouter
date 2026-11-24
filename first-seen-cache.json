@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-20T11:44:03.954312Z",
+  "fetched_at": "2026-11-24T16:30:26.267409Z",
   "first_seen": {
     "ai21labs/jamba-1.5-large-instruct": "2026-11-06",
     "beam": "2026-10-27",
@@ -27,7 +27,6 @@
     "iceman-free": "2026-11-07",
     "jev-1.13-free": "2026-09-26",
     "longcat-2.5-free": "2026-11-10",
-    "longcat-2.5-preview-free": "2026-09-26",
     "meta/llama2-70b": "2026-09-26",
     "meta/muse-glimmer-30b": "2026-11-06",
     "mimo-v2.6-flash-free": "2026-09-26",
@@ -61,10 +60,12 @@
     "databricks/dbrx-instruct": "2026-11-16",
     "deepseek-ai/deepseek-coder-6.7b-instruct": "2026-11-16",
     "deepseek-ai/deepseek-v4.1-flash": "2026-11-18",
+    "dots-studio/dots-3-note-preview:free": "2026-11-24",
+    "fastino/gliner2-pii": "2026-11-23",
     "glm-5.3-flash-free": "2026-11-19",
     "ibm/granite-3.0-3b-a800m-instruct": "2026-11-16",
     "ibm/granite-3.0-8b-instruct": "2026-11-16",
-    "longcat-2.5-preview-free": "2026-10-22",
+    "longcat-2.5-free": "2026-11-23",
     "meta/llama2-70b": "2026-11-16",
     "nvidia/nemotron-3.5-content-safety:free": "2026-11-04",
     "poolside/laguna-s-2.1-free": "2026-11-06",
