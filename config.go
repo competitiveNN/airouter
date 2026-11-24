@@ -382,7 +382,7 @@ const opencodeCLIName = "cli"
 func opencodeRequestHeaders() map[string]string {
 	sess := opencodeSessionID()
 	return map[string]string{
-		"User-Agent": "opencode/1.19.5",
+		"User-Agent": "opencode/1.19.6",
 		// `x-opencode-client` is the client name the gateway logs
 		// per request. The session id is carried under every
 		// spelling the shipped client and the routing backend

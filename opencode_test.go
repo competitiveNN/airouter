@@ -314,8 +314,8 @@ func ioReadFull(r *http.Request, buf []byte) (int, error) {
 func TestOpencodeHeaderShape(t *testing.T) {
 	hdrs := opencodeRequestHeaders()
 	ua := hdrs["User-Agent"]
-	if ua != "opencode/1.19.5" {
-		t.Errorf("User-Agent = %q, want the official opencode/1.19.5", ua)
+	if ua != "opencode/1.19.6" {
+		t.Errorf("User-Agent = %q, want the official opencode/1.19.6", ua)
 	}
 	// The session id is the canonical `ses_<12 hex><14 base62>`
 	// shape the gateway measures a 403 for any other form of.

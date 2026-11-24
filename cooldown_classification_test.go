@@ -336,6 +336,39 @@ func TestAClientErrorIsStillRecorded(t *testing.T) {
 	}
 }
 
+// TestOpencode429CooledForOneMinute verifies that OpenCode free-tier 429s cap
+// at 1 minute, like Command Code. OpenCode rate limits clear in tens of
+// seconds, so an endpoint must not be parked for hours or days on a transient
+// 429 -- doing so removes a working model from rotation for far longer than
+// the limit lasts.
+func TestOpencode429CooledForOneMinute(t *testing.T) {
+	r := NewRouter(&Config{}, "")
+	ep := &ModelEndpoint{Provider: "opencode", Model: "big-pickle"}
+
+	// One 429 -> starts at 30s base, escalates once to 60s (still <= 1 minute).
+	d1 := r.ApplyCooldownForSession(ep, 429, "rate limited", "", 0)
+	if d1 > time.Minute {
+		t.Errorf("first opencode 429 cooled for %v, want <= 1 minute", d1)
+	}
+
+	// Many consecutive 429s must never exceed 1 minute.
+	r.mu.Lock()
+	cd := r.cooldowns[ep.Key()]
+	cd.ErrorCount = 100
+	r.cooldowns[ep.Key()] = cd
+	r.mu.Unlock()
+	d2 := r.ApplyCooldownForSession(ep, 429, "rate limited", "", 0)
+	if d2 > time.Minute {
+		t.Errorf("opencode 429 at 100 errors cooled for %v, want <= 1 minute", d2)
+	}
+
+	// Non-429 errors on opencode still escalate normally (not capped).
+	d3 := r.ApplyCooldownForSession(ep, 503, "unavailable", "", 0)
+	if d3 <= time.Minute {
+		t.Errorf("opencode 503 cooled for %v, want > 1 minute (not capped)", d3)
+	}
+}
+
 // TestRouterLearnsTheProtocolAModelActuallySpeaks is the measured behaviour
 // this replaces a wrong fix with.
 //

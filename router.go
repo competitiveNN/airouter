@@ -2125,10 +2125,12 @@ func (r *Router) applyCooldown(ep *ModelEndpoint, statusCode int, errMsg string,
 			duration += time.Duration(float64(duration) * r.cooldownJitter)
 		}
 	}
-	// Command Code upstreams are free-tier and rate-limit aggressively; cap
-	// their 429 cooldown at 1 minute so a single 429 does not park the
-	// endpoint for the full escalation ladder (which reaches 30 minutes).
-	if statusCode == 429 && (ep.Provider == "commandcode" || strings.HasPrefix(ep.Provider, "commandcode")) {
+	// Command Code and OpenCode upstreams are free-tier and rate-limit
+	// aggressively; cap their 429 cooldown at 1 minute so a single 429 does
+	// not park the endpoint for the full escalation ladder (which reaches
+	// 30 minutes). OpenCode free-tier 429s clear in tens of seconds, so
+	// cooling an endpoint for hours/days is pure waste.
+	if statusCode == 429 && (isOpencodeProvider(ep.Provider) || ep.Provider == "commandcode" || strings.HasPrefix(ep.Provider, "commandcode")) {
 		if duration > time.Minute {
 			duration = time.Minute
 		}
