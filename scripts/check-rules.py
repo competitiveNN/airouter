@@ -107,8 +107,8 @@ PROVIDER_GROUPS = {
 # regeneration (SKIP_AUTO_PROBE=1) that leaves a "probed live" claim behind is
 # caught here rather than being read as verified for months.
 TERMINATOR_LADDER = (
-    "kilocode/kilo-auto/free unless the probe says it is refused; the opencode "
-    "rescue requires positive evidence; with no live router left, refuse to write"
+    "opencode/big-pickle unless the probe says it is refused; with no live router "
+    "left, refuse to write"
 )
 
 # Per-profile membership (rule 5). `min_intelligence`/`min_context` are floors,
@@ -122,8 +122,8 @@ PROFILE_RULES = {
     "work": {"min_intelligence": 10.0},
     # fast: intelligence >= 5 and < 10. No cap - all qualifying models included.
     "fast": {"min_intelligence": 5.0, "max_intelligence": 10.0},
-    # large: context_length >= 200000 and intelligence >= 5, sorted by ctx desc then score desc.
-    "large": {"min_context": 200000, "min_intelligence": 5.0},
+    # large: context_length >= 200000 and intelligence >= 10, sorted by ctx desc then score desc.
+    "large": {"min_context": 200000, "min_intelligence": 10.0},
 }
 
 

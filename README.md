@@ -319,7 +319,7 @@ file. `scripts/sync-models.sh` (the timer's unit) runs:
    arena.ai code-leaderboard ELO when AA has none), and **proves every
    candidate with a real 1-token completion** — a listing is not evidence
    a model is callable. It also probes both chain terminators
-   (kilocode `kilo-auto/free`, opencode `big-pickle`) and records a
+   (opencode `big-pickle`) and records a
    live/dead verdict per router, prunes models the providers no longer
    list. First-seen dates are committed in `first-seen-cache.json`, so they
    survive a fresh clone.

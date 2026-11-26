@@ -235,19 +235,19 @@ models:
   smart:
     chain:
       - provider: kilocode
-        model: kilo-auto/free
+        model: big-pickle
   work:
     chain:
       - provider: kilocode
-        model: kilo-auto/free
+        model: big-pickle
   fast:
     chain:
       - provider: kilocode
-        model: kilo-auto/free
+        model: big-pickle
   large:
     chain:
       - provider: kilocode
-        model: kilo-auto/free
+        model: big-pickle
 EOF
 run_harness --models smart
 if [[ $RC -ne 0 && "$OUT" == *"not to opencode"* ]]; then
@@ -264,7 +264,7 @@ import sys
 p = sys.argv[1]
 src = open(p).read()
 open(p, "w").write(src.replace(
-    "  fast:\n    chain:\n      - provider: kilocode\n        model: kilo-auto/free",
+    "  fast:\n    chain:\n      - provider: kilocode\n        model: big-pickle",
     "  fast:\n    chain:\n      - provider: kilocode\n        model: some-other-model"))
 PY
 run_harness --models smart

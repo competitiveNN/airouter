@@ -154,8 +154,7 @@ def main() -> int:
         # profile, so their last entry is an ordinary model.
         if name == "fast" and last_model not in ("big-pickle"):
             problems.append(
-                f"{name}: last chain entry must be kilo-auto/free or "
-                f"big-pickle, got {last_model!r}"
+                f"{name}: last chain entry must be big-pickle, got {last_model!r}"
             )
 
         # Enforce provider-group completeness: if a model from a grouped

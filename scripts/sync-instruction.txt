@@ -87,7 +87,7 @@ Rules:
    endpoint that can actually be called — never a model that 403s. The choice
    is made on a PROBE VERDICT, never on a count:
    - preferred = `opencode`/`big-pickle` only when the chain contains opencode
-     endpoints and no kilocode ones; otherwise `kilocode`/`kilo-auto/free`.
+     endpoints and no kilocode ones; otherwise `opencode`/`big-pickle`.
    - `fetch-free-models.py --probe-auto` records a verdict per router in the
      model list (`verified`): true = a real 1-token completion came back,
      false = the provider REFUSED the call (4xx), absent = no verdict (not
@@ -136,7 +136,7 @@ Rules:
      `vision:` line on that endpoint: `vision: true` when truthy, `vision: false`
      when falsy. This drives capability-aware routing (vision requests are sent
      only to vision-capable models; text-only models are skipped for them). The
-     trailing auto-fallback model (kilo-auto/free / big-pickle) is a gateway
+     trailing auto-fallback model (big-pickle) is a gateway
      meta-router, so emit `vision: true` for it. For a manually-added model with
      no matching JSON record, keep any existing `vision:` value as-is. Place the
      `vision:` line directly under the `model:` line (the trailing score comment

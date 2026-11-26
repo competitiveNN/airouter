@@ -44,7 +44,7 @@ fi
 echo "[sync] using python: $PYTHON"
 
 echo "[sync] fetching free model list..."
-# --probe-auto calls both chain terminators (kilocode kilo-auto/free, opencode
+# --probe-auto calls the chain terminator (opencode big-pickle)
 # big-pickle) with one real 1-token completion each and records a live/dead/
 # unknown verdict in the model list. ENABLE_OPENCODE_PROBE=1 additionally
 # live-verifies every free OpenCode candidate so only endpoints the gateway can

@@ -251,7 +251,7 @@ def update_first_seen_cache(
 # Meta-router models (formerly AUTO_FALLBACK_MODELS). These are now treated as
 # regular models with hardcoded intelligence scores (see INTELLIGENCE_OVERRIDES)
 # and can appear anywhere in chains, not just as trailing terminators.
-META_ROUTER_MODELS: set[str] = {"kilo-auto/free", "big-pickle"}
+META_ROUTER_MODELS: set[str] = {"big-pickle"}
 
 # Models that are unscored (no AA intelligence, no arena ELO) but are NOT
 # usable routing candidates. They are excluded BEFORE the smart floor is
@@ -302,6 +302,7 @@ BLACKLISTED_MODEL_PATTERNS: tuple[str, ...] = (
     "gliner",  # PII / entity-extraction encoders (e.g. fastino/gliner2-pii)
     "pii",     # PII detection / redaction models
     "gpt-live",  # full-duplex voice models (e.g. opencode gpt-live-1)
+    "kilo-auto/free",  # removed auto fallback; never route through Kilo Code auto router
 )
 BLACKLISTED_MODEL_REGEXES: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE) for pattern in BLACKLISTED_MODEL_PATTERNS
@@ -533,7 +534,6 @@ HEADERS = {
 INTELLIGENCE_OVERRIDES: dict[str, float] = {
     "poolside/laguna-xs-2.1": 10.0,
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": 2.5,
-    "kilo-auto/free": 5.0,
     "big-pickle": 5.0,
 }
 
@@ -1009,8 +1009,7 @@ def _mark_unverified(models: list[dict[str, Any]], reason: str) -> list[dict[str
 
 # ── Auto-fallback liveness probe (--probe-auto) ─────────────────────────────────
 #
-# Every chain ends on a meta-router (kilocode `kilo-auto/free`, opencode
-# `big-pickle`). regenerate_config.py refuses to write a terminator it knows to
+# Every chain ends on a meta-router (opencode `big-pickle`). regenerate_config.py refuses to write a terminator it knows to
 # be dead, but it can only honour that if the fetcher says something about the
 # two auto routers — and the ordinary opencode pass only covers models the
 # listing advertises as free, which excludes opencode/big-pickle entirely. Left
@@ -1034,7 +1033,6 @@ def _mark_unverified(models: list[dict[str, Any]], reason: str) -> list[dict[str
 # terminator. A dropped connection must never be able to block a sync.
 AUTO_PROBE_TARGETS = (
     # (provider, models endpoint, model id, api key env, extra headers)
-    ("kilocode", "https://api.kilo.ai/api/gateway/v1", "kilo-auto/free", "KILOCODE_API_KEY", {}),
     (
         "opencode",
         OPENCODE_ENDPOINT,
@@ -1206,7 +1204,7 @@ def probe_auto_fallbacks(
 ) -> list[dict[str, Any]]:
     """Probe every auto router and stamp the verdict onto the model list.
 
-    A router that is already in the list (kilocode's `kilo-auto/free` is: it is
+    A router that is already in the list: it is
     a free-tier model) gets its `verified` field set in place. A router the
     provider does not offer for free (opencode's `big-pickle`, which the
     listing hides behind a paywall) has no record to stamp, so a minimal
@@ -3028,7 +3026,7 @@ def main() -> None:
     parser.add_argument(
         "--probe-auto",
         action="store_true",
-        help="Probe the two chain terminators (kilocode kilo-auto/free, opencode big-pickle) "
+        help="Probe the chain terminator (opencode big-pickle) "
              "with a real 1-token completion and record a live/dead/unknown verdict for each. "
              "regenerate_config.py acts on the verdict: it never writes a terminator known to "
              "be dead, and only treats a verdict as evidence when the provider REFUSED the "

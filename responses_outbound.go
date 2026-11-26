@@ -473,7 +473,7 @@ func finishReasonForResponses(status string) *string {
 // ---------------------------------------------------------------------------
 //
 // Event shapes are not guessed. The mapping below was captured from a live
-// stream on 2026-10-02 (kilocode kilo-auto/free over /responses), which emits:
+// stream on 2026-10-02 (opencode big-pickle over /responses), which emits:
 //
 //	response.created / response.in_progress      full response envelope
 //	response.output_item.added                   the item, empty

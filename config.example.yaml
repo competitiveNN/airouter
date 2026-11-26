@@ -211,7 +211,7 @@ models:
       #     it (or direct when the provider sets none); N = max proxies to try
       #     on this endpoint before chain fallback
       # - provider: kilocode
-      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   model: big-pickle  # last: auto fallback (placeholder)
       #   vision: true
   work:
     chain:
@@ -220,7 +220,7 @@ models:
       #   vision: false
       #   intelligence: 45.0
       # - provider: kilocode
-      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   model: big-pickle  # last: auto fallback (placeholder)
       #   vision: true
   fast:
     chain:
@@ -229,7 +229,7 @@ models:
       #   vision: false
       #   intelligence: 22.0
       # - provider: kilocode
-      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   model: big-pickle  # last: auto fallback (placeholder)
       #   vision: true
   large:
     chain:
@@ -243,5 +243,5 @@ models:
       #     the provider supports (e.g. some models work on /chat/completions
       #     but not /responses).
       # - provider: kilocode
-      #   model: kilo-auto/free  # last: auto fallback (placeholder)
+      #   model: big-pickle  # last: auto fallback (placeholder)
       #   vision: true
