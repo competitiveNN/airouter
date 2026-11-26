@@ -207,7 +207,7 @@ print('ses_%012x%s' % (~val & mask, b62()), 'msg_%012x%s' % (val, b62()))
     -H 'x-opencode-client: cli' \
     -H 'x-opencode-project: default' \
     -H "x-opencode-session: $session" \
-    -H "X-Session-ID: $session" \
+    -H "x-opencode-session-id: $session" \
     -H "x-opencode-request: $request_id" \
     -H 'x-opencode-preflight: liveness' \
     -d "$PREFLIGHT_BODY" 2>/dev/null) || true

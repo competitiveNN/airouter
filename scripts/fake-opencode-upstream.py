@@ -201,19 +201,18 @@ class Handler(BaseHTTPRequestHandler):
         problem = opencode_id_problem("session", session)
         if problem:
             return f"x-opencode-session: {problem}"
-        # The routing backend validates a session id under this second name as
-        # well, and reads it alongside x-opencode-session. A gateway that sets
-        # only the first is treated as having no session at all: routing and
-        # prompt-cache affinity are lost even though the free-tier gate passed.
-        # It carries the same value, so a disagreement is also a failure.
-        routing_session = self.headers.get("X-Session-ID", "")
+        # For opencode providers, the routing backend reads x-opencode-session-id
+        # (not X-Session-ID). The official CLI does NOT send X-Session-ID or
+        # x-session-affinity for opencode providers. x-opencode-session-id must
+        # match x-opencode-session.
+        routing_session = self.headers.get("x-opencode-session-id", "")
         if not routing_session:
-            return "X-Session-ID is absent; the routing backend sees no session"
+            return "x-opencode-session-id is absent; the routing backend sees no session"
         problem = opencode_id_problem("session", routing_session)
         if problem:
-            return f"X-Session-ID: {problem}"
+            return f"x-opencode-session-id: {problem}"
         if routing_session != session:
-            return (f"X-Session-ID={routing_session!r} disagrees with "
+            return (f"x-opencode-session-id={routing_session!r} disagrees with "
                     f"x-opencode-session={session!r}")
         request_id = self.headers.get("x-opencode-request", "")
         problem = opencode_id_problem("request", request_id)
