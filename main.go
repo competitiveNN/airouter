@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -24,12 +23,6 @@ func main() {
 	warmup := flag.Bool("warmup", false, "Warm up model profiles on startup (fires test requests to each provider)")
 	toolCalls := flag.Bool("tool-calls", false, "Enable synthesized tool-call events in streaming responses (disabled by default for compatibility)")
 	pruneStats := flag.String("prune-stats", "", "Prune the dashboard stats journal at PATH to the 30-day retention window, then exit")
-	commandCodePort := flag.String("commandcode-port", "3050", "Port for the built-in Command Code API endpoint (empty string disables it)")
-	commandCodeProviders := flag.String("commandcode-providers", "commandcode,commandcode2", "Command Code providers exposed on that endpoint, in failover order")
-	maxConcurrentRequests := flag.Int("max-concurrent-requests", 0, "Maximum concurrent Command Code proxy requests (0 = use config or default of 16; negative disables the cap)")
-	flag.IntVar(maxConcurrentRequests, "max-concurrent", 0, "Same as -max-concurrent-requests")
-	flag.IntVar(maxConcurrentRequests, "max-inflight", 0, "Same as -max-concurrent-requests")
-	flag.IntVar(maxConcurrentRequests, "commandcode-max-concurrent", 0, "Same as -max-concurrent-requests")
 	flag.Parse()
 
 	// The prune mode is a maintenance operation, not a gateway: it
@@ -57,58 +50,21 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Cap the process heap at 50MB. The gateway is a thin proxy that
+	// Cap the process heap at 20MB. The gateway is a thin proxy that
 	// buffers at most one attempt body at a time, so this is a soft
 	// ceiling: it pressures the GC to keep long-lived objects collected
 	// rather than letting heap usage drift upward across long-running
 	// sessions. (debug.SetMemoryLimit sets GOMEMLIMIT-equivalent; it is
 	// advisory — the GC tries to stay under it — but keeps the process
 	// small for operator deployments on constrained hosts.)
-	debug.SetMemoryLimit(50 * 1024 * 1024)
+	debug.SetMemoryLimit(20 * 1024 * 1024)
 
 	cooldownPath := filepath.Join(filepath.Dir(*configPath), defaultCooldownDBName)
-	// The dashboard journal lives beside the config for the same
-	// reason cooldowns.db does: it is state the gateway owns, and
-	// the config's directory is the one place the operator already
-	// associates with the gateway's data.
-	journalPath := filepath.Join(filepath.Dir(*configPath), "metrics-ring.jsonl")
 	router := NewRouter(cfg, cooldownPath)
 	proxy := NewProxy(cfg)
 	proxy.SetProtocolResolver(router.ProtocolFor)
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	// Proxy service: fetches proxy lists from proxy_sources.txt every 15 min,
-	// geolocates each proxy, and maintains a priority-sorted pool (EU/NA
-	// preferred, all others as backup). It only runs when at least one
-	// provider or endpoint has proxying enabled; otherwise the periodic
-	// fetching is unnecessary overhead.
-	// The built-in source list lives in proxysources.go; proxy_sources.txt is
-	// an optional file that can add further sources (see docs/proxy_sources.txt
-	// for the reference copy of the built-in list).
-	//
-	// It resolves beside the config, like cooldowns.db and the journal:
-	// resolving it against the process CWD meant the daemon only ever found
-	// the file when started from the directory that holds it, so an operator
-	// running it with -config /etc/airouter/config.yaml silently lost every
-	// extra source they had configured.
-	proxySourcesPath := filepath.Join(filepath.Dir(*configPath), "proxy_sources.txt")
-	proxySvc := NewProxyService(proxySourcesPath, 15*time.Minute)
-	if ti := cfg.Preferences.TorInstancesValue(); ti > 0 {
-		proxySvc.EnableTor(ti)
-	}
-	if proxyEnabled(cfg) || proxySvc.TorMode() {
-		proxy.SetProxyService(proxySvc)
-		proxy.UpdateRequiredReady()
-		go proxySvc.Start(ctx)
-		defer proxySvc.Stop()
-		if proxySvc.TorMode() {
-			log.Printf("Proxy service enabled (tor mode, %d instances)", proxySvc.TorInstances())
-		} else {
-			log.Printf("Proxy service enabled (pool refresh every 15 min, %d proxies must be ready)",
-				proxySvc.RequiredReady())
-		}
-	}
 
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
 	router.SetMetrics(gateway.metrics)
@@ -127,25 +83,7 @@ func main() {
 	mux.HandleFunc("/v1/models", gateway.HandleModels)
 	mux.HandleFunc("/v1/chat/completions", gateway.HandleChatCompletions)
 	mux.HandleFunc("/v1/responses", gateway.HandleResponses)
-	mux.HandleFunc("/v1/responses/ws", gateway.HandleResponsesWebSocket)
 	mux.HandleFunc("/health", gateway.HandleHealth)
-	mux.HandleFunc("/metrics", gateway.HandleMetrics)
-	mux.HandleFunc("/v1/airouter/state", gateway.HandleAirouterState)
-	mux.HandleFunc("/admin/providers", gateway.HandleAdminProviders)
-	mux.HandleFunc("/admin/sessions", gateway.HandleAdminSessions)
-	mux.HandleFunc("/admin/cooldowns", gateway.HandleAdminCooldowns)
-	mux.HandleFunc("/admin/config", gateway.HandleAdminConfig)
-	mux.HandleFunc("/admin/config/editor", gateway.HandleAdminConfigEditor)
-	mux.HandleFunc("/admin/config/edit", gateway.HandleAdminConfigEdit)
-	mux.HandleFunc("/admin/config-editor", gateway.HandleAdminConfigEditor)
-	mux.HandleFunc("/admin/config/page", gateway.HandleAdminConfigPage)
-	mux.HandleFunc("/admin/editor", gateway.HandleConfigEditor)
-	mux.HandleFunc("/admin/dashboard/data", gateway.HandleAdminDashboardData)
-	mux.HandleFunc("/admin/", gateway.HandleAdminDashboard)
-	mux.HandleFunc("/admin/dashboard", gateway.HandleAdminDashboard)
-	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/admin/", http.StatusFound)
-	})
 
 	// recoveryMiddleware wraps handlers to catch panics so a single bad
 	// request can't take down the entire server.
@@ -154,42 +92,8 @@ func main() {
 		Handler:           recoveryMiddleware(mux),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		// Large-context requests can spend minutes in prefill; a 5m write
-		// deadline cut them off before the fallback walk could finish.
-		WriteTimeout: 15 * time.Minute,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	// The Command Code endpoint is a second, self-contained OpenAI-compatible
-	// surface on its own port. It exists because Command Code's upstream is not
-	// OpenAI-shaped: a client that wants it directly (rather than through one of
-	// the four logical models) needs the protocol translation in front of it,
-	// which used to mean running the separate commandcode-proxy process. The
-	// default port is the one that proxy listened on, so an existing
-	// `url: http://127.0.0.1:3050/v1` provider entry keeps working once the
-	// separate process is stopped.
-	var commandCodeServer *http.Server
-	if *commandCodePort != "" {
-		shim := NewCommandCodeShim(gateway, strings.Split(*commandCodeProviders, ","), *maxConcurrentRequests)
-		if shim.Enabled() {
-			commandCodeServer = &http.Server{
-				Addr:              ":" + *commandCodePort,
-				Handler:           recoveryMiddleware(shim.Handler()),
-				ReadTimeout:       5 * time.Minute,
-				ReadHeaderTimeout: 60 * time.Second,
-				WriteTimeout:      30 * time.Minute,
-				IdleTimeout:       10 * time.Minute,
-			}
-			go func() {
-				log.Printf("Command Code API on port %s (providers: %s)", *commandCodePort, *commandCodeProviders)
-				if err := commandCodeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					// A busy port must not take the main gateway down with it.
-					log.Printf("Command Code API error: %v", err)
-				}
-			}()
-		} else {
-			log.Printf("Command Code API disabled: none of %q is configured", *commandCodeProviders)
-		}
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	defer cancel()
@@ -202,13 +106,10 @@ func main() {
 		cancel()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
-		if commandCodeServer != nil {
-			commandCodeServer.Shutdown(shutdownCtx)
-		}
 		server.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("Starting airouter on port %s", *port)
+	log.Printf("Starting minimal airouter on port %s", *port)
 	log.Printf("Config: %s", *configPath)
 	log.Printf("Models: %v", LogicalModels)
 	log.Printf("Tool calls (coalesced): %v", *toolCalls)
@@ -217,16 +118,6 @@ func main() {
 		log.Println("Warming up model profiles in the background...")
 		go proxy.Warmup(ctx)
 	}
-
-	// Proactively warm the HTTP connection pool to upstream endpoints so the
-	// first user request does not pay a cold-start dial/TLS handshake penalty.
-	log.Println("Starting connection pool warmer (60s interval)...")
-	proxy.StartConnectionPoolWarmer(ctx, 60*time.Second)
-
-	// Start the dashboard attempt ring so the 1d/7d leaderboards are live
-	// from startup rather than only after the first dashboard scrape.
-	stopDashboard := gateway.metrics.StartDashboardTelemetry(journalPath)
-	defer stopDashboard()
 	for name, p := range cfg.Providers {
 		keyStatus := "no key"
 		if p.APIKey() != "" {
