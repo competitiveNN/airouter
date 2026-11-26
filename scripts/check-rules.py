@@ -122,8 +122,8 @@ PROFILE_RULES = {
     "work": {"min_intelligence": 10.0},
     # fast: intelligence >= 5 and < 10. No cap - all qualifying models included.
     "fast": {"min_intelligence": 5.0, "max_intelligence": 10.0},
-    # large: context_length >= 200000 and intelligence >= 10, sorted by ctx desc then score desc.
-    "large": {"min_context": 200000, "min_intelligence": 10.0},
+    # large: context_length >= 500000 and intelligence >= 10, sorted by ctx desc then score desc.
+    "large": {"min_context": 500000, "min_intelligence": 10.0},
 }
 
 
