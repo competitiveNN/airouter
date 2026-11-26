@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -323,10 +322,14 @@ func TestOpencodeHeaderShape(t *testing.T) {
 	if !strings.HasPrefix(sess, "ses_") || len(sess) != 4+12+14 {
 		t.Errorf("x-opencode-session = %q, want the canonical ses_ shape", sess)
 	}
-	for _, name := range []string{"x-opencode-session-id", "x-session-affinity", "X-Session-ID"} {
-		if hdrs[name] != sess {
-			t.Errorf("%s = %q, want the same session id as x-opencode-session (%q)", name, hdrs[name], sess)
-		}
+	if hdrs["x-opencode-session-id"] != sess {
+		t.Errorf("x-opencode-session-id = %q, want the same session id as x-opencode-session (%q)", hdrs["x-opencode-session-id"], sess)
+	}
+	if _, ok := hdrs["x-session-affinity"]; ok {
+		t.Errorf("x-session-affinity should NOT be present for opencode providers, got %q", hdrs["x-session-affinity"])
+	}
+	if _, ok := hdrs["X-Session-ID"]; ok {
+		t.Errorf("X-Session-ID should NOT be present for opencode providers, got %q", hdrs["X-Session-ID"])
 	}
 	if hdrs["x-opencode-client"] != "cli" {
 		t.Errorf("x-opencode-client = %q, want cli", hdrs["x-opencode-client"])
@@ -334,8 +337,11 @@ func TestOpencodeHeaderShape(t *testing.T) {
 	if !strings.HasPrefix(hdrs["x-opencode-request"], "msg_") {
 		t.Errorf("x-opencode-request = %q, want the msg_ shape", hdrs["x-opencode-request"])
 	}
-	if !bytes.HasPrefix([]byte(sess), []byte("ses_")) {
-		t.Error("unreachable")
+	if hdrs["x-opencode-project"] != "default" {
+		t.Errorf("x-opencode-project = %q, want default", hdrs["x-opencode-project"])
+	}
+	if !strings.HasPrefix(sess, "ses_") {
+		t.Errorf("x-opencode-session = %q, want the canonical ses_ shape", sess)
 	}
 }
 

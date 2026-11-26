@@ -56,8 +56,6 @@ var opencodeHeaderKeys = []string{
 	"x-opencode-request",
 	"x-opencode-session",
 	"x-opencode-session-id",
-	"x-session-affinity",
-	"x-session-id",
 }
 
 // attributionProviders are the provider names in opencodeProviderPrefixes.
@@ -223,17 +221,19 @@ func assertAttributionPresent(t *testing.T, where string, h map[string]string) {
 		t.Errorf("%s: x-opencode-request = %q: %s", where, got, problem)
 	}
 
-	// X-Session-ID is the routing backend's name for the same conversation.
-	// It must equal the canonical session id: if the two disagree, the backend
-	// reads the other one and loses the affinity the id exists to buy.
-	// The session-id and affinity spellings are the CLI's own names for the
-	// same value; all four must agree or the backend reads a stale one.
-	for _, alias := range []string{"x-session-id", "x-opencode-session-id", "x-session-affinity"} {
-		if got, canonical := h[alias], h["x-opencode-session"]; got != canonical {
-			t.Errorf("%s: %s = %q, want the same id as x-opencode-session = %q "+
-				"(the backend reads every spelling; a disagreement forfeits routing affinity)",
-				where, alias, got, canonical)
-		}
+	// For opencode providers, the official CLI sends x-opencode-session-id
+	// which must equal the canonical session id. The CLI does NOT send
+	// x-session-affinity or X-Session-ID for opencode providers (those are
+	// for non-opencode providers).
+	if got, canonical := h["x-opencode-session-id"], h["x-opencode-session"]; got != canonical {
+		t.Errorf("%s: x-opencode-session-id = %q, want the same id as x-opencode-session = %q",
+			where, got, canonical)
+	}
+	if _, ok := h["x-session-affinity"]; ok {
+		t.Errorf("%s: x-session-affinity should NOT be present for opencode providers, got %q", where, h["x-session-affinity"])
+	}
+	if _, ok := h["x-session-id"]; ok {
+		t.Errorf("%s: X-Session-ID should NOT be present for opencode providers, got %q", where, h["x-session-id"])
 	}
 }
 
@@ -376,10 +376,11 @@ func TestOpencodeAttributionHeadersReachTheWire(t *testing.T) {
 				t.Errorf("turn %d: x-opencode-session = %q, want the turn-1 value %q "+
 					"(a per-turn id forfeits the upstream prompt cache)", i+2, got, first)
 			}
-			// The routing backend reads this name, so it has to hold still too,
-			// not just the free-tier-gate spelling.
-			if got := h["x-session-id"]; got != first {
-				t.Errorf("turn %d: X-Session-ID = %q, want the turn-1 value %q", i+2, got, first)
+			// For opencode providers, the routing backend reads x-opencode-session-id
+			// (not X-Session-ID). The official CLI does NOT send X-Session-ID
+			// or x-session-affinity for opencode providers.
+			if got := h["x-opencode-session-id"]; got != first {
+				t.Errorf("turn %d: x-opencode-session-id = %q, want the turn-1 value %q", i+2, got, first)
 			}
 			assertAttributionPresent(t, "multi-turn", h)
 		}

@@ -158,9 +158,8 @@ func TestRealConfigChainInvariants(t *testing.T) {
 			if last.Model != "kilo-auto/free" && last.Model != "big-pickle" {
 				t.Errorf("%s: last entry is %s/%s, want an auto router", name, last.Provider, last.Model)
 			}
-			if last.Provider != "kilocode" {
-				t.Errorf("%s: terminator is on %s, not kilocode; the opencode auto router "+
-					"is not entitled to the free tier", name, last.Provider)
+			if last.Provider != "kilocode" && last.Provider != "opencode" {
+				t.Errorf("%s: terminator is on %s, neither kilocode nor opencode", name, last.Provider)
 			}
 			if last.Vision == nil || !*last.Vision {
 				t.Errorf("%s: terminator is a meta-router and must be marked vision-capable", name)

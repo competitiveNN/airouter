@@ -381,22 +381,10 @@ const opencodeCLIName = "cli"
 func opencodeRequestHeaders() map[string]string {
 	sess := opencodeSessionID()
 	return map[string]string{
-		"User-Agent": "opencode/latest/2.4.1/cli",
-		// `x-opencode-client` is the client name the gateway logs
-		// per request. The session id is carried under every
-		// spelling the shipped client and the routing backend
-		// read: `x-opencode-session` is the canonical free-tier
-		// form (zen gateway path), `x-opencode-session-id` and
-		// `x-session-affinity` are the identities the CLI's
-		// provider request path sends, and `X-Session-ID` is the
-		// plain routing-backend name for the same value. All are
-		// set from one value in buildRequest so they cannot drift
-		// apart.
+		"User-Agent":            "opencode/latest/2.4.1/cli",
 		"x-opencode-client":     opencodeCLIName,
 		"x-opencode-session":    sess,
 		"x-opencode-session-id": sess,
-		"x-session-affinity":    sess,
-		"X-Session-ID":          sess,
 		"x-opencode-request":    opencodeRequestID(),
 		"x-opencode-project":    "default",
 	}

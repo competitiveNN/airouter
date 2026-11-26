@@ -1022,17 +1022,12 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 		// body on purpose: the logical model is part of the anchor, and using
 		// backendBody would key the anchor on the endpoint's substituted model
 		// name and split one conversation across a fallback chain.
-		// Both spellings carry the same id. Setting only the canonical
-		// x-opencode-session would leave X-Session-ID holding the per-request
-		// random id from opencodeRequestHeaders, so the two would disagree and
-		// the routing backend would read the unstable one. The session-id and
-		// affinity spellings are set from the same value for the same reason.
+		// For opencode providers, the official CLI only sends x-opencode-session
+		// and x-opencode-session-id (not X-Session-ID or x-session-affinity).
 		setSession := func(id string) {
 			ses := opencodeSessionFor(id)
 			req.Header.Set("x-opencode-session", ses)
 			req.Header.Set("x-opencode-session-id", ses)
-			req.Header.Set("x-session-affinity", ses)
-			req.Header.Set("X-Session-ID", ses)
 		}
 		if conv := opencodeConversationID(body); conv != "" {
 			setSession(conv)
