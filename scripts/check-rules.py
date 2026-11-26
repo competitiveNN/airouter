@@ -51,7 +51,7 @@ GENERATOR = REPO / "regenerate_config.py"
 DEFAULT_MODELS = "/tmp/free-models.json"
 BLACKLIST_DEFAULT = REPO / "blacklisted-models.json"
 
-AUTO_MODELS = {"kilo-auto/free", "big-pickle"}
+AUTO_MODELS = {"big-pickle"}
 ROUTABLE_PROFILES = ["smart", "work", "fast", "large"]
 BANNED_ID = re.compile(r"content-safety|x-preview-f-free")
 
@@ -114,16 +114,16 @@ TERMINATOR_LADDER = (
 # Per-profile membership (rule 5). `min_intelligence`/`min_context` are floors,
 # `below_intelligence` an exclusive ceiling. None means unbounded on that side.
 PROFILE_RULES = {
-    # smart: strongest generalists, intelligence >= 25, any context length.
-    "smart": {"min_intelligence": 25.0},
-    # work: the smart pool extended down to intelligence >= 15. The tiny-model
+    # smart: strongest generalists, intelligence >= 15, any context length.
+    "smart": {"min_intelligence": 15.0},
+    # work: the smart pool extended down to intelligence >= 10. The tiny-model
     # drop is NOT waived for dedicated code models: cohere/north-mini-code
     # scores 9.9, so it stays out of `work` and only qualifies via `large`.
-    "work": {"min_intelligence": 15.0},
-    # fast: strictly intelligence < 10. No cap - all qualifying models included.
-    "fast": {},
-    # large: context_length >= 200000 only, sorted by ctx desc then score desc.
-    "large": {"min_context": 200000},
+    "work": {"min_intelligence": 10.0},
+    # fast: intelligence >= 5 and < 10. No cap - all qualifying models included.
+    "fast": {"min_intelligence": 5.0, "max_intelligence": 10.0},
+    # large: context_length >= 200000 and intelligence >= 5, sorted by ctx desc then score desc.
+    "large": {"min_context": 200000, "min_intelligence": 5.0},
 }
 
 
@@ -470,12 +470,12 @@ def check(
             distinct = {e.get("model") for e in rest}
             if len(distinct) > cap:
                 problems.append(f"rule5: {profile} has {len(distinct)} distinct models, cap is {cap}")
+        max_intel = rules.get("max_intelligence")
+        if max_intel is not None:
             for ep in rest:
-                mid_l, sc = str(ep.get("model")).lower(), ep.get("intelligence")
-                if isinstance(sc, (int, float)) and not (
-                    sc < 10
-                ):
-                    problems.append(f"rule5: {profile} entry {ep.get('model')} is neither small nor cheap")
+                sc = ep.get("intelligence")
+                if isinstance(sc, (int, float)) and sc >= max_intel:
+                    problems.append(f"rule5: {profile} entry {ep.get('model')} has intelligence {sc} >= {max_intel}")
 
         # rule 3 / 10 (legacy): with multi-key providers, each provider appears
         # once in the chain and the gateway expands API keys at runtime. The

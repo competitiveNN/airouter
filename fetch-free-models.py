@@ -93,11 +93,11 @@ ARENA_FALLBACK_MAX_AGE_DAYS = 45
 ELO_BASE = 1200.0
 ELO_TO_INTELLIGENCE = 63.0 / 500.0
 # Models with no Artificial Analysis intelligence score AND no arena.ai
-# code-leaderboard ELO receive the "smart floor" (25.0) -- the lowest value
-# that still lets them enter the smart/work/large chains. This is a
+# code-leaderboard ELO receive the "smart floor" (10.0) -- the lowest value
+# that still lets them enter the work/large chains. This is a
 # deterministic default, not a hand-picked override: it keeps unscored models
 # visible in the chains without claiming a benchmark score they never earned.
-SMART_FLOOR = 10.0
+SMART_FLOOR = 10.0  # work floor
 
 # First-seen cache: when a model appears in the free-models list for the
 # first time, we record the fetch date as its "release date" fallback.  The
@@ -3233,7 +3233,7 @@ def main() -> None:
 
     # Deterministic smart floor: any model that still has no intelligence
     # score (neither AA nor arena code ELO) gets the lowest value that lets
-    # it enter the smart/work/large chains. Auto-fallback meta-router models
+    # it enter the work/large chains. Auto-fallback meta-router models
     # and curated unscored-exclude models stay unscored -- they only ever
     # appear as the trailing chain entry, never as concrete candidates.
     floored = 0
@@ -3252,8 +3252,8 @@ def main() -> None:
         model["intelligence_source"] = "smart floor"
         model["intelligence_note"] = (
             "No AA intelligence score and no arena.ai code-leaderboard ELO; "
-            "assigned the smart floor (25.0) so the model is visible in the "
-            "chains. This is a deterministic default, not a benchmark score."
+            "assigned the smart floor (10.0) so the model is visible in the "
+            "work/large chains. This is a deterministic default, not a benchmark score."
         )
         floored += 1
     print(

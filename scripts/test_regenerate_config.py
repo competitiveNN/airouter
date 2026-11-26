@@ -1283,11 +1283,11 @@ def test_emit_output_passes_the_generators_own_validator():
 
 
 @pytest.mark.parametrize("filtername,provider,boundary,below", [
-    ("filter_smart", "kilocode", 25.0, 24.9),
-    ("filter_work", "kilocode", 15.0, 14.9),
+    ("filter_smart", "kilocode", 15.0, 14.9),
+    ("filter_work", "kilocode", 10.0, 9.9),
 ])
 def test_profile_floors_are_inclusive_and_enforced(filtername, provider, boundary, below):
-    """`smart` starts at 25, `work` at 15, and the boundary belongs in.
+    """`smart` starts at 15, `work` at 10, and the boundary belongs in.
 
     A floor that is off by a whole point, or exclusive at the boundary, is
     invisible in a config whose members are far from the edge.
@@ -1302,17 +1302,19 @@ def test_profile_floors_are_inclusive_and_enforced(filtername, provider, boundar
 
 def test_fast_cap_and_large_floor_are_enforced():
     """The other two profiles' limits, for the same reason."""
-    # `fast` takes strictly intelligence < 10. No cap - all qualify.
+    # `fast` takes strictly intelligence < 5. No cap - all qualify.
     many = [
-        _model("small/high:free", "kilocode", 15.0),   # excluded: >= 10
-        _model("small/mid:free", "kilocode", 9.9),     # included: < 10
-        _model("small/low:free", "kilocode", 5.0),     # included: < 10
+        _model("small/high:free", "kilocode", 5.0),    # excluded: >= 5
+        _model("small/mid:free", "kilocode", 4.9),     # included: < 5
+        _model("small/low:free", "kilocode", 2.0),     # included: < 5
     ]
     assert len(gen.filter_fast(many)) == 2
 
     small = _model("large/small:free", "kilocode", 30.0, ctx=131072)
     big = _model("large/big:free", "kilocode", 30.0, ctx=262144)
     assert {m.id for m in gen.filter_large([small, big])} == {"large/big:free"}
+    below = _model("large/below:free", "kilocode", 4.9, ctx=262144)
+    assert {m.id for m in gen.filter_large([below, big])} == {"large/big:free"}
 
 
 def test_sort_models_returns_best_first():

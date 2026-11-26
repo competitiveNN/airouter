@@ -250,7 +250,7 @@ class Model:
     @property
     def is_auto_fallback(self) -> bool:
         """Check if this is an auto-fallback model"""
-        return self.id in ('kilo-auto/free', 'big-pickle')
+        return self.id == 'big-pickle'
 
     @property
     def is_chain_candidate(self) -> bool:
@@ -386,32 +386,32 @@ def sort_models(
 
 
 def filter_smart(models: list[Model]) -> list[Model]:
-    """smart: strongest generalists, intelligence >= 25, any context length"""
+    """smart: strongest generalists, intelligence >= 15, any context length"""
     return [m for m in models
-            if m.score is not None and m.score >= 25 and m.is_chain_candidate]
+            if m.score is not None and m.score >= 15 and m.is_chain_candidate]
 
 
 def filter_work(models: list[Model]) -> list[Model]:
-    """work: coding workhorses. Same pool as smart plus dedicated code models (e.g. cohere/north-mini-code). Drop tiny models (intelligence < 15).
+    """work: coding workhorses. Same pool as smart plus dedicated code models (e.g. cohere/north-mini-code). Drop tiny models (intelligence < 10).
 
     'Same pool as smart' means the broader eligible pool (all non-null-intelligence,
-    non-excluded, non-auto-fallback models), extending down to intelligence >= 15 to
+    non-excluded, non-auto-fallback models), extending down to intelligence >= 10 to
     include more workhorse models. Dedicated code models (e.g. cohere/north-mini-code)
-    are included when they meet the >= 15 threshold.
+    are included when they meet the >= 10 threshold.
     """
     return [m for m in models
-            if m.score is not None and m.score >= 15
+            if m.score is not None and m.score >= 10
             and not m.is_excluded and m.is_chain_candidate]
 
 
 def filter_fast(models: list[Model]) -> list[Model]:
-    """fast: small/cheap models only - strictly intelligence < 10, no cap.
+    """fast: small/cheap models only - intelligence >= 5 and < 10.
     All qualifying models included, sorted descending by intelligence."""
     candidates = []
     for m in models:
         if m.score is None or not m.is_chain_candidate:
             continue
-        if m.score < 10:
+        if 5 <= m.score < 10:
             candidates.append(m)
     # Sort by intelligence desc - all qualifying models included
     candidates.sort(key=lambda x: x.score, reverse=True)
@@ -419,11 +419,11 @@ def filter_fast(models: list[Model]) -> list[Model]:
 
 
 def filter_large(models: list[Model]) -> list[Model]:
-    """large: context_length >= 200000 only. Sort by context_length desc, then intelligence desc.
+    """large: context_length >= 200000 and intelligence >= 5. Sort by context_length desc, then intelligence desc.
     Per rule 4: skip null-intelligence models; auto models only appear as the trailing entry."""
     candidates = [m for m in models
                   if m.context_length >= 200000
-                  and m.score is not None
+                  and m.score is not None and m.score >= 5
                   and m.is_chain_candidate]
     candidates.sort(key=lambda x: (x.context_length, x.score or 0), reverse=True)
     return candidates
@@ -437,147 +437,27 @@ def auto_fallback_terminator(
     catalog: dict[tuple[str, str], Model] | None = None,
     previous: tuple[str, str, str] | None = None,
 ) -> tuple[str, str, str]:
-    """Pick the chain terminator and return (provider, model, comment).
+    """Pick the chain terminator (opencode/big-pickle) and return (provider, model, comment)."""
+    provider, model = 'opencode', 'big-pickle'
+    rec = (catalog or {}).get((provider, model))
+    state = 'unknown'
+    if rec is not None and rec.verified is not None and rec.probe_checked_at is not None:
+        age_days = (datetime.now(UTC) - rec.probe_checked_at).total_seconds() / 86400.0
+        if age_days <= AUTO_PROBE_MAX_AGE_DAYS:
+            state = 'live' if rec.verified is True else 'dead'
 
-    Liveness, never popularity. The opencode key authenticates but is not
-    entitled to the free tier: 11 of its 12 models 403 FreeTierError (paid
-    big-pickle included), so a kilocode-vs-opencode COUNT comparison is not
-    evidence of anything — it once appended opencode/big-pickle as the
-    terminator of `smart` while that endpoint failed on every call.
-
-    `catalog` is the full (mapped_provider, id) -> Model catalog, built from
-    fetch-free-models.py --probe-auto output. Verdict per candidate, from that
-    record's `verified` field:
-
-        live     verified is True  — a 1-token completion came back
-        dead     verified is False — the provider REFUSED the call (4xx)
-        unknown  verified is None  — not probed, or the probe could not reach
-                 a verdict (429, 5xx, timeout). Says nothing about the endpoint.
-
-    The ladder, in full:
-
-        1. Preferred = opencode only when the chain contains opencode endpoints
-           and no kilocode ones; otherwise kilocode. The rescue is always the
-           other router, whether or not the chain already uses that provider:
-           a chain with no kilocode endpoint at all still needs a terminator,
-           and a live opencode router beats a refused kilocode one even where
-           it introduces a provider the chain did not have.
-        2. live or unknown -> use the preferred router. `unknown` deliberately
-           does not change today's behaviour: a flaky network must never be
-           able to move the terminator off a working provider, and a stale
-           verdict (older than AUTO_PROBE_MAX_AGE_DAYS) counts as unknown for
-           the same reason.
-        3. dead -> use the other router ONLY if it probed live. Promoting an
-           unverified endpoint over a confirmed-dead one would be trading a
-           known failure for a possible one.
-        4. dead with no live alternative -> abort, leaving the existing config
-           in place. Emitting a terminator the provider has refused turns every
-           exhausted chain into a failed request, and regenerating anyway would
-           overwrite a working config with a worse one. This is a state a human
-           has to resolve (fix the key, or drop the auto entry deliberately);
-           the previous behaviour was to write the dead endpoint and hope.
-
-    The decision is per chain but the abort is global, because the generator
-    writes all four chains at once. That is why the rescue is unconditional:
-    a single degenerate chain (say a `fast` profile with no qualifying model)
-    must not be able to strand the other three.
-
-    With no catalog at all (a caller that cannot probe) step 2 always applies,
-    so the choice degrades to the pre-probe rule rather than to a hard failure.
-
-    `previous` is the (provider, model, comment) this chain already carries, if
-    any. When the verdict is unknown AND the endpoint is unchanged, the existing
-    comment is kept verbatim: a run that could not check the claim must not
-    rewrite it into a different claim. A regeneration from a verdict-less list
-    (SKIP_AUTO_PROBE=1, a fixture, a fetcher that never probed) would otherwise
-    overwrite a recorded "probed live" with "not probed" — destroying the only
-    provenance the file has — and the next run would do it again, so the diff
-    would be permanent noise. scripts/check-rules.py reports an unverifiable
-    claim as its own problem instead, which is where an operator will look.
-    Any real change of endpoint, or a fresh verdict, still writes a fresh
-    comment.
-    """
-    available = {
-        'kilocode': ('kilocode', 'kilo-auto/free'),
-        'opencode': ('opencode', 'big-pickle'),
-    }
-
-    def verdict(provider: str) -> str:
-        rec = (catalog or {}).get(available[provider])
-        if rec is None:
-            return 'unknown'
-        if rec.verified is None:
-            return 'unknown'
-        # Freshness. A verdict is a fact about one moment; a `live` from three
-        # weeks ago is evidence that the endpoint existed, not that it works
-        # now, and a `dead` from three weeks ago may since have been fixed. Both
-        # decay to `unknown`, which keeps the preferred router and cannot
-        # trigger the rescue. A verdict with no timestamp at all is treated the
-        # same way: unverifiable freshness is not freshness.
-        checked = rec.probe_checked_at
-        if checked is None:
-            key = available[provider]
-            if key not in _WARNED_NO_TIMESTAMP:
-                _WARNED_NO_TIMESTAMP.add(key)
-                print(
-                    f'warning: {key[0]}/{key[1]} carries a verdict with no probe '
-                    f'timestamp; treating it as unprobed',
-                    file=sys.stderr,
-                )
-            return 'unknown'
-        age_days = (datetime.now(UTC) - checked).total_seconds() / 86400.0
-        if age_days > AUTO_PROBE_MAX_AGE_DAYS:
-            return 'unknown'
-        return 'live' if rec.verified is True else 'dead'
-
-    if 'opencode' in providers_present and 'kilocode' not in providers_present:
-        preferred, rescue = 'opencode', 'kilocode'
-        why = 'kilocode absent from chain'
-    elif 'kilocode' in providers_present:
-        preferred, rescue = 'kilocode', 'opencode'
-        why = 'opencode auto not entitled to free tier'
-    else:
-        preferred, rescue = 'kilocode', 'opencode'
-        why = 'no auto provider in chain'
-
-    if verdict(preferred) != 'dead':
-        provider, model = available[preferred]
-        state = verdict(preferred)
-        # Preserve the previous comment when the verdict is unknown and the
-        # endpoint is unchanged: a run that could not check the claim must not
-        # rewrite it into a different claim.
-        if state == 'unknown' and previous is not None and previous[:2] == (provider, model):
-            return provider, model, previous[2]
-        # The probe verdict is stable text, not the probe timestamp: a date here
-        # would rewrite every chain on every nightly run for no added signal,
-        # and "probed live" is the part worth having in the file.
-        if state == 'live':
-            note = f'auto router probed live; {why}'
-        else:
-            note = why + ('; auto router not probed (unknown verdict)'
-                          if catalog is not None else '')
-        return provider, model, f'# last: {preferred} ({note})'
-
-    if verdict(rescue) == 'live':
-        provider, model = available[rescue]
-        print(
-            f'warning: {preferred} auto router is dead in the model list; '
-            f'falling back to {rescue}/{model}, which probed live',
-            file=sys.stderr,
+    if state == 'dead':
+        raise SystemExit(
+            f'refusing to write {provider}/{model} as the chain terminator: the probe '
+            'record in the model list says the provider refuses it. '
+            'A dead last-resort endpoint turns every exhausted chain into a failed request.'
         )
-        return provider, model, f'# last: {rescue} ({preferred} auto router probed dead)'
 
-    provider, model = available[preferred]
-    alternative = (
-        f'{rescue}/{available[rescue][1]} is not live either ({verdict(rescue)})'
-    )
-    raise SystemExit(
-        f'refusing to write {provider}/{model} as the chain terminator: the probe '
-        f'record in the model list says the provider refuses it, and {alternative}. '
-        f'A dead last-resort endpoint turns every exhausted chain into a failed '
-        f'request. config.yaml has been left unchanged — fix the key, re-fetch '
-        f'with --probe-auto, or drop the auto entry deliberately.'
-    )
+    if state == 'unknown' and previous is not None and previous[:2] == (provider, model):
+        return provider, model, previous[2]
+
+    note = 'auto router probed live' if state == 'live' else 'auto router not probed (unknown verdict)'
+    return provider, model, f'# last: opencode ({note})'
 
 
 COMMANDCODE_SPELLINGS = frozenset({"commandcode", "command-code", "cc"})
@@ -902,8 +782,8 @@ HEADER_COMMENT = """# AI Router configuration generated by regenerate_config.py
 #      best-first by intelligence descending (smart, work, fast). Striding
 #      interleaves high- and lower-scoring models so smart coverage recurs
 #      throughout the chain.
-#   5. Exactly four routable profiles: smart (intelligence >= 25), work
-#      (>= 15), fast (< 25), large (context_length >= 200000, ctx-first).
+#   5. Exactly four routable profiles: smart (intelligence >= 15), work
+#      (>= 10), fast (< 5), large (context_length >= 200000, intelligence >= 5, ctx-first).
 #   6. The last entry of every chain is the auto fallback, chosen on probe
 #      verdict (live/no verdict -> preferred; refused -> other router).
 #   7. Vision boolean on every concrete endpoint matching the source record.
