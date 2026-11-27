@@ -992,7 +992,11 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 
 	req.Header.Set("Content-Type", "application/json")
 	if isOpencodeProvider(endpoint.Provider) {
-		req.Header.Set("Authorization", "Bearer public")
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		} else {
+			req.Header.Set("Authorization", "Bearer public")
+		}
 	} else if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
