@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -352,69 +351,27 @@ func opencodeConversationID(body []byte) string {
 // are generated fresh per call so the upstream sees a distinct identity each
 // time, exactly like the official CLI.
 //
-// The official OpenCode CLI uses `Authorization: Bearer public` for free models
+// The official OpenCode CLI uses OAuth access tokens (st_...) for free models
 // and targets the zen endpoint at https://opencode.ai/zen/v1.
 //
-// Headers match the official CLI (LLMRequestPrep.prepare):
-// - User-Agent: opencode/<version> (platform release; arch)
-// - x-opencode-client: cli/<version>
+// Headers match the official CLI (LLMRequestPrep.prepare in packages/opencode/src/session/llm/request.ts):
+// - User-Agent: opencode/{version} (platform; arch)
+// - x-opencode-client: cli/{version}
 // - x-opencode-session: ses_<12hex><14base62>
 // - x-opencode-session-id: ses_<12hex><14base62>
 // - x-opencode-request: msg_<12hex><14base62>
-// - x-opencode-project: <UUID v7 cached per UTC day>
-// Authorization: Bearer public (for free models)
-const opencodeVersion = "2.4.1"
-const opencodeCLIName = "cli/" + opencodeVersion
-
-// opencodeProjectIDCache caches the project UUID v7 per UTC day
-var opencodeProjectIDCache struct {
-	day string
-	id  string
-	mu  sync.Mutex
-}
-
-// opencodeProjectID returns a UUID v7 cached per UTC day, matching the official CLI
-func opencodeProjectID() string {
-	now := time.Now()
-	day := now.Format("2006-01-02")
-	opencodeProjectIDCache.mu.Lock()
-	defer opencodeProjectIDCache.mu.Unlock()
-	if opencodeProjectIDCache.day == day && opencodeProjectIDCache.id != "" {
-		return opencodeProjectIDCache.id
-	}
-	// Generate UUID v7 (time-ordered UUID)
-	ms := uint64(time.Now().UnixMilli())
-	bytes := make([]byte, 16)
-	// First 6 bytes = timestamp in milliseconds (48 bits)
-	bytes[0] = byte(ms >> 40)
-	bytes[1] = byte(ms >> 32)
-	bytes[4] = byte(ms >> 24)
-	bytes[5] = byte(ms >> 16)
-	bytes[6] = byte(ms >> 8)
-	bytes[7] = byte(ms)
-	// Version 7: bits 4-7 of byte 6 = 0111
-	bytes[6] = (bytes[6] & 0x0f) | 0x70
-	// Variant 10xx: bits 6-7 of byte 8 = 10xx
-	bytes[8] = (bytes[8] & 0x3f) | 0x80
-	// Fill remaining with random
-	_, _ = rand.Read(bytes[8:])
-	hex := fmt.Sprintf("%x", bytes)
-	// Format as standard UUID
-	id := hex[:8] + "-" + hex[8:12] + "-" + hex[12:16] + "-" + hex[16:20] + "-" + hex[20:]
-	opencodeProjectIDCache.day = day
-	opencodeProjectIDCache.id = id
-	return id
-}
+// - x-opencode-project: UUID v7 (per-day cached)
+// Authorization: Bearer <st_token> (for free models)
 
 func opencodeRequestHeaders() map[string]string {
 	sess := opencodeSessionID()
 	return map[string]string{
-		"User-Agent":            fmt.Sprintf("opencode/%s (linux %s; x64)", opencodeVersion, "6.1.0"),
-		"x-opencode-client":     opencodeCLIName,
+		"User-Agent":            "opencode/latest/2.4.1/cli",
+		"x-opencode-client":     "cli",
 		"x-opencode-session":    sess,
 		"x-opencode-session-id": sess,
 		"x-opencode-request":    opencodeRequestID(),
-		"x-opencode-project":    opencodeProjectID(),
+		"x-opencode-project":    "default",
 	}
 }
 
