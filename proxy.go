@@ -1004,6 +1004,20 @@ func (p *Proxy) buildRequest(ctx context.Context, body []byte, endpoint ModelEnd
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
+	// Ensure User-Agent and client attribution headers are robustly set
+	if isOpencodeProvider(endpoint.Provider) {
+		for k, v := range opencodeRequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
+	} else if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+
 	// OpenCode gateways (opencode.ai/zen, /zen/go) require client-attribution
 	// headers to grant free-tier access and to pin a session to a single
 	// upstream for cache affinity. Without them the gateway treats the request
