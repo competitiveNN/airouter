@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -351,42 +352,69 @@ func opencodeConversationID(body []byte) string {
 // are generated fresh per call so the upstream sees a distinct identity each
 // time, exactly like the official CLI.
 //
-// `X-Session-ID` is a second name for the same conversation, not a third
-// identity. OpenCode's /zen/v1 routing backend validates a session id and reads
-// it under both spellings: x-opencode-session carries the canonical
-// `ses_<12hex><14base62>` form the free-tier gate accepts, while X-Session-ID is
-// the plain routing-backend name for it. A third-party gateway that sends only
-// the first is treated as having no session, which loses routing and cache
-// affinity even though the free-tier check passes. Both are set from one value
-// in buildRequest so they cannot drift apart.
-// The User-Agent is the official client string. The shipped v2 CLI (2.4.1)
-// sends `opencode/<channel>/<version>/<client>` -- captured live as
-// `opencode/latest/2.4.1/cli` -- while the v1 line sent `opencode/<version>`.
-// The gateway's edge verifies the client identity, not just the header names,
-// measured live against opencode.ai:
+// The official OpenCode CLI uses `Authorization: Bearer public` for free models
+// and targets the zen endpoint at https://opencode.ai/zen/v1.
 //
-//   - a user agent that is not an opencode client is refused by the
-//     Cloudflare edge with `403 error code: 1010` before the request
-//     reaches the gateway at all;
-//   - a user agent naming an old CLI build is refused with
-//     `426 UpgradeRequired`.
-//
-// The version is pinned to the installed release and kept equal to
-// OPENCODE_UA in fetch-free-models.py: the gateway asks third-party
-// gateways for "the correct, official User-Agent string (matching
-// opencode/<version>)", and test_opencode_ua_matches_the_gateway
-// fails when only one of the two copies is bumped.
-const opencodeCLIName = "cli"
+// Headers match the official CLI (LLMRequestPrep.prepare):
+// - User-Agent: opencode/<version> (platform release; arch)
+// - x-opencode-client: cli/<version>
+// - x-opencode-session: ses_<12hex><14base62>
+// - x-opencode-session-id: ses_<12hex><14base62>
+// - x-opencode-request: msg_<12hex><14base62>
+// - x-opencode-project: <UUID v7 cached per UTC day>
+// Authorization: Bearer public (for free models)
+const opencodeVersion = "2.4.1"
+const opencodeCLIName = "cli/" + opencodeVersion
+
+// opencodeProjectIDCache caches the project UUID v7 per UTC day
+var opencodeProjectIDCache struct {
+	day string
+	id  string
+	mu  sync.Mutex
+}
+
+// opencodeProjectID returns a UUID v7 cached per UTC day, matching the official CLI
+func opencodeProjectID() string {
+	now := time.Now()
+	day := now.Format("2006-01-02")
+	opencodeProjectIDCache.mu.Lock()
+	defer opencodeProjectIDCache.mu.Unlock()
+	if opencodeProjectIDCache.day == day && opencodeProjectIDCache.id != "" {
+		return opencodeProjectIDCache.id
+	}
+	// Generate UUID v7 (time-ordered UUID)
+	ms := uint64(time.Now().UnixMilli())
+	bytes := make([]byte, 16)
+	// First 6 bytes = timestamp in milliseconds (48 bits)
+	bytes[0] = byte(ms >> 40)
+	bytes[1] = byte(ms >> 32)
+	bytes[4] = byte(ms >> 24)
+	bytes[5] = byte(ms >> 16)
+	bytes[6] = byte(ms >> 8)
+	bytes[7] = byte(ms)
+	// Version 7: bits 4-7 of byte 6 = 0111
+	bytes[6] = (bytes[6] & 0x0f) | 0x70
+	// Variant 10xx: bits 6-7 of byte 8 = 10xx
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	// Fill remaining with random
+	_, _ = rand.Read(bytes[8:])
+	hex := fmt.Sprintf("%x", bytes)
+	// Format as standard UUID
+	id := hex[:8] + "-" + hex[8:12] + "-" + hex[12:16] + "-" + hex[16:20] + "-" + hex[20:]
+	opencodeProjectIDCache.day = day
+	opencodeProjectIDCache.id = id
+	return id
+}
 
 func opencodeRequestHeaders() map[string]string {
 	sess := opencodeSessionID()
 	return map[string]string{
-		"User-Agent":            "opencode/latest/2.4.1/cli",
+		"User-Agent":            fmt.Sprintf("opencode/%s (linux %s; x64)", opencodeVersion, "6.1.0"),
 		"x-opencode-client":     opencodeCLIName,
 		"x-opencode-session":    sess,
 		"x-opencode-session-id": sess,
 		"x-opencode-request":    opencodeRequestID(),
-		"x-opencode-project":    "default",
+		"x-opencode-project":    opencodeProjectID(),
 	}
 }
 

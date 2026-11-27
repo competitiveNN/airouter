@@ -1231,8 +1231,8 @@ func TestOpencodeHeadersInjected(t *testing.T) {
 	if gotUA == "" {
 		t.Error("expected User-Agent attribution header")
 	}
-	if gotClient != "cli" {
-		t.Errorf("expected x-opencode-client=cli, got %q", gotClient)
+	if gotClient != "cli/2.4.1" {
+		t.Errorf("expected x-opencode-client=cli/2.4.1, got %q", gotClient)
 	}
 	// The header carries the canonical `ses_<12hex><14base62>` shape rather than
 	// the raw gateway id: measured live on 2026-10-01, any other session shape is
@@ -1248,8 +1248,8 @@ func TestOpencodeHeadersInjected(t *testing.T) {
 	if gotRequest == "" {
 		t.Error("expected x-opencode-request header")
 	}
-	if gotProject != "default" {
-		t.Errorf("expected x-opencode-project=default, got %q", gotProject)
+	if gotProject == "" {
+		t.Error("expected non-empty x-opencode-project header (UUID v7)")
 	}
 }
 
