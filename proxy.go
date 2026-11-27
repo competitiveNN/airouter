@@ -575,7 +575,13 @@ func (p *Proxy) UpdateRequiredReady() {
 	if svc == nil {
 		return
 	}
-	svc.SetRequiredReady(p.requiredProxyTries())
+	required := p.requiredProxyTries()
+	if svc.TorMode() {
+		if instances := svc.TorInstances(); required > instances {
+			required = instances
+		}
+	}
+	svc.SetRequiredReady(required)
 	// Keep the readiness probe's target list in sync with the configured
 	// providers, so proxies are verified against the real origins they will
 	// carry traffic for.

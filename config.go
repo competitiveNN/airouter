@@ -550,7 +550,15 @@ func opencodeGateToolName(tool map[string]json.RawMessage) string {
 // every free-tier request 403.
 func opencodeGateTool(name string) map[string]json.RawMessage {
 	description := "opencode gate tool"
-	parameters := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)
+	var parameters json.RawMessage
+	switch name {
+	case "bash":
+		parameters = json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}`)
+	case "read":
+		parameters = json.RawMessage(`{"type":"object","properties":{"filePath":{"type":"string"}},"required":["filePath"],"additionalProperties":false}`)
+	default:
+		parameters = json.RawMessage(`{"type":"object","properties":{}}`)
+	}
 	fn, _ := json.Marshal(struct {
 		Name        string          `json:"name"`
 		Description string          `json:"description"`

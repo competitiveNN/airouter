@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1293,5 +1295,79 @@ func TestPoolProxyFailureChargesTheProxyNotTheEndpoint(t *testing.T) {
 	}
 	for _, cd := range router.GetAllCooldowns() {
 		t.Errorf("endpoint penalised for a proxy failure: %+v", cd)
+	}
+}
+
+func TestStopTorInstancesKillsTrackedPIDsAndClearsState(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	pid := cmd.Process.Pid
+	reaped := make(chan error, 1)
+	go func() { reaped <- cmd.Wait() }()
+
+	dataDir := t.TempDir()
+	if err := os.WriteFile(dataDir+"/marker", []byte("x"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	svc := NewProxyService("", time.Minute)
+	svc.torStateMu.Lock()
+	svc.torState["socks5://127.0.0.1:9999"] = &torInstanceState{
+		URL:     "socks5://127.0.0.1:9999",
+		PID:     pid,
+		DataDir: dataDir,
+	}
+	svc.torStateMu.Unlock()
+
+	svc.stopTorInstances()
+
+	select {
+	case <-reaped:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("sleep process %d was not reaped after stopTorInstances", pid)
+	}
+
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("process %d still alive after stopTorInstances", pid)
+	}
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("dataDir still exists after stopTorInstances: err=%v", err)
+	}
+	svc.torStateMu.Lock()
+	n := len(svc.torState)
+	svc.torStateMu.Unlock()
+	if n != 0 {
+		t.Fatalf("torState not cleared, got %d entries", n)
+	}
+}
+
+func TestProxyServiceStopKillsTorInstances(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	pid := cmd.Process.Pid
+	reaped := make(chan error, 1)
+	go func() { reaped <- cmd.Wait() }()
+
+	svc := NewProxyService("", time.Minute)
+	svc.torStateMu.Lock()
+	svc.torState["socks5://127.0.0.1:9998"] = &torInstanceState{
+		URL: "socks5://127.0.0.1:9998",
+		PID: pid,
+	}
+	svc.torStateMu.Unlock()
+
+	svc.Stop()
+
+	select {
+	case <-reaped:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("sleep process %d was not reaped after Stop", pid)
+	}
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("process %d still alive after Stop", pid)
 	}
 }
