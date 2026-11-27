@@ -110,8 +110,8 @@ const (
 	maxProbesPerCycle = 40
 	// proxyProbeConcurrency is how many proxies a top-up pass probes at once.
 	proxyProbeConcurrency = 8
-	// maxAcceptableLatency is the low-latency threshold (<500ms) for active proxies.
-	maxAcceptableLatency = 500 * time.Millisecond
+	// maxAcceptableLatency is the low-latency threshold (<5s) for active proxies.
+	maxAcceptableLatency = 5 * time.Second
 )
 
 type ProxyService struct {
@@ -268,6 +268,35 @@ func NewProxyService(sourcesFile string, refreshInterval time.Duration) *ProxySe
 		refreshInterval: refreshInterval,
 		stopCh:          make(chan struct{}),
 	}
+}
+
+// newConfiguredProxyService creates a proxy service and applies the Tor
+// preference from cfg. Keeping this in one place prevents the gateway and the
+// standalone provider proxy from interpreting tor_instances differently.
+func newConfiguredProxyService(cfg *Config, sourcesFile string, refreshInterval time.Duration) *ProxyService {
+	svc := NewProxyService(sourcesFile, refreshInterval)
+	if cfg != nil {
+		if n := cfg.Preferences.TorInstancesValue(); n > 0 {
+			svc.EnableTor(n)
+		}
+	}
+	return svc
+}
+
+// wireTorProxyService attaches a Tor-backed proxy pool to p when the config
+// enables Tor. It returns nil when Tor is disabled. The caller starts the
+// service separately so startup and shutdown remain under its context.
+func wireTorProxyService(cfg *Config, p *Proxy, sourcesFile string) *ProxyService {
+	if p == nil {
+		return nil
+	}
+	svc := newConfiguredProxyService(cfg, sourcesFile, 15*time.Minute)
+	if !svc.TorMode() {
+		return nil
+	}
+	p.SetProxyService(svc)
+	p.UpdateRequiredReady()
+	return svc
 }
 
 // loadSources returns the sources to fetch on this pass: the built-in list,
@@ -1767,9 +1796,10 @@ func (s *ProxyService) Start(ctx context.Context) {
 	}
 }
 
-// Stop signals the refresh loop to exit.
+// Stop signals the refresh loop to exit and kills any Tor instances.
 func (s *ProxyService) Stop() {
 	s.stopOnce.Do(func() { close(s.stopCh) })
+	s.stopTorInstances()
 }
 
 // torExitNodes is the set of exit-node country codes (Americas + Europe) Tor
@@ -1854,7 +1884,8 @@ Log notice stdout
 ExitNodes %s
 StrictNodes 1
 NumEntryGuards 1
-`, socksAddr, controlAddr, dataDir, cookiePath, torExitNodes)
+__OwningControllerProcess %d
+`, socksAddr, controlAddr, dataDir, cookiePath, torExitNodes, os.Getpid())
 		if err := os.WriteFile(torrcPath, []byte(torrc), 0o600); err != nil {
 			log.Printf("[tor] write torrc: %v", err)
 			continue
@@ -1927,20 +1958,64 @@ func resolveFreeAddr() (string, error) {
 // stopTorInstances terminates all spawned Tor daemons.
 func (s *ProxyService) stopTorInstances() {
 	s.torMu.Lock()
-	defer s.torMu.Unlock()
-	for _, p := range s.torProcesses {
-		_ = p.Stop()
-	}
+	procs := make([]*tornago.TorProcess, len(s.torProcesses))
+	copy(procs, s.torProcesses)
 	s.torProcesses = nil
-	// Clean up data directories.
+	s.torMu.Unlock()
+
+	for _, p := range procs {
+		if p == nil {
+			continue
+		}
+		_ = p.Stop()
+		// Fallback: tornago.Stop() should kill the daemon, but be sure.
+		if pid := p.PID(); pid > 0 {
+			killPID(pid)
+		}
+	}
+
+	// Also kill any tracked PIDs not covered above (defensive).
 	s.torStateMu.Lock()
+	states := make([]*torInstanceState, 0, len(s.torState))
 	for _, st := range s.torState {
+		states = append(states, st)
+	}
+	s.torState = make(map[string]*torInstanceState)
+	s.torStateMu.Unlock()
+
+	for _, st := range states {
+		if st.PID > 0 {
+			killPID(st.PID)
+		}
 		if st.DataDir != "" {
 			_ = os.RemoveAll(st.DataDir)
 		}
 	}
-	s.torState = make(map[string]*torInstanceState)
-	s.torStateMu.Unlock()
+}
+
+func killPID(pid int) {
+	if pid <= 0 {
+		return
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	// liveness check; also handles already-dead.
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return
+	}
+	_ = proc.Signal(syscall.SIGTERM)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := proc.Signal(syscall.Signal(0)); err == nil {
+		_ = proc.Signal(syscall.SIGKILL)
+	}
 }
 
 // TransportFor returns an http.Transport configured to route through the given

@@ -77,6 +77,43 @@ func loadTestConfig(t *testing.T) *Config {
 // from an absent key.
 func intPtr(v int) *int { return &v }
 
+func TestWireTorProxyServiceHonorsConfiguredInstances(t *testing.T) {
+	cfg := &Config{
+		Preferences: &Preferences{TorInstances: 4},
+		Providers: map[string]ProviderConfig{
+			"opencode": {Proxies: ProxyConfig{Retries: 8}},
+		},
+	}
+	proxy := NewProxy(cfg)
+
+	svc := wireTorProxyService(cfg, proxy, "")
+	if svc == nil {
+		t.Fatal("wireTorProxyService returned nil with tor_instances=4")
+	}
+	if got := svc.TorInstances(); got != 4 {
+		t.Fatalf("TorInstances = %d, want 4", got)
+	}
+	status := proxy.ProxyTorStatus()
+	if !status.Enabled {
+		t.Fatal("dashboard Tor status is disabled with tor_instances=4")
+	}
+	if status.Configured != 4 {
+		t.Fatalf("dashboard configured Tor instances = %d, want 4", status.Configured)
+	}
+	if status.RequiredReady != 4 {
+		t.Fatalf("dashboard required Tor instances = %d, want 4 (the configured cap)", status.RequiredReady)
+	}
+}
+
+func TestWireTorProxyServiceDisabled(t *testing.T) {
+	cfg := &Config{Preferences: &Preferences{TorInstances: 0}}
+	proxy := NewProxy(cfg)
+
+	if svc := wireTorProxyService(cfg, proxy, ""); svc != nil {
+		t.Fatal("wireTorProxyService returned a service with tor_instances=0")
+	}
+}
+
 func loadTestConfig2(t *testing.T) *Config {
 	cfg := &Config{
 		Providers: map[string]ProviderConfig{
