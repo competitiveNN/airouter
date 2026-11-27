@@ -78,7 +78,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 func handleEvent(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		http.Error(w, "streaming unsupported", http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -110,14 +110,14 @@ func handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		"paths": map[string]any{
 			"/global/health": map[string]any{
 				"get": map[string]any{
-					"summary":     "Get server health and version",
-					"responses":   map[string]any{"200": map[string]any{"description": "healthy"}},
+					"summary":   "Get server health and version",
+					"responses": map[string]any{"200": map[string]any{"description": "healthy"}},
 				},
 			},
 			"/global/event": map[string]any{
 				"get": map[string]any{
-					"summary":     "Get global events (SSE stream)",
-					"responses":   map[string]any{"200": map[string]any{"description": "event stream"}},
+					"summary":   "Get global events (SSE stream)",
+					"responses": map[string]any{"200": map[string]any{"description": "event stream"}},
 				},
 			},
 		},

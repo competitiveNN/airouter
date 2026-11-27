@@ -62,7 +62,7 @@ KEEP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --models) shift; IFS=, read -r -a MODELS <<< "$1" ;;
+    --models) shift; IFS=',' read -r -a MODELS <<< "$1" ;;
     --port) shift; PORT="$1" ;;
     --attempts) shift; ATTEMPTS="$1" ;;
     --max-retries) shift; MAX_RETRIES="$1" ;;

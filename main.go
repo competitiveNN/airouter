@@ -66,6 +66,13 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	proxySourcesPath := filepath.Join(filepath.Dir(*configPath), "proxy_sources.txt")
+	if proxySvc := wireTorProxyService(cfg, proxy, proxySourcesPath); proxySvc != nil {
+		go proxySvc.Start(ctx)
+		defer proxySvc.Stop()
+		log.Printf("Proxy service enabled (tor mode, %d instances)", proxySvc.TorInstances())
+	}
+
 	gateway := NewGatewayContext(router, proxy, cfg, *configPath, *gatewayAPIKey, *allowNoAuth)
 	router.SetMetrics(gateway.metrics)
 	proxy.SetMetrics(gateway.metrics)
@@ -84,6 +91,10 @@ func main() {
 	mux.HandleFunc("/v1/chat/completions", gateway.HandleChatCompletions)
 	mux.HandleFunc("/v1/responses", gateway.HandleResponses)
 	mux.HandleFunc("/health", gateway.HandleHealth)
+	mux.HandleFunc("/metrics", gateway.HandleMetrics)
+	mux.HandleFunc("/admin/dashboard", gateway.HandleAdminDashboard)
+	mux.HandleFunc("/admin/dashboard/data", gateway.HandleAdminDashboardData)
+	mux.HandleFunc("/admin/", gateway.HandleAdminDashboard)
 
 	// recoveryMiddleware wraps handlers to catch panics so a single bad
 	// request can't take down the entire server.
